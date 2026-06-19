@@ -1,0 +1,31 @@
+# Compiled executables / C build files
+*.exe
+*.o
+*.out
+*.obj
+*.dll
+
+# Editor and Cache
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+
+# Logs and debug files
+*.log
+build_errors.txt
+
+# Backups
+*.zip
+*.bak
+
+# Temporary outputs from the server
+output/
+temp_*
+
+# Node modules (for server.js)
+node_modules/
+
+# Documentos internos (propriedade intelectual do NVDR)
+docs/
+ANTIGRAVITY.md

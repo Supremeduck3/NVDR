@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVBC Web Render Demo</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+        }
+        canvas {
+            border: 1px solid #333;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+            background-color: #000;
+            margin-top: 20px;
+            max-width: 100%;
+        }
+        .controls {
+            margin-bottom: 20px;
+            background: #1e1e1e;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        input[type="file"] {
+            margin-right: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            background: #4caf50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover { background: #45a049; }
+        #info {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <h1>SVBC Renderer (Canvas)</h1>
+    
+    <div class="controls">
+        <label for="svbcFile">Select a <b>.svbc</b> file:</label>
+        <input type="file" id="svbcFile" accept=".svbc">
+        <div id="info"></div>
+    </div>
+
+    <canvas id="c" width="800" height="600"></canvas>
+
+    <script>
+        const canvas = document.getElementById("c");
+        const ctx = canvas.getContext("2d");
+        const infoDiv = document.getElementById("info");
+
+        document.getElementById("svbcFile").addEventListener("change", async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                const buf = await file.arrayBuffer();
+                renderSvbc(buf);
+            } catch (err) {
+                console.error("Failed to load SVBC file", err);
+                infoDiv.textContent = `Error: ${err.message}`;
+            }
+        });
+
+        function renderSvbc(buffer) {
+            const view = new DataView(buffer);
+
+            // Read header
+            const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+            if (magic !== "SVBC") {
+                throw new Error("Invalid magic, not an SVBC file.");
+            }
+            
+            const version = view.getUint8(4);
+            const w = view.getUint16(8, true);
+            const h = view.getUint16(10, true);
+            const nodeCount = view.getUint32(12, true);  // little-endian
+            const HEADER = 16;
+            const NODE = 12;
+
+            canvas.width = w;
+            canvas.height = h;
+
+            infoDiv.textContent = `Rendering ${nodeCount} nodes...`;
+            console.log(`Rendering ${nodeCount} nodes...`);
+            
+            const start = performance.now();
+
+            // Clear previous render
+            ctx.clearRect(0, 0, w, h);
+
+            for (let i = 0; i < nodeCount; i++) {
+                const off = HEADER + i * NODE;
+                const nx = view.getUint16(off,     true);
+                const ny = view.getUint16(off + 2, true);
+                const nw = view.getUint16(off + 4, true);
+                const nh = view.getUint16(off + 6, true);
+                const r = view.getUint8 (off + 8);
+                const g = view.getUint8 (off + 9);
+                const b = view.getUint8 (off + 10);
+                const layer_id = view.getUint8 (off + 11);
+                
+                ctx.fillStyle = `rgb(${r},${g},${b})`;
+                ctx.fillRect(nx, ny, nw, nh);
+            }
+            
+            const end = performance.now();
+            const timeMs = (end - start).toFixed(2);
+            infoDiv.textContent = `Rendered ${nodeCount} nodes in ${timeMs}ms - Dimensions: ${w}x${h} - Format v${version}`;
+            console.log(`Render time: ${timeMs}ms`);
+        }
+    </script>
+</body>
+</html>

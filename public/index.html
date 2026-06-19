@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVBC Studio | Neural Vector Renderer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0a0c;
+            --panel-bg: rgba(20, 20, 24, 0.7);
+            --border-glass: rgba(255, 255, 255, 0.08);
+            --brand: #6366f1;
+            --brand-glow: rgba(99, 102, 241, 0.5);
+            --text-main: #f8f9fa;
+            --text-muted: #a1a1aa;
+            --btn-bg: rgba(255, 255, 255, 0.1);
+            --btn-hover: rgba(255, 255, 255, 0.15);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.15), transparent 25%),
+                radial-gradient(circle at 85% 30%, rgba(236, 72, 153, 0.1), transparent 25%);
+            background-attachment: fixed;
+        }
+
+        header {
+            padding: 1.5rem 3rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border-glass);
+            background: rgba(10, 10, 12, 0.7);
+            backdrop-filter: blur(12px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .logo span { color: var(--brand); }
+
+        main {
+            padding: 2rem;
+            max-width: 1600px;
+            margin: 0 auto;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+        }
+
+        .top-controls {
+            display: flex;
+            gap: 2rem;
+            align-items: stretch;
+            flex-wrap: wrap;
+        }
+
+        .drop-section {
+            flex: 1;
+            min-width: 300px;
+            border: 2px dashed var(--border-glass);
+            border-radius: 16px;
+            background: var(--panel-bg);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            text-align: center;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+            position: relative;
+        }
+
+        .drop-section:hover, .drop-section.dragover {
+            border-color: var(--brand);
+            box-shadow: 0 0 20px var(--brand-glow), inset 0 0 20px rgba(99, 102, 241, 0.1);
+            background: rgba(30, 30, 38, 0.8);
+        }
+
+        .upload-icon {
+            width: 50px;
+            height: 50px;
+            background: rgba(99, 102, 241, 0.2);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1rem;
+            color: var(--brand);
+        }
+
+        .upload-icon svg { width: 24px; height: 24px; fill: currentColor; }
+        .drop-section h3 { margin-bottom: 0.5rem; font-weight: 600; }
+        .drop-section p { color: var(--text-muted); font-size: 0.9rem; }
+        #fileInput { display: none; }
+
+        .settings-panel {
+            flex: 1;
+            min-width: 300px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glass);
+            border-radius: 16px;
+            padding: 1.5rem 2rem;
+            backdrop-filter: blur(8px);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 1.5rem;
+        }
+
+        .setting-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .setting-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+
+        .setting-val { color: var(--brand); font-weight: 700; }
+
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px; width: 16px;
+            border-radius: 50%;
+            background: var(--brand);
+            cursor: pointer;
+            margin-top: -6px;
+            box-shadow: 0 0 10px var(--brand-glow);
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%; height: 4px;
+            cursor: pointer;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+        }
+
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 2rem;
+            align-items: start;
+        }
+
+        .card {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-glass);
+            border-radius: 16px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(8px);
+            position: relative;
+            animation: fadeIn 0.4s ease forwards;
+        }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .card-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-glass);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(0,0,0,0.3);
+        }
+
+        .card-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 200px;
+        }
+
+        .badge {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--brand);
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+        .canvas-container {
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: #000;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .canvas-container canvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            opacity: 0;
+            transform: scale(0.95);
+            transition: opacity 0.5s ease, transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .canvas-container canvas.loaded {
+            opacity: 1; transform: scale(1);
+        }
+
+        .card-metrics {
+            padding: 1rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.8rem;
+            font-size: 0.85rem;
+        }
+
+        .metrics-row { display: flex; justify-content: space-between; }
+        .metric-label { color: var(--text-muted); }
+        .metric-value { font-weight: 600; }
+        .metric-value.highlight { color: #ec4899; }
+
+        .card-actions {
+            padding: 0 1rem 1rem 1rem;
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 0.6rem 0;
+            background: var(--btn-bg);
+            border: 1px solid var(--border-glass);
+            color: var(--text-main);
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .btn:hover:not(:disabled) {
+            background: var(--btn-hover);
+            transform: translateY(-1px);
+        }
+
+        .btn.primary {
+            background: rgba(99, 102, 241, 0.2);
+            border-color: rgba(99, 102, 241, 0.4);
+            color: #fff;
+        }
+
+        .btn.primary:hover:not(:disabled) {
+            background: rgba(99, 102, 241, 0.3);
+            box-shadow: 0 0 15px var(--brand-glow);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .overlay-loader {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+
+        .spinner {
+            width: 30px; height: 30px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top-color: var(--brand);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 10px;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+
+        /* Icon buttons */
+        .icon-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        .icon-btn:hover {
+            background: rgba(255,255,255,0.1);
+            color: var(--text-main);
+        }
+        .icon-btn.close:hover {
+            color: #ef4444;
+            background: rgba(239, 68, 68, 0.15);
+        }
+
+        /* Modal Focus */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.9);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+        .modal-content {
+            position: relative;
+            width: 90vw;
+            height: 90vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content canvas {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            box-shadow: 0 0 50px rgba(0,0,0,0.5);
+            background: #000;
+            border-radius: 8px;
+        }
+        .modal-close {
+            position: absolute;
+            top: -40px;
+            right: 0;
+            background: none;
+            border: none;
+            color: white;
+            font-size: 2rem;
+            cursor: pointer;
+        }
+
+        /* Toggle Switch */
+        .toggle-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .toggle-row label {
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+        .toggle-row .toggle-desc {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+        .toggle-switch {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            flex-shrink: 0;
+        }
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            inset: 0;
+            background: rgba(255,255,255,0.1);
+            border-radius: 24px;
+            transition: 0.3s;
+        }
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #fff;
+            left: 3px;
+            bottom: 3px;
+            transition: 0.3s;
+        }
+        .toggle-switch input:checked + .toggle-slider {
+            background: var(--brand);
+            box-shadow: 0 0 12px var(--brand-glow);
+        }
+        .toggle-switch input:checked + .toggle-slider::before {
+            transform: translateX(20px);
+        }
+        .badge-logo {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--brand)"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+            SVBC <span>Studio</span>
+        </div>
+        <div style="color: var(--text-muted); font-size: 0.9rem;">
+            Mult-Image Concurrent Engine
+        </div>
+    </header>
+
+    <main>
+        <div class="top-controls">
+            <div class="drop-section" id="dropZone">
+                <div class="upload-icon">
+                    <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </div>
+                <h3>Drag & Drop</h3>
+                <p>Upload mutiple images for parallel conversion</p>
+                <input type="file" id="fileInput" accept="image/jpeg, image/png, image/webp" multiple>
+            </div>
+
+            <div class="settings-panel">
+                <div class="setting-group">
+                    <div class="setting-header">
+                        <span>Min Tile Size (Quality)</span>
+                        <span class="setting-val" id="valTile">2px</span>
+                    </div>
+                    <input type="range" id="minTile" min="1" max="8" step="1" value="2">
+                </div>
+                
+                <div class="setting-group">
+                    <div class="setting-header">
+                        <span>Homogeneity Threshold (Compression)</span>
+                        <span class="setting-val" id="valThresh">0.010</span>
+                    </div>
+                    <input type="range" id="homoThresh" min="0.001" max="0.05" step="0.001" value="0.01">
+                </div>
+                <div class="setting-group">
+                    <div class="toggle-row">
+                        <div>
+                            <label>Logo / Icon Mode</label><br>
+                            <span class="toggle-desc">Pixel-perfect edges, exact colors, no gradients</span>
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="logoMode">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+                <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
+                    Configure settings before dropping. SVBC conversions execute using these parameters.
+                </p>
+            </div>
+        </div>
+
+        <div class="gallery" id="gallery">
+            <!-- Render Cards will be injected here dynamically -->
+        </div>
+    </main>
+
+    <!-- Fullscreen Modal -->
+    <div class="modal-overlay" id="fullscreenModal">
+        <div class="modal-content">
+            <button class="modal-close" id="modalClose">&times;</button>
+            <canvas id="modalCanvas"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // Settings Binding
+        const inpTile = document.getElementById('minTile');
+        const valTile = document.getElementById('valTile');
+        inpTile.addEventListener('input', e => valTile.textContent = e.target.value + 'px');
+
+        const inpThresh = document.getElementById('homoThresh');
+        const valThresh = document.getElementById('valThresh');
+        inpThresh.addEventListener('input', e => valThresh.textContent = parseFloat(e.target.value).toFixed(3));
+
+        // UI Modals
+        const modal = document.getElementById('fullscreenModal');
+        const modalClose = document.getElementById('modalClose');
+        const modalCanvas = document.getElementById('modalCanvas');
+        const modalCtx = modalCanvas.getContext('2d');
+
+        function closeFullscreen() {
+            modal.classList.remove('active');
+        }
+        modalClose.addEventListener('click', closeFullscreen);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal || e.target.classList.contains('modal-content')) closeFullscreen();
+        });
+
+        // Drag & Drop Handling
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const gallery = document.getElementById('gallery');
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, e => {
+                e.preventDefault(); e.stopPropagation();
+            }, false);
+        });
+
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
+        });
+
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            handleFiles(files);
+        });
+
+        fileInput.addEventListener('change', function() {
+            handleFiles(this.files);
+            this.value = ''; // reset
+        });
+
+        function handleFiles(files) {
+            Array.from(files).forEach(file => {
+                if (file.type.startsWith('image/')) {
+                    createRenderCard(file);
+                }
+            });
+        }
+
+        const inpLogo = document.getElementById('logoMode');
+
+        async function createRenderCard(file) {
+            const tile = inpTile.value;
+            const thresh = inpThresh.value;
+            const isLogo = inpLogo.checked;
+            const cardId = 'card_' + Math.random().toString(36).substr(2, 9);
+            
+            // Build UI
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.id = cardId;
+            card.innerHTML = `
+                <div class="card-header">
+                    <span class="card-title" title="${file.name}">${file.name}</span>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        ${isLogo ? '<span class="badge-logo">LOGO</span>' : ''}
+                        <span class="badge">T${tile} / H${thresh}</span>
+                        <button class="icon-btn fullscreen" id="fs_${cardId}" title="Expand" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
+                        </button>
+                        <button class="icon-btn close" id="close_${cardId}" title="Remove">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="canvas-container">
+                    <div class="overlay-loader" id="loader_${cardId}">
+                        <div class="spinner"></div>
+                        <span style="font-size:0.8rem">Processing NVDR</span>
+                    </div>
+                    <canvas id="canvas_${cardId}"></canvas>
+                </div>
+                <div class="card-metrics">
+                    <div class="metrics-row">
+                        <span class="metric-label">Nodes</span>
+                        <span class="metric-value" id="n_${cardId}">-</span>
+                    </div>
+                    <div class="metrics-row">
+                        <span class="metric-label">SVBC Size</span>
+                        <span class="metric-value" id="s_${cardId}">-</span>
+                    </div>
+                    <div class="metrics-row">
+                        <span class="metric-label">Resolution</span>
+                        <span class="metric-value" id="r_${cardId}">-</span>
+                    </div>
+                    <div class="metrics-row">
+                        <span class="metric-label">Render Time</span>
+                        <span class="metric-value highlight" id="t_${cardId}">-</span>
+                    </div>
+                </div>
+                <div class="card-actions">
+                    <button class="btn primary" id="dl_${cardId}" disabled>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path></svg>
+                        Download SVBC
+                    </button>
+                </div>
+            `;
+            
+            // Prepend new card directly below top controls
+            gallery.prepend(card);
+
+            const loader = document.getElementById(`loader_${cardId}`);
+            const canvas = document.getElementById(`canvas_${cardId}`);
+            const btnDownload = document.getElementById(`dl_${cardId}`);
+            const btnClose = document.getElementById(`close_${cardId}`);
+            const btnExpand = document.getElementById(`fs_${cardId}`);
+            const ctx = canvas.getContext('2d');
+
+            btnClose.onclick = () => { card.remove(); };
+
+            try {
+                const ext = file.name.substring(file.name.lastIndexOf('.'));
+                const arrayBuffer = await file.arrayBuffer();
+
+                // Call local backend server
+                const response = await fetch('/convert', {
+                    method: 'POST',
+                    headers: {
+                        'x-file-ext': ext,
+                        'x-min-tile': tile,
+                        'x-homo-thresh': thresh,
+                        'x-logo-mode': isLogo ? '1' : '0',
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: arrayBuffer
+                });
+
+                if (!response.ok) throw new Error('Server error: ' + response.status);
+
+                const svbcBuffer = await response.arrayBuffer();
+                loader.style.display = 'none';
+
+                // Setup Download SVBC Button mapping logic
+                const blob = new Blob([svbcBuffer], { type: 'application/octet-stream' });
+                const objUrl = URL.createObjectURL(blob);
+                
+                btnDownload.removeAttribute('disabled');
+                btnDownload.onclick = () => {
+                    const a = document.createElement('a');
+                    a.href = objUrl;
+                    a.download = file.name.replace(/\.[^/.]+$/, "") + ".svbc";
+                    a.click();
+                };
+
+                btnExpand.removeAttribute('disabled');
+                btnExpand.onclick = () => {
+                    modal.classList.add('active');
+                    renderSvbc(svbcBuffer, modalCanvas, modalCtx, 'dummy', true); // Render to master HD modal canvas
+                };
+
+                // Render loop
+                renderSvbc(svbcBuffer, canvas, ctx, cardId, false);
+
+            } catch (err) {
+                console.error(err);
+                if (loader) loader.innerHTML = `<span style="color:#ef4444; font-size:0.9rem">❌ Error: ${err.message}</span>`;
+            }
+        }
+
+        function renderSvbc(buffer, canvas, ctx, cId, isModal) {
+            const kbSize = (buffer.byteLength / 1024).toFixed(1);
+            const view = new DataView(buffer);
+
+            const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+            if (magic !== "SVBC") {
+                console.error("Invalid magic");
+                return;
+            }
+            
+            const version = view.getUint8(4);
+            if (version !== 3) {
+                console.error("SVBC Viewer only supports v0.3 protocol or higher.");
+                return;
+            }
+
+            const codebookCount = view.getUint16(6, true);
+            const w = view.getUint16(8, true);
+            const h = view.getUint16(10, true);
+            const nodeCount = view.getUint32(12, true);
+            
+            const HEADER_SIZE = 20;
+            const NODE_SIZE = 11;
+
+            const palette = [];
+            for (let i = 0; i < codebookCount; i++) {
+                const off = HEADER_SIZE + (i * 3);
+                palette.push([
+                    view.getUint8(off),
+                    view.getUint8(off + 1),
+                    view.getUint8(off + 2)
+                ]);
+            }
+
+            canvas.width = w; canvas.height = h;
+            ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, w, h);
+
+            const start = performance.now();
+            const NODES_OFFSET = HEADER_SIZE + (codebookCount * 3);
+
+            // Parse ALL node data first (no GPU interaction yet)
+            const allNodes = new Array(nodeCount);
+            for (let i = 0; i < nodeCount; i++) {
+                const off = NODES_OFFSET + (i * NODE_SIZE);
+                const nx = view.getUint16(off,     true);
+                const ny = view.getUint16(off + 2, true);
+                const nw = view.getUint16(off + 4, true);
+                const nh = view.getUint16(off + 6, true);
+                const token = view.getUint16(off + 8, true);
+                const layerByte = view.getUint8(off + 10);
+                const [r, g, b] = palette[token];
+                allNodes[i] = { nx, ny, nw, nh, r, g, b, layerByte };
+            }
+
+            // Pass 1: Render all nodes
+            // For large images (>10K nodes), use ImageData pixel buffer for O(1) per pixel
+            // For small images, use fillRect (simpler, GPU-accelerated for large rects)
+            if (nodeCount > 10000) {
+                // Fast path: write directly to pixel buffer
+                const imgData = ctx.createImageData(w, h);
+                const pixels = imgData.data; // Uint8ClampedArray [R,G,B,A, R,G,B,A, ...]
+
+                for (let i = 0; i < nodeCount; i++) {
+                    const nd = allNodes[i];
+                    const r = nd.r, g = nd.g, b = nd.b;
+                    const x1 = nd.nx, y1 = nd.ny;
+                    const x2 = Math.min(x1 + nd.nw, w);
+                    const y2 = Math.min(y1 + nd.nh, h);
+                    for (let py = y1; py < y2; py++) {
+                        let idx = (py * w + x1) * 4;
+                        for (let px = x1; px < x2; px++) {
+                            pixels[idx]     = r;
+                            pixels[idx + 1] = g;
+                            pixels[idx + 2] = b;
+                            pixels[idx + 3] = 255;
+                            idx += 4;
+                        }
+                    }
+                }
+                ctx.putImageData(imgData, 0, 0);
+            } else {
+                // Standard path: fillRect per node
+                for (let i = 0; i < nodeCount; i++) {
+                    const nd = allNodes[i];
+                    ctx.fillStyle = `rgb(${nd.r},${nd.g},${nd.b})`;
+                    ctx.fillRect(nd.nx, nd.ny, nd.nw, nd.nh);
+                }
+            }
+
+            // Pass 2: Blend strips using parsed node colors (NO getImageData)
+            // Build spatial index: grid of node indices by position
+            // For blend-right: find node at (nx+nw, ny) 
+            // For blend-below: find node at (nx, ny+nh)
+            const BLEND_RIGHT = 0x40;
+            const BLEND_BELOW = 0x80;
+
+            // Collect blend candidates and cap at MAX_BLENDS for performance
+            // Only blend nodes with area >= 64px (visible at normal zoom)
+            const MAX_BLENDS = 500;
+            const blendNodes = [];
+            for (let i = 0; i < nodeCount; i++) {
+                const nd = allNodes[i];
+                if (!(nd.layerByte & 0xC0)) continue;
+                if (nd.nw * nd.nh < 64) continue; // skip tiny nodes
+                blendNodes.push(nd);
+            }
+            // Sort by area descending — blend largest borders first
+            blendNodes.sort((a, b) => (b.nw * b.nh) - (a.nw * a.nh));
+            const blendCount = Math.min(blendNodes.length, MAX_BLENDS);
+
+            if (blendCount > 0) {
+                // Build a map: "x,y" → node index for fast neighbor lookup
+                const posMap = new Map();
+                for (let i = 0; i < nodeCount; i++) {
+                    const nd = allNodes[i];
+                    posMap.set(`${nd.nx},${nd.ny}`, i);
+                }
+
+                for (let bi = 0; bi < blendCount; bi++) {
+                    const nd = blendNodes[bi];
+
+                    if (nd.layerByte & BLEND_RIGHT) {
+                        const key = `${nd.nx + nd.nw},${nd.ny}`;
+                        const ni = posMap.get(key);
+                        if (ni !== undefined) {
+                            const nb = allNodes[ni];
+                            const bpx = Math.max(1, Math.min(3, Math.floor(nd.nw / 8)));
+                            const grad = ctx.createLinearGradient(
+                                nd.nx + nd.nw - bpx, nd.ny,
+                                nd.nx + nd.nw + bpx, nd.ny
+                            );
+                            grad.addColorStop(0, `rgb(${nd.r},${nd.g},${nd.b})`);
+                            grad.addColorStop(1, `rgb(${nb.r},${nb.g},${nb.b})`);
+                            ctx.fillStyle = grad;
+                            ctx.fillRect(nd.nx + nd.nw - bpx, nd.ny, bpx * 2, nd.nh);
+                        }
+                    }
+                    if (nd.layerByte & BLEND_BELOW) {
+                        const key = `${nd.nx},${nd.ny + nd.nh}`;
+                        const ni = posMap.get(key);
+                        if (ni !== undefined) {
+                            const nb = allNodes[ni];
+                            const bpx = Math.max(1, Math.min(3, Math.floor(nd.nh / 8)));
+                            const grad = ctx.createLinearGradient(
+                                nd.nx, nd.ny + nd.nh - bpx,
+                                nd.nx, nd.ny + nd.nh + bpx
+                            );
+                            grad.addColorStop(0, `rgb(${nd.r},${nd.g},${nd.b})`);
+                            grad.addColorStop(1, `rgb(${nb.r},${nb.g},${nb.b})`);
+                            ctx.fillStyle = grad;
+                            ctx.fillRect(nd.nx, nd.ny + nd.nh - bpx, nd.nw, bpx * 2);
+                        }
+                    }
+                }
+            }
+
+            const end = performance.now();
+            const timeMs = (end - start).toFixed(1);
+
+            if (!isModal) {
+                document.getElementById(`n_${cId}`).textContent = nodeCount.toLocaleString();
+                document.getElementById(`s_${cId}`).textContent = `${kbSize} KB`;
+                document.getElementById(`r_${cId}`).textContent = `${w}x${h}`;
+                document.getElementById(`t_${cId}`).textContent = `${timeMs}ms`;
+            }
+
+            requestAnimationFrame(() => canvas.classList.add('loaded'));
+        }
+    </script>
+</body>
+</html>
