@@ -42,8 +42,11 @@ int svbc_write(const char* path,
     if (!flat_nodes) { fclose(f); return -1; }
     
     int n_idx = 0;
+    // B10: calloc instead of malloc so the unused weight field of
+    // any pre-allocated slot is defined and won't be read uninitialized
+    // when codebook assembly picks a slot before this loop touches it.
     int cap = 4096;
-    CWeight* cw = malloc(cap * sizeof(CWeight));
+    CWeight* cw = calloc((size_t)cap, sizeof(CWeight));
     if (!cw) {
         free(flat_nodes);
         fclose(f);

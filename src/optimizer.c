@@ -102,15 +102,19 @@ typedef struct {
 } ColorWeight;
 
 void optimizer_apply_ilut(QuadTree* qt, int max_colors) {
+    // B10: use calloc so unused slots are zero-initialized — the
+    // first iteration's `cw[best_idx]` read would otherwise trip
+    // -Wmaybe-uninitialized and ship undefined bytes when unique_count
+    // is small.
     int cap = 4096;
-    ColorWeight* cw = malloc(cap * sizeof(ColorWeight));
+    ColorWeight* cw = calloc((size_t)cap, sizeof(ColorWeight));
     if (!cw) return;
     int unique_count = 0;
 
     // Hash table for O(1) color dedup
     ColorHashTable cht;
     cht_init(&cht, cap);
-    
+
     // Pass 1: Gather area-weighted colors (O(N) with hash table)
     for (int i = 0; i < qt->count; i++) {
         if (!qt->nodes[i].is_leaf) continue;
@@ -124,7 +128,7 @@ void optimizer_apply_ilut(QuadTree* qt, int max_colors) {
             // New color inserted
             if (unique_count >= cap) {
                 cap *= 2;
-                ColorWeight* grown = realloc(cw, cap * sizeof(ColorWeight));
+                ColorWeight* grown = realloc(cw, (size_t)cap * sizeof(ColorWeight));
                 if (!grown) {
                     free(cw);
                     cht_free(&cht);

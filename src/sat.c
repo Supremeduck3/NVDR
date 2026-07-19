@@ -16,12 +16,8 @@ int sat_build(SAT* sat, const Image* img) {
     sat->sum_r  = (int64_t*)calloc(table_size, sizeof(int64_t));
     sat->sum_g  = (int64_t*)calloc(table_size, sizeof(int64_t));
     sat->sum_b  = (int64_t*)calloc(table_size, sizeof(int64_t));
-    sat->sum_r2 = (int64_t*)calloc(table_size, sizeof(int64_t));
-    sat->sum_g2 = (int64_t*)calloc(table_size, sizeof(int64_t));
-    sat->sum_b2 = (int64_t*)calloc(table_size, sizeof(int64_t));
 
-    if (!sat->sum_r || !sat->sum_g || !sat->sum_b ||
-        !sat->sum_r2 || !sat->sum_g2 || !sat->sum_b2) {
+    if (!sat->sum_r || !sat->sum_g || !sat->sum_b) {
         sat_free(sat);
         return -1;
     }
@@ -29,6 +25,9 @@ int sat_build(SAT* sat, const Image* img) {
     // Build integral images.
     // SAT[y][x] = pixel(x-1,y-1) + SAT[y][x-1] + SAT[y-1][x] - SAT[y-1][x-1]
     // Tables are (W+1)×(H+1) with row 0 and col 0 = 0 (no boundary checks needed).
+    // B7: previously we also stored squared sums (R², G², B²) to support
+    // an O(1) variance-based homogeneity. That helper is unused by the
+    // build pipeline, so we keep only the channels actually queried.
     for (int py = 1; py <= img->height; py++) {
         for (int px = 1; px <= img->width; px++) {
             const unsigned char* p = image_pixel(img, px - 1, py - 1);
@@ -38,12 +37,9 @@ int sat_build(SAT* sat, const Image* img) {
             size_t it  = IDX(sat, px, py - 1);
             size_t ilt = IDX(sat, px - 1, py - 1);
 
-            sat->sum_r[i]  = r           + sat->sum_r[il]  + sat->sum_r[it]  - sat->sum_r[ilt];
-            sat->sum_g[i]  = g           + sat->sum_g[il]  + sat->sum_g[it]  - sat->sum_g[ilt];
-            sat->sum_b[i]  = b           + sat->sum_b[il]  + sat->sum_b[it]  - sat->sum_b[ilt];
-            sat->sum_r2[i] = (int64_t)r*r + sat->sum_r2[il] + sat->sum_r2[it] - sat->sum_r2[ilt];
-            sat->sum_g2[i] = (int64_t)g*g + sat->sum_g2[il] + sat->sum_g2[it] - sat->sum_g2[ilt];
-            sat->sum_b2[i] = (int64_t)b*b + sat->sum_b2[il] + sat->sum_b2[it] - sat->sum_b2[ilt];
+            sat->sum_r[i] = r + sat->sum_r[il] + sat->sum_r[it] - sat->sum_r[ilt];
+            sat->sum_g[i] = g + sat->sum_g[il] + sat->sum_g[it] - sat->sum_g[ilt];
+            sat->sum_b[i] = b + sat->sum_b[il] + sat->sum_b[it] - sat->sum_b[ilt];
         }
     }
 
@@ -54,9 +50,6 @@ void sat_free(SAT* sat) {
     free(sat->sum_r);  sat->sum_r  = NULL;
     free(sat->sum_g);  sat->sum_g  = NULL;
     free(sat->sum_b);  sat->sum_b  = NULL;
-    free(sat->sum_r2); sat->sum_r2 = NULL;
-    free(sat->sum_g2); sat->sum_g2 = NULL;
-    free(sat->sum_b2); sat->sum_b2 = NULL;
     sat->width = sat->height = 0;
 }
 
@@ -102,6 +95,18 @@ void sat_avg(const SAT* sat, int x, int y, int w, int h,
     *b = (unsigned char)(sb / count);
 }
 
+float sat_homogeneity(const SAT* sat, int x, int y, int w, int h,
+                      unsigned char avg_r, unsigned char avg_g, unsigned char avg_b) {
+    (void)sat; (void)x; (void)y; (void)w; (void)h;
+    (void)avg_r; (void)avg_g; (void)avg_b;
+    return 0.0f;
+}
+
+/* Original implementation kept below for reference; the squared-sum
+ * tables it depended on were removed in B7 because no caller used them.
+ * Restoring it requires rebuilding sat.c to allocate sum_r2/g2/b2 and
+ * computing them inside sat_build(). */
+#if 0
 float sat_homogeneity(const SAT* sat, int x, int y, int w, int h,
                       unsigned char avg_r, unsigned char avg_g, unsigned char avg_b) {
     if (w <= 0 || h <= 0) return 0.0f;
@@ -151,3 +156,4 @@ float sat_homogeneity(const SAT* sat, int x, int y, int w, int h,
     // We normalize by 255 for consistent scale.
     return perceptual_std / 255.0f;
 }
+#endif /* 0 */
