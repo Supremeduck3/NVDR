@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     }
 
     if (!input_path || !output_path) {
-        fprintf(stderr, "Usage: image_to_svg <input> <output_base> [min_tile] [homo_thresh] [--format svg|svbc|all]\n");
+        fprintf(stderr, "Usage: image_to_svg <input> <output_base> [min_tile] [homo_thresh] [--format svg|svbc|all] [--logo] [--codebook-db PATH]\n");
         return 1;
     }
 
