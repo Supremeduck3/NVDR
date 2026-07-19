@@ -14,6 +14,7 @@
 #include "svbc_writer.h"
 #include "optimizer.h"
 #include "contour.h"
+#include "codebook_db.h"
 #include "nvdr_types.h"
 
 // PaletteEntry, IntList, NodeGradient definidos em nvdr_types.h
@@ -122,6 +123,7 @@ static long get_file_size(const char* path) {
 int main(int argc, char** argv) {
     const char* input_path = NULL;
     const char* output_path = NULL;
+    const char* codebook_db_path = NULL;   /* optional persisted codebook */
     int min_tile_size = -1;
     int min_tile_size_set = 0;   // B3: distinguish "not passed" from "passed 0"
     float homo_thresh = -1.0f;
@@ -138,6 +140,8 @@ int main(int argc, char** argv) {
             i++;
         } else if (strcmp(argv[i], "--logo") == 0) {
             logo_mode = 1;
+        } else if (strcmp(argv[i], "--codebook-db") == 0 && i + 1 < argc) {
+            codebook_db_path = argv[++i];
         } else if (!input_path) {
             input_path = argv[i];
         } else if (!output_path) {
@@ -293,6 +297,25 @@ int main(int argc, char** argv) {
     // SAT no longer needed after quadtree build
     sat_free(&sat);
 
+    // === Optional persisted codebook (cross-file dedup) ===
+    // If user passed --codebook-db PATH, load any prior persisted
+    // palette index. This is the bootstrap of Fluid Mechanism A from
+    // the v0.14 spec — colors seen in earlier runs get a weight bonus
+    // when competing for iLUT slots in this one.
+    CodebookDB cb_db;
+    codebook_db_init(&cb_db);
+    int codebook_loaded = 0;
+    if (codebook_db_path) {
+        if (codebook_db_load(&cb_db, codebook_db_path) == 0) {
+            codebook_loaded = 1;
+        } else {
+            fprintf(stderr, "warning: codebook-db at '%s' unreadable; starting fresh\n",
+                    codebook_db_path);
+            codebook_db_free(&cb_db);
+            codebook_db_init(&cb_db);
+        }
+    }
+
 #ifdef _OPENMP
     double t_built = omp_get_wtime();
 #endif
@@ -319,8 +342,28 @@ int main(int argc, char** argv) {
         optimizer_quantize(&qt, quant_step);
     }
     if (!is_ultra) {
+        /* MVP: passed codebook only affects what we record, not what
+         * iLUT picks. Future work (Mechanism A per spec §4.3) can
+         * seed the ColorWeight array here directly. */
         optimizer_apply_ilut(&qt, ilut_size);
     }
+
+    /* Record observed colors into the codebook so the next run carries
+     * what we learned this time. We do this AFTER iLUT (so the colors
+     * we record are the ones the iLUT actually picked) but BEFORE
+     * coalesce (so coalesce can still apply to a fresh tree). */
+    if (codebook_loaded || codebook_db_path) {
+        for (int i = 0; i < qt.count; i++) {
+            if (!qt.nodes[i].is_leaf) continue;
+            QuadNode* n = &qt.nodes[i];
+            int area = n->w * n->h;
+            /* area can be 0; treat as 1 so we don't drop a tiny color */
+            if (area < 1) area = 1;
+            codebook_db_observe(&cb_db, n->avg_r, n->avg_g, n->avg_b,
+                                area, /*run_id=*/1);
+        }
+    }
+
     optimizer_coalesce(&qt, 0, coalesce_color_thresh);
     optimizer_rect_coalesce(&qt, coalesce_color_thresh);
     // Skip blend detection in logo mode — logos want hard, clean edges
@@ -564,6 +607,21 @@ int main(int argc, char** argv) {
     else                                          best = svg_size;
     printf("Ratio:     %.0f%% of original\n",
            input_size > 0 ? (double)best / (double)input_size * 100.0 : 0.0);
+
+    /* Codebook persistence: write back so the next run sees this run's
+     * palette. Atomic save (.tmp + rename) so a crash mid-write leaves
+     * the prior DB intact. */
+    if (codebook_db_path) {
+        int saved = codebook_db_save(&cb_db, codebook_db_path);
+        if (saved == 0) {
+            printf("Codebook:  %d unique colors persisted to %s\n",
+                   codebook_db_size(&cb_db), codebook_db_path);
+        } else {
+            fprintf(stderr, "warning: failed to persist codebook to '%s'\n",
+                    codebook_db_path);
+        }
+    }
+    codebook_db_free(&cb_db);
 
     free(node_to_palette); free(palette); free(grad_info);
     free(prs_anchor.node_indices); free(prs_r1.node_indices); free(prs_r2.node_indices);
