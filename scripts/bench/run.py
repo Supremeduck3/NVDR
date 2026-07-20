@@ -31,6 +31,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -125,8 +127,77 @@ def run_one(binary: Path, image: Path, db_path: Path):
     svbc_path = out_base.with_suffix(".svbc")
     if svbc_path.exists():
         rec["svbc_actual_bytes"] = svbc_path.stat().st_size
+        # Pull W/H from the SVBC v3 header to compute uncompressed
+        # reference size: W*H*3 bytes of raw RGB.
+        try:
+            with open(svbc_path, "rb") as f:
+                hdr = f.read(20)
+            if len(hdr) >= 12 and hdr[:4] == b"SVBC" and hdr[4] == 3:
+                w, h = struct.unpack_from("<HH", hdr, 8)
+                rec["img_width"] = int(w)
+                rec["img_height"] = int(h)
+                rec["uncompressed_kb"] = round((w * h * 3) / 1024.0, 1)
+        except OSError:
+            pass  # leave dims unset; SVBC unreadable
+
+        # Compare-against-cjpeg sizes. These are decoded from the
+        # ORIGINAL source file (not from SVBC), so they measure what
+        # an equivalent-quality JPEG would look like vs our SVBC.
+        # Quality 90 = near-lossless; 75 = high but compressed.
+        rec["cjpeg90_kb"] = try_cjpeg(image, 90)
+        rec["cjpeg75_kb"] = try_cjpeg(image, 75)
 
     return rec
+
+
+def try_cjpeg(image_path: Path, quality: int) -> int:
+    """Run `cjpeg -quality N` on the input image's pixel data and return
+    the produced JPEG's size in KB, rounded to 1 decimal.
+
+    cjpeg needs PPM/PGM/BMP/TGA input — JPG is not accepted. So if the
+    source is JPG (or anything else non-PPM), we route through ffmpeg
+    to decompress to PPM first. ffmpeg is widely available even on
+    minimal sandboxes where Pillow isn't installed.
+
+    Returns 0 if neither tool is missing or fails. The bench records
+    the field either way — readers can tell "0" from a successful
+    small file because all of our test images produce >1 KB outputs.
+    """
+    ppm_out = Path("/tmp") / f"nvdr-cjpeg-{int(time.time()*1000)*1000}-{quality}.ppm"
+    jpg_out = Path("/tmp") / f"nvdr-cjpeg-{int(time.time()*1000)*1000+1}-{quality}.jpg"
+    try:
+        # Step 1: decode input → raw PPM (if input isn't already PPM).
+        if not image_path.suffix.lower() in (".ppm", ".pgm", ".bmp", ".tga", ".tiff"):
+            if not shutil.which("ffmpeg"):
+                return 0
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-i", str(image_path), str(ppm_out), "-y"],
+                capture_output=True, timeout=60, check=True,
+            )
+            pmp = ppm_out
+        else:
+            pmp = image_path
+
+        # Step 2: encode PPM → JPEG at the requested quality.
+        if not shutil.which("cjpeg"):
+            if pmp != image_path and pmp.exists():
+                pmp.unlink()
+            return 0
+        subprocess.run(
+            ["cjpeg", "-quality", str(quality), "-outfile", str(jpg_out), str(pmp)],
+            capture_output=True, timeout=60, check=True,
+        )
+        if jpg_out.exists():
+            return round(jpg_out.stat().st_size / 1024.0, 1)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        pass
+    finally:
+        for p in (ppm_out, jpg_out):
+            if p.exists():
+                try: p.unlink()
+                except OSError: pass
+    return 0
 
 
 def collect_images(dirpath: Path):
@@ -156,23 +227,35 @@ def print_table(records):
     if not records:
         print("(no successful records)")
         return
-    cols = ("image", "leaves_in", "leaves_out", "svbc_kb",
-            "codebook_size", "ratio_pct", "ms")
-    fmt = "{:<28} {:>10} {:>10} {:>8} {:>14} {:>8} {:>6}"
+    cols = ("image", "WxH", "svbc_KB", "uncomp_KB",
+            "cj75_KB", "cj90_KB", "svbc_vs_cj75",
+            "leaves", "ms")
+    fmt = ("{:<28} {:>11} {:>8} {:>10} {:>8} {:>8} {:>12} "
+           "{:>10} {:>6}")
     print()
     print(fmt.format(*cols))
-    print("-" * 92)
+    print("-" * 110)
     for r in records:
         if not r.get("ok"):
             print(f"  FAIL  {r.get('image')}: {r.get('error')}")
             continue
+        wh = "-"
+        if r.get("img_width") and r.get("img_height"):
+            wh = f"{r['img_width']}x{r['img_height']}"
+        svbc = r.get("svbc_kb") or 0
+        cj75 = r.get("cjpeg75_kb") or 0
+        ratio = "-"
+        if cj75 > 0 and svbc > 0:
+            ratio = f"{(svbc - cj75) / cj75 * 100:+.0f}%"
         print(fmt.format(
             r["image"][:28],
-            r.get("leaves_before", "-"),
-            r.get("leaves_after", "-"),
-            r.get("svbc_kb", "-"),
-            r.get("codebook_size_after", "-"),
-            r.get("ratio_pct", "-"),
+            wh,
+            svbc or "-",
+            r.get("uncompressed_kb", "-"),
+            cj75 or "-",
+            r.get("cjpeg90_kb", "-") or "-",
+            ratio,
+            f"{r.get('leaves_after', '-')}/{r.get('leaves_before', '-')}",
             r.get("ms_reported", "-"),
         ))
     print()
