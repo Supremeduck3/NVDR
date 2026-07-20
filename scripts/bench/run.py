@@ -15,10 +15,12 @@ Output:
    stdout — summary table + verdict
 
 Usage:
-   python3 scripts/bench/run.py                # defaults
-   python3 scripts/bench/run.py --reset        # ignore prior runs
-   python3 scripts/bench/run.py --images DIR   # custom sample dir
-   python3 scripts/bench/run.py --db PATH      # custom DB path
+   python3 scripts/bench/run.py                       # defaults
+   python3 scripts/bench/run.py --reset               # ignore prior runs
+   python3 scripts/bench/run.py --images DIR          # custom sample dir
+   python3 scripts/bench/run.py --db PATH             # custom DB path
+   python3 scripts/bench/run.py --limit 12            # first 12 images only
+   NVDR_BENCH_IMAGES=/path/to/with/50/run-on/ python3 scripts/bench/run.py
 
 MVP scope: this is a measurement harness, not a perf benchmark.
 We do NOT time individual phases inside image_to_svg — that needs
@@ -133,6 +135,12 @@ def collect_images(dirpath: Path):
                   if p.suffix.lower() in extensions and not p.name.startswith("."))
 
 
+def filter_top_n(images, n):
+    """Pick first N images, then sort the slice lexicographically by filename.
+    Deterministic across runs."""
+    return sorted(images[:n]) if n and n > 0 else images
+
+
 def reset_db(db_path: Path):
     if db_path.exists() or db_path.is_symlink():
         db_path.unlink()
@@ -179,6 +187,8 @@ def main():
                     help="Delete DB and results file before running")
     ap.add_argument("--no-db", action="store_true",
                     help="Run without --codebook-db (control arm)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="Process at most N images (0=all). Picked deterministically.")
     args = ap.parse_args()
 
     if not args.binary.exists():
@@ -188,7 +198,7 @@ def main():
         print(f"error: images dir not found: {args.images}", file=sys.stderr)
         sys.exit(1)
 
-    images = collect_images(args.images)
+    images = filter_top_n(collect_images(args.images), args.limit)
     if not images:
         print(f"error: no images at {args.images}", file=sys.stderr)
         sys.exit(1)
