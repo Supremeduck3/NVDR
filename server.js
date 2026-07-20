@@ -91,7 +91,33 @@ const server = http.createServer((req, res) => {
             // B1: argv array passed to execFile — args are NOT parsed by
             // a shell, so header values can't inject commands. The exe
             // path is local and resolved via path.join.
-            const exePath = path.join(__dirname, 'image_to_svg.exe');
+            //
+            // Across platforms the executable name differs:
+            //   Windows (gcc/MinGW + `make`):  image_to_svg.exe
+            //   Linux/macOS (gcc):              image_to_svg
+            // Pick whichever exists locally. If neither does,
+            // execFile ENOENT will surface as a 500 with a clear
+            // error message instead of hanging.
+            const exeCandidates = ['image_to_svg.exe', 'image_to_svg'];
+            let exePath = null;
+            for (const name of exeCandidates) {
+                const candidate = path.join(__dirname, name);
+                try {
+                    if (fs.existsSync(candidate)) {
+                        exePath = candidate;
+                        break;
+                    }
+                } catch (e) { /* permission errors fall through */ }
+            }
+            if (!exePath) {
+                console.error(`Conversion failed: no executable found. Tried ${exeCandidates.join(', ')} in ${__dirname}`);
+                if (!res.writableEnded) {
+                    res.writeHead(500);
+                    res.end(`Conversion failed: image_to_svg executable not found in ${__dirname}. Build it with \`make\`.`);
+                }
+                cleanupAll();
+                return;
+            }
             const args = [
                 inputPath,
                 outBase,
