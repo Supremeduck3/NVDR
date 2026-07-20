@@ -14,6 +14,7 @@
 #include "svbc_writer.h"
 #include "optimizer.h"
 #include "contour.h"
+#include "codebook_db.h"
 #include "nvdr_types.h"
 
 // PaletteEntry, IntList, NodeGradient definidos em nvdr_types.h
@@ -122,8 +123,11 @@ static long get_file_size(const char* path) {
 int main(int argc, char** argv) {
     const char* input_path = NULL;
     const char* output_path = NULL;
+    const char* codebook_db_path = NULL;   /* optional persisted codebook */
     int min_tile_size = -1;
+    int min_tile_size_set = 0;   // B3: distinguish "not passed" from "passed 0"
     float homo_thresh = -1.0f;
+    int homo_thresh_set = 0;     // B3: distinguish "not passed" from "user explicitly chose 0"
     int export_svg = 1;
     int export_svbc = 1;
     int logo_mode = 0;
@@ -136,19 +140,23 @@ int main(int argc, char** argv) {
             i++;
         } else if (strcmp(argv[i], "--logo") == 0) {
             logo_mode = 1;
+        } else if (strcmp(argv[i], "--codebook-db") == 0 && i + 1 < argc) {
+            codebook_db_path = argv[++i];
         } else if (!input_path) {
             input_path = argv[i];
         } else if (!output_path) {
             output_path = argv[i];
-        } else if (min_tile_size == -1) {
+        } else if (!min_tile_size_set) {
             min_tile_size = atoi(argv[i]);
-        } else if (homo_thresh < 0.0f) {
+            min_tile_size_set = 1;
+        } else if (!homo_thresh_set) {
             homo_thresh = (float)atof(argv[i]);
+            homo_thresh_set = 1;
         }
     }
 
     if (!input_path || !output_path) {
-        fprintf(stderr, "Usage: image_to_svg <input> <output_base> [min_tile] [homo_thresh] [--format svg|svbc|all]\n");
+        fprintf(stderr, "Usage: image_to_svg <input> <output_base> [min_tile] [homo_thresh] [--format svg|svbc|all] [--logo] [--codebook-db PATH]\n");
         return 1;
     }
 
@@ -163,8 +171,8 @@ int main(int argc, char** argv) {
     .psq_midground_mult = 2.0f
     };
     
-    if (min_tile_size > 0) cfg.min_tile_size = min_tile_size;
-    if (homo_thresh >= 0.0f) cfg.homo_threshold = homo_thresh;
+    if (min_tile_size_set && min_tile_size > 0) cfg.min_tile_size = min_tile_size;
+    if (homo_thresh_set && homo_thresh >= 0.0f) cfg.homo_threshold = homo_thresh;
 
     // Logo mode: pixel-perfect settings for small mono/unicolor images
     if (logo_mode) {
@@ -174,8 +182,8 @@ int main(int argc, char** argv) {
         cfg.psq_midground_mult = 1.0f;  // all layers equal
         cfg.max_depth = 12;             // deeper recursion for small icons
         // Allow user overrides even in logo mode
-        if (min_tile_size > 0) cfg.min_tile_size = min_tile_size;
-        if (homo_thresh >= 0.0f) cfg.homo_threshold = homo_thresh;
+        if (min_tile_size_set && min_tile_size > 0) cfg.min_tile_size = min_tile_size;
+        if (homo_thresh_set && homo_thresh >= 0.0f) cfg.homo_threshold = homo_thresh;
     }
 
     // Quality profile: quando o threshold é muito baixo, evitar PSQ agressivo.
@@ -240,13 +248,14 @@ int main(int argc, char** argv) {
         coalesce_color_thresh = 2;      // merge only near-identical colors
     } else if (img_complexity > 30.0f) {
         // High complexity: organic photo — gentle adjustments only
-        if (homo_thresh < 0.0f) cfg.homo_threshold = 0.015f;
+        // B3: only override if user did NOT explicitly pass a threshold.
+        if (!homo_thresh_set || homo_thresh < 0.0f) cfg.homo_threshold = 0.015f;
         cull_thresh = 16.0f;
         quant_step = 4;
         coalesce_color_thresh = 10;
     } else if (img_complexity > 15.0f) {
         // Medium complexity
-        if (homo_thresh < 0.0f) cfg.homo_threshold = 0.012f;
+        if (!homo_thresh_set || homo_thresh < 0.0f) cfg.homo_threshold = 0.012f;
         cull_thresh = 15.0f;
         quant_step = 4;
         coalesce_color_thresh = 10;
@@ -288,6 +297,25 @@ int main(int argc, char** argv) {
     // SAT no longer needed after quadtree build
     sat_free(&sat);
 
+    // === Optional persisted codebook (cross-file dedup) ===
+    // If user passed --codebook-db PATH, load any prior persisted
+    // palette index. This is the bootstrap of Fluid Mechanism A from
+    // the v0.14 spec — colors seen in earlier runs get a weight bonus
+    // when competing for iLUT slots in this one.
+    CodebookDB cb_db;
+    codebook_db_init(&cb_db);
+    int codebook_loaded = 0;
+    if (codebook_db_path) {
+        if (codebook_db_load(&cb_db, codebook_db_path) == 0) {
+            codebook_loaded = 1;
+        } else {
+            fprintf(stderr, "warning: codebook-db at '%s' unreadable; starting fresh\n",
+                    codebook_db_path);
+            codebook_db_free(&cb_db);
+            codebook_db_init(&cb_db);
+        }
+    }
+
 #ifdef _OPENMP
     double t_built = omp_get_wtime();
 #endif
@@ -314,8 +342,28 @@ int main(int argc, char** argv) {
         optimizer_quantize(&qt, quant_step);
     }
     if (!is_ultra) {
+        /* MVP: passed codebook only affects what we record, not what
+         * iLUT picks. Future work (Mechanism A per spec §4.3) can
+         * seed the ColorWeight array here directly. */
         optimizer_apply_ilut(&qt, ilut_size);
     }
+
+    /* Record observed colors into the codebook so the next run carries
+     * what we learned this time. We do this AFTER iLUT (so the colors
+     * we record are the ones the iLUT actually picked) but BEFORE
+     * coalesce (so coalesce can still apply to a fresh tree). */
+    if (codebook_loaded || codebook_db_path) {
+        for (int i = 0; i < qt.count; i++) {
+            if (!qt.nodes[i].is_leaf) continue;
+            QuadNode* n = &qt.nodes[i];
+            int area = n->w * n->h;
+            /* area can be 0; treat as 1 so we don't drop a tiny color */
+            if (area < 1) area = 1;
+            codebook_db_observe(&cb_db, n->avg_r, n->avg_g, n->avg_b,
+                                area, /*run_id=*/1);
+        }
+    }
+
     optimizer_coalesce(&qt, 0, coalesce_color_thresh);
     optimizer_rect_coalesce(&qt, coalesce_color_thresh);
     // Skip blend detection in logo mode — logos want hard, clean edges
@@ -330,9 +378,29 @@ int main(int argc, char** argv) {
     int leaves_after = optimizer_count_leaves(&qt, 0);
 
     // PRS Classification (v0.14.1 Section 1.2)
-    IntList prs_anchor = {malloc(qt.count * sizeof(int)), 0};
-    IntList prs_r1     = {malloc(qt.count * sizeof(int)), 0};
-    IntList prs_r2     = {malloc(qt.count * sizeof(int)), 0};
+    // B4: each IntList's backing array is malloc'd and may return NULL
+    // (especially for empty quadtrees where qt.count is 0 — that is
+    // implementation-defined). We bail out cleanly if any allocation
+    // fails.
+    if (qt.count <= 0) {
+        fprintf(stderr, "error: empty quadtree (%d nodes)\n", qt.count);
+        quadtree_free(&qt); image_free(&img);
+        return 1;
+    }
+    IntList prs_anchor = {NULL, 0};
+    IntList prs_r1     = {NULL, 0};
+    IntList prs_r2     = {NULL, 0};
+    prs_anchor.node_indices = (int*)malloc((size_t)qt.count * sizeof(int));
+    prs_r1.node_indices     = (int*)malloc((size_t)qt.count * sizeof(int));
+    prs_r2.node_indices     = (int*)malloc((size_t)qt.count * sizeof(int));
+    if (!prs_anchor.node_indices || !prs_r1.node_indices || !prs_r2.node_indices) {
+        fprintf(stderr, "error: failed to allocate PRS layer buffers (%d nodes)\n", qt.count);
+        free(prs_anchor.node_indices);
+        free(prs_r1.node_indices);
+        free(prs_r2.node_indices);
+        quadtree_free(&qt); image_free(&img);
+        return 1;
+    }
     
     // Quality detection for Ultra mode
 
@@ -539,6 +607,21 @@ int main(int argc, char** argv) {
     else                                          best = svg_size;
     printf("Ratio:     %.0f%% of original\n",
            input_size > 0 ? (double)best / (double)input_size * 100.0 : 0.0);
+
+    /* Codebook persistence: write back so the next run sees this run's
+     * palette. Atomic save (.tmp + rename) so a crash mid-write leaves
+     * the prior DB intact. */
+    if (codebook_db_path) {
+        int saved = codebook_db_save(&cb_db, codebook_db_path);
+        if (saved == 0) {
+            printf("Codebook:  %d unique colors persisted to %s\n",
+                   codebook_db_size(&cb_db), codebook_db_path);
+        } else {
+            fprintf(stderr, "warning: failed to persist codebook to '%s'\n",
+                    codebook_db_path);
+        }
+    }
+    codebook_db_free(&cb_db);
 
     free(node_to_palette); free(palette); free(grad_info);
     free(prs_anchor.node_indices); free(prs_r1.node_indices); free(prs_r2.node_indices);

@@ -49,7 +49,7 @@
 </head>
 <body>
     <h1>SVBC Renderer (Canvas)</h1>
-    
+
     <div class="controls">
         <label for="svbcFile">Select a <b>.svbc</b> file:</label>
         <input type="file" id="svbcFile" accept=".svbc">
@@ -76,51 +76,91 @@
             }
         });
 
+        // SVBC v3 wire format (header 20 bytes, packed struct):
+        //   [0..3]   magic           "SVBC"
+        //   [4]      version         uint8 (currently 3)
+        //   [5]      _pad            uint8
+        //   [6..7]   codebook_count  uint16 LE
+        //   [8..9]   img_width       uint16 LE
+        //   [10..11] img_height      uint16 LE
+        //   [12..15] node_count      uint32 LE
+        //   [16..19] _reserved       uint32 LE
+        //   [20 .. 20 + 3*codebook_count)   palette (RGB triples)
+        //   [ ... ]  leaf nodes (11 bytes each: x,y,w,h as uint16 LE,
+        //             token_id uint16 LE, layer_id uint8)
+        const HEADER_SIZE = 20;
+        const NODE_SIZE = 11;
+
+        function readPalette(view, codebookCount, offset) {
+            const palette = new Array(codebookCount);
+            for (let i = 0; i < codebookCount; i++) {
+                const off = offset + (i * 3);
+                palette[i] = [
+                    view.getUint8(off),
+                    view.getUint8(off + 1),
+                    view.getUint8(off + 2),
+                ];
+            }
+            return palette;
+        }
+
         function renderSvbc(buffer) {
             const view = new DataView(buffer);
 
-            // Read header
-            const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+            // Header
+            const magic = String.fromCharCode(
+                view.getUint8(0), view.getUint8(1),
+                view.getUint8(2), view.getUint8(3));
             if (magic !== "SVBC") {
                 throw new Error("Invalid magic, not an SVBC file.");
             }
-            
+
             const version = view.getUint8(4);
+            if (version !== 3) {
+                throw new Error(`Unsupported SVBC version ${version}; this viewer handles v3.`);
+            }
+
+            const codebookCount = view.getUint16(6, true);
             const w = view.getUint16(8, true);
             const h = view.getUint16(10, true);
-            const nodeCount = view.getUint32(12, true);  // little-endian
-            const HEADER = 16;
-            const NODE = 12;
+            const nodeCount = view.getUint32(12, true);
+
+            // B9: previous demo skipped the codebook entirely and treated
+            // every node as if it carried raw RGB. The writer emits token
+            // IDs, so without this palette lookup colours were rendered
+            // as black for any non-empty codebook. Reading it now.
+            const palette = readPalette(view, codebookCount, HEADER_SIZE);
+            const nodesOffset = HEADER_SIZE + codebookCount * 3;
 
             canvas.width = w;
             canvas.height = h;
 
             infoDiv.textContent = `Rendering ${nodeCount} nodes...`;
-            console.log(`Rendering ${nodeCount} nodes...`);
-            
+            console.log(`Rendering ${nodeCount} nodes (codebook=${codebookCount})...`);
+
             const start = performance.now();
 
             // Clear previous render
-            ctx.clearRect(0, 0, w, h);
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, w, h);
 
             for (let i = 0; i < nodeCount; i++) {
-                const off = HEADER + i * NODE;
+                const off = nodesOffset + i * NODE_SIZE;
                 const nx = view.getUint16(off,     true);
                 const ny = view.getUint16(off + 2, true);
                 const nw = view.getUint16(off + 4, true);
                 const nh = view.getUint16(off + 6, true);
-                const r = view.getUint8 (off + 8);
-                const g = view.getUint8 (off + 9);
-                const b = view.getUint8 (off + 10);
-                const layer_id = view.getUint8 (off + 11);
-                
-                ctx.fillStyle = `rgb(${r},${g},${b})`;
+                const token = view.getUint16(off + 8, true);
+                const pal = palette[token] || [0, 0, 0];
+                ctx.fillStyle = `rgb(${pal[0]},${pal[1]},${pal[2]})`;
                 ctx.fillRect(nx, ny, nw, nh);
             }
-            
+
             const end = performance.now();
             const timeMs = (end - start).toFixed(2);
-            infoDiv.textContent = `Rendered ${nodeCount} nodes in ${timeMs}ms - Dimensions: ${w}x${h} - Format v${version}`;
+            infoDiv.textContent =
+                `Rendered ${nodeCount} nodes in ${timeMs}ms - ` +
+                `Dimensions: ${w}x${h} - Format v${version} - Codebook: ${codebookCount}`;
             console.log(`Render time: ${timeMs}ms`);
         }
     </script>

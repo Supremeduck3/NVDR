@@ -23,6 +23,17 @@ build_errors.txt
 output/
 temp_*
 
+# Build artifact (Makefile target)
+image_to_svg
+
+# Benchmark script's ad-hoc SVBC outputs land in /tmp/ (outside the repo).
+# If you ever run the bench with a custom --images pointing into the repo,
+# nothing inside /tmp/nvdr-inspect/ gets polluted.
+
+# Python tooling leftovers
+__pycache__/
+*.pyc
+
 # Node modules (for server.js)
 node_modules/
 

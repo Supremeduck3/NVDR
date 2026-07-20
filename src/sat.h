@@ -20,9 +20,6 @@ typedef struct SAT_tag {
     int64_t* sum_r;    // prefix sum of R
     int64_t* sum_g;    // prefix sum of G
     int64_t* sum_b;    // prefix sum of B
-    int64_t* sum_r2;   // prefix sum of R² (for variance)
-    int64_t* sum_g2;   // prefix sum of G²
-    int64_t* sum_b2;   // prefix sum of B²
     int width, height;
 } SAT;
 
@@ -37,11 +34,5 @@ void sat_free(SAT* sat);
 // Clamped to image bounds internally.
 void sat_avg(const SAT* sat, int x, int y, int w, int h,
              unsigned char* r, unsigned char* g, unsigned char* b);
-
-// O(1) variance-based homogeneity for the rectangle.
-// Returns 0.0 (uniform) to ~1.0 (chaotic), same scale as color_homogeneity().
-// Uses perceptual YCbCr weighting: Y=0.70, Cb=0.15, Cr=0.15.
-float sat_homogeneity(const SAT* sat, int x, int y, int w, int h,
-                      unsigned char avg_r, unsigned char avg_g, unsigned char avg_b);
 
 #endif /* SAT_H */
