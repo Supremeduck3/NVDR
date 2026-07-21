@@ -26,9 +26,11 @@
  * No external dependencies. No locking — call sites run single-threaded
  * around the load/save boundary.
  *
- * The codebook is intentionally NOT used to bias the iLUT selection
- * algorithm — it only seeds pre-existing colors so they get a head
- * start in the Pareto loop. Selection still honors current-run weights.
+ * The codebook is used to bias the iLUT selection algorithm — colors
+ * already seen in prior runs get a weight bonus (their accumulated
+ * area) added in Pass 1.5 of optimizer_apply_ilut, so they compete
+ * for palette slots on equal footing with current-run colors. Selection
+ * still honors current-run weights; the bonus is additive, not exclusive.
  */
 
 typedef struct {

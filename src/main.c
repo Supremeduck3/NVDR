@@ -342,10 +342,12 @@ int main(int argc, char** argv) {
         optimizer_quantize(&qt, quant_step);
     }
     if (!is_ultra) {
-        /* MVP: passed codebook only affects what we record, not what
-         * iLUT picks. Future work (Mechanism A per spec §4.3) can
-         * seed the ColorWeight array here directly. */
-        optimizer_apply_ilut(&qt, ilut_size);
+        /* Mechanism A per spec §4.3: colors already known to the
+         * persisted codebook get a weight bonus in the Pareto loop,
+         * so cross-file color reuse actually competes for palette
+         * slots instead of only being recorded after the fact.
+         * codebook_loaded==0 means persisted is empty -> no bias. */
+        optimizer_apply_ilut(&qt, ilut_size, codebook_loaded ? &cb_db : NULL);
     }
 
     /* Record observed colors into the codebook so the next run carries
