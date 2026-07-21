@@ -147,7 +147,69 @@ def run_one(binary: Path, image: Path, db_path: Path):
         rec["cjpeg90_kb"] = try_cjpeg(image, 90)
         rec["cjpeg75_kb"] = try_cjpeg(image, 75)
 
+        # Post-hoc MTF hit-rate diagnostic. Reads SVBC file we just
+        # wrote and computes what fraction of leaves would have
+        # benefited from a Move-To-Front encoding. Reference:
+        # docs/SVBC_ColorRelation_v0_4_proposal.md.
+        for n in (2, 4, 8):
+            hits, total, rate = analyze_mtf_hits(svbc_path, n)
+            rec[f"mtf_hits_n{n}"] = hits
+            rec[f"mtf_total_n{n}"] = total
+            rec[f"mtf_hit_rate_n{n}"] = round(rate, 1)
+
     return rec
+
+
+def analyze_mtf_hits(svbc_path: Path, n: int) -> tuple:
+    """Post-hoc MTF hit-rate analysis. Read an existing SVBC file and
+    simulate a Move-To-Front list of size `n` over the leaves. Returns
+    (hits, total, hit_rate) where hit_rate is hits/total as a float.
+
+    This is the diagnostic the v0.4 MTF proposal asks for: if the
+    hit rate is high (>=60-70%), then a binary-format change to
+    actually implement MTF is worth it. If low, the proposal is not
+    worth the implementation cost. See
+    ~/.agent-notes/SVBC_ColorRelation_v0_4_proposal.md for context.
+
+    CVE: a literal (not in list) write to the encoder is still 17 bits
+    (1 flag + 16 token_id). A hit is 1 + log2(n) bits. The hit rate
+    alone tells us the *potential* saving; actual cost depends on
+    whether you'd also redesign the bitstream packing.
+    """
+    try:
+        with open(svbc_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return (0, 0, 0.0)
+
+    if len(data) < 20 or data[:4] != b"SVBC" or data[4] != 3:
+        return (0, 0, 0.0)
+
+    codebook_count = struct.unpack_from("<H", data, 6)[0]
+    nodes_offset   = 20 + codebook_count * 3
+    file_remaining = len(data) - nodes_offset
+    if file_remaining < 0:
+        return (0, 0, 0.0)
+
+    node_count = file_remaining // 11
+    mtf = []
+    hits = 0
+    total = 0
+    for i in range(node_count):
+        off = nodes_offset + i * 11
+        tok = struct.unpack_from("<H", data, off + 8)[0]
+        if tok in mtf:
+            hits += 1
+            mtf.remove(tok)
+            mtf.insert(0, tok)
+        else:
+            mtf.insert(0, tok)
+            if len(mtf) > n:
+                mtf.pop()
+        total += 1
+
+    rate = (hits / total * 100.0) if total else 0.0
+    return (hits, total, rate)
 
 
 def try_cjpeg(image_path: Path, quality: int) -> int:
@@ -227,14 +289,15 @@ def print_table(records):
     if not records:
         print("(no successful records)")
         return
-    cols = ("image", "WxH", "svbc_KB", "uncomp_KB",
-            "cj75_KB", "cj90_KB", "svbc_vs_cj75",
+    cols = ("image", "WxH", "svbc_KB", "cj75_KB", "vs_cj75",
+            "MTF_n2", "MTF_n4", "MTF_n8",
             "leaves", "ms")
-    fmt = ("{:<28} {:>11} {:>8} {:>10} {:>8} {:>8} {:>12} "
+    fmt = ("{:<28} {:>11} {:>8} {:>8} {:>8} "
+           "{:>7} {:>7} {:>7} "
            "{:>10} {:>6}")
     print()
     print(fmt.format(*cols))
-    print("-" * 110)
+    print("-" * 116)
     for r in records:
         if not r.get("ok"):
             print(f"  FAIL  {r.get('image')}: {r.get('error')}")
@@ -247,14 +310,20 @@ def print_table(records):
         ratio = "-"
         if cj75 > 0 and svbc > 0:
             ratio = f"{(svbc - cj75) / cj75 * 100:+.0f}%"
+        def mtf(col):
+            v = r.get(col)
+            if v is None:
+                return "-"
+            return f"{v:.0f}%"
         print(fmt.format(
             r["image"][:28],
             wh,
             svbc or "-",
-            r.get("uncompressed_kb", "-"),
             cj75 or "-",
-            r.get("cjpeg90_kb", "-") or "-",
             ratio,
+            mtf("mtf_hit_rate_n2"),
+            mtf("mtf_hit_rate_n4"),
+            mtf("mtf_hit_rate_n8"),
             f"{r.get('leaves_after', '-')}/{r.get('leaves_before', '-')}",
             r.get("ms_reported", "-"),
         ))
