@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="3822" height="2817" viewBox="0 0 3822 2817" shape-rendering="geometricPrecision">
+<defs>
+</defs>
+<style>.c0{fill:#000}</style>
+<rect x="0" y="0" width="3822" height="2817" fill="#000"/>
+<g id="NVDR_Anchor">
+<path class="c0" d="m0 0h3822v2817h-3822z"/>
+</g>
+<g id="NVDR_R1" opacity="0">
+<animate attributeName="opacity" from="0" to="1" begin="0.2s" dur="0.2s" fill="freeze"/>
+</g>
+<g id="NVDR_R2" opacity="0">
+<animate attributeName="opacity" from="0" to="1" begin="0.4s" dur="0.2s" fill="freeze"/>
+</g>
+</svg>

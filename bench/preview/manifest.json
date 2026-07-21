@@ -1,0 +1,44 @@
+[
+  {
+    "stem": "glass(really important)",
+    "input": "/home/supremeduck008/share/code/samples_images/glass(really important).jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/glass(really important)",
+    "svg_kb": 467.7,
+    "svbc_kb": 51.2
+  },
+  {
+    "stem": "light (ambiente escuro com feixe de luz)",
+    "input": "/home/supremeduck008/share/code/samples_images/light (ambiente escuro com feixe de luz).jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/light (ambiente escuro com feixe de luz)",
+    "svg_kb": 574.3,
+    "svbc_kb": 272.3
+  },
+  {
+    "stem": "moon",
+    "input": "/home/supremeduck008/share/code/samples_images/moon.jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/moon",
+    "svg_kb": 30.8,
+    "svbc_kb": 3.1
+  },
+  {
+    "stem": "pexels-rajesh-s-balouria-1289088-9187144",
+    "input": "/home/supremeduck008/share/code/samples_images/pexels-rajesh-s-balouria-1289088-9187144.jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/pexels-rajesh-s-balouria-1289088-9187144",
+    "svg_kb": 0.5,
+    "svbc_kb": 0.0
+  },
+  {
+    "stem": "pexels-shea-gordon-2158373258-35867673",
+    "input": "/home/supremeduck008/share/code/samples_images/pexels-shea-gordon-2158373258-35867673.jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/pexels-shea-gordon-2158373258-35867673",
+    "svg_kb": 731.5,
+    "svbc_kb": 117.1
+  },
+  {
+    "stem": "pexels-skymer-36770757",
+    "input": "/home/supremeduck008/share/code/samples_images/pexels-skymer-36770757.jpg",
+    "svg": "/home/supremeduck008/NVDR/bench/preview/pexels-skymer-36770757",
+    "svg_kb": 458.9,
+    "svbc_kb": 234.5
+  }
+]
