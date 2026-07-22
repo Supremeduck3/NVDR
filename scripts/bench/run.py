@@ -39,9 +39,9 @@ import time
 from pathlib import Path
 
 
-REPO = Path("/tmp/nvdr-inspect")
-DEFAULT_BIN = REPO / "image_to_svg"
-DEFAULT_IMG_DIR = REPO / "samples"
+REPO = Path("/Users/Familia/iasvgbug/NVDR")
+DEFAULT_BIN = REPO / "image_to_svg.exe"
+DEFAULT_IMG_DIR = REPO / "Z:/samples_images/2"
 DEFAULT_DB = Path("/tmp/nvdr-bench-codebook.nvcb")
 RESULTS_PATH = REPO / "bench" / "results.jsonl"
 
