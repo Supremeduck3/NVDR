@@ -2,6 +2,7 @@
 #define OPTIMIZER_H
 
 #include "quadtree.h"
+#include "codebook_db.h"
 
 // Coalesces sibling leaf nodes with similar colors back into parent
 // color_threshold: max sum of absolute RGB diffs to merge (e.g., 12)
@@ -15,7 +16,11 @@ void optimizer_quantize(QuadTree* qt, int step);
 int optimizer_count_leaves(const QuadTree* qt, int node_idx);
 
 // Sub-pass B: iLUT Pareto-weighted Palette (N=256)
-void optimizer_apply_ilut(QuadTree* qt, int max_colors);
+// `persisted` is optional (NULL = no bias, same behavior as before):
+// when set, colors already known to the cross-file codebook get a
+// weight bonus before the Pareto greedy selection, so they compete
+// for palette slots on equal footing with colors this run just saw.
+void optimizer_apply_ilut(QuadTree* qt, int max_colors, const CodebookDB* persisted);
 
 // Fluid System W_i: Drops noisy frequency leaves
 void optimizer_apply_importance_cull(QuadTree* qt, float w_i_threshold);

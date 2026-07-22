@@ -101,7 +101,7 @@ typedef struct {
     int weight;
 } ColorWeight;
 
-void optimizer_apply_ilut(QuadTree* qt, int max_colors) {
+void optimizer_apply_ilut(QuadTree* qt, int max_colors, const CodebookDB* persisted) {
     // B10: use calloc so unused slots are zero-initialized — the
     // first iteration's `cw[best_idx]` read would otherwise trip
     // -Wmaybe-uninitialized and ship undefined bytes when unique_count
@@ -144,7 +144,24 @@ void optimizer_apply_ilut(QuadTree* qt, int max_colors) {
         }
     }
     cht_free(&cht);
-    
+
+    // Pass 1.5: seed — colors already known to the persisted cross-file
+    // codebook get a weight bonus (their accumulated area from prior
+    // runs) so they compete for palette slots on equal footing with
+    // whatever this run happens to weight heavily. Same units as the
+    // area-weight above (both are pixel-area accumulations), so this
+    // is a straight addition, not a separate scoring pass. NULL/empty
+    // `persisted` means zero bonus everywhere — identical to the old
+    // behavior.
+    if (persisted && persisted->count > 0) {
+        for (int i = 0; i < unique_count; i++) {
+            CodebookDBEntry hit;
+            if (codebook_db_lookup(persisted, cw[i].r, cw[i].g, cw[i].b, &hit)) {
+                cw[i].weight += hit.weight;
+            }
+        }
+    }
+
     // Pass 2: Select N=256 palette using Pareto-weighted Perceptual Salience (Frequency * Perceptual Distance)
     int palette_size = 0;
     int max_palette = unique_count > max_colors ? max_colors : unique_count;
