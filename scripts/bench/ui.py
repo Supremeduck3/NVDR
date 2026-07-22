@@ -25,7 +25,10 @@ except ImportError:
 REPO = Path(os.environ.get("NVDR_REPO", str(Path(__file__).resolve().parents[2])))
 RESULTS = REPO / "bench" / "results.jsonl"
 MANIFEST = REPO / "bench" / "preview" / "manifest.json"
-IMAGES_DIR = Path(os.environ.get("NVDR_IMAGES_DIR", r"Z:\samples_images"))
+IMAGES_DIR = Path(os.environ.get(
+    "NVDR_IMAGES_DIR",
+    "/home/supremeduck008/share/code/samples_images",
+))
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -177,12 +180,13 @@ class BenchApp(App):
     }
 
     #path-input {
+        height: 3;
         margin-bottom: 1;
         border: tall $accent;
     }
 
     #meta-card {
-        height: auto;
+        height: 9;
         padding: 1;
         margin-bottom: 1;
         border: round $primary;
@@ -193,7 +197,7 @@ class BenchApp(App):
         height: 1fr;
         border: round $accent;
         background: $surface;
-        content-align: center middle;
+        padding: 0 1;
         overflow: hidden;
     }
     """
