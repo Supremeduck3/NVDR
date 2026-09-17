@@ -78,7 +78,7 @@
 
         // SVBC v3 wire format (header 20 bytes, packed struct):
         //   [0..3]   magic           "SVBC"
-        //   [4]      version         uint8 (currently 3)
+        //   [4]      version         uint8 (3 = interleaved nodes, 4 = planar)
         //   [5]      _pad            uint8
         //   [6..7]   codebook_count  uint16 LE
         //   [8..9]   img_width       uint16 LE
@@ -116,8 +116,8 @@
             }
 
             const version = view.getUint8(4);
-            if (version !== 3) {
-                throw new Error(`Unsupported SVBC version ${version}; this viewer handles v3.`);
+            if (version !== 3 && version !== 4) {
+                throw new Error(`Unsupported SVBC version ${version}; this viewer handles v3 and v4.`);
             }
 
             const codebookCount = view.getUint16(6, true);
@@ -144,13 +144,22 @@
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, w, h);
 
+            // v4 stores each field in its own plane (all x, then all y, ...);
+            // v3 interleaved them into 11-byte records.
+            const planar = version >= 4;
+            const xOff = nodesOffset;
+            const yOff = xOff + nodeCount * 2;
+            const wOff = yOff + nodeCount * 2;
+            const hOff = wOff + nodeCount * 2;
+            const tOff = hOff + nodeCount * 2;
+
             for (let i = 0; i < nodeCount; i++) {
                 const off = nodesOffset + i * NODE_SIZE;
-                const nx = view.getUint16(off,     true);
-                const ny = view.getUint16(off + 2, true);
-                const nw = view.getUint16(off + 4, true);
-                const nh = view.getUint16(off + 6, true);
-                const token = view.getUint16(off + 8, true);
+                const nx = planar ? view.getUint16(xOff + i * 2, true) : view.getUint16(off,     true);
+                const ny = planar ? view.getUint16(yOff + i * 2, true) : view.getUint16(off + 2, true);
+                const nw = planar ? view.getUint16(wOff + i * 2, true) : view.getUint16(off + 4, true);
+                const nh = planar ? view.getUint16(hOff + i * 2, true) : view.getUint16(off + 6, true);
+                const token = planar ? view.getUint16(tOff + i * 2, true) : view.getUint16(off + 8, true);
                 const pal = palette[token] || [0, 0, 0];
                 ctx.fillStyle = `rgb(${pal[0]},${pal[1]},${pal[2]})`;
                 ctx.fillRect(nx, ny, nw, nh);

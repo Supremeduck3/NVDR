@@ -712,8 +712,8 @@
             }
             
             const version = view.getUint8(4);
-            if (version !== 3) {
-                console.error("SVBC Viewer only supports v0.3 protocol or higher.");
+            if (version !== 3 && version !== 4) {
+                console.error(`SVBC Viewer supports v0.3 and v0.4; got v${version}.`);
                 return;
             }
 
@@ -723,7 +723,6 @@
             const nodeCount = view.getUint32(12, true);
             
             const HEADER_SIZE = 20;
-            const NODE_SIZE = 11;
 
             const palette = [];
             for (let i = 0; i < codebookCount; i++) {
@@ -741,18 +740,51 @@
             const start = performance.now();
             const NODES_OFFSET = HEADER_SIZE + (codebookCount * 3);
 
+            // v0.3 stored nodes as interleaved 11-byte records; v0.4 stores
+            // them as separate planes (all x, then all y, ...), which gzips
+            // about twice as well. Both are decoded into the same array.
+            const readNodes = (view, version, nodesOffset, nodeCount) => {
+                const out = new Array(nodeCount);
+                if (version >= 4) {
+                    const xOff = nodesOffset;
+                    const yOff = xOff + nodeCount * 2;
+                    const wOff = yOff + nodeCount * 2;
+                    const hOff = wOff + nodeCount * 2;
+                    const tOff = hOff + nodeCount * 2;
+                    const lOff = tOff + nodeCount * 2;
+                    for (let i = 0; i < nodeCount; i++) {
+                        out[i] = {
+                            nx: view.getUint16(xOff + i * 2, true),
+                            ny: view.getUint16(yOff + i * 2, true),
+                            nw: view.getUint16(wOff + i * 2, true),
+                            nh: view.getUint16(hOff + i * 2, true),
+                            token: view.getUint16(tOff + i * 2, true),
+                            layerByte: view.getUint8(lOff + i)
+                        };
+                    }
+                } else {
+                    for (let i = 0; i < nodeCount; i++) {
+                        const off = nodesOffset + i * 11;
+                        out[i] = {
+                            nx: view.getUint16(off, true),
+                            ny: view.getUint16(off + 2, true),
+                            nw: view.getUint16(off + 4, true),
+                            nh: view.getUint16(off + 6, true),
+                            token: view.getUint16(off + 8, true),
+                            layerByte: view.getUint8(off + 10)
+                        };
+                    }
+                }
+                return out;
+            };
+
             // Parse ALL node data first (no GPU interaction yet)
-            const allNodes = new Array(nodeCount);
+            const allNodes = readNodes(view, version, NODES_OFFSET, nodeCount);
             for (let i = 0; i < nodeCount; i++) {
-                const off = NODES_OFFSET + (i * NODE_SIZE);
-                const nx = view.getUint16(off,     true);
-                const ny = view.getUint16(off + 2, true);
-                const nw = view.getUint16(off + 4, true);
-                const nh = view.getUint16(off + 6, true);
-                const token = view.getUint16(off + 8, true);
-                const layerByte = view.getUint8(off + 10);
-                const [r, g, b] = palette[token];
-                allNodes[i] = { nx, ny, nw, nh, r, g, b, layerByte };
+                const entry = palette[allNodes[i].token] || [0, 0, 0];
+                allNodes[i].r = entry[0];
+                allNodes[i].g = entry[1];
+                allNodes[i].b = entry[2];
             }
 
             // Pass 1: Render all nodes
