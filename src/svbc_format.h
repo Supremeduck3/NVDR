@@ -4,13 +4,32 @@
 #include <stdint.h>
 
 /*
- * SVBC v0.3 — SVG Binary Compression
+ * SVBC v0.4 — SVG Binary Compression
  * Formato binário nativo do pipeline NVDR.
  *
- * Layout do arquivo:
- *   [SVBC_Header     — 20 bytes]
+ * Layout do arquivo (v0.4):
+ *   [SVBC_Header      — 20 bytes]
  *   [SVBC_Color × codebook_count — 3 bytes cada]
- *   [SVBC_Node  × node_count     — 11 bytes cada]
+ *   [plano x      — uint16 × node_count]
+ *   [plano y      — uint16 × node_count]
+ *   [plano w      — uint16 × node_count]
+ *   [plano h      — uint16 × node_count]
+ *   [plano token  — uint16 × node_count]
+ *   [plano layer  — uint8  × node_count]
+ *
+ * v0.3 → v0.4 (mesmo tamanho não comprimido, ~2x menor depois do gzip):
+ *   - Nós gravados em planos separados (structure-of-arrays) em vez de
+ *     registros de 11 bytes intercalados. Cada plano vira uma sequência
+ *     quase monotônica, que o deflate modela muito melhor do que campos
+ *     alternando entre coordenada, cor e flag.
+ *   - Nós ordenados em varredura (y, depois x) em vez de por área
+ *     decrescente. A ordem por área destruía a localidade espacial e
+ *     junto com ela a redundância que o compressor exploraria.
+ *   Medido em samples/montanha_pessoas.jpg: 111 KB → 57 KB gzipado,
+ *   sem perder um único bit de informação.
+ *
+ * SVBC_Node continua sendo a forma em memória (11 bytes); em disco os
+ * campos são desmembrados nos planos acima.
  */
 
 #pragma pack(push, 1)

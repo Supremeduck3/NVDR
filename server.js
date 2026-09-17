@@ -5,6 +5,7 @@ const { execFile } = require('child_process');
 const crypto = require('crypto');
 
 const PORT = 3000;
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 // Whitelist of accepted file extensions. Any other value is rejected
 // before reaching the file system — protects shell, sanitize path.
@@ -67,6 +68,7 @@ const server = http.createServer((req, res) => {
 
         const writeStream = fs.createWriteStream(inputPath);
         let aborted = false;
+        let received = 0;
 
         writeStream.on('error', (err) => {
             aborted = true;
@@ -78,7 +80,23 @@ const server = http.createServer((req, res) => {
 
         req.on('aborted', () => {
             aborted = true;
+            writeStream.destroy();
             safeUnlink(inputPath);
+        });
+
+        // Guard against unbounded uploads filling the disk.
+        req.on('data', (chunk) => {
+            received += chunk.length;
+            if (received > MAX_UPLOAD_BYTES && !aborted) {
+                aborted = true;
+                writeStream.destroy();
+                if (!res.writableEnded) {
+                    res.writeHead(413, { 'Content-Type': 'text/plain' });
+                    res.end(`Upload too large (limit ${MAX_UPLOAD_BYTES} bytes)`);
+                }
+                req.destroy();
+                safeUnlink(inputPath);
+            }
         });
 
         writeStream.on('finish', () => {
@@ -87,6 +105,15 @@ const server = http.createServer((req, res) => {
                 return;
             }
             console.log(`Starting conversion for ${inputPath} (Tile: ${minTile}, Thresh: ${homoThresh}, Logo: ${logoMode})...`);
+
+            // B2: cleanup-on-error helper. Schedules deletion of any
+            // intermediate files regardless of which step bailed. Declared
+            // before the first call site — the exe lookup below can bail out.
+            const cleanupAll = () => {
+                setTimeout(() => {
+                    [inputPath, outBase, outSvbc, outSvbcz].forEach(safeUnlink);
+                }, 5000);
+            };
 
             // B1: argv array passed to execFile — args are NOT parsed by
             // a shell, so header values can't inject commands. The exe
@@ -127,14 +154,6 @@ const server = http.createServer((req, res) => {
             ];
             if (logoMode) args.push('--logo');
 
-            // B2: cleanup-on-error helper. Schedules deletion of any
-            // intermediate files regardless of which step bailed.
-            const cleanupAll = () => {
-                setTimeout(() => {
-                    [inputPath, outBase, outSvbc, outSvbcz].forEach(safeUnlink);
-                }, 5000);
-            };
-
             execFile(exePath, args, (error, stdout, stderr) => {
                 if (error) {
                     console.error("Conversion failed:", error);
@@ -172,6 +191,10 @@ const server = http.createServer((req, res) => {
                 });
             });
         });
+
+        // Without this the request body is never consumed: 'finish' never
+        // fires and the connection hangs until the client times out.
+        req.pipe(writeStream);
     } else {
         res.writeHead(404);
         res.end("Not found");

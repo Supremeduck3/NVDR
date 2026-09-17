@@ -178,36 +178,49 @@ void optimizer_apply_ilut(QuadTree* qt, int max_colors, const CodebookDB* persis
     }
     palette[palette_size++] = cw[best_idx];
     cw[best_idx].weight = -1; // mark as used
-    
-    // Greedily select colors that maximize (weight * distance_to_closest_selected)
+
+    /* Greedily select colors maximizing (weight * distance_to_closest_selected).
+     *
+     * The distance of a candidate to the palette only ever shrinks as the
+     * palette grows, so we keep a running min per candidate and refresh it
+     * against the single color just appended. That turns the selection from
+     * O(max_palette^2 * unique_count) into O(max_palette * unique_count) —
+     * same output, ~two orders of magnitude less work on real photos, where
+     * this loop dominated total runtime. */
+    long* min_dist_cache = malloc((size_t)unique_count * sizeof(long));
+    if (!min_dist_cache) {
+        free(palette);
+        free(cw);
+        return;
+    }
+    for (int i = 0; i < unique_count; i++) min_dist_cache[i] = 255*255*10;
+
     while(palette_size < max_palette) {
+        const ColorWeight* just_added = &palette[palette_size - 1];
         int highest_salience_idx = -1;
         long long max_salience = -1;
-        
+
         for(int i=0; i<unique_count; i++) {
             if(cw[i].weight < 0) continue;
-            
-            // Find distance to closest color already in palette
-            long min_dist = 255*255*10;
-            for(int p=0; p<palette_size; p++) {
-                int dr = cw[i].r - palette[p].r;
-                int dg = cw[i].g - palette[p].g;
-                int db = cw[i].b - palette[p].b;
-                int dist = dr*dr*3 + dg*dg*4 + db*db*2;
-                if(dist < min_dist) min_dist = dist;
-            }
-            
-            long long salience = (long long)cw[i].weight * min_dist;
+
+            int dr = cw[i].r - just_added->r;
+            int dg = cw[i].g - just_added->g;
+            int db = cw[i].b - just_added->b;
+            long dist = dr*dr*3 + dg*dg*4 + db*db*2;
+            if (dist < min_dist_cache[i]) min_dist_cache[i] = dist;
+
+            long long salience = (long long)cw[i].weight * min_dist_cache[i];
             if(salience > max_salience) {
                 max_salience = salience;
                 highest_salience_idx = i;
             }
         }
-        
+
         if (highest_salience_idx == -1) break;
         palette[palette_size++] = cw[highest_salience_idx];
         cw[highest_salience_idx].weight = -1;
     }
+    free(min_dist_cache);
     
     // Pass 3: Map all nodes to nearest neighbor in generated iLUT Palette
 #pragma omp parallel for

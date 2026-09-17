@@ -16,6 +16,33 @@
 #include "contour.h"
 #include "codebook_db.h"
 #include "nvdr_types.h"
+#include <zlib.h>
+
+/* gzip a file in place of the old `system("powershell ...")` call, which
+ * only ever worked on Windows and left .svgz/.svbcz missing everywhere
+ * else — which in turn made the printed compression ratio meaningless.
+ * Returns 0 on success, -1 on failure. */
+static int gzip_file(const char* src_path, const char* dst_path) {
+    FILE* in = fopen(src_path, "rb");
+    if (!in) return -1;
+
+    gzFile out = gzopen(dst_path, "wb9");
+    if (!out) { fclose(in); return -1; }
+
+    unsigned char buf[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (gzwrite(out, buf, (unsigned)n) != (int)n) { ok = 0; break; }
+    }
+    if (ferror(in)) ok = 0;
+
+    fclose(in);
+    if (gzclose(out) != Z_OK) ok = 0;
+    if (!ok) { remove(dst_path); return -1; }
+    return 0;
+}
+
 
 // PaletteEntry, IntList, NodeGradient definidos em nvdr_types.h
 
@@ -499,13 +526,16 @@ int main(int argc, char** argv) {
                                        palette, palette_size, node_to_palette);
             svg_end_group(&svg_final);
 
-            fprintf(svg_final.file, "<g id=\"NVDR_R1\" opacity=\"0\">\n");
-            fprintf(svg_final.file, "<animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0.2s\" dur=\"0.2s\" fill=\"freeze\"/>\n");
+            fprintf(svg_final.file, "<g id=\"NVDR_R1\" opacity=\"1\">\n");
+            /* The group carries opacity="1" so renderers without SMIL (Inkscape,
+             * librsvg, PDF export, OS thumbnailers) show the complete image
+             * instead of the anchor layer alone. Browsers still fade it in. */
+            fprintf(svg_final.file, "<animate attributeName=\"opacity\" values=\"0;1\" begin=\"0.2s\" dur=\"0.2s\" fill=\"freeze\"/>\n");
             write_layer(&svg_final, &prs_r1, &qt, palette, palette_size, node_to_palette);
             svg_end_group(&svg_final);
 
-            fprintf(svg_final.file, "<g id=\"NVDR_R2\" opacity=\"0\">\n");
-            fprintf(svg_final.file, "<animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0.4s\" dur=\"0.2s\" fill=\"freeze\"/>\n");
+            fprintf(svg_final.file, "<g id=\"NVDR_R2\" opacity=\"1\">\n");
+            fprintf(svg_final.file, "<animate attributeName=\"opacity\" values=\"0;1\" begin=\"0.4s\" dur=\"0.2s\" fill=\"freeze\"/>\n");
             write_layer(&svg_final, &prs_r2, &qt, palette, palette_size, node_to_palette);
             svg_end_group(&svg_final);
 
@@ -548,16 +578,7 @@ int main(int argc, char** argv) {
         if (dot_ext_svbc) strcpy(dot_ext_svbc, ".svbcz");
         else strcat(svbcz_path, ".svbcz");
 
-        char cmd_zip_svbc[2048];
-        snprintf(cmd_zip_svbc, sizeof(cmd_zip_svbc),
-            "powershell -NoProfile -Command \""
-            "$in=[System.IO.File]::ReadAllBytes('%s');"
-            "$ms=New-Object System.IO.MemoryStream;"
-            "$gz=New-Object System.IO.Compression.GZipStream($ms,[System.IO.Compression.CompressionMode]::Compress);"
-            "$gz.Write($in,0,$in.Length);$gz.Close();"
-            "[System.IO.File]::WriteAllBytes('%s',$ms.ToArray())\"",
-            svbc_path, svbcz_path);
-        system(cmd_zip_svbc);
+        gzip_file(svbc_path, svbcz_path);
         svbcz_size = get_file_size(svbcz_path);
     }
 
@@ -571,16 +592,7 @@ int main(int argc, char** argv) {
         if (dot_ext) strcpy(dot_ext, ".svgz");
         else strcat(svgz_path, ".svgz");
 
-        char cmd_zip[2048];
-        snprintf(cmd_zip, sizeof(cmd_zip),
-            "powershell -NoProfile -Command \""
-            "$in=[System.IO.File]::ReadAllBytes('%s');"
-            "$ms=New-Object System.IO.MemoryStream;"
-            "$gz=New-Object System.IO.Compression.GZipStream($ms,[System.IO.Compression.CompressionMode]::Compress);"
-            "$gz.Write($in,0,$in.Length);$gz.Close();"
-            "[System.IO.File]::WriteAllBytes('%s',$ms.ToArray())\"",
-            output_path, svgz_path);
-        system(cmd_zip);
+        gzip_file(output_path, svgz_path);
         svgz_size = get_file_size(svgz_path);
     }
 

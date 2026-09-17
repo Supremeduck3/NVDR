@@ -5,12 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int cmp_node_area_desc(const void* a, const void* b) {
+/* Scanline order (y, then x). v0.3 sorted by area descending, which put
+ * spatially unrelated nodes next to each other and cost roughly half the
+ * achievable gzip ratio. Neighbours in scanline order tend to share the
+ * same token and to differ by small deltas in every coordinate plane. */
+static int cmp_node_scanline(const void* a, const void* b) {
     const SVBC_Node* na = a;
     const SVBC_Node* nb = b;
-    int area_a = na->w * na->h;
-    int area_b = nb->w * nb->h;
-    return area_b - area_a;
+    if (na->y != nb->y) return (int)na->y - (int)nb->y;
+    return (int)na->x - (int)nb->x;
 }
 
 // Removed vq_snap_anchor due to extreme loss of visual fidelity
@@ -167,13 +170,13 @@ int svbc_write(const char* path,
         n_idx++;
     }
 
-    // 4. Sort for PRS Fractal Parsing (Largest physical objects first)
-    qsort(flat_nodes, leaf_count, sizeof(SVBC_Node), cmp_node_area_desc);
+    // 4. Scanline order — maximises run-length/delta coherence per plane
+    qsort(flat_nodes, leaf_count, sizeof(SVBC_Node), cmp_node_scanline);
 
     // 5. Build Header and Flush payload physically
     SVBC_Header hdr;
     memcpy(hdr.magic, "SVBC", 4);
-    hdr.version    = 3;
+    hdr.version    = 4;
     hdr._pad[0]    = 0;
     hdr.codebook_count = (uint16_t)palette_size;
     hdr.img_width  = (uint16_t)img_width;
@@ -183,7 +186,39 @@ int svbc_write(const char* path,
 
     fwrite(&hdr, sizeof(SVBC_Header), 1, f);
     fwrite(palette, sizeof(SVBC_Color), palette_size, f);
-    fwrite(flat_nodes, sizeof(SVBC_Node), leaf_count, f);
+
+    /* Planar (structure-of-arrays) node payload — see svbc_format.h.
+     * Same bytes, same order of nodes, grouped by field. */
+    {
+        uint16_t* plane16 = (uint16_t*)malloc((size_t)leaf_count * sizeof(uint16_t));
+        uint8_t*  plane8  = (uint8_t*)malloc((size_t)leaf_count);
+        if (!plane16 || !plane8) {
+            free(plane16); free(plane8);
+            free(cw); free(palette); free(flat_nodes);
+            fclose(f);
+            return -1;
+        }
+
+        #define SVBC_WRITE_PLANE16(field)                                   \
+            do {                                                            \
+                for (uint32_t k = 0; k < leaf_count; k++)                   \
+                    plane16[k] = flat_nodes[k].field;                       \
+                fwrite(plane16, sizeof(uint16_t), leaf_count, f);           \
+            } while (0)
+
+        SVBC_WRITE_PLANE16(x);
+        SVBC_WRITE_PLANE16(y);
+        SVBC_WRITE_PLANE16(w);
+        SVBC_WRITE_PLANE16(h);
+        SVBC_WRITE_PLANE16(token_id);
+        #undef SVBC_WRITE_PLANE16
+
+        for (uint32_t k = 0; k < leaf_count; k++) plane8[k] = flat_nodes[k].layer_id;
+        fwrite(plane8, 1, leaf_count, f);
+
+        free(plane16);
+        free(plane8);
+    }
 
     fclose(f);
     free(cw);
