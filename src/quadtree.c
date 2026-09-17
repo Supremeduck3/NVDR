@@ -157,6 +157,51 @@ static int build_recursive(QuadTree* qt, const Image* img, const SAT* sat,
     return idx;
 }
 
+
+/* --- Canonicalisation -------------------------------------------------
+ *
+ * The parallel build hands out node slots through an atomic counter, so
+ * the index a node lands on depends on how the OpenMP runtime happened to
+ * schedule the tasks. The tree is structurally identical every run, but
+ * the downstream passes (rect coalescing above all) walk nodes in index
+ * order and merge greedily, so a different numbering yields a different
+ * — still valid, but different — output file. Eight consecutive runs of
+ * the same image produced eight distinct SVBCs.
+ *
+ * Renumbering the tree into depth-first pre-order after the build makes
+ * the whole pipeline reproducible without giving up the parallel build:
+ * the order becomes a property of the tree's shape, not of the scheduler.
+ */
+static void canon_visit(const QuadNode* src, int src_idx,
+                        QuadNode* dst, int* dst_count) {
+    int self = (*dst_count)++;
+    dst[self] = src[src_idx];
+
+    int mapped[4] = { -1, -1, -1, -1 };
+    for (int i = 0; i < 4; i++) {
+        int child = src[src_idx].children[i];
+        if (child < 0) continue;
+        mapped[i] = *dst_count;
+        canon_visit(src, child, dst, dst_count);
+    }
+    for (int i = 0; i < 4; i++) dst[self].children[i] = mapped[i];
+}
+
+static int quadtree_canonicalize(QuadTree* qt, int root) {
+    if (root < 0 || qt->count <= 0) return root;
+
+    QuadNode* ordered = (QuadNode*)malloc(sizeof(QuadNode) * (size_t)qt->count);
+    if (!ordered) return root;   /* non-fatal: output stays valid, just unstable */
+
+    int written = 0;
+    canon_visit(qt->nodes, root, ordered, &written);
+
+    memcpy(qt->nodes, ordered, sizeof(QuadNode) * (size_t)written);
+    qt->count = written;
+    free(ordered);
+    return 0;   /* root is always slot 0 after a pre-order walk */
+}
+
 int quadtree_build(QuadTree* qt, const Image* img, const SAT* sat,
                    const SVGConfig* cfg) {
     int root = -1;
@@ -167,5 +212,6 @@ int quadtree_build(QuadTree* qt, const Image* img, const SAT* sat,
             root = build_recursive(qt, img, sat, cfg, 0, 0, img->width, img->height, 0);
         }
     }
-    return root;
+    if (root < 0) return root;
+    return quadtree_canonicalize(qt, root);
 }

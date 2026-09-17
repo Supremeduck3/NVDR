@@ -40,3 +40,5 @@ node_modules/
 # Documentos internos (propriedade intelectual do NVDR)
 docs/
 ANTIGRAVITY.md
+# Verifier binary (Makefile target)
+svbc_check
