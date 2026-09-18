@@ -95,6 +95,39 @@ Output is bit-identical across codecs, verified by decoding both
 containers at all three levels and comparing every byte, in C and again
 in JavaScript against the C output.
 
+## Where detail goes
+
+The subdivision gate used to measure deviation against a constant 255,
+making it a test of absolute difference. The eye does not work that way:
+an error of 7 on a pixel of value 16 is obvious, the same error on a pixel
+of value 240 is invisible. The consequence was measurable and someone
+spotted it by eye first — large dark regions collapsing into single
+rectangles.
+
+Leaf size by source luminance on `montanha_pessoas.jpg`, before:
+
+    luminance    leaves   px per leaf   source's own deviation
+      0-31         4563       9.5            16.3
+     32-63         9322       6.5            33.8
+     64-95        12954       6.3            37.8
+    224-255         709      54.8             3.1
+
+Shadows were getting leaves 50% coarser than mid-tones despite carrying
+comparable detail. The deviation is now divided by
+`255 * (luma + weber) / (pivot + weber)`, where `pivot` is the image's own
+mean luminance — pivoting on a constant instead would tighten every dark
+image and loosen every bright one, which is a quality setting wearing a
+reallocation costume, and cost macarrao.jpg 1.35 dB when tried.
+
+After, at `--weber 64`: shadows drop to 7.1 px per leaf, mid-tones stay at
+6.1, and the sky coarsens from 54.8 to 79.1 — the bits move from a region
+whose source deviation is 3.1 to one whose deviation is 16.3. Across
+`samples/` it costs 0.4% to 6.9% more bytes at PSNR within 0.07 dB.
+
+PSNR cannot see this improvement, by construction: it is an absolute-error
+metric, and absolute error is exactly the thing the old gate was already
+optimising. `--weber 1e9` restores the previous behaviour for comparison.
+
 ## The anchor palette
 
 Candidates come from a 5-bit-per-channel histogram of the level-0 leaf

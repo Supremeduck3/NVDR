@@ -173,6 +173,7 @@ NvdrConfig nvdr_default_config(void) {
     NvdrConfig cfg;
     cfg.min_tile     = 2;
     cfg.max_depth    = 12;
+    cfg.weber        = 64.0f;
     cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
     cfg.tolerance[1] = 0.040f;
     cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
@@ -200,6 +201,7 @@ static unsigned char* pixel_at(const NvdrImage* img, int x, int y) {
  * terms and a float accumulator starts dropping the small ones.
  */
 static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
+                          float weber, float pivot,
                           uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
     int x1 = x + w > img->width  ? img->width  : x + w;
     int y1 = y + h > img->height ? img->height : y + h;
@@ -230,7 +232,12 @@ static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
             deviation += 0.30 * dr + 0.59 * dg + 0.11 * db;
         }
     }
-    return (float)(deviation / count / 255.0);
+    /* Weber normalisation: the same absolute deviation counts for more in
+     * a dark region than a bright one, which is the whole difference
+     * between "this region is uniform" and "this region looks uniform". */
+    double luma = 0.30 * mr + 0.59 * mg + 0.11 * mb;
+    double denominator = 255.0 * (luma + weber) / (pivot + weber);
+    return (float)(deviation / count / denominator);
 }
 
 static int32_t tree_alloc(NvdrTree* tree) {
@@ -245,13 +252,14 @@ static int32_t tree_alloc(NvdrTree* tree) {
 }
 
 static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
-                          const NvdrConfig* cfg,
+                          const NvdrConfig* cfg, float pivot,
                           int32_t idx, int x, int y, int w, int h, int depth) {
     NvdrNode* node = &tree->nodes[idx];
     node->x = (uint16_t)x; node->y = (uint16_t)y;
     node->w = (uint16_t)w; node->h = (uint16_t)h;
     node->first_child = -1;
-    node->deviation = region_stats(img, x, y, w, h, &node->r, &node->g, &node->b);
+    node->deviation = region_stats(img, x, y, w, h, cfg->weber, pivot,
+                                   &node->r, &node->g, &node->b);
 
     int splittable = w > cfg->min_tile && h > cfg->min_tile && depth < cfg->max_depth;
     if (!splittable || node->deviation <= cfg->tolerance[NVDR_LEVELS - 1]) return 0;
@@ -263,18 +271,33 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
 
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     int rc = 0;
-    rc |= tree_build_rec(tree, img, cfg, first + 0, x,      y,      hw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 1, x + hw, y,      rw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 2, x,      y + hh, hw, rh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 3, x + hw, y + hh, rw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 0, x,      y,      hw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 1, x + hw, y,      rw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 2, x,      y + hh, hw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 3, x + hw, y + hh, rw, rh, depth + 1);
     return rc;
 }
 
 int nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg) {
     memset(tree, 0, sizeof(*tree));
+
+    /* The Weber denominator pivots on the image's own mean luminance
+     * rather than on mid-grey. Pivoting on a constant would tighten every
+     * dark image and loosen every bright one, which is a quality setting
+     * wearing a reallocation costume — measured, it cost macarrao.jpg
+     * 1.35 dB. Pivoting on the image keeps the average tolerance where it
+     * was and changes only how it is distributed. */
+    double sum_luma = 0.0;
+    size_t pixels = (size_t)img->width * img->height;
+    for (size_t i = 0; i < pixels; i++) {
+        const unsigned char* p = img->pixels + i * 3;
+        sum_luma += 0.30 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+    }
+    float pivot = pixels ? (float)(sum_luma / (double)pixels) : 128.0f;
+
     int32_t root = tree_alloc(tree);
     if (root < 0) return -1;
-    if (tree_build_rec(tree, img, cfg, root, 0, 0, img->width, img->height, 0) != 0) {
+    if (tree_build_rec(tree, img, cfg, pivot, root, 0, 0, img->width, img->height, 0) != 0) {
         nvdr_tree_free(tree);
         return -1;
     }

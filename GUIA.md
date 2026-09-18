@@ -153,6 +153,9 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
   é o "int4" do spec. `6` costuma dar um anchor melhor a custo total
   quase neutro e vale testar; `8` custa mais bytes e quase não melhora em
   cima de 6.
+- **`--weber F`** — quanto mais a tolerância aperta nas sombras. O default
+  64 equaliza a alocação de detalhe entre regiões escuras e claras; um
+  valor enorme (`1e9`) volta à métrica de diferença absoluta antiga.
 - **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
   para comparação; os dois decodificam para imagens idênticas.
 
@@ -176,6 +179,11 @@ com qualidade igual, JPEG ainda vence.
 **PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
 com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número
 está lá justamente para não esconder isso.
+
+**PSNR não enxerga tudo.** Ele mede erro absoluto, então é cego para onde
+o erro está. Uma mudança que tira detalhe do céu e dá para as sombras
+melhora a imagem e não move o PSNR — foi exatamente o caso do `--weber`.
+Quando avaliar uma mudança de alocação, olhe a imagem, não só o número.
 
 **O servidor não testa o codec novo em `/`.** A página raiz é o pipeline
 antigo, que devolve `.svbc`. O codec novo está em `/nvdr.html`.

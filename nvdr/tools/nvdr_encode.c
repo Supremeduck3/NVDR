@@ -24,7 +24,10 @@ static void usage(const char* argv0) {
         "                     (default 16,4)\n"
         "  --min-tile N       smallest tile edge (default 2)\n"
         "  --max-depth N      deepest subdivision (default 12)\n"
-        "  --codec NAME       arith (default) or deflate, for comparison\n",
+        "  --codec NAME       arith (default) or deflate, for comparison\n"
+        "  --weber F          how much harder to push in dark regions\n"
+        "                     (default 64; a huge value restores the old\n"
+        "                      absolute-difference metric)\n",
         argv0);
 }
 
@@ -63,6 +66,8 @@ int main(int argc, char** argv) {
             cfg.min_tile = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--max-depth") && i + 1 < argc) {
             cfg.max_depth = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--weber") && i + 1 < argc) {
+            cfg.weber = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--codec") && i + 1 < argc) {
             const char* name = argv[++i];
             if (!strcmp(name, "arith")) cfg.codec = NVDR_COMPRESS_ARITH;
