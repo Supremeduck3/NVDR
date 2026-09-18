@@ -40,3 +40,7 @@ node_modules/
 # Documentos internos (propriedade intelectual do NVDR)
 docs/
 ANTIGRAVITY.md
+# Built binaries
+svbc_check
+nvdr/nvdr_encode
+nvdr/nvdr_decode
