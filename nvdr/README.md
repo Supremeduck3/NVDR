@@ -128,6 +128,53 @@ PSNR cannot see this improvement, by construction: it is an absolute-error
 metric, and absolute error is exactly the thing the old gate was already
 optimising. `--weber 1e9` restores the previous behaviour for comparison.
 
+## Spending less on fine grain
+
+Deviation says a region is not uniform. It does not say whether
+subdividing would help. Distant grass varies as much inside a 4x4 window
+as it does across the whole patch, so splitting reproduces noise nobody
+could pick out; a face varies across the region and barely within a
+window, so splitting is what resolves it. The ratio between the two — the
+region's grain — comes from a 4x4 deviation map summed into an integral
+image once per encode, so any region's is an O(1) query.
+
+`--texture F` raises a region's minimum tile by `1 + F * grain`, which
+spends grain at a coarser resolution and leaves structure at the full one.
+At matched bytes on `montanha_pessoas.jpg` against plain tolerance
+loosening, it moves 40% of the rectangles out of the highest-grain band
+and into smooth and structured regions:
+
+    band (source 8x8 deviation)   tolerance only      --texture 1
+    smooth  <10                    95 @ 591.7 px     486 @ 109.4 px
+    10-25                         561 @ 123.2 px    3473 @  19.6 px
+    25-45                        2937 @  44.3 px    6898 @  17.0 px
+    45-70                        7049 @  12.7 px    5588 @  17.1 px
+    grain   >70                  6921 @   7.0 px    4157 @  14.1 px
+
+**It is a rate control, not a free improvement.** Capping how fine
+anything can get also caps quality: with it on, tightening the tolerance
+saturates at 23.9 dB and cannot reach the 26.2 dB the default hits. The
+crossover, measured:
+
+    budget      tolerance only      --texture
+    <= 60 KB   58.0 KB / 24.89 dB   36.7 KB / 23.87 dB    tolerance wins
+    <= 40 KB   31.0 KB / 20.64 dB   36.7 KB / 23.87 dB    +3.2 dB
+    <= 25 KB   14.8 KB / 19.33 dB   23.6 KB / 23.11 dB    +3.8 dB
+    <= 15 KB   14.8 KB / 19.33 dB    7.0 KB / 19.61 dB    half the bytes
+
+So it is off by default and is the right mechanism below roughly half the
+default rate.
+
+Two formulations failed before this one, both because they measured grain
+by splitting a node and watching its children's deviation drop, which is
+confounded with scale. Scaling the threshold by that drop only bit the
+middle of the range and left the highest-grain band untouched at 6.1 px
+per leaf. A hard floor on the drop pruned the root — the drop is small at
+the top of the tree whatever the content — and collapsed the image to one
+rectangle. The fixed 4x4 window is what removes the confound, and raising
+the minimum tile rather than the threshold is what actually stops a
+descent that a multiplier never could.
+
 ## The anchor palette
 
 Candidates come from a 5-bit-per-channel histogram of the level-0 leaf

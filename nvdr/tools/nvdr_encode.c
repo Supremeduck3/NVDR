@@ -27,7 +27,9 @@ static void usage(const char* argv0) {
         "  --codec NAME       arith (default) or deflate, for comparison\n"
         "  --weber F          how much harder to push in dark regions\n"
         "                     (default 64; a huge value restores the old\n"
-        "                      absolute-difference metric)\n",
+        "                      absolute-difference metric)\n"
+        "  --texture F        how much to penalise regions that do not get\n"
+        "                     better when split (default 1.0; 0 disables)\n",
         argv0);
 }
 
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
             cfg.max_depth = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--weber") && i + 1 < argc) {
             cfg.weber = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--texture") && i + 1 < argc) {
+            cfg.texture = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--codec") && i + 1 < argc) {
             const char* name = argv[++i];
             if (!strcmp(name, "arith")) cfg.codec = NVDR_COMPRESS_ARITH;

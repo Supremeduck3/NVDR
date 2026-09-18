@@ -87,6 +87,7 @@ typedef struct {
     uint16_t x, y, w, h;
     int32_t  first_child;    /* -1 when this node was never split */
     float    deviation;      /* mean perceptual distance from the mean colour */
+    float    penalty;        /* how much harder this region is to justify splitting */
     uint8_t  r, g, b;
 } NvdrNode;
 
@@ -117,6 +118,23 @@ typedef struct {
      * the old absolute metric.
      */
     float weber;
+    /*
+     * How coarsely fine grain is allowed to be resolved.
+     *
+     * Deviation says a region is not uniform; it does not say whether
+     * subdividing would help. Distant grass varies as much inside a 4x4
+     * window as across the whole patch, so splitting reproduces noise. A
+     * face varies across the region and barely within a window, so
+     * splitting resolves it. The ratio between the two is the grain of a
+     * region, and it raises that region's minimum tile by
+     * `1 + texture * grain`.
+     *
+     * This is a rate control, not a free improvement: it caps how fine
+     * anything can get, so it cannot reach the high-quality end at all.
+     * Below roughly half the default rate it beats plain tolerance by 3-4
+     * dB; above that it is strictly worse. Zero, the default, disables it.
+     */
+    float texture;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */

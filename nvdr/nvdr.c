@@ -174,6 +174,7 @@ NvdrConfig nvdr_default_config(void) {
     cfg.min_tile     = 2;
     cfg.max_depth    = 12;
     cfg.weber        = 64.0f;
+    cfg.texture      = 0.0f;   /* off: see the crossover in the README */
     cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
     cfg.tolerance[1] = 0.040f;
     cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
@@ -200,12 +201,16 @@ static unsigned char* pixel_at(const NvdrImage* img, int x, int y) {
  * deviation accumulates in double because a 4K region is millions of
  * terms and a float accumulator starts dropping the small ones.
  */
-static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
-                          float weber, float pivot,
-                          uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
+static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
+                               float weber, float pivot, double* out_raw,
+                               uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
     int x1 = x + w > img->width  ? img->width  : x + w;
     int y1 = y + h > img->height ? img->height : y + h;
-    if (x1 <= x || y1 <= y) { *out_r = *out_g = *out_b = 0; return 0.0f; }
+    if (x1 <= x || y1 <= y) {
+        *out_r = *out_g = *out_b = 0;
+        if (out_raw) *out_raw = 0.0;
+        return 0.0f;
+    }
 
     uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
     uint32_t count = 0;
@@ -235,9 +240,107 @@ static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
     /* Weber normalisation: the same absolute deviation counts for more in
      * a dark region than a bright one, which is the whole difference
      * between "this region is uniform" and "this region looks uniform". */
+    double mean_deviation = deviation / count;
+    if (out_raw) *out_raw = mean_deviation;
+
     double luma = 0.30 * mr + 0.59 * mg + 0.11 * mb;
     double denominator = 255.0 * (luma + weber) / (pivot + weber);
-    return (float)(deviation / count / denominator);
+    return (float)(mean_deviation / denominator);
+}
+
+/* --------------------------------------------------------- texture map --
+ *
+ * How much of a region's variation is fine grain rather than structure.
+ *
+ * Deviation alone cannot tell distant grass from a face: both are far from
+ * uniform. What separates them is the scale of the variation. Grass varies
+ * as much inside a 4x4 window as it does across the whole patch, so
+ * subdividing reproduces noise; a face varies mostly across the region and
+ * barely within a window, so subdividing resolves it.
+ *
+ * Two earlier attempts measured this by splitting a node and looking at how
+ * much its children's deviation dropped. Both failed, for the same reason:
+ * that drop is confounded with scale. It is small at the top of the tree
+ * whatever the content, so a threshold scaled by it only bit the middle of
+ * the range, and a hard floor on it pruned the root and collapsed the
+ * image to one rectangle.
+ *
+ * A 4x4 deviation map answers the question directly and at a fixed scale.
+ * Summed once into an integral image, any region's mean local deviation is
+ * an O(1) query however large the region.
+ */
+typedef struct {
+    double* sat;        /* (bw+1) x (bh+1) integral image over block deviations */
+    int     bw, bh;     /* block grid size */
+} NvdrTextureMap;
+
+#define NVDR_TEXTURE_BLOCK 4
+
+static void texture_map_free(NvdrTextureMap* map) {
+    free(map->sat);
+    map->sat = NULL;
+}
+
+static int texture_map_build(NvdrTextureMap* map, const NvdrImage* img) {
+    map->bw = (img->width  + NVDR_TEXTURE_BLOCK - 1) / NVDR_TEXTURE_BLOCK;
+    map->bh = (img->height + NVDR_TEXTURE_BLOCK - 1) / NVDR_TEXTURE_BLOCK;
+    map->sat = (double*)calloc((size_t)(map->bw + 1) * (map->bh + 1), sizeof(double));
+    if (!map->sat) return -1;
+
+    for (int by = 0; by < map->bh; by++) {
+        for (int bx = 0; bx < map->bw; bx++) {
+            int x0 = bx * NVDR_TEXTURE_BLOCK, y0 = by * NVDR_TEXTURE_BLOCK;
+            int x1 = x0 + NVDR_TEXTURE_BLOCK, y1 = y0 + NVDR_TEXTURE_BLOCK;
+            if (x1 > img->width)  x1 = img->width;
+            if (y1 > img->height) y1 = img->height;
+
+            double sr = 0, sg = 0, sb = 0;
+            int n = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++) {
+                    const unsigned char* p = pixel_at(img, x, y);
+                    sr += p[0]; sg += p[1]; sb += p[2]; n++;
+                }
+            double dev = 0.0;
+            if (n) {
+                double mr = sr / n, mg = sg / n, mb = sb / n;
+                for (int y = y0; y < y1; y++)
+                    for (int x = x0; x < x1; x++) {
+                        const unsigned char* p = pixel_at(img, x, y);
+                        dev += fabs(p[0] - mr) * 0.30 + fabs(p[1] - mg) * 0.59
+                             + fabs(p[2] - mb) * 0.11;
+                    }
+                dev /= n;
+            }
+            size_t i = (size_t)(by + 1) * (map->bw + 1) + (bx + 1);
+            map->sat[i] = dev;
+        }
+    }
+
+    for (int by = 1; by <= map->bh; by++)
+        for (int bx = 1; bx <= map->bw; bx++) {
+            size_t w1 = (size_t)(map->bw + 1);
+            map->sat[by * w1 + bx] += map->sat[by * w1 + bx - 1]
+                                    + map->sat[(by - 1) * w1 + bx]
+                                    - map->sat[(by - 1) * w1 + bx - 1];
+        }
+    return 0;
+}
+
+static double texture_map_mean(const NvdrTextureMap* map, int x, int y, int w, int h) {
+    int bx0 = x / NVDR_TEXTURE_BLOCK, by0 = y / NVDR_TEXTURE_BLOCK;
+    int bx1 = (x + w + NVDR_TEXTURE_BLOCK - 1) / NVDR_TEXTURE_BLOCK;
+    int by1 = (y + h + NVDR_TEXTURE_BLOCK - 1) / NVDR_TEXTURE_BLOCK;
+    if (bx1 > map->bw) bx1 = map->bw;
+    if (by1 > map->bh) by1 = map->bh;
+    if (bx1 <= bx0 || by1 <= by0) return 0.0;
+
+    size_t w1 = (size_t)(map->bw + 1);
+    double sum = map->sat[(size_t)by1 * w1 + bx1]
+               - map->sat[(size_t)by0 * w1 + bx1]
+               - map->sat[(size_t)by1 * w1 + bx0]
+               + map->sat[(size_t)by0 * w1 + bx0];
+    return sum / ((double)(bx1 - bx0) * (double)(by1 - by0));
 }
 
 static int32_t tree_alloc(NvdrTree* tree) {
@@ -253,16 +356,39 @@ static int32_t tree_alloc(NvdrTree* tree) {
 
 static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
                           const NvdrConfig* cfg, float pivot,
+                          const NvdrTextureMap* texture,
                           int32_t idx, int x, int y, int w, int h, int depth) {
     NvdrNode* node = &tree->nodes[idx];
     node->x = (uint16_t)x; node->y = (uint16_t)y;
     node->w = (uint16_t)w; node->h = (uint16_t)h;
     node->first_child = -1;
-    node->deviation = region_stats(img, x, y, w, h, cfg->weber, pivot,
-                                   &node->r, &node->g, &node->b);
 
-    int splittable = w > cfg->min_tile && h > cfg->min_tile && depth < cfg->max_depth;
-    if (!splittable || node->deviation <= cfg->tolerance[NVDR_LEVELS - 1]) return 0;
+    double raw = 0.0;
+    node->deviation = region_stats_full(img, x, y, w, h, cfg->weber, pivot, &raw,
+                                        &node->r, &node->g, &node->b);
+
+    /* The share of this region's variation that lives inside 4x4 windows.
+     * Near 1 the region is fine grain and subdividing reproduces noise;
+     * near 0 the variation is structure and subdividing resolves it. */
+    node->penalty = 1.0f;
+    if (cfg->texture > 0.0f && raw > 0.0) {
+        double grain = texture_map_mean(texture, x, y, w, h) / raw;
+        if (grain > 1.0) grain = 1.0;
+        if (grain < 0.0) grain = 0.0;
+        node->penalty = 1.0f + cfg->texture * (float)grain;
+    }
+
+    /* In fine grain the deviation never falls, so a scaled threshold never
+     * bites and the tree descends to min_tile regardless — measured, the
+     * high-grain band sat at 6.1 px per leaf whatever the penalty. What
+     * stops it is raising the floor it descends to, so grain is spent at a
+     * coarser resolution while structure keeps the full one. */
+    int floor_tile = (int)(cfg->min_tile * node->penalty + 0.5f);
+    if (floor_tile < cfg->min_tile) floor_tile = cfg->min_tile;
+
+    int splittable = w > floor_tile && h > floor_tile && depth < cfg->max_depth;
+    if (!splittable ||
+        node->deviation <= cfg->tolerance[NVDR_LEVELS - 1]) return 0;
 
     int32_t first = tree_alloc(tree);
     if (first < 0) return -1;
@@ -271,10 +397,10 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
 
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     int rc = 0;
-    rc |= tree_build_rec(tree, img, cfg, pivot, first + 0, x,      y,      hw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, first + 1, x + hw, y,      rw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, first + 2, x,      y + hh, hw, rh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, first + 3, x + hw, y + hh, rw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 0, x,      y,      hw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 1, x + hw, y,      rw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 2, x,      y + hh, hw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 3, x + hw, y + hh, rw, rh, depth + 1);
     return rc;
 }
 
@@ -295,12 +421,19 @@ int nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg)
     }
     float pivot = pixels ? (float)(sum_luma / (double)pixels) : 128.0f;
 
-    int32_t root = tree_alloc(tree);
-    if (root < 0) return -1;
-    if (tree_build_rec(tree, img, cfg, pivot, root, 0, 0, img->width, img->height, 0) != 0) {
+    NvdrTextureMap texture;
+    memset(&texture, 0, sizeof(texture));
+    if (cfg->texture > 0.0f && texture_map_build(&texture, img) != 0) {
         nvdr_tree_free(tree);
         return -1;
     }
+
+    int32_t root = tree_alloc(tree);
+    if (root < 0) { texture_map_free(&texture); nvdr_tree_free(tree); return -1; }
+    int rc = tree_build_rec(tree, img, cfg, pivot, &texture, root,
+                            0, 0, img->width, img->height, 0);
+    texture_map_free(&texture);
+    if (rc != 0) { nvdr_tree_free(tree); return -1; }
     return 0;
 }
 
