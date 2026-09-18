@@ -16,11 +16,25 @@ one domain that can be built and measured today.
     R1     = quantize_mid  (L - dequant(ANCHOR))
     R2     = quantize_fine (L - dequant(ANCHOR) - dequant(R1))
 
-In the spec, `L` is a 64x64x4 diffusion latent and the three layers are
-int4/int8/fp16 quantisations of it. Here `L` is the exact mean colour of
-each leaf of a quadtree over the source image, ANCHOR is a 2^k-entry
-palette, and R1/R2 are signed per-channel corrections. With `r2_step = 1`
-the three layers reconstruct `L` exactly, which is the spec's claim in §12.
+In the spec, `L` is a 64x64x4 diffusion latent: a grid of fixed shape, so
+the three layers differ only in quantisation precision.
+
+An image has no fixed grid, and the first version of this code found that
+out the hard way. It held the leaf set constant and let the residuals
+correct colour, faithfully mirroring the spec — and PSNR climbed from
+23.3 dB to 26.3 dB and stopped, because 26.3 dB was never a colour limit.
+It was the geometry. The stack was polishing the axis that was already
+nearly solved.
+
+So here a level is a **tolerance**. Level 0 prunes the tree wherever a
+region is flat enough for a coarse tolerance; each further level lowers the
+tolerance, and leaves that no longer qualify split into their subtrees.
+Every rectangle at level k carries one signed delta against the colour that
+level k-1 displayed at that spot — so a rectangle that just split gets its
+colour, and a rectangle that stayed gets a correction, through the same
+mechanism. Geometric and colour refinement become one operation, and the
+residual is a parent-to-child delta, which is where the low entropy the
+spec counts on actually lives.
 
 ## The guarantee
 
@@ -30,9 +44,12 @@ from those — it never waits for a layer and never fails on a partial one.
 Truncate the file anywhere and it still produces a picture at the quality
 the surviving bytes pay for.
 
-    $ head -c 40% image.nvdr > partial.nvdr
+    $ head -c 5% image.nvdr > partial.nvdr
     $ nvdr_decode partial.nvdr out.ppm
-    ... rendered at ANCHOR  (file carries only ANCHOR)  psnr 23.31 dB
+    ... rendered at ANCHOR  (file carries only ANCHOR)  psnr 19.99 dB
+
+The anchor is 1.5% of a typical container, so almost any surviving prefix
+carries it.
 
 ## Build and run
 
@@ -44,13 +61,32 @@ the surviving bytes pay for.
 of this implementation is to test the spec's claims rather than assume
 them.
 
+## Measured
+
+Cumulative gzipped bytes and PSNR against the source, on `samples/`:
+
+    image                   source     ANCHOR            +R1             +R2
+    OIP-1304511485.jpg         24K   2.2K 18.0dB   10.3K 21.8dB   22.7K 22.6dB
+    OIP-3451121336.jpg         57K   5.4K 18.9dB   37.1K 21.5dB   71.5K 21.7dB
+    OIP-3786546191.jpg         48K   4.9K 20.1dB   34.1K 23.4dB   72.2K 24.1dB
+    OIP-4140498144.jpg         36K   3.2K 19.6dB   23.9K 24.0dB   56.7K 24.7dB
+    macarrao.jpg               13K   0.3K 18.4dB    5.8K 27.0dB   19.1K 29.2dB
+    montanha_pessoas.jpg      133K   3.7K 20.0dB   44.6K 25.1dB  113.5K 26.3dB
+
+Read this honestly: **JPEG wins on rate-distortion for photographs.** At
+113 KB the source JPEG of montanha_pessoas sits far above 26.3 dB. What
+this format buys is not a smaller file at equal quality — it is that the
+first 3.7 KB are already a whole picture, and every byte after that
+improves it without the decoder ever needing to wait or restart.
+
 ## Format
 
-    [header 32B]
-    [ANCHOR : palette, geometry bitstream, packed tokens]
-    [R1     : 3 planes of int8, one per channel]
-    [R2     : 3 planes of int8, one per channel]
+    [header 56B]
+    [level 0 : palette, split bitstream, packed anchor tokens]
+    [level 1 : split bitstream, 3 int8 residual planes]
+    [level 2 : split bitstream, 3 int8 residual planes]
 
-Geometry travels as one bit per quadtree node in DFS pre-order — 1 splits,
-0 is a leaf — and the decoder replays the subdivision rule from the canvas
-size. No coordinate is ever transmitted.
+Geometry travels as one bit per visited quadtree node — 1 splits, 0 stops —
+and the decoder replays the subdivision rule from the canvas rectangle. No
+coordinate is ever transmitted. Level k's bitstream is read per level-(k-1)
+rectangle, so each level only describes where it disagrees with the last.

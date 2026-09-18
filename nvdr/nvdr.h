@@ -12,26 +12,44 @@
  *
  * with the guarantee that ANCHOR alone always decodes, that each further
  * layer is a pure delta on top of what came before, and that the three
- * together reconstruct L exactly (§12: "the mathematical structure is
- * exact"). Nothing here is a metaphor for that — the three layers below
- * are that decomposition.
+ * together reconstruct L to within a rounding step.
  *
- * In the spec L is a diffusion latent and the three layers are int4/int8/
- * fp16 quantizations of it. Here L is the exact per-leaf colour of a
- * quadtree over the source image, and the three layers are a 2^k-entry
- * palette (the int4 analogue, and k is a knob), a coarse signed residual,
- * and a fine signed residual that closes the gap exactly.
+ * WHAT L IS, AND WHY IT MOVED
+ * ---------------------------
+ * The first cut of this file made L the colour of each leaf of a fixed
+ * quadtree: the anchor picked colours from a 16-entry palette and the two
+ * residuals corrected them. That is a faithful reading of the spec, and it
+ * measured badly — the residuals drove PSNR from 23.3 dB to 26.3 dB and
+ * then stopped dead, because 26.3 dB was not a colour limit at all. It was
+ * the geometry: one flat colour per leaf, and the leaf set never changed.
+ * The stack was refining the dimension that was already nearly solved.
  *
- * What carries over unchanged is the property the spec is actually about:
- * every prefix of the container is decodable. Truncate the file anywhere
- * past the anchor and it still renders, at the quality the surviving bytes
- * pay for. There is no such thing as a partially-decodable failure.
+ * That is an artefact of the domain, not of the spec. In the spec L is a
+ * diffusion latent — a fixed 64x64x4 grid — so the support is constant and
+ * quantisation precision really is the only axis left. An image has no such
+ * fixed support. Its dominant error is where the tiles are.
+ *
+ * So here a level is a *tolerance*, and refining means both subdividing and
+ * recolouring. Level 0 prunes the tree wherever a region is uniform enough
+ * for a coarse tolerance; each further level lowers the tolerance, so some
+ * leaves split into their subtrees. Every leaf at level k — whether it is
+ * newly split or the same rectangle as before — carries one signed delta
+ * against the colour level k-1 displayed at that spot. Geometric refinement
+ * and colour refinement become the same operation, and the residual is a
+ * parent-to-child delta, which is where the low entropy the spec counts on
+ * actually lives.
+ *
+ * The guarantee is unchanged and is the point: every prefix of the
+ * container past the anchor decodes. Truncate the file anywhere and it
+ * still renders, at the quality the surviving bytes pay for.
  */
 #ifndef NVDR_H
 #define NVDR_H
 
 #include <stdint.h>
 #include <stddef.h>
+
+#define NVDR_LEVELS 3
 
 /* ---------------------------------------------------------------- image */
 
@@ -44,146 +62,99 @@ int  nvdr_image_load(NvdrImage* img, const char* path);
 int  nvdr_image_write_ppm(const NvdrImage* img, const char* path);
 void nvdr_image_free(NvdrImage* img);
 
-/* ------------------------------------------------------------- geometry */
+double nvdr_psnr(const NvdrImage* a, const NvdrImage* b);
+
+/* ----------------------------------------------------------------- tree */
 
 /*
- * The quadtree is stored in depth-first pre-order, which is what lets the
- * geometry travel as one bit per node: 1 = this node splits, 0 = this node
- * is a leaf. The decoder replays the same subdivision rule from the canvas
- * size, so coordinates are never transmitted. For a typical photo this is
- * the difference between 8 bytes and 1 bit per leaf.
+ * The full quadtree, built once at the finest tolerance. Every node keeps
+ * the mean colour of its region and how far the region strays from it, so
+ * a level can be cut out of the tree by thresholding that deviation
+ * without ever touching pixels again.
  */
 typedef struct {
     uint16_t x, y, w, h;
-} NvdrLeaf;
+    int32_t  first_child;    /* -1 when this node was never split */
+    float    deviation;      /* mean perceptual distance from the mean colour */
+    uint8_t  r, g, b;
+} NvdrNode;
 
 typedef struct {
-    uint8_t*  split_bits;    /* 1 bit per node, DFS pre-order */
-    uint32_t  node_count;
-    NvdrLeaf* leaves;
-    uint32_t  leaf_count;
-} NvdrGeometry;
+    NvdrNode* nodes;
+    uint32_t  count;
+    uint32_t  capacity;
+} NvdrTree;
 
 typedef struct {
-    int   min_tile;          /* stop splitting at this size */
+    int   min_tile;
     int   max_depth;
-    float homogeneity;       /* split while a region is less uniform than this */
-} NvdrBuildConfig;
+    float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
+    int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
+    int   step[NVDR_LEVELS];        /* residual quantisation step per level */
+} NvdrConfig;
 
-NvdrBuildConfig nvdr_default_build_config(void);
+NvdrConfig nvdr_default_config(void);
 
-/* Build the quadtree over `img` and collect its leaves in DFS pre-order. */
-int  nvdr_geometry_build(NvdrGeometry* geo, const NvdrImage* img,
-                         const NvdrBuildConfig* cfg);
+int  nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg);
+void nvdr_tree_free(NvdrTree* tree);
 
-/* Replay a split bitstream back into leaves. The inverse of the above. */
-int  nvdr_geometry_decode(NvdrGeometry* geo, const uint8_t* split_bits,
-                          uint32_t node_count, int width, int height);
-
-void nvdr_geometry_free(NvdrGeometry* geo);
-
-/* ------------------------------------------------------- residual stack */
+/* ------------------------------------------------------------- pyramid */
 
 /*
- * PRS_LEVEL_ANCHOR is the contract: it is always present and always
- * decodes. The other two are bonuses delivered by whatever bytes arrived.
+ * One decoded or encoded level: the rectangles visible at that tolerance
+ * and the colour each of them shows.
  */
-typedef enum {
-    NVDR_LEVEL_ANCHOR = 0,
-    NVDR_LEVEL_R1     = 1,
-    NVDR_LEVEL_R2     = 2
-} NvdrLevel;
+typedef struct {
+    uint16_t* x;
+    uint16_t* y;
+    uint16_t* w;
+    uint16_t* h;
+    uint8_t*  rgb;        /* 3 bytes per rectangle, the reconstruction */
+    uint32_t  count;
+} NvdrLevelData;
 
 typedef struct {
-    /* ANCHOR — palette index per leaf, packed at anchor_bits per entry */
-    int            anchor_bits;       /* 4 in the spec's int4 sense; tunable */
-    unsigned char* anchor_palette;    /* 3 bytes per entry */
-    int            anchor_palette_n;
-    uint8_t*       anchor_tokens;     /* one per leaf, unpacked in memory */
+    NvdrLevelData level[NVDR_LEVELS];
+    int           levels_present;   /* 1, 2 or 3 */
 
-    /* R1 — coarse signed residual, one int8 per channel per leaf */
-    int8_t* r1[3];
-    int     r1_step;
+    /* Anchor palette, shared by level 0 only. */
+    unsigned char* palette;
+    int            palette_count;
+    int            anchor_bits;
+    int            step[NVDR_LEVELS];
+} NvdrPyramid;
 
-    /* R2 — fine signed residual; with step 1 it closes the gap exactly */
-    int8_t* r2[3];
-    int     r2_step;
-
-    uint32_t leaf_count;
-} NvdrStack;
-
-typedef struct {
-    int anchor_bits;   /* palette size is 1 << anchor_bits */
-    int r1_step;       /* quantisation step of the coarse residual */
-    int r2_step;       /* 1 means anchor + R1 + R2 is bit-exact */
-} NvdrEncodeConfig;
-
-NvdrEncodeConfig nvdr_default_encode_config(void);
-
-/*
- * Decompose the exact per-leaf colours into the three layers. `exact` is
- * 3 * leaf_count bytes: the mean colour of each leaf's region.
- */
-int  nvdr_stack_encode(NvdrStack* stack, const unsigned char* exact,
-                       uint32_t leaf_count, const NvdrEncodeConfig* cfg);
-
-/*
- * Accumulate the layers up to `level` into an RGB colour per leaf. This is
- * §3.1's synthesis loop: start from the anchor, add each residual that is
- * actually present, never wait for one that is not.
- */
-void nvdr_stack_resolve(const NvdrStack* stack, NvdrLevel level,
-                        unsigned char* out_rgb);
-
-void nvdr_stack_free(NvdrStack* stack);
-
-/*
- * Build geometry and all three layers in one call. This is the encoder
- * proper; the pieces above are exposed for tools that need one of them.
- */
-int nvdr_encode_image(const NvdrImage* img, const NvdrBuildConfig* build_cfg,
-                      const NvdrEncodeConfig* enc_cfg,
-                      NvdrGeometry* geo, NvdrStack* stack);
-
-/* Geometry build that also hands back the exact per-leaf colours. */
-int nvdr_geometry_build_ex(NvdrGeometry* geo, unsigned char** exact_out,
-                           const NvdrImage* img, const NvdrBuildConfig* cfg);
+void nvdr_pyramid_free(NvdrPyramid* pyr);
 
 /* ------------------------------------------------------------ container */
 
-#define NVDR_MAGIC   "NVDR"
-#define NVDR_VERSION 1
-#define NVDR_HEADER_SIZE 32
+#define NVDR_MAGIC       "NVDR"
+#define NVDR_VERSION     2
+#define NVDR_HEADER_SIZE 56
 
 typedef struct {
     uint16_t width, height;
-    uint32_t node_count;
-    uint32_t leaf_count;
-    uint32_t anchor_bytes;
-    uint32_t r1_bytes;
-    uint32_t r2_bytes;
+    uint32_t leaf_count[NVDR_LEVELS];
+    uint32_t split_bits[NVDR_LEVELS];   /* bits, not bytes */
+    uint32_t stream_bytes[NVDR_LEVELS];
     uint8_t  anchor_bits;
-    uint8_t  r1_step;
-    uint8_t  r2_step;
+    uint8_t  step[NVDR_LEVELS];
 } NvdrHeader;
 
-int nvdr_container_write(const char* path, const NvdrGeometry* geo,
-                         const NvdrStack* stack, int width, int height);
+/* Encode an image straight to a container. */
+int nvdr_encode_file(const char* out_path, const NvdrImage* img,
+                     const NvdrConfig* cfg, NvdrHeader* hdr_out);
 
 /*
- * Read whatever is there. `available_level` reports how far the bytes on
- * disk actually reach — a file truncated mid-R1 decodes at the anchor, and
- * reports so, rather than failing.
+ * Read whatever is there. `levels_present` on the returned pyramid says how
+ * far the bytes on disk actually reach: a file truncated mid-stream decodes
+ * at the last level whose bytes are all present, rather than failing.
  */
-int nvdr_container_read(const char* path, NvdrGeometry* geo, NvdrStack* stack,
-                        NvdrHeader* hdr, NvdrLevel* available_level);
+int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr);
 
 /* --------------------------------------------------------------- render */
 
-/* Paint one flat colour per leaf onto an RGB canvas. */
-void nvdr_render(const NvdrGeometry* geo, const unsigned char* leaf_rgb,
-                 NvdrImage* out);
-
-double nvdr_psnr(const NvdrImage* a, const NvdrImage* b);
+/* Paint the rectangles of one level onto an RGB canvas. */
+void nvdr_render_level(const NvdrLevelData* level, NvdrImage* out);
 
 #endif /* NVDR_H */
