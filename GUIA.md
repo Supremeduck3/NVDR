@@ -156,6 +156,11 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--weber F`** — quanto mais a tolerância aperta nas sombras. O default
   64 equaliza a alocação de detalhe entre regiões escuras e claras; um
   valor enorme (`1e9`) volta à métrica de diferença absoluta antiga.
+- **`--texture F`** — gasta menos resolução em textura fina (grama
+  distante, folhagem) e mais em estrutura (rostos, bordas). É **controle
+  de taxa**: desligado por padrão, porque também limita a qualidade
+  máxima. Abaixo de ~metade da taxa padrão vale +3 a +4 dB contra
+  simplesmente afrouxar a tolerância; acima disso é pior. Comece em `1`.
 - **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
   para comparação; os dois decodificam para imagens idênticas.
 
