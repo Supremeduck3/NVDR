@@ -5,7 +5,7 @@
 
 CC      = gcc
 CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I. -I../vendor
-LDLIBS  = -lm
+LDLIBS  = -lm -lz
 
 TOOLS   = nvdr_encode nvdr_decode
 

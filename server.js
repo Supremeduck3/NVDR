@@ -3,7 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const crypto = require('crypto');
-const zlib = require('zlib');
 
 const PORT = 3000;
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
@@ -153,46 +152,20 @@ function runConverter(res, { exePath, args, resultPath, artifacts, label }) {
                 cleanupAll();
                 return;
             }
-            const headers = {
+            // No Content-Encoding here on purpose: the container already
+            // carries each level deflated on its own, and wrapping the whole
+            // response in one more stream would undo the property that makes
+            // a prefix decodable.
+            res.writeHead(200, {
                 'Content-Type': 'application/octet-stream',
                 'Content-Length': data.length,
                 'X-Encoder-Report': Buffer.from(stdout || '', 'utf8').toString('base64')
-            };
-            const gzipSizes = levelGzipSizes(data);
-            if (gzipSizes && gzipSizes.length) headers['X-Level-Gzip'] = gzipSizes.join(',');
-            res.writeHead(200, headers);
+            });
             res.end(data);
             console.log(`${label} completed. Sent ${data.length} bytes.`);
             cleanupAll();
         });
     });
-}
-
-/*
- * Cumulative gzipped size of each level, as a wire-transfer estimate.
- *
- * The container is stored uncompressed because truncation has to stay
- * meaningful — a prefix of one gzip stream is not decodable, so the
- * levels have to compress independently for both properties to hold at
- * once. Until the format does that itself, the viewer at least reports
- * what the bytes would actually cost, instead of the raw file size.
- */
-function levelGzipSizes(buffer) {
-    const HEADER_SIZE = 56;
-    if (buffer.length < HEADER_SIZE || buffer.toString('ascii', 0, 4) !== 'NVDR') return null;
-
-    const sizes = [];
-    let offset = HEADER_SIZE;
-    let total = HEADER_SIZE;
-    for (let k = 0; k < 3; k++) {
-        const streamBytes = buffer.readUInt32LE(40 + k * 4);
-        if (streamBytes === 0 || offset + streamBytes > buffer.length) break;
-        total += zlib.gzipSync(buffer.subarray(offset, offset + streamBytes),
-                               { level: 9 }).length;
-        sizes.push(total);
-        offset += streamBytes;
-    }
-    return sizes;
 }
 
 function serveStatic(req, res) {

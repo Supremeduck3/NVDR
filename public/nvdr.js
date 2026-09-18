@@ -8,12 +8,18 @@
  * anchor and reports that the rest never arrived. A short buffer is a
  * normal outcome here, not an error path.
  *
- * Format (v2), little-endian throughout:
+ * Format (v3), little-endian throughout:
  *
- *   [header 56B]
+ *   [header 72B]
  *   [level 0 : palette, split bitstream, packed anchor tokens]
  *   [level 1 : split bitstream, 3 int8 residual planes]
  *   [level 2 : split bitstream, 3 int8 residual planes]
+ *
+ * Each level is deflated on its own. Compressing the container as a whole
+ * would be smaller and would make every prefix undecodable, which is the
+ * one property this format cannot trade away — so the streams compress
+ * separately and both hold at once. Inflation is why decode() is async:
+ * DecompressionStream is the only inflate the platform gives us.
  *
  * Geometry is never transmitted as coordinates. Each level carries one bit
  * per visited quadtree node — 1 splits, 0 stops — and the decoder replays
@@ -22,8 +28,9 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 2;
-const HEADER_SIZE = 56;
+const VERSION = 3;
+const HEADER_SIZE = 72;
+const COMPRESS_NONE = 0;
 export const LEVELS = 3;
 export const LEVEL_NAMES = ['ANCHOR', 'ANCHOR+R1', 'ANCHOR+R1+R2'];
 
@@ -92,29 +99,57 @@ export function readHeader(buffer) {
         width: view.getUint16(6, true),
         height: view.getUint16(8, true),
         anchorBits: view.getUint8(10),
+        compression: view.getUint8(5),
         step: [],
         leafCount: [],
         splitBits: [],
-        streamBytes: []
+        rawBytes: [],
+        storedBytes: []
     };
     for (let k = 0; k < LEVELS; k++) {
         header.step.push(view.getUint8(11 + k));
         header.leafCount.push(view.getUint32(16 + k * 4, true));
         header.splitBits.push(view.getUint32(28 + k * 4, true));
-        header.streamBytes.push(view.getUint32(40 + k * 4, true));
+        header.rawBytes.push(view.getUint32(40 + k * 4, true));
+        header.storedBytes.push(view.getUint32(52 + k * 4, true));
     }
     return header;
 }
 
-/* How many bytes a decoder needs before each level becomes displayable. */
+/*
+ * How many bytes a decoder needs before each level becomes displayable.
+ * These are stored bytes, so they are also what the level costs on the
+ * wire — the container is not compressed again on top of itself.
+ */
 export function levelThresholds(header) {
     const thresholds = [];
     let total = HEADER_SIZE;
     for (let k = 0; k < LEVELS; k++) {
-        total += header.streamBytes[k];
+        total += header.storedBytes[k];
         thresholds.push(total);
     }
     return thresholds;
+}
+
+/*
+ * Inflate one level. Returns null when the bytes are not all there, which
+ * for a truncated container is the ordinary outcome rather than an error.
+ */
+async function readStream(bytes, offset, header, k) {
+    const stored = header.storedBytes[k];
+    if (stored === 0 || offset + stored > bytes.length) return null;
+
+    const packed = bytes.subarray(offset, offset + stored);
+    if (header.compression === COMPRESS_NONE) return packed;
+
+    try {
+        const stream = new Blob([packed]).stream()
+            .pipeThrough(new DecompressionStream('deflate'));
+        const raw = new Uint8Array(await new Response(stream).arrayBuffer());
+        return raw.length === header.rawBytes[k] ? raw : null;
+    } catch (err) {
+        return null;   // a stream cut mid-block throws; that is a short file
+    }
 }
 
 function clampByte(v) {
@@ -129,27 +164,25 @@ function clampByte(v) {
  * the bytes actually paid for — 0 means not even the anchor arrived, which
  * is the only case that yields no picture.
  */
-export function decode(buffer) {
+export async function decode(buffer) {
     const header = readHeader(buffer);
     if (!header) return null;
 
     const bytes = new Uint8Array(buffer);
     const levels = [];
-    let available = buffer.byteLength - HEADER_SIZE;
     let cursor = HEADER_SIZE;
 
     /* --- level 0: the contract --- */
-    if (available < header.streamBytes[0]) {
-        return { header, levels, levelsPresent: 0 };
-    }
+    const anchorStream = await readStream(bytes, cursor, header, 0);
+    if (!anchorStream) return { header, levels, levelsPresent: 0 };
 
-    let offset = cursor;
-    const paletteCount = bytes[offset++];
-    const palette = bytes.subarray(offset, offset + paletteCount * 3);
+    let offset = 0;
+    const paletteCount = anchorStream[offset++];
+    const palette = anchorStream.subarray(offset, offset + paletteCount * 3);
     offset += paletteCount * 3;
 
     const anchorRects = new RectSet(header.leafCount[0]);
-    const anchorReader = new BitReader(bytes, offset, header.splitBits[0]);
+    const anchorReader = new BitReader(anchorStream, offset, header.splitBits[0]);
     if (!replay(anchorReader, anchorRects, 0, 0, header.width, header.height)
         || anchorReader.overrun
         || anchorRects.count !== header.leafCount[0]) {
@@ -163,7 +196,7 @@ export function decode(buffer) {
         let token = 0;
         for (let b = 0; b < header.anchorBits; b++) {
             const at = bit + b;
-            if (bytes[offset + (at >> 3)] & (1 << (at & 7))) token |= (1 << b);
+            if (anchorStream[offset + (at >> 3)] & (1 << (at & 7))) token |= (1 << b);
         }
         if (token >= paletteCount) token = 0;
         anchorRgb[i * 3] = palette[token * 3];
@@ -171,24 +204,24 @@ export function decode(buffer) {
         anchorRgb[i * 3 + 2] = palette[token * 3 + 2];
     }
     levels.push({ rects: anchorRects, rgb: anchorRgb });
-
-    cursor += header.streamBytes[0];
-    available -= header.streamBytes[0];
+    cursor += header.storedBytes[0];
 
     /* --- every further level is a bonus the bytes may not have paid for --- */
     for (let k = 1; k < LEVELS; k++) {
-        if (header.streamBytes[k] === 0 || available < header.streamBytes[k]) break;
+        const stream = await readStream(bytes, cursor, header, k);
+        if (!stream) break;
 
         const prev = levels[k - 1];
         const rects = new RectSet(header.leafCount[k]);
-        const reader = new BitReader(bytes, cursor, header.splitBits[k]);
+        const reader = new BitReader(stream, 0, header.splitBits[k]);
         const rgb = new Uint8Array(header.leafCount[k] * 3);
 
         /* Expanding one previous rectangle may yield several here; they all
          * take the colour it was showing as the base of their delta. */
-        const residualOffset = cursor + ((header.splitBits[k] + 7) >> 3);
+        const residualOffset = (header.splitBits[k] + 7) >> 3;
         const residual = new Int8Array(
-            buffer, residualOffset, header.leafCount[k] * 3);
+            stream.buffer, stream.byteOffset + residualOffset,
+            header.leafCount[k] * 3);
         const n = header.leafCount[k];
         const step = header.step[k];
 
@@ -208,8 +241,7 @@ export function decode(buffer) {
         if (!ok || rects.count !== header.leafCount[k]) break;
 
         levels.push({ rects, rgb });
-        cursor += header.streamBytes[k];
-        available -= header.streamBytes[k];
+        cursor += header.storedBytes[k];
     }
 
     return { header, levels, levelsPresent: levels.length };

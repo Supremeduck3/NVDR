@@ -42,6 +42,13 @@
  * The guarantee is unchanged and is the point: every prefix of the
  * container past the anchor decodes. Truncate the file anywhere and it
  * still renders, at the quality the surviving bytes pay for.
+ *
+ * Each level is deflated on its own rather than the container being
+ * compressed as a whole. That is not a packaging detail — a prefix of one
+ * deflate stream does not decode, so compressing everything together would
+ * buy smaller files by destroying the property the format exists for. Per
+ * level, both hold: the bytes on disk are the bytes on the wire, and any
+ * prefix still ends on a level boundary that decodes.
  */
 #ifndef NVDR_H
 #define NVDR_H
@@ -129,15 +136,21 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     2
-#define NVDR_HEADER_SIZE 56
+#define NVDR_VERSION     3
+#define NVDR_HEADER_SIZE 72
+
+/* Compression applied to each level stream independently. */
+#define NVDR_COMPRESS_NONE    0
+#define NVDR_COMPRESS_DEFLATE 1
 
 typedef struct {
     uint16_t width, height;
     uint32_t leaf_count[NVDR_LEVELS];
     uint32_t split_bits[NVDR_LEVELS];   /* bits, not bytes */
-    uint32_t stream_bytes[NVDR_LEVELS];
+    uint32_t raw_bytes[NVDR_LEVELS];    /* stream size once inflated */
+    uint32_t stored_bytes[NVDR_LEVELS]; /* stream size on disk and on the wire */
     uint8_t  anchor_bits;
+    uint8_t  compression;
     uint8_t  step[NVDR_LEVELS];
 } NvdrHeader;
 

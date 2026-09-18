@@ -21,7 +21,7 @@ static void usage(const char* argv0) {
         "  --tolerance A,B,C  per-level tolerance, coarse to fine\n"
         "                     (default 0.090,0.040,0.018)\n"
         "  --step B,C         residual quantisation step for levels 1 and 2\n"
-        "                     (default 2,2)\n"
+        "                     (default 16,4)\n"
         "  --min-tile N       smallest tile edge (default 2)\n"
         "  --max-depth N      deepest subdivision (default 12)\n",
         argv0);
@@ -122,15 +122,15 @@ int main(int argc, char** argv) {
     }
 
     printf("%s  %dx%d\n", in_path, source.width, source.height);
-    printf("  level      rects      bytes   cumulative     PSNR\n");
+    printf("  level      rects        raw     stored  cumulative     PSNR\n");
     size_t cumulative = NVDR_HEADER_SIZE;
     static const char* names[NVDR_LEVELS] = { "ANCHOR", "R1", "R2" };
     for (int k = 0; k < pyr.levels_present; k++) {
         nvdr_render_level(&pyr.level[k], &canvas);
-        cumulative += hdr.stream_bytes[k];
-        printf("  %-8s %8u  %9u    %9zu   %6.2f dB\n",
-               names[k], pyr.level[k].count, hdr.stream_bytes[k],
-               cumulative, nvdr_psnr(&source, &canvas));
+        cumulative += hdr.stored_bytes[k];
+        printf("  %-8s %8u %10u %10u  %10zu   %6.2f dB\n",
+               names[k], pyr.level[k].count, hdr.raw_bytes[k],
+               hdr.stored_bytes[k], cumulative, nvdr_psnr(&source, &canvas));
     }
 
     free(canvas.pixels);

@@ -96,7 +96,10 @@
   <section id="results" class="hidden">
     <div class="panel">
       <h3 style="margin:0 0 4px;font-size:.95rem">Camadas</h3>
-      <p class="note" style="margin:0 0 14px">Bytes acumulados são gzip por nível, medidos no servidor.</p>
+      <p class="note" style="margin:0 0 14px">
+        Cada nível é deflacionado separadamente, então os bytes acumulados
+        são exatamente o que o arquivo ocupa e o que trafegaria na rede.
+      </p>
       <div class="levels" id="levels"></div>
     </div>
 
@@ -105,9 +108,9 @@
       <p class="note" style="margin:0 0 14px">
         Arraste para simular um download interrompido. O decoder mostra o último nível
         cujos bytes chegaram inteiros — nunca espera, nunca falha no meio.
-        A fração é sobre o container cru: comprimir tudo de uma vez tornaria
-        qualquer prefixo indecodificável, então os níveis teriam que comprimir
-        separadamente para as duas propriedades valerem juntas.
+        Comprimir o container inteiro de uma vez seria menor e tornaria
+        qualquer prefixo indecodificável; por nível, as duas propriedades
+        valem juntas.
       </p>
       <div class="slider-row">
         <input type="range" id="trunc" min="0" max="100" value="100" step="0.5">
@@ -138,7 +141,6 @@ const truncOut = document.getElementById('truncOut');
 const truncCanvas = document.getElementById('truncCanvas');
 
 let container = null;   // the full ArrayBuffer of the last encode
-let gzipSizes = null;   // cumulative wire cost per level, measured server-side
 let sourceSize = 0;
 
 const setStatus = (text, isError) => {
@@ -190,28 +192,24 @@ async function handleFile(file) {
     container = await response.arrayBuffer();
     sourceSize = file.size;
 
-    const header = response.headers.get('X-Level-Gzip');
-    gzipSizes = header ? header.split(',').map(Number) : null;
-
     const encoded = response.headers.get('X-Encoder-Report');
     // The encoder names the server's temp upload; show the real filename.
     reportEl.textContent = encoded
         ? atob(encoded).trim().replace(/^\S*temp_[0-9a-f-]+\.\w+/, file.name)
         : '(sem relatório)';
 
-    const wire = gzipSizes ? gzipSizes[gzipSizes.length - 1] : container.byteLength;
-    setStatus(`${formatBytes(wire)} comprimidos para qualidade cheia, ` +
-              `${(100 * wire / file.size).toFixed(0)}% do original.`);
+    setStatus(`${formatBytes(container.byteLength)} para qualidade cheia, ` +
+              `${(100 * container.byteLength / file.size).toFixed(0)}% do original.`);
     results.classList.remove('hidden');
 
-    showLevels();
+    await showLevels();
     truncInput.value = 100;
-    showTruncated();
+    await showTruncated();
 }
 
-function showLevels() {
+async function showLevels() {
     const t0 = performance.now();
-    const result = decode(container);
+    const result = await decode(container);
     const decodeMs = performance.now() - t0;
 
     if (!result || result.levelsPresent === 0) {
@@ -226,12 +224,11 @@ function showLevels() {
     levels.forEach((level, k) => {
         const wrap = document.createElement('div');
         wrap.className = 'level';
-        const wire = gzipSizes && gzipSizes[k] ? gzipSizes[k] : thresholds[k];
         wrap.innerHTML = `
             <h3>${LEVEL_NAMES[k]}</h3>
             <div class="meta">
-              ${formatBytes(wire)} acumulados
-              ${sourceSize ? `· ${(100 * wire / sourceSize).toFixed(0)}% do original` : ''}
+              ${formatBytes(thresholds[k])} acumulados
+              ${sourceSize ? `· ${(100 * thresholds[k] / sourceSize).toFixed(0)}% do original` : ''}
               · ${level.rects.count.toLocaleString('pt-BR')} retângulos
             </div>`;
         const canvas = document.createElement('canvas');
@@ -250,20 +247,21 @@ function showLevels() {
 }
 
 let pending = false;
-truncInput.addEventListener('input', () => {
+truncInput.addEventListener('input', async () => {
     if (pending) return;
     pending = true;
-    requestAnimationFrame(() => { pending = false; showTruncated(); });
+    await showTruncated();
+    pending = false;
 });
 
-function showTruncated() {
+async function showTruncated() {
     if (!container) return;
 
     const fraction = Number(truncInput.value) / 100;
     const kept = Math.floor(container.byteLength * fraction);
     const prefix = container.slice(0, kept);
 
-    const result = decode(prefix);
+    const result = await decode(prefix);
     const ctx = truncCanvas.getContext('2d');
 
     if (!result || result.levelsPresent === 0) {

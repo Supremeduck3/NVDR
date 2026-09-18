@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <zlib.h>
 
 /* ================================================================ image */
 
@@ -456,20 +457,64 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
 
     /* ------------------------------- write ------------------------------- */
     {
-        size_t stream_bytes[NVDR_LEVELS];
+        /* Each level is assembled whole, then deflated on its own. Sharing
+         * one deflate stream across levels would compress better and would
+         * make every prefix undecodable, which is the one thing this format
+         * is not allowed to give up. */
+        uint8_t* raw[NVDR_LEVELS] = { NULL, NULL, NULL };
+        uint8_t* stored[NVDR_LEVELS] = { NULL, NULL, NULL };
+        size_t raw_size[NVDR_LEVELS] = { 0, 0, 0 };
+        size_t stored_size[NVDR_LEVELS] = { 0, 0, 0 };
+        int wrote = 0;
+
         size_t token_bytes = ((size_t)leaves[0].count * cfg->anchor_bits + 7) / 8;
-        stream_bytes[0] = 1 + (size_t)palette_n * 3
-                        + (bits[0].bit_count + 7) / 8 + token_bytes;
-        for (int k = 1; k < NVDR_LEVELS; k++)
-            stream_bytes[k] = (bits[k].bit_count + 7) / 8 + (size_t)leaves[k].count * 3;
+        size_t bits0_bytes = (bits[0].bit_count + 7) / 8;
+        raw_size[0] = 1 + (size_t)palette_n * 3 + bits0_bytes + token_bytes;
+        raw[0] = (uint8_t*)malloc(raw_size[0]);
+        if (!raw[0]) goto write_done;
+        {
+            size_t at = 0;
+            raw[0][at++] = (uint8_t)palette_n;
+            memcpy(raw[0] + at, palette, (size_t)palette_n * 3);
+            at += (size_t)palette_n * 3;
+            memcpy(raw[0] + at, bits[0].bytes, bits0_bytes);
+            at += bits0_bytes;
+            memset(raw[0] + at, 0, token_bytes);
+            for (uint32_t i = 0; i < leaves[0].count; i++) {
+                size_t bit = (size_t)i * cfg->anchor_bits;
+                for (int b = 0; b < cfg->anchor_bits; b++)
+                    if (tokens[i] & (1u << b))
+                        raw[0][at + ((bit + b) >> 3)] |= (uint8_t)(1u << ((bit + b) & 7));
+            }
+        }
+
+        for (int k = 1; k < NVDR_LEVELS; k++) {
+            size_t bits_bytes = (bits[k].bit_count + 7) / 8;
+            size_t residual_bytes = (size_t)leaves[k].count * 3;
+            raw_size[k] = bits_bytes + residual_bytes;
+            raw[k] = (uint8_t*)malloc(raw_size[k]);
+            if (!raw[k]) goto write_done;
+            memcpy(raw[k], bits[k].bytes, bits_bytes);
+            memcpy(raw[k] + bits_bytes, residual[k], residual_bytes);
+        }
+
+        for (int k = 0; k < NVDR_LEVELS; k++) {
+            uLongf bound = compressBound((uLong)raw_size[k]);
+            stored[k] = (uint8_t*)malloc(bound);
+            if (!stored[k]) goto write_done;
+            if (compress2(stored[k], &bound, raw[k], (uLong)raw_size[k], 9) != Z_OK)
+                goto write_done;
+            stored_size[k] = bound;
+        }
 
         FILE* f = fopen(out_path, "wb");
-        if (!f) goto done;
+        if (!f) goto write_done;
 
         uint8_t header[NVDR_HEADER_SIZE];
         memset(header, 0, sizeof(header));
         memcpy(header, NVDR_MAGIC, 4);
         header[4] = NVDR_VERSION;
+        header[5] = NVDR_COMPRESS_DEFLATE;
         put_u16(header + 6, (uint16_t)img->width);
         put_u16(header + 8, (uint16_t)img->height);
         header[10] = (uint8_t)cfg->anchor_bits;
@@ -477,44 +522,33 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         for (int k = 0; k < NVDR_LEVELS; k++) {
             put_u32(header + 16 + k * 4, leaves[k].count);
             put_u32(header + 28 + k * 4, (uint32_t)bits[k].bit_count);
-            put_u32(header + 40 + k * 4, (uint32_t)stream_bytes[k]);
+            put_u32(header + 40 + k * 4, (uint32_t)raw_size[k]);
+            put_u32(header + 52 + k * 4, (uint32_t)stored_size[k]);
         }
         fwrite(header, 1, sizeof(header), f);
-
-        uint8_t palette_n8 = (uint8_t)palette_n;
-        fwrite(&palette_n8, 1, 1, f);
-        fwrite(palette, 3, (size_t)palette_n, f);
-        fwrite(bits[0].bytes, 1, (bits[0].bit_count + 7) / 8, f);
-
-        uint8_t* packed = (uint8_t*)calloc(token_bytes, 1);
-        if (!packed) { fclose(f); goto done; }
-        for (uint32_t i = 0; i < leaves[0].count; i++) {
-            size_t bit = (size_t)i * cfg->anchor_bits;
-            for (int b = 0; b < cfg->anchor_bits; b++)
-                if (tokens[i] & (1u << b))
-                    packed[(bit + b) >> 3] |= (uint8_t)(1u << ((bit + b) & 7));
-        }
-        fwrite(packed, 1, token_bytes, f);
-        free(packed);
-
-        for (int k = 1; k < NVDR_LEVELS; k++) {
-            fwrite(bits[k].bytes, 1, (bits[k].bit_count + 7) / 8, f);
-            fwrite(residual[k], 1, (size_t)leaves[k].count * 3, f);
-        }
+        for (int k = 0; k < NVDR_LEVELS; k++)
+            fwrite(stored[k], 1, stored_size[k], f);
         fclose(f);
+        wrote = 1;
 
         if (hdr_out) {
             memset(hdr_out, 0, sizeof(*hdr_out));
             hdr_out->width = (uint16_t)img->width;
             hdr_out->height = (uint16_t)img->height;
             hdr_out->anchor_bits = (uint8_t)cfg->anchor_bits;
+            hdr_out->compression = NVDR_COMPRESS_DEFLATE;
             for (int k = 0; k < NVDR_LEVELS; k++) {
                 hdr_out->leaf_count[k]   = leaves[k].count;
                 hdr_out->split_bits[k]   = (uint32_t)bits[k].bit_count;
-                hdr_out->stream_bytes[k] = (uint32_t)stream_bytes[k];
+                hdr_out->raw_bytes[k]    = (uint32_t)raw_size[k];
+                hdr_out->stored_bytes[k] = (uint32_t)stored_size[k];
                 hdr_out->step[k]         = (uint8_t)cfg->step[k];
             }
         }
+
+write_done:
+        for (int k = 0; k < NVDR_LEVELS; k++) { free(raw[k]); free(stored[k]); }
+        if (!wrote) goto done;
     }
     rc = 0;
 
@@ -584,6 +618,32 @@ void nvdr_pyramid_free(NvdrPyramid* pyr) {
     memset(pyr, 0, sizeof(*pyr));
 }
 
+/*
+ * Read one level's stream: `stored_bytes` compressed bytes off disk,
+ * inflated to exactly `raw_bytes`. Returns NULL when the bytes are not all
+ * there, which is the ordinary outcome for a truncated file rather than an
+ * error — the caller simply stops at the previous level.
+ */
+static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
+                            uint32_t raw_bytes, uint8_t compression) {
+    if (stored_bytes == 0 || *available < (long)stored_bytes) return NULL;
+
+    uint8_t* packed = (uint8_t*)malloc(stored_bytes);
+    if (!packed) return NULL;
+    if (fread(packed, 1, stored_bytes, f) != stored_bytes) { free(packed); return NULL; }
+    *available -= (long)stored_bytes;
+
+    if (compression == NVDR_COMPRESS_NONE) return packed;
+
+    uint8_t* raw = (uint8_t*)malloc(raw_bytes ? raw_bytes : 1);
+    if (!raw) { free(packed); return NULL; }
+    uLongf produced = raw_bytes;
+    int rc = uncompress(raw, &produced, packed, (uLong)stored_bytes);
+    free(packed);
+    if (rc != Z_OK || produced != raw_bytes) { free(raw); return NULL; }
+    return raw;
+}
+
 int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     memset(pyr, 0, sizeof(*pyr));
 
@@ -602,14 +662,16 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     }
 
     memset(hdr, 0, sizeof(*hdr));
-    hdr->width  = get_u16(header + 6);
-    hdr->height = get_u16(header + 8);
+    hdr->width       = get_u16(header + 6);
+    hdr->height      = get_u16(header + 8);
     hdr->anchor_bits = header[10];
+    hdr->compression = header[5];
     for (int k = 0; k < NVDR_LEVELS; k++) {
         hdr->step[k]         = header[11 + k];
         hdr->leaf_count[k]   = get_u32(header + 16 + k * 4);
         hdr->split_bits[k]   = get_u32(header + 28 + k * 4);
-        hdr->stream_bytes[k] = get_u32(header + 40 + k * 4);
+        hdr->raw_bytes[k]    = get_u32(header + 40 + k * 4);
+        hdr->stored_bytes[k] = get_u32(header + 52 + k * 4);
     }
     pyr->anchor_bits = hdr->anchor_bits;
     for (int k = 0; k < NVDR_LEVELS; k++) pyr->step[k] = hdr->step[k];
@@ -617,13 +679,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     long available = file_size - NVDR_HEADER_SIZE;
 
     /* --- level 0 is the contract; without it there is no picture --- */
-    if (available < (long)hdr->stream_bytes[0]) { fclose(f); return -1; }
-
-    uint8_t* stream = (uint8_t*)malloc(hdr->stream_bytes[0]);
-    if (!stream || fread(stream, 1, hdr->stream_bytes[0], f) != hdr->stream_bytes[0]) {
-        free(stream); fclose(f); return -1;
-    }
-    available -= (long)hdr->stream_bytes[0];
+    uint8_t* stream = read_stream(f, &available, hdr->stored_bytes[0],
+                                  hdr->raw_bytes[0], hdr->compression);
+    if (!stream) { fclose(f); return -1; }
 
     size_t off = 0;
     pyr->palette_count = stream[off++];
@@ -634,7 +692,8 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
 
     BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
     RectSink sink = { &pyr->level[0], 0 };
-    if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun) {
+    if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
+        pyr->level[0].count != hdr->leaf_count[0]) {
         free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
     }
     off += (hdr->split_bits[0] + 7) / 8;
@@ -653,22 +712,17 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     free(stream);
     pyr->levels_present = 1;
 
-    /* --- every further level is a bonus the bytes may or may not pay for -- */
+    /* --- every further level is a bonus the bytes may not have paid for -- */
     for (int k = 1; k < NVDR_LEVELS; k++) {
-        if (hdr->stream_bytes[k] == 0 || available < (long)hdr->stream_bytes[k]) break;
-
-        uint8_t* buf = (uint8_t*)malloc(hdr->stream_bytes[k]);
-        if (!buf || fread(buf, 1, hdr->stream_bytes[k], f) != hdr->stream_bytes[k]) {
-            free(buf);
-            break;
-        }
-        available -= (long)hdr->stream_bytes[k];
+        uint8_t* buf = read_stream(f, &available, hdr->stored_bytes[k],
+                                   hdr->raw_bytes[k], hdr->compression);
+        if (!buf) break;
 
         BitReader lbr = { buf, hdr->split_bits[k], 0, 0 };
         RectSink lsink = { &pyr->level[k], 0 };
         const NvdrLevelData* prev = &pyr->level[k - 1];
 
-        /* Track which previous leaf each new rectangle came from, so the
+        /* Track which previous rectangle each new one came from, so the
          * delta has the colour that was on screen there as its base. */
         uint8_t* base = (uint8_t*)malloc((size_t)hdr->leaf_count[k] * 3);
         if (!base) { free(buf); break; }
