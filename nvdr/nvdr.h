@@ -99,6 +99,24 @@ typedef struct {
 typedef struct {
     int   min_tile;
     int   max_depth;
+    /*
+     * How much the tolerance tightens in dark regions.
+     *
+     * Deviation used to be measured against a constant 255, which makes
+     * the metric one of absolute difference. The eye does not work that
+     * way: an error of 7 on a pixel of value 16 is obvious, the same error
+     * on a pixel of value 240 is invisible. Measured on
+     * samples/montanha_pessoas.jpg, the darkest eighth of the image was
+     * carrying 41% relative error against 1.3% in the brightest — dark
+     * regions were being collapsed into single rectangles while the metric
+     * reported them as uniform.
+     *
+     * The denominator is now `255 * (luma + weber) / (128 + weber)`, which
+     * leaves mid-grey exactly where it was and tightens or loosens either
+     * side of it. Smaller values push harder; a very large value reproduces
+     * the old absolute metric.
+     */
+    float weber;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
@@ -141,7 +159,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     4
+#define NVDR_VERSION     5
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */

@@ -62,9 +62,9 @@ Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
 ```
 samples/montanha_pessoas.jpg  768x512
   level      rects        raw     stored  cumulative     PSNR
-  ANCHOR       5941       4011       3094        3166    19.99 dB
-  R1          33592     106128      33297       36463    25.10 dB
-  R2          52216     163951      54923       91386    26.26 dB
+  ANCHOR       5941       4011       3123        3195    20.19 dB
+  R1          33592     106128      28919       32114    25.11 dB
+  R2          52216     163951      53925       86039    26.26 dB
 ```
 
 Como ler cada coluna:
@@ -150,10 +150,12 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--step B,C`** — o passo de quantização do resíduo nos níveis 1 e 2.
   Menor = mais fiel e mais pesado.
 - **`--anchor-bits N`** — a paleta do anchor tem `2^N` cores. O default 4
-  é o "int4" do spec. Medido nas seis amostras, `6` dá um anchor sempre
-  melhor (de +0,05 a +0,96 dB) a custo total praticamente neutro — é a
-  primeira coisa que eu testaria. `8` custa mais bytes e quase não melhora
-  em cima de 6.
+  é o "int4" do spec. `6` costuma dar um anchor melhor a custo total
+  quase neutro e vale testar; `8` custa mais bytes e quase não melhora em
+  cima de 6.
+- **`--weber F`** — quanto mais a tolerância aperta nas sombras. O default
+  64 equaliza a alocação de detalhe entre regiões escuras e claras; um
+  valor enorme (`1e9`) volta à métrica de diferença absoluta antiga.
 - **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
   para comparação; os dois decodificam para imagens idênticas.
 
@@ -177,6 +179,11 @@ com qualidade igual, JPEG ainda vence.
 **PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
 com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número
 está lá justamente para não esconder isso.
+
+**PSNR não enxerga tudo.** Ele mede erro absoluto, então é cego para onde
+o erro está. Uma mudança que tira detalhe do céu e dá para as sombras
+melhora a imagem e não move o PSNR — foi exatamente o caso do `--weber`.
+Quando avaliar uma mudança de alocação, olhe a imagem, não só o número.
 
 **O servidor não testa o codec novo em `/`.** A página raiz é o pipeline
 antigo, que devolve `.svbc`. O codec novo está em `/nvdr.html`.

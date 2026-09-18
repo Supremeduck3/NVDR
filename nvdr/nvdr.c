@@ -173,6 +173,7 @@ NvdrConfig nvdr_default_config(void) {
     NvdrConfig cfg;
     cfg.min_tile     = 2;
     cfg.max_depth    = 12;
+    cfg.weber        = 64.0f;
     cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
     cfg.tolerance[1] = 0.040f;
     cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
@@ -200,6 +201,7 @@ static unsigned char* pixel_at(const NvdrImage* img, int x, int y) {
  * terms and a float accumulator starts dropping the small ones.
  */
 static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
+                          float weber, float pivot,
                           uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
     int x1 = x + w > img->width  ? img->width  : x + w;
     int y1 = y + h > img->height ? img->height : y + h;
@@ -230,7 +232,12 @@ static float region_stats(const NvdrImage* img, int x, int y, int w, int h,
             deviation += 0.30 * dr + 0.59 * dg + 0.11 * db;
         }
     }
-    return (float)(deviation / count / 255.0);
+    /* Weber normalisation: the same absolute deviation counts for more in
+     * a dark region than a bright one, which is the whole difference
+     * between "this region is uniform" and "this region looks uniform". */
+    double luma = 0.30 * mr + 0.59 * mg + 0.11 * mb;
+    double denominator = 255.0 * (luma + weber) / (pivot + weber);
+    return (float)(deviation / count / denominator);
 }
 
 static int32_t tree_alloc(NvdrTree* tree) {
@@ -245,13 +252,14 @@ static int32_t tree_alloc(NvdrTree* tree) {
 }
 
 static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
-                          const NvdrConfig* cfg,
+                          const NvdrConfig* cfg, float pivot,
                           int32_t idx, int x, int y, int w, int h, int depth) {
     NvdrNode* node = &tree->nodes[idx];
     node->x = (uint16_t)x; node->y = (uint16_t)y;
     node->w = (uint16_t)w; node->h = (uint16_t)h;
     node->first_child = -1;
-    node->deviation = region_stats(img, x, y, w, h, &node->r, &node->g, &node->b);
+    node->deviation = region_stats(img, x, y, w, h, cfg->weber, pivot,
+                                   &node->r, &node->g, &node->b);
 
     int splittable = w > cfg->min_tile && h > cfg->min_tile && depth < cfg->max_depth;
     if (!splittable || node->deviation <= cfg->tolerance[NVDR_LEVELS - 1]) return 0;
@@ -263,18 +271,33 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
 
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     int rc = 0;
-    rc |= tree_build_rec(tree, img, cfg, first + 0, x,      y,      hw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 1, x + hw, y,      rw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 2, x,      y + hh, hw, rh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, first + 3, x + hw, y + hh, rw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 0, x,      y,      hw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 1, x + hw, y,      rw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 2, x,      y + hh, hw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, cfg, pivot, first + 3, x + hw, y + hh, rw, rh, depth + 1);
     return rc;
 }
 
 int nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg) {
     memset(tree, 0, sizeof(*tree));
+
+    /* The Weber denominator pivots on the image's own mean luminance
+     * rather than on mid-grey. Pivoting on a constant would tighten every
+     * dark image and loosen every bright one, which is a quality setting
+     * wearing a reallocation costume — measured, it cost macarrao.jpg
+     * 1.35 dB. Pivoting on the image keeps the average tolerance where it
+     * was and changes only how it is distributed. */
+    double sum_luma = 0.0;
+    size_t pixels = (size_t)img->width * img->height;
+    for (size_t i = 0; i < pixels; i++) {
+        const unsigned char* p = img->pixels + i * 3;
+        sum_luma += 0.30 * p[0] + 0.59 * p[1] + 0.11 * p[2];
+    }
+    float pivot = pixels ? (float)(sum_luma / (double)pixels) : 128.0f;
+
     int32_t root = tree_alloc(tree);
     if (root < 0) return -1;
-    if (tree_build_rec(tree, img, cfg, root, 0, 0, img->width, img->height, 0) != 0) {
+    if (tree_build_rec(tree, img, cfg, pivot, root, 0, 0, img->width, img->height, 0) != 0) {
         nvdr_tree_free(tree);
         return -1;
     }
@@ -294,6 +317,19 @@ void nvdr_tree_free(NvdrTree* tree) {
  * whatever the image size, and costs one pass.
  */
 typedef struct { uint8_t r, g, b; double weight; } Candidate;
+
+static int nearest_entry(const unsigned char* palette, int n, int r, int g, int b) {
+    int best = 0;
+    long best_dist = -1;
+    for (int i = 0; i < n; i++) {
+        long dr = r - palette[i * 3 + 0];
+        long dg = g - palette[i * 3 + 1];
+        long db = b - palette[i * 3 + 2];
+        long d = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+        if (best_dist < 0 || d < best_dist) { best_dist = d; best = i; }
+    }
+    return best;
+}
 
 static int build_palette(const NvdrTree* tree, const uint32_t* leaves,
                          uint32_t leaf_count, int wanted,
@@ -369,21 +405,58 @@ static int build_palette(const NvdrTree* tree, const uint32_t* leaves,
         best = next;
     }
 
-    free(cands); free(min_dist); free(taken);
-    return chosen;
-}
+    free(min_dist); free(taken);
 
-static int nearest_entry(const unsigned char* palette, int n, int r, int g, int b) {
-    int best = 0;
-    long best_dist = -1;
-    for (int i = 0; i < n; i++) {
-        long dr = r - palette[i * 3 + 0];
-        long dg = g - palette[i * 3 + 1];
-        long db = b - palette[i * 3 + 2];
-        long d = dr * dr * 3 + dg * dg * 4 + db * db * 2;
-        if (best_dist < 0 || d < best_dist) { best_dist = d; best = i; }
+    /*
+     * Lloyd refinement. The greedy pass above maximises spread, which is a
+     * good seeding — it is essentially k-means++ without the randomness —
+     * but spread is not the objective. The objective is the area-weighted
+     * error of assigning every leaf colour to its nearest entry, and that
+     * is what these iterations actually minimise.
+     *
+     * Runs over the histogram candidates rather than the leaves, so the
+     * cost is bounded by the 32768 bins regardless of image size.
+     */
+    double* cell_r = (double*)calloc((size_t)chosen, sizeof(double));
+    double* cell_g = (double*)calloc((size_t)chosen, sizeof(double));
+    double* cell_b = (double*)calloc((size_t)chosen, sizeof(double));
+    double* mass  = (double*)calloc((size_t)chosen, sizeof(double));
+    if (cell_r && cell_g && cell_b && mass) {
+        for (int iteration = 0; iteration < 12; iteration++) {
+            memset(cell_r, 0, (size_t)chosen * sizeof(double));
+            memset(cell_g, 0, (size_t)chosen * sizeof(double));
+            memset(cell_b, 0, (size_t)chosen * sizeof(double));
+            memset(mass,  0, (size_t)chosen * sizeof(double));
+
+            for (int i = 0; i < cand_count; i++) {
+                int nearest = nearest_entry(palette_out, chosen,
+                                            cands[i].r, cands[i].g, cands[i].b);
+                double w = cands[i].weight;
+                cell_r[nearest] += w * cands[i].r;
+                cell_g[nearest] += w * cands[i].g;
+                cell_b[nearest] += w * cands[i].b;
+                mass[nearest]  += w;
+            }
+
+            int moved = 0;
+            for (int p = 0; p < chosen; p++) {
+                if (mass[p] <= 0.0) continue;   /* empty cell keeps its seed */
+                unsigned char r = (unsigned char)(cell_r[p] / mass[p] + 0.5);
+                unsigned char g = (unsigned char)(cell_g[p] / mass[p] + 0.5);
+                unsigned char b = (unsigned char)(cell_b[p] / mass[p] + 0.5);
+                if (r != palette_out[p * 3 + 0] || g != palette_out[p * 3 + 1] ||
+                    b != palette_out[p * 3 + 2]) moved = 1;
+                palette_out[p * 3 + 0] = r;
+                palette_out[p * 3 + 1] = g;
+                palette_out[p * 3 + 2] = b;
+            }
+            if (!moved) break;
+        }
     }
-    return best;
+    free(cell_r); free(cell_g); free(cell_b); free(mass);
+
+    free(cands);
+    return chosen;
 }
 
 /* ============================================================== helpers */
@@ -646,11 +719,18 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                         transcode_split(&br, &ae, &models, n->w, n->h);
                     }
                     uint32_t count = leaves[k].count;
-                    for (int c = 0; c < 3; c++)
-                        for (uint32_t i = 0; i < count; i++)
-                            nvdr_enc_residual(&ae, &models,
-                                              residual[k][(size_t)c * count + i],
-                                              split_ctx[k][i], c);
+                    for (int c = 0; c < 3; c++) {
+                        int prev = 0;
+                        for (uint32_t i = 0; i < count; i++) {
+                            int value = residual[k][(size_t)c * count + i];
+                            int neighbour = c > 0
+                                ? residual[k][(size_t)(c - 1) * count + i] : prev;
+                            prev = value;
+                            nvdr_enc_residual(&ae, &models, value,
+                                              split_ctx[k][i], c,
+                                              nvdr_prev_context(neighbour));
+                        }
+                    }
                 }
 
                 if (nvdr_enc_finish(&ae) != 0) { nvdr_enc_free(&ae); goto write_done; }
@@ -977,10 +1057,17 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         }
 
         if (arith) {
-            for (int c = 0; c < 3; c++)
-                for (uint32_t i = 0; i < n; i++)
-                    residual[(size_t)c * n + i] =
-                        (int8_t)nvdr_dec_residual(&ad, &models, split_ctx[i], c);
+            for (int c = 0; c < 3; c++) {
+                int prev = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    int neighbour = c > 0
+                        ? residual[(size_t)(c - 1) * n + i] : prev;
+                    int value = nvdr_dec_residual(&ad, &models, split_ctx[i], c,
+                                                  nvdr_prev_context(neighbour));
+                    residual[(size_t)c * n + i] = (int8_t)value;
+                    prev = value;
+                }
+            }
             if (ad.overrun) {
                 free(residual); free(base); free(split_ctx); free(buf);
                 free(pyr->level[k].rgb);
