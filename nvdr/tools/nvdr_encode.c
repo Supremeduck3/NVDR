@@ -23,7 +23,8 @@ static void usage(const char* argv0) {
         "  --step B,C         residual quantisation step for levels 1 and 2\n"
         "                     (default 16,4)\n"
         "  --min-tile N       smallest tile edge (default 2)\n"
-        "  --max-depth N      deepest subdivision (default 12)\n",
+        "  --max-depth N      deepest subdivision (default 12)\n"
+        "  --codec NAME       arith (default) or deflate, for comparison\n",
         argv0);
 }
 
@@ -62,6 +63,11 @@ int main(int argc, char** argv) {
             cfg.min_tile = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--max-depth") && i + 1 < argc) {
             cfg.max_depth = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--codec") && i + 1 < argc) {
+            const char* name = argv[++i];
+            if (!strcmp(name, "arith")) cfg.codec = NVDR_COMPRESS_ARITH;
+            else if (!strcmp(name, "deflate")) cfg.codec = NVDR_COMPRESS_DEFLATE;
+            else { fprintf(stderr, "--codec takes arith or deflate\n"); return 2; }
         } else {
             usage(argv[0]);
             return 2;

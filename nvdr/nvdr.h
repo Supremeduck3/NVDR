@@ -43,7 +43,7 @@
  * container past the anchor decodes. Truncate the file anywhere and it
  * still renders, at the quality the surviving bytes pay for.
  *
- * Each level is deflated on its own rather than the container being
+ * Each level is entropy-coded on its own rather than the container being
  * compressed as a whole. That is not a packaging detail — a prefix of one
  * deflate stream does not decode, so compressing everything together would
  * buy smaller files by destroying the property the format exists for. Per
@@ -98,6 +98,7 @@ typedef struct {
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
+    int   codec;                    /* NVDR_COMPRESS_DEFLATE or _ARITH */
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
@@ -142,6 +143,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* Compression applied to each level stream independently. */
 #define NVDR_COMPRESS_NONE    0
 #define NVDR_COMPRESS_DEFLATE 1
+#define NVDR_COMPRESS_ARITH   2   /* adaptive arithmetic coding, see entropy.h */
 
 typedef struct {
     uint16_t width, height;

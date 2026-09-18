@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <zlib.h>
+#include "entropy.h"
 
 /* ================================================================ image */
 
@@ -111,6 +112,7 @@ NvdrConfig nvdr_default_config(void) {
      * lands 35KB below a 2/2 stack at the same PSNR. */
     cfg.step[1]      = 16;
     cfg.step[2]      = 4;
+    cfg.codec        = NVDR_COMPRESS_ARITH;
     return cfg;
 }
 
@@ -356,6 +358,24 @@ static int cut_level(const NvdrTree* tree, int32_t idx, float tolerance,
     return 0;
 }
 
+/*
+ * Re-code a level's split bitstream through the arithmetic coder, giving
+ * each bit the area context of the rectangle it decides. The tree shape is
+ * recovered by walking it again rather than stored, so nothing extra is
+ * carried: the walk is deterministic from the canvas rectangle down.
+ */
+static void transcode_split(BitReader* br, NvdrEncoder* enc, NvdrModels* m,
+                            int w, int h) {
+    int bit = br_get(br);
+    nvdr_enc_bit(enc, &m->split[nvdr_area_context(w, h)], bit);
+    if (!bit) return;
+    int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
+    transcode_split(br, enc, m, hw, hh);
+    transcode_split(br, enc, m, rw, hh);
+    transcode_split(br, enc, m, hw, rh);
+    transcode_split(br, enc, m, rw, rh);
+}
+
 static void put_u16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put_u32(uint8_t* p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
@@ -376,6 +396,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
     IndexList  leaves[NVDR_LEVELS];
     uint8_t*   recon[NVDR_LEVELS];       /* reconstructed rgb per leaf */
     int8_t*    residual[NVDR_LEVELS];    /* 3 planes, level >= 1 only */
+    uint8_t*   split_ctx[NVDR_LEVELS];   /* 1 when the parent subdivided */
     unsigned char* palette = NULL;
     uint8_t*   tokens = NULL;
     int rc = -1;
@@ -384,6 +405,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
     memset(leaves, 0, sizeof(leaves));
     memset(recon, 0, sizeof(recon));
     memset(residual, 0, sizeof(residual));
+    memset(split_ctx, 0, sizeof(split_ctx));
 
     for (int k = 0; k < NVDR_LEVELS; k++)
         if (bw_init(&bits[k], tree.count + 1024) != 0) goto done;
@@ -413,7 +435,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         /* Expanding one previous leaf may yield many leaves here; they all
          * inherit that leaf's displayed colour as the base of their delta. */
         uint8_t* base = NULL;
-        size_t base_capacity = 0, base_count = 0;
+        size_t base_capacity = 0, base_count = 0, ctx_capacity = 0;
 
         for (uint32_t i = 0; i < leaves[k - 1].count; i++) {
             uint32_t before = leaves[k].count;
@@ -430,8 +452,23 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                 base = next;
                 base_capacity = grown;
             }
-            for (uint32_t j = 0; j < produced; j++)
+            /* A rectangle whose parent subdivided carries a genuinely new
+             * colour; one whose parent did not carries a small correction
+             * to a colour already close. The entropy coder is given that
+             * distinction as context; it is recomputed on the decoder side
+             * from the same split bitstream, never transmitted. */
+            if (base_count + produced > ctx_capacity) {
+                size_t grown = ctx_capacity ? ctx_capacity * 2 : 8192;
+                while (grown < base_count + produced) grown *= 2;
+                uint8_t* next = (uint8_t*)realloc(split_ctx[k], grown);
+                if (!next) { free(base); goto done; }
+                split_ctx[k] = next;
+                ctx_capacity = grown;
+            }
+            for (uint32_t j = 0; j < produced; j++) {
                 memcpy(base + (base_count + j) * 3, recon[k - 1] + (size_t)i * 3, 3);
+                split_ctx[k][base_count + j] = (uint8_t)(produced > 1);
+            }
             base_count += produced;
         }
 
@@ -498,13 +535,65 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             memcpy(raw[k] + bits_bytes, residual[k], residual_bytes);
         }
 
-        for (int k = 0; k < NVDR_LEVELS; k++) {
-            uLongf bound = compressBound((uLong)raw_size[k]);
-            stored[k] = (uint8_t*)malloc(bound);
-            if (!stored[k]) goto write_done;
-            if (compress2(stored[k], &bound, raw[k], (uLong)raw_size[k], 9) != Z_OK)
-                goto write_done;
-            stored_size[k] = bound;
+        if (cfg->codec == NVDR_COMPRESS_ARITH) {
+            /* Each level gets its own coder and its own fresh model: a
+             * level has to decode without the ones after it, so adaptation
+             * cannot carry across the boundary. */
+            for (int k = 0; k < NVDR_LEVELS; k++) {
+                NvdrModels models;
+                NvdrEncoder ae;
+                nvdr_models_init(&models);
+                if (nvdr_enc_init(&ae, raw_size[k] / 2 + 1024) != 0) goto write_done;
+
+                size_t prefix = 0;
+                if (k == 0) {
+                    /* The palette rides ahead of the coded stream: 48 bytes
+                     * of genuinely incompressible colour are not worth
+                     * modelling. */
+                    prefix = 1 + (size_t)palette_n * 3;
+                }
+
+                BitReader br;
+                br.bytes = bits[k].bytes;
+                br.bit_count = bits[k].bit_count;
+                br.bit_pos = 0;
+                br.overrun = 0;
+
+                if (k == 0) {
+                    transcode_split(&br, &ae, &models, img->width, img->height);
+                    for (uint32_t i = 0; i < leaves[0].count; i++)
+                        nvdr_enc_tree(&ae, models.token, tokens[i], cfg->anchor_bits);
+                } else {
+                    for (uint32_t i = 0; i < leaves[k - 1].count; i++) {
+                        const NvdrNode* n = &tree.nodes[leaves[k - 1].items[i]];
+                        transcode_split(&br, &ae, &models, n->w, n->h);
+                    }
+                    uint32_t count = leaves[k].count;
+                    for (int c = 0; c < 3; c++)
+                        for (uint32_t i = 0; i < count; i++)
+                            nvdr_enc_residual(&ae, &models,
+                                              residual[k][(size_t)c * count + i],
+                                              split_ctx[k][i], c);
+                }
+
+                if (nvdr_enc_finish(&ae) != 0) { nvdr_enc_free(&ae); goto write_done; }
+
+                stored_size[k] = prefix + ae.count;
+                stored[k] = (uint8_t*)malloc(stored_size[k]);
+                if (!stored[k]) { nvdr_enc_free(&ae); goto write_done; }
+                if (prefix) memcpy(stored[k], raw[k], prefix);
+                memcpy(stored[k] + prefix, ae.bytes, ae.count);
+                nvdr_enc_free(&ae);
+            }
+        } else {
+            for (int k = 0; k < NVDR_LEVELS; k++) {
+                uLongf bound = compressBound((uLong)raw_size[k]);
+                stored[k] = (uint8_t*)malloc(bound);
+                if (!stored[k]) goto write_done;
+                if (compress2(stored[k], &bound, raw[k], (uLong)raw_size[k], 9) != Z_OK)
+                    goto write_done;
+                stored_size[k] = bound;
+            }
         }
 
         FILE* f = fopen(out_path, "wb");
@@ -514,7 +603,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         memset(header, 0, sizeof(header));
         memcpy(header, NVDR_MAGIC, 4);
         header[4] = NVDR_VERSION;
-        header[5] = NVDR_COMPRESS_DEFLATE;
+        header[5] = (uint8_t)cfg->codec;
         put_u16(header + 6, (uint16_t)img->width);
         put_u16(header + 8, (uint16_t)img->height);
         header[10] = (uint8_t)cfg->anchor_bits;
@@ -536,7 +625,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             hdr_out->width = (uint16_t)img->width;
             hdr_out->height = (uint16_t)img->height;
             hdr_out->anchor_bits = (uint8_t)cfg->anchor_bits;
-            hdr_out->compression = NVDR_COMPRESS_DEFLATE;
+            hdr_out->compression = (uint8_t)cfg->codec;
             for (int k = 0; k < NVDR_LEVELS; k++) {
                 hdr_out->leaf_count[k]   = leaves[k].count;
                 hdr_out->split_bits[k]   = (uint32_t)bits[k].bit_count;
@@ -558,6 +647,7 @@ done:
         free(leaves[k].items);
         free(recon[k]);
         free(residual[k]);
+        free(split_ctx[k]);
     }
     free(palette);
     free(tokens);
@@ -608,6 +698,20 @@ static int replay(BitReader* br, RectSink* sink, int x, int y, int w, int h) {
     return 0;
 }
 
+/* The mirror of transcode_split: same walk, same area contexts. */
+static int replay_arith(NvdrDecoder* dec, NvdrModels* m, RectSink* sink,
+                        int x, int y, int w, int h) {
+    if (dec->overrun) return -1;
+    if (!nvdr_dec_bit(dec, &m->split[nvdr_area_context(w, h)]))
+        return sink_push(sink, x, y, w, h);
+    int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
+    if (replay_arith(dec, m, sink, x,      y,      hw, hh) != 0) return -1;
+    if (replay_arith(dec, m, sink, x + hw, y,      rw, hh) != 0) return -1;
+    if (replay_arith(dec, m, sink, x,      y + hh, hw, rh) != 0) return -1;
+    if (replay_arith(dec, m, sink, x + hw, y + hh, rw, rh) != 0) return -1;
+    return 0;
+}
+
 void nvdr_pyramid_free(NvdrPyramid* pyr) {
     for (int k = 0; k < NVDR_LEVELS; k++) {
         free(pyr->level[k].x); free(pyr->level[k].y);
@@ -633,7 +737,7 @@ static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
     if (fread(packed, 1, stored_bytes, f) != stored_bytes) { free(packed); return NULL; }
     *available -= (long)stored_bytes;
 
-    if (compression == NVDR_COMPRESS_NONE) return packed;
+    if (compression != NVDR_COMPRESS_DEFLATE) return packed;
 
     uint8_t* raw = (uint8_t*)malloc(raw_bytes ? raw_bytes : 1);
     if (!raw) { free(packed); return NULL; }
@@ -690,25 +794,50 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     memcpy(pyr->palette, stream + off, (size_t)pyr->palette_count * 3);
     off += (size_t)pyr->palette_count * 3;
 
-    BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
     RectSink sink = { &pyr->level[0], 0 };
-    if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
-        pyr->level[0].count != hdr->leaf_count[0]) {
-        free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+    uint32_t* tokens = (uint32_t*)malloc((size_t)hdr->leaf_count[0] * sizeof(uint32_t));
+    if (!tokens) { free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1; }
+
+    if (hdr->compression == NVDR_COMPRESS_ARITH) {
+        NvdrModels models;
+        NvdrDecoder ad;
+        nvdr_models_init(&models);
+        nvdr_dec_init(&ad, stream + off, hdr->stored_bytes[0] - off);
+        if (replay_arith(&ad, &models, &sink, 0, 0, hdr->width, hdr->height) != 0 ||
+            ad.overrun || pyr->level[0].count != hdr->leaf_count[0]) {
+            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+        }
+        for (uint32_t i = 0; i < hdr->leaf_count[0]; i++)
+            tokens[i] = nvdr_dec_tree(&ad, models.token, hdr->anchor_bits);
+        if (ad.overrun) {
+            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+        }
+    } else {
+        BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
+        if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
+            pyr->level[0].count != hdr->leaf_count[0]) {
+            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+        }
+        off += (hdr->split_bits[0] + 7) / 8;
+        for (uint32_t i = 0; i < hdr->leaf_count[0]; i++) {
+            size_t bit = (size_t)i * hdr->anchor_bits;
+            uint32_t token = 0;
+            for (int b = 0; b < hdr->anchor_bits; b++)
+                if (stream[off + ((bit + b) >> 3)] & (1u << ((bit + b) & 7)))
+                    token |= (1u << b);
+            tokens[i] = token;
+        }
     }
-    off += (hdr->split_bits[0] + 7) / 8;
 
     pyr->level[0].rgb = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
-    if (!pyr->level[0].rgb) { free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1; }
+    if (!pyr->level[0].rgb) {
+        free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+    }
     for (uint32_t i = 0; i < pyr->level[0].count; i++) {
-        size_t bit = (size_t)i * hdr->anchor_bits;
-        uint32_t token = 0;
-        for (int b = 0; b < hdr->anchor_bits; b++)
-            if (stream[off + ((bit + b) >> 3)] & (1u << ((bit + b) & 7)))
-                token |= (1u << b);
-        if ((int)token >= pyr->palette_count) token = 0;
+        uint32_t token = tokens[i] < (uint32_t)pyr->palette_count ? tokens[i] : 0;
         memcpy(pyr->level[0].rgb + (size_t)i * 3, pyr->palette + token * 3, 3);
     }
+    free(tokens);
     free(stream);
     pyr->levels_present = 1;
 
@@ -721,37 +850,72 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         BitReader lbr = { buf, hdr->split_bits[k], 0, 0 };
         RectSink lsink = { &pyr->level[k], 0 };
         const NvdrLevelData* prev = &pyr->level[k - 1];
+        const int arith = hdr->compression == NVDR_COMPRESS_ARITH;
+
+        NvdrModels models;
+        NvdrDecoder ad;
+        if (arith) {
+            nvdr_models_init(&models);
+            nvdr_dec_init(&ad, buf, hdr->stored_bytes[k]);
+        }
 
         /* Track which previous rectangle each new one came from, so the
-         * delta has the colour that was on screen there as its base. */
+         * delta has the colour that was on screen there as its base, and
+         * whether that rectangle subdivided, which is the entropy
+         * context — derived here, never read from the file. */
         uint8_t* base = (uint8_t*)malloc((size_t)hdr->leaf_count[k] * 3);
-        if (!base) { free(buf); break; }
+        uint8_t* split_ctx = (uint8_t*)malloc(hdr->leaf_count[k]);
+        if (!base || !split_ctx) { free(base); free(split_ctx); free(buf); break; }
 
         int failed = 0;
         for (uint32_t i = 0; i < prev->count && !failed; i++) {
             uint32_t before = pyr->level[k].count;
-            if (replay(&lbr, &lsink, prev->x[i], prev->y[i],
-                       prev->w[i], prev->h[i]) != 0 || lbr.overrun) {
-                failed = 1;
-                break;
-            }
+            int rc = arith
+                ? replay_arith(&ad, &models, &lsink, prev->x[i], prev->y[i],
+                               prev->w[i], prev->h[i])
+                : replay(&lbr, &lsink, prev->x[i], prev->y[i],
+                         prev->w[i], prev->h[i]);
+            if (rc != 0 || (arith ? ad.overrun : lbr.overrun)) { failed = 1; break; }
+
+            uint32_t produced = pyr->level[k].count - before;
             for (uint32_t j = before; j < pyr->level[k].count; j++) {
                 if (j >= hdr->leaf_count[k]) { failed = 1; break; }
                 memcpy(base + (size_t)j * 3, prev->rgb + (size_t)i * 3, 3);
+                split_ctx[j] = (uint8_t)(produced > 1);
             }
         }
         if (failed || pyr->level[k].count != hdr->leaf_count[k]) {
-            free(base); free(buf);
+            free(base); free(split_ctx); free(buf);
             free(pyr->level[k].x); free(pyr->level[k].y);
             free(pyr->level[k].w); free(pyr->level[k].h);
             memset(&pyr->level[k], 0, sizeof(pyr->level[k]));
             break;
         }
 
-        const int8_t* residual = (const int8_t*)(buf + (hdr->split_bits[k] + 7) / 8);
         uint32_t n = pyr->level[k].count;
+        int8_t* residual = (int8_t*)malloc((size_t)n * 3);
         pyr->level[k].rgb = (uint8_t*)malloc((size_t)n * 3);
-        if (!pyr->level[k].rgb) { free(base); free(buf); break; }
+        if (!residual || !pyr->level[k].rgb) {
+            free(residual); free(base); free(split_ctx); free(buf); break;
+        }
+
+        if (arith) {
+            for (int c = 0; c < 3; c++)
+                for (uint32_t i = 0; i < n; i++)
+                    residual[(size_t)c * n + i] =
+                        (int8_t)nvdr_dec_residual(&ad, &models, split_ctx[i], c);
+            if (ad.overrun) {
+                free(residual); free(base); free(split_ctx); free(buf);
+                free(pyr->level[k].rgb);
+                free(pyr->level[k].x); free(pyr->level[k].y);
+                free(pyr->level[k].w); free(pyr->level[k].h);
+                memset(&pyr->level[k], 0, sizeof(pyr->level[k]));
+                break;
+            }
+        } else {
+            memcpy(residual, buf + (hdr->split_bits[k] + 7) / 8, (size_t)n * 3);
+        }
+
         for (uint32_t i = 0; i < n; i++) {
             for (int c = 0; c < 3; c++) {
                 int value = (int)base[(size_t)i * 3 + c] +
@@ -760,7 +924,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
             }
         }
 
+        free(residual);
         free(base);
+        free(split_ctx);
         free(buf);
         pyr->levels_present = k + 1;
     }
