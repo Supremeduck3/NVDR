@@ -29,6 +29,17 @@ int nvdr_area_context(int w, int h) {
     return bucket;
 }
 
+int nvdr_prev_context(int value) {
+    int magnitude = value < 0 ? -value : value;
+    if (magnitude == 0) return 0;
+    if (magnitude == 1) return 1;
+    if (magnitude == 2) return 2;
+    if (magnitude <= 4) return 3;
+    if (magnitude <= 8) return 4;
+    if (magnitude <= 16) return 5;
+    return 6;
+}
+
 /* ================================================================ encoder */
 
 static void enc_put(NvdrEncoder* enc, uint8_t byte) {
@@ -105,9 +116,9 @@ void nvdr_enc_tree(NvdrEncoder* enc, uint16_t* probs, uint32_t value, int bit_co
 }
 
 void nvdr_enc_residual(NvdrEncoder* enc, NvdrModels* m, int value,
-                       int split_ctx, int channel) {
+                       int split_ctx, int channel, int prev_ctx) {
     int significant = value != 0;
-    nvdr_enc_bit(enc, &m->sig[split_ctx][channel], significant);
+    nvdr_enc_bit(enc, &m->sig[split_ctx][channel][prev_ctx], significant);
     if (!significant) return;
 
     nvdr_enc_bit(enc, &m->sign[split_ctx][channel], value < 0);
@@ -120,7 +131,7 @@ void nvdr_enc_residual(NvdrEncoder* enc, NvdrModels* m, int value,
     int i = 0;
     for (; i < NVDR_MAG_CTX; i++) {
         int more = remaining > i;
-        nvdr_enc_bit(enc, &m->mag[split_ctx][channel][i], more);
+        nvdr_enc_bit(enc, &m->mag[split_ctx][channel][prev_ctx][i], more);
         if (!more) return;
     }
     nvdr_enc_direct(enc, (uint32_t)(remaining - NVDR_MAG_CTX), 7);
@@ -197,15 +208,16 @@ uint32_t nvdr_dec_tree(NvdrDecoder* dec, uint16_t* probs, int bit_count) {
     return node - ((uint32_t)1 << bit_count);
 }
 
-int nvdr_dec_residual(NvdrDecoder* dec, NvdrModels* m, int split_ctx, int channel) {
-    if (!nvdr_dec_bit(dec, &m->sig[split_ctx][channel])) return 0;
+int nvdr_dec_residual(NvdrDecoder* dec, NvdrModels* m,
+                      int split_ctx, int channel, int prev_ctx) {
+    if (!nvdr_dec_bit(dec, &m->sig[split_ctx][channel][prev_ctx])) return 0;
 
     int negative = nvdr_dec_bit(dec, &m->sign[split_ctx][channel]);
 
     int remaining = 0;
     int i = 0;
     for (; i < NVDR_MAG_CTX; i++) {
-        if (!nvdr_dec_bit(dec, &m->mag[split_ctx][channel][i])) break;
+        if (!nvdr_dec_bit(dec, &m->mag[split_ctx][channel][prev_ctx][i])) break;
         remaining = i + 1;
     }
     if (i == NVDR_MAG_CTX)

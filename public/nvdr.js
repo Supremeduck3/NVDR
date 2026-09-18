@@ -28,7 +28,7 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 4;
+const VERSION = 5;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
@@ -42,20 +42,36 @@ const MOVE_BITS = 5;
 const TOP_VALUE = 1 << 24;
 const AREA_CTX = 16;
 const MAG_CTX = 8;
+const PREV_CTX = 7;
 
 function newModels() {
     return {
         split: new Uint16Array(AREA_CTX).fill(PROB_INIT),
         token: new Uint16Array(256).fill(PROB_INIT),
-        sig: [new Uint16Array(3).fill(PROB_INIT), new Uint16Array(3).fill(PROB_INIT)],
-        sign: [new Uint16Array(3).fill(PROB_INIT), new Uint16Array(3).fill(PROB_INIT)],
-        mag: [
-            [new Uint16Array(MAG_CTX).fill(PROB_INIT), new Uint16Array(MAG_CTX).fill(PROB_INIT),
-             new Uint16Array(MAG_CTX).fill(PROB_INIT)],
-            [new Uint16Array(MAG_CTX).fill(PROB_INIT), new Uint16Array(MAG_CTX).fill(PROB_INIT),
-             new Uint16Array(MAG_CTX).fill(PROB_INIT)]
-        ]
+        // [split][channel][prevBucket] and [split][channel][prevBucket][magBit]
+        sig: grid([2, 3], () => new Uint16Array(PREV_CTX).fill(PROB_INIT)),
+        sign: grid([2], () => new Uint16Array(3).fill(PROB_INIT)),
+        mag: grid([2, 3, PREV_CTX], () => new Uint16Array(MAG_CTX).fill(PROB_INIT))
     };
+}
+
+/* Nested arrays of the given shape, each leaf built by `make`. */
+function grid(shape, make) {
+    if (shape.length === 0) return make();
+    const [head, ...rest] = shape;
+    return Array.from({ length: head }, () => grid(rest, make));
+}
+
+/* Must match nvdr_prev_context: fine near zero, where the residuals are. */
+function prevContext(value) {
+    const magnitude = value < 0 ? -value : value;
+    if (magnitude === 0) return 0;
+    if (magnitude === 1) return 1;
+    if (magnitude === 2) return 2;
+    if (magnitude <= 4) return 3;
+    if (magnitude <= 8) return 4;
+    if (magnitude <= 16) return 5;
+    return 6;
 }
 
 /* Same bucketing as nvdr_area_context: both sides must index the same slot. */
@@ -132,14 +148,14 @@ class ArithDecoder {
         return node - (1 << bitCount);
     }
 
-    residual(models, splitCtx, channel) {
-        if (!this.bit(models.sig[splitCtx], channel)) return 0;
+    residual(models, splitCtx, channel, prevCtx) {
+        if (!this.bit(models.sig[splitCtx][channel], prevCtx)) return 0;
         const negative = this.bit(models.sign[splitCtx], channel);
 
         let remaining = 0;
         let i = 0;
         for (; i < MAG_CTX; i++) {
-            if (!this.bit(models.mag[splitCtx][channel], i)) break;
+            if (!this.bit(models.mag[splitCtx][channel][prevCtx], i)) break;
             remaining = i + 1;
         }
         if (i === MAG_CTX) remaining = MAG_CTX + this.direct(7);
@@ -396,9 +412,18 @@ export async function decode(buffer) {
         let residual;
         if (arith) {
             residual = new Int8Array(n * 3);
-            for (let c = 0; c < 3; c++)
-                for (let i = 0; i < n; i++)
-                    residual[c * n + i] = dec.residual(models, splitCtx[i], c);
+            for (let c = 0; c < 3; c++) {
+                let prev = 0;
+                for (let i = 0; i < n; i++) {
+                    // Channel 0 has no previous plane, so it leans on its
+                    // in-plane predecessor instead.
+                    const neighbour = c > 0 ? residual[(c - 1) * n + i] : prev;
+                    const value = dec.residual(models, splitCtx[i], c,
+                                               prevContext(neighbour));
+                    residual[c * n + i] = value;
+                    prev = value;
+                }
+            }
             if (dec.overrun) break;
         } else {
             const residualOffset = (header.splitBits[k] + 7) >> 3;
