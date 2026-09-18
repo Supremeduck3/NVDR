@@ -5,17 +5,17 @@
 
 CC      = gcc
 CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I. -I../vendor
-LDLIBS  = -lm
+LDLIBS  = -lm -lz
 
 TOOLS   = nvdr_encode nvdr_decode
 
 all: $(TOOLS)
 
-nvdr_encode: tools/nvdr_encode.c nvdr.c nvdr.h
-	$(CC) $(CFLAGS) -o $@ tools/nvdr_encode.c nvdr.c $(LDLIBS)
+nvdr_encode: tools/nvdr_encode.c nvdr.c entropy.c nvdr.h entropy.h
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_encode.c nvdr.c entropy.c $(LDLIBS)
 
-nvdr_decode: tools/nvdr_decode.c nvdr.c nvdr.h
-	$(CC) $(CFLAGS) -o $@ tools/nvdr_decode.c nvdr.c $(LDLIBS)
+nvdr_decode: tools/nvdr_decode.c nvdr.c entropy.c nvdr.h entropy.h
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_decode.c nvdr.c entropy.c $(LDLIBS)
 
 clean:
 	rm -f $(TOOLS)
