@@ -28,7 +28,7 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 3;
+const VERSION = 4;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
@@ -308,7 +308,7 @@ export async function decode(buffer) {
 
     const arith = header.compression === COMPRESS_ARITH;
     let offset = 0;
-    const paletteCount = anchorStream[offset++];
+    const paletteCount = anchorStream[offset++] + 1;   // stored biased by one
     const palette = anchorStream.subarray(offset, offset + paletteCount * 3);
     offset += paletteCount * 3;
 

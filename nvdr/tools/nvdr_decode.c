@@ -24,7 +24,7 @@ static const char* level_name(int level) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "usage: %s <in.nvdr> <out.ppm> [--level N] [--compare source]\n"
+            "usage: %s <in.nvdr> <out.png|out.ppm> [--level N] [--compare source]\n"
             "  --level N      cap the render at level N; the file may carry\n"
             "                 less, and then less is what you get\n"
             "  --compare IMG  also report PSNR against IMG\n",
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
 
     nvdr_render_level(&pyr.level[level], &out);
 
-    if (nvdr_image_write_ppm(&out, out_path) != 0) {
+    if (nvdr_image_write(&out, out_path) != 0) {
         fprintf(stderr, "cannot write '%s'\n", out_path);
         free(out.pixels);
         nvdr_pyramid_free(&pyr);
