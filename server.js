@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = 3000;
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
@@ -10,6 +11,13 @@ const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 // Whitelist of accepted file extensions. Any other value is rejected
 // before reaching the file system — protects shell, sanitize path.
 const ALLOWED_EXTS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tga']);
+
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const STATIC_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8'
+};
 
 // Ensure output dir exists
 const outDir = path.join(__dirname, 'output');
@@ -28,182 +36,286 @@ function sanitizeExtension(raw) {
     return ext;
 }
 
-const server = http.createServer((req, res) => {
-    if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
-        fs.readFile(path.join(__dirname, 'public', 'index.html'), (err, data) => {
-            if (err) {
-                res.writeHead(500);
-                res.end("Error loading HTML");
-            } else {
-                res.writeHead(200, { 'Content-Type': 'text/html' });
-                res.end(data);
-            }
-        });
-    } else if (req.method === 'POST' && req.url === '/convert') {
-        const fileExtension = sanitizeExtension(req.headers['x-file-ext']);
-        if (!fileExtension) {
-            res.writeHead(400, { 'Content-Type': 'text/plain' });
-            res.end("Invalid or missing x-file-ext header");
-            return;
+// B2: best-effort cleanup helper. Each cleanup is fire-and-forget unlink;
+// failures are logged but do not block the call site.
+function safeUnlink(p) {
+    fs.unlink(p, (err) => {
+        if (err && err.code !== 'ENOENT') {
+            console.warn(`Could not delete ${p}: ${err.message}`);
         }
-        const minTile = req.headers['x-min-tile'] || '-1';
-        const homoThresh = req.headers['x-homo-thresh'] || '-1.0';
-        const logoMode = req.headers['x-logo-mode'] === '1';
+    });
+}
 
-        const fileId = crypto.randomUUID();
-        const inputPath = path.join(outDir, `temp_${fileId}${fileExtension}`);
-        const outBase = path.join(outDir, `temp_${fileId}.svg`);
-        const outSvbc = path.join(outDir, `temp_${fileId}.svbc`);
-        const outSvbcz = path.join(outDir, `temp_${fileId}.svbcz`);
+// Across platforms the built binaries differ by extension:
+//   Windows (gcc/MinGW + `make`):  name.exe
+//   Linux/macOS (gcc):              name
+// Pick whichever exists. Returning null lets the caller answer with a
+// clear 500 rather than an opaque ENOENT.
+function findExecutable(dir, name) {
+    for (const candidate of [path.join(dir, `${name}.exe`), path.join(dir, name)]) {
+        try {
+            if (fs.existsSync(candidate)) return candidate;
+        } catch (e) { /* permission errors fall through */ }
+    }
+    return null;
+}
 
-        // B2: best-effort cleanup helper. Each cleanup is fire-and-forget
-        // unlink; failures are logged but do not block the call site.
-        const safeUnlink = (p) => {
-            fs.unlink(p, (err) => {
-                if (err && err.code !== 'ENOENT') {
-                    console.warn(`Could not delete ${p}: ${err.message}`);
-                }
-            });
-        };
+/*
+ * Stream an upload to disk, then hand the path to `onReady`.
+ *
+ * The pipe at the bottom is load-bearing: without it the request body is
+ * never consumed, 'finish' never fires, and the connection hangs until the
+ * client times out.
+ */
+function receiveUpload(req, res, onReady) {
+    const fileExtension = sanitizeExtension(req.headers['x-file-ext']);
+    if (!fileExtension) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Invalid or missing x-file-ext header');
+        return;
+    }
 
-        const writeStream = fs.createWriteStream(inputPath);
-        let aborted = false;
-        let received = 0;
+    const fileId = crypto.randomUUID();
+    const inputPath = path.join(outDir, `temp_${fileId}${fileExtension}`);
+    const writeStream = fs.createWriteStream(inputPath);
+    let aborted = false;
+    let received = 0;
 
-        writeStream.on('error', (err) => {
-            aborted = true;
-            console.error("Failed to write upload file:", err);
+    writeStream.on('error', (err) => {
+        aborted = true;
+        console.error('Failed to write upload file:', err);
+        if (!res.writableEnded) {
             res.writeHead(500);
-            res.end("Upload write failed");
-            safeUnlink(inputPath);
-        });
+            res.end('Upload write failed');
+        }
+        safeUnlink(inputPath);
+    });
 
-        req.on('aborted', () => {
+    req.on('aborted', () => {
+        aborted = true;
+        writeStream.destroy();
+        safeUnlink(inputPath);
+    });
+
+    // Guard against unbounded uploads filling the disk.
+    req.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > MAX_UPLOAD_BYTES && !aborted) {
             aborted = true;
             writeStream.destroy();
+            if (!res.writableEnded) {
+                res.writeHead(413, { 'Content-Type': 'text/plain' });
+                res.end(`Upload too large (limit ${MAX_UPLOAD_BYTES} bytes)`);
+            }
+            req.destroy();
             safeUnlink(inputPath);
-        });
+        }
+    });
 
-        // Guard against unbounded uploads filling the disk.
-        req.on('data', (chunk) => {
-            received += chunk.length;
-            if (received > MAX_UPLOAD_BYTES && !aborted) {
-                aborted = true;
-                writeStream.destroy();
-                if (!res.writableEnded) {
-                    res.writeHead(413, { 'Content-Type': 'text/plain' });
-                    res.end(`Upload too large (limit ${MAX_UPLOAD_BYTES} bytes)`);
-                }
-                req.destroy();
-                safeUnlink(inputPath);
+    writeStream.on('finish', () => {
+        if (aborted || res.writableEnded) {
+            safeUnlink(inputPath);
+            return;
+        }
+        onReady(inputPath, fileId);
+    });
+
+    req.pipe(writeStream);
+}
+
+/*
+ * Run a converter and return its output file as an octet-stream. Every
+ * intermediate file is scheduled for deletion whichever way the call
+ * goes.
+ */
+function runConverter(res, { exePath, args, resultPath, artifacts, label }) {
+    const cleanupAll = () => setTimeout(() => artifacts.forEach(safeUnlink), 5000);
+
+    execFile(exePath, args, (error, stdout, stderr) => {
+        if (error) {
+            console.error(`${label} failed:`, error);
+            console.error('Stderr:', stderr);
+            if (!res.writableEnded) {
+                res.writeHead(500);
+                res.end(`Conversion failed: ${stderr || error.message}`);
             }
-        });
+            cleanupAll();
+            return;
+        }
 
-        writeStream.on('finish', () => {
-            if (aborted || res.writableEnded) {
-                safeUnlink(inputPath);
-                return;
-            }
-            console.log(`Starting conversion for ${inputPath} (Tile: ${minTile}, Thresh: ${homoThresh}, Logo: ${logoMode})...`);
-
-            // B2: cleanup-on-error helper. Schedules deletion of any
-            // intermediate files regardless of which step bailed. Declared
-            // before the first call site — the exe lookup below can bail out.
-            const cleanupAll = () => {
-                setTimeout(() => {
-                    [inputPath, outBase, outSvbc, outSvbcz].forEach(safeUnlink);
-                }, 5000);
-            };
-
-            // B1: argv array passed to execFile — args are NOT parsed by
-            // a shell, so header values can't inject commands. The exe
-            // path is local and resolved via path.join.
-            //
-            // Across platforms the executable name differs:
-            //   Windows (gcc/MinGW + `make`):  image_to_svg.exe
-            //   Linux/macOS (gcc):              image_to_svg
-            // Pick whichever exists locally. If neither does,
-            // execFile ENOENT will surface as a 500 with a clear
-            // error message instead of hanging.
-            const exeCandidates = ['image_to_svg.exe', 'image_to_svg'];
-            let exePath = null;
-            for (const name of exeCandidates) {
-                const candidate = path.join(__dirname, name);
-                try {
-                    if (fs.existsSync(candidate)) {
-                        exePath = candidate;
-                        break;
-                    }
-                } catch (e) { /* permission errors fall through */ }
-            }
-            if (!exePath) {
-                console.error(`Conversion failed: no executable found. Tried ${exeCandidates.join(', ')} in ${__dirname}`);
+        fs.readFile(resultPath, (err, data) => {
+            if (err) {
+                console.error(`Failed to read ${label} output:`, err);
                 if (!res.writableEnded) {
                     res.writeHead(500);
-                    res.end(`Conversion failed: image_to_svg executable not found in ${__dirname}. Build it with \`make\`.`);
+                    res.end(`${label} produced no output`);
                 }
                 cleanupAll();
                 return;
             }
-            const args = [
-                inputPath,
-                outBase,
-                minTile,
-                homoThresh,
-                '--format', 'svbc',
-            ];
+            const headers = {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': data.length,
+                'X-Encoder-Report': Buffer.from(stdout || '', 'utf8').toString('base64')
+            };
+            const gzipSizes = levelGzipSizes(data);
+            if (gzipSizes && gzipSizes.length) headers['X-Level-Gzip'] = gzipSizes.join(',');
+            res.writeHead(200, headers);
+            res.end(data);
+            console.log(`${label} completed. Sent ${data.length} bytes.`);
+            cleanupAll();
+        });
+    });
+}
+
+/*
+ * Cumulative gzipped size of each level, as a wire-transfer estimate.
+ *
+ * The container is stored uncompressed because truncation has to stay
+ * meaningful — a prefix of one gzip stream is not decodable, so the
+ * levels have to compress independently for both properties to hold at
+ * once. Until the format does that itself, the viewer at least reports
+ * what the bytes would actually cost, instead of the raw file size.
+ */
+function levelGzipSizes(buffer) {
+    const HEADER_SIZE = 56;
+    if (buffer.length < HEADER_SIZE || buffer.toString('ascii', 0, 4) !== 'NVDR') return null;
+
+    const sizes = [];
+    let offset = HEADER_SIZE;
+    let total = HEADER_SIZE;
+    for (let k = 0; k < 3; k++) {
+        const streamBytes = buffer.readUInt32LE(40 + k * 4);
+        if (streamBytes === 0 || offset + streamBytes > buffer.length) break;
+        total += zlib.gzipSync(buffer.subarray(offset, offset + streamBytes),
+                               { level: 9 }).length;
+        sizes.push(total);
+        offset += streamBytes;
+    }
+    return sizes;
+}
+
+function serveStatic(req, res) {
+    const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+    const resolved = path.join(PUBLIC_DIR, path.normalize(requested));
+
+    // path.normalize collapses "..", but the containment check is what
+    // actually keeps a crafted URL inside public/.
+    if (!resolved.startsWith(PUBLIC_DIR + path.sep)) {
+        res.writeHead(403);
+        res.end('Forbidden');
+        return;
+    }
+
+    const type = STATIC_TYPES[path.extname(resolved).toLowerCase()];
+    if (!type) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+    }
+
+    fs.readFile(resolved, (err, data) => {
+        if (err) {
+            res.writeHead(404);
+            res.end('Not found');
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': type });
+        res.end(data);
+    });
+}
+
+const server = http.createServer((req, res) => {
+    if (req.method === 'GET') {
+        serveStatic(req, res);
+        return;
+    }
+
+    if (req.method !== 'POST') {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+    }
+
+    // --- SVBC pipeline (src/, image_to_svg) ---
+    if (req.url === '/convert') {
+        const minTile = req.headers['x-min-tile'] || '-1';
+        const homoThresh = req.headers['x-homo-thresh'] || '-1.0';
+        const logoMode = req.headers['x-logo-mode'] === '1';
+
+        receiveUpload(req, res, (inputPath, fileId) => {
+            const outBase = path.join(outDir, `temp_${fileId}.svg`);
+            const outSvbc = path.join(outDir, `temp_${fileId}.svbc`);
+            const outSvbcz = path.join(outDir, `temp_${fileId}.svbcz`);
+            const artifacts = [inputPath, outBase, outSvbc, outSvbcz];
+
+            const exePath = findExecutable(__dirname, 'image_to_svg');
+            if (!exePath) {
+                console.error('Conversion failed: image_to_svg not found');
+                if (!res.writableEnded) {
+                    res.writeHead(500);
+                    res.end(`image_to_svg not found in ${__dirname}. Build it with \`make\`.`);
+                }
+                setTimeout(() => artifacts.forEach(safeUnlink), 5000);
+                return;
+            }
+
+            console.log(`SVBC conversion for ${inputPath} ` +
+                        `(Tile: ${minTile}, Thresh: ${homoThresh}, Logo: ${logoMode})...`);
+
+            const args = [inputPath, outBase, minTile, homoThresh, '--format', 'svbc'];
             if (logoMode) args.push('--logo');
 
-            execFile(exePath, args, (error, stdout, stderr) => {
-                if (error) {
-                    console.error("Conversion failed:", error);
-                    console.error("Stderr:", stderr);
-                    if (!res.writableEnded) {
-                        res.writeHead(500);
-                        res.end(`Conversion failed: ${stderr || error.message}`);
-                    }
-                    cleanupAll();
-                    return;
-                }
-
-                fs.readFile(outSvbc, (err, svbcData) => {
-                    if (err) {
-                        console.error("Failed to read SVBC file:", err);
-                        if (!res.writableEnded) {
-                            res.writeHead(500);
-                            res.end("SVBC generation failed");
-                        }
-                        cleanupAll();
-                        return;
-                    }
-                    res.writeHead(200, {
-                        'Content-Type': 'application/octet-stream',
-                        'Content-Length': svbcData.length
-                    });
-                    res.end(svbcData);
-                    console.log(`Conversion completed. Sent ${svbcData.length} bytes.`);
-
-                    // B2: deferred cleanup of every file we created,
-                    // including the SVG (which may or may not exist).
-                    setTimeout(() => {
-                        [inputPath, outBase, outSvbc, outSvbcz].forEach(safeUnlink);
-                    }, 5000);
-                });
+            runConverter(res, {
+                exePath, args, resultPath: outSvbc, artifacts, label: 'SVBC'
             });
         });
-
-        // Without this the request body is never consumed: 'finish' never
-        // fires and the connection hangs until the client times out.
-        req.pipe(writeStream);
-    } else {
-        res.writeHead(404);
-        res.end("Not found");
+        return;
     }
+
+    // --- PRS pipeline (nvdr/, nvdr_encode) ---
+    if (req.url === '/nvdr') {
+        const anchorBits = req.headers['x-anchor-bits'];
+        const tolerance = req.headers['x-tolerance'];
+
+        receiveUpload(req, res, (inputPath, fileId) => {
+            const outNvdr = path.join(outDir, `temp_${fileId}.nvdr`);
+            const artifacts = [inputPath, outNvdr];
+
+            const exeDir = path.join(__dirname, 'nvdr');
+            const exePath = findExecutable(exeDir, 'nvdr_encode');
+            if (!exePath) {
+                console.error('PRS encode failed: nvdr_encode not found');
+                if (!res.writableEnded) {
+                    res.writeHead(500);
+                    res.end(`nvdr_encode not found in ${exeDir}. Build it with \`cd nvdr && make\`.`);
+                }
+                setTimeout(() => artifacts.forEach(safeUnlink), 5000);
+                return;
+            }
+
+            const args = [inputPath, outNvdr];
+            // Only forward options that match the encoder's own grammar —
+            // a header is untrusted input, and these reach argv directly.
+            if (/^[1-8]$/.test(anchorBits || '')) args.push('--anchor-bits', anchorBits);
+            if (/^[\d.]+,[\d.]+,[\d.]+$/.test(tolerance || '')) args.push('--tolerance', tolerance);
+
+            console.log(`PRS encode for ${inputPath}...`);
+            runConverter(res, {
+                exePath, args, resultPath: outNvdr, artifacts, label: 'PRS'
+            });
+        });
+        return;
+    }
+
+    res.writeHead(404);
+    res.end('Not found');
 });
 
 server.listen(PORT, () => {
     console.log(`\n==========================================`);
-    console.log(`🚀 SVBC Studio server running!`);
-    console.log(`➡️  Access at: http://localhost:${PORT}/`);
+    console.log(`🚀 NVDR server running!`);
+    console.log(`➡️  SVBC studio:  http://localhost:${PORT}/`);
+    console.log(`➡️  PRS viewer:   http://localhost:${PORT}/nvdr.html`);
     console.log(`==========================================\n`);
 });
