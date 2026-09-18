@@ -67,6 +67,10 @@ typedef struct {
 
 int  nvdr_image_load(NvdrImage* img, const char* path);
 int  nvdr_image_write_ppm(const NvdrImage* img, const char* path);
+int  nvdr_image_write_png(const NvdrImage* img, const char* path);
+
+/* Picks the writer from the extension: .png gets a PNG, anything else PPM. */
+int  nvdr_image_write(const NvdrImage* img, const char* path);
 void nvdr_image_free(NvdrImage* img);
 
 double nvdr_psnr(const NvdrImage* a, const NvdrImage* b);
@@ -137,7 +141,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     3
+#define NVDR_VERSION     4
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */

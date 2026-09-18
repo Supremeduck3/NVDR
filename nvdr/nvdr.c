@@ -32,6 +32,79 @@ int nvdr_image_write_ppm(const NvdrImage* img, const char* path) {
     return written == n ? 0 : -1;
 }
 
+/*
+ * PNG writer. PPM is trivial to emit but opens in almost nothing, which
+ * makes eyeballing a decode harder than it needs to be. zlib is already
+ * linked for the container, so a real PNG costs one deflate and three
+ * CRCs.
+ */
+static void png_chunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
+    uint8_t size[4] = {
+        (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len
+    };
+    fwrite(size, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (len) fwrite(data, 1, len, f);
+
+    uLong crc = crc32(0, (const Bytef*)type, 4);
+    if (len) crc = crc32(crc, (const Bytef*)data, (uInt)len);
+    uint8_t crc_bytes[4] = {
+        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc
+    };
+    fwrite(crc_bytes, 1, 4, f);
+}
+
+int nvdr_image_write_png(const NvdrImage* img, const char* path) {
+    /* Every scanline is prefixed with filter type 0 — no prediction. The
+     * data is flat rectangles, so a filter would buy little. */
+    size_t stride = (size_t)img->width * 3;
+    size_t raw_size = (stride + 1) * (size_t)img->height;
+    uint8_t* raw = (uint8_t*)malloc(raw_size);
+    if (!raw) return -1;
+    for (int y = 0; y < img->height; y++) {
+        raw[(stride + 1) * (size_t)y] = 0;
+        memcpy(raw + (stride + 1) * (size_t)y + 1, img->pixels + stride * (size_t)y, stride);
+    }
+
+    uLongf packed_size = compressBound((uLong)raw_size);
+    uint8_t* packed = (uint8_t*)malloc(packed_size);
+    if (!packed || compress2(packed, &packed_size, raw, (uLong)raw_size, 6) != Z_OK) {
+        free(raw); free(packed);
+        return -1;
+    }
+    free(raw);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) { free(packed); return -1; }
+
+    static const uint8_t signature[8] = { 137, 'P', 'N', 'G', 13, 10, 26, 10 };
+    fwrite(signature, 1, 8, f);
+
+    uint8_t ihdr[13];
+    uint32_t w = (uint32_t)img->width, h = (uint32_t)img->height;
+    ihdr[0] = (uint8_t)(w >> 24); ihdr[1] = (uint8_t)(w >> 16);
+    ihdr[2] = (uint8_t)(w >> 8);  ihdr[3] = (uint8_t)w;
+    ihdr[4] = (uint8_t)(h >> 24); ihdr[5] = (uint8_t)(h >> 16);
+    ihdr[6] = (uint8_t)(h >> 8);  ihdr[7] = (uint8_t)h;
+    ihdr[8] = 8;    /* bit depth */
+    ihdr[9] = 2;    /* truecolour */
+    ihdr[10] = ihdr[11] = ihdr[12] = 0;
+    png_chunk(f, "IHDR", ihdr, sizeof(ihdr));
+    png_chunk(f, "IDAT", packed, packed_size);
+    png_chunk(f, "IEND", NULL, 0);
+
+    fclose(f);
+    free(packed);
+    return 0;
+}
+
+int nvdr_image_write(const NvdrImage* img, const char* path) {
+    size_t len = strlen(path);
+    if (len >= 4 && strcmp(path + len - 4, ".png") == 0)
+        return nvdr_image_write_png(img, path);
+    return nvdr_image_write_ppm(img, path);
+}
+
 void nvdr_image_free(NvdrImage* img) {
     free(img->pixels);
     img->pixels = NULL;
@@ -511,7 +584,11 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         if (!raw[0]) goto write_done;
         {
             size_t at = 0;
-            raw[0][at++] = (uint8_t)palette_n;
+            /* Stored biased by one: a full 256-entry palette would
+             * otherwise wrap to zero in this byte, which is exactly what
+             * --anchor-bits 8 used to produce. A palette is never empty,
+             * so the bias costs nothing. */
+            raw[0][at++] = (uint8_t)(palette_n - 1);
             memcpy(raw[0] + at, palette, (size_t)palette_n * 3);
             at += (size_t)palette_n * 3;
             memcpy(raw[0] + at, bits[0].bytes, bits0_bytes);
@@ -788,7 +865,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     if (!stream) { fclose(f); return -1; }
 
     size_t off = 0;
-    pyr->palette_count = stream[off++];
+    pyr->palette_count = (int)stream[off++] + 1;   /* stored biased by one */
     pyr->palette = (unsigned char*)malloc((size_t)pyr->palette_count * 3);
     if (!pyr->palette) { free(stream); fclose(f); return -1; }
     memcpy(pyr->palette, stream + off, (size_t)pyr->palette_count * 3);
