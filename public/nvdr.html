@@ -107,10 +107,10 @@
       <h3 style="margin:0 0 6px;font-size:.95rem">Entrega parcial</h3>
       <p class="note" style="margin:0 0 14px">
         Arraste para simular um download interrompido. O decoder mostra o último nível
-        cujos bytes chegaram inteiros — nunca espera, nunca falha no meio.
-        Comprimir o container inteiro de uma vez seria menor e tornaria
-        qualquer prefixo indecodificável; por nível, as duas propriedades
-        valem juntas.
+        Cada nível é entregue em unidades independentes, dos retângulos
+        maiores para os menores, então o corte cai numa fronteira de unidade
+        e o que não chegou simplesmente mantém o retângulo que tinha antes.
+        A imagem melhora continuamente conforme os bytes entram, sem degraus.
       </p>
       <div class="slider-row">
         <input type="range" id="trunc" min="0" max="100" value="100" step="0.5">
@@ -279,7 +279,8 @@ async function showTruncated() {
     renderLevel(level, result.header.width, result.header.height, ctx);
     truncOut.innerHTML =
         `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +
-        `${LEVEL_NAMES[result.levelsPresent - 1]}`;
+        `${LEVEL_NAMES[result.levelsPresent - 1]} · ` +
+        `${level.rects.count.toLocaleString('pt-BR')} retângulos`;
 }
 </script>
 </body>

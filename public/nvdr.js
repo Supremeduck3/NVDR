@@ -28,11 +28,12 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 5;
+const VERSION = 6;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
 const COMPRESS_ARITH = 2;
+const ORDER_AREA = 1;
 
 /* --- entropy layer, mirroring nvdr/entropy.c ------------------------- */
 
@@ -246,6 +247,7 @@ export function readHeader(buffer) {
         height: view.getUint16(8, true),
         anchorBits: view.getUint8(10),
         compression: view.getUint8(5),
+        order: view.getUint8(14),
         step: [],
         leafCount: [],
         splitBits: [],
@@ -283,9 +285,18 @@ export function levelThresholds(header) {
  */
 async function readStream(bytes, offset, header, k) {
     const stored = header.storedBytes[k];
-    if (stored === 0 || offset + stored > bytes.length) return null;
+    if (stored === 0 || offset >= bytes.length) return null;
 
-    const packed = bytes.subarray(offset, offset + stored);
+    // An arithmetic stream decodes as far as its bytes go, so a short read
+    // is handed over as-is and the unit loop stops where it runs out. A
+    // deflate stream has no such property, so that one is all or nothing.
+    let end = offset + stored;
+    if (end > bytes.length) {
+        if (header.compression === COMPRESS_DEFLATE) return null;
+        end = bytes.length;
+    }
+
+    const packed = bytes.subarray(offset, end);
     if (header.compression !== COMPRESS_DEFLATE) return packed;
 
     try {
@@ -320,7 +331,9 @@ export async function decode(buffer) {
 
     /* --- level 0: the contract --- */
     const anchorStream = await readStream(bytes, cursor, header, 0);
-    if (!anchorStream) return { header, levels, levelsPresent: 0 };
+    // The anchor is the contract: a partial one is no picture at all.
+    if (!anchorStream || anchorStream.length < header.storedBytes[0])
+        return { header, levels, levelsPresent: 0 };
 
     const arith = header.compression === COMPRESS_ARITH;
     let offset = 0;
@@ -377,69 +390,93 @@ export async function decode(buffer) {
         if (!stream) break;
 
         const prev = levels[k - 1];
-        const n = header.leafCount[k];
-        const step = header.step[k];
-        const rects = new RectSet(n);
-        const rgb = new Uint8Array(n * 3);
 
-        /* Expanding one previous rectangle may yield several here; they all
-         * take the colour it was showing as the base of their delta, and
-         * whether it subdivided is the entropy context — derived here, the
-         * same way the encoder derived it, never read from the file. */
-        const base = new Uint8Array(n * 3);
-        const splitCtx = new Uint8Array(n);
+        // The same unit order the encoder used, derived from rectangles
+        // already decoded rather than read from the file.
+        const order = Array.from({ length: prev.rects.count }, (_, i) => i);
+        if (header.order === ORDER_AREA) {
+            const area = i => prev.rects.w[i] * prev.rects.h[i];
+            order.sort((a, b) => area(b) - area(a) || a - b);
+        }
+
+        const capacity = header.leafCount[k] + prev.rects.count + 1;
+        const rects = new RectSet(capacity);
+        const rgb = new Uint8Array(capacity * 3);
 
         const models = arith ? newModels() : null;
         const dec = arith ? new ArithDecoder(stream, 0, stream.length) : null;
         const reader = arith ? null : new BitReader(stream, 0, header.splitBits[k]);
+        const flatResidual = arith ? null : new Int8Array(
+            stream.buffer, stream.byteOffset + ((header.splitBits[k] + 7) >> 3),
+            header.leafCount[k] * 3);
 
-        let ok = true;
-        for (let i = 0; i < prev.rects.count && ok; i++) {
+        const step = header.step[k];
+        let processed = 0, prev0 = 0, stopped = false;
+
+        for (let u = 0; u < order.length; u++) {
+            const i = order[u];
+
+            if (stopped) {
+                // Past the end of what arrived: this unit keeps the
+                // rectangle and colour it had at the level before.
+                rects.push(prev.rects.x[i], prev.rects.y[i],
+                           prev.rects.w[i], prev.rects.h[i]);
+                const j = rects.count - 1;
+                for (let c = 0; c < 3; c++) rgb[j * 3 + c] = prev.rgb[i * 3 + c];
+                continue;
+            }
+
             const before = rects.count;
-            ok = arith
+            const ok = arith
                 ? replayArith(dec, models, rects, prev.rects.x[i], prev.rects.y[i],
                               prev.rects.w[i], prev.rects.h[i]) && !dec.overrun
                 : replay(reader, rects, prev.rects.x[i], prev.rects.y[i],
                          prev.rects.w[i], prev.rects.h[i]) && !reader.overrun;
-            const produced = rects.count - before;
+            if (!ok) {
+                // This unit did not arrive whole. Roll it back and treat
+                // every remaining one as absent.
+                rects.count = before;
+                stopped = true;
+                u--;
+                continue;
+            }
+
+            const ctx = rects.count - before > 1 ? 1 : 0;
             for (let j = before; j < rects.count; j++) {
-                for (let c = 0; c < 3; c++) base[j * 3 + c] = prev.rgb[i * 3 + c];
-                splitCtx[j] = produced > 1 ? 1 : 0;
-            }
-        }
-        if (!ok || rects.count !== n) break;
-
-        let residual;
-        if (arith) {
-            residual = new Int8Array(n * 3);
-            for (let c = 0; c < 3; c++) {
-                let prev = 0;
-                for (let i = 0; i < n; i++) {
-                    // Channel 0 has no previous plane, so it leans on its
-                    // in-plane predecessor instead.
-                    const neighbour = c > 0 ? residual[(c - 1) * n + i] : prev;
-                    const value = dec.residual(models, splitCtx[i], c,
-                                               prevContext(neighbour));
-                    residual[c * n + i] = value;
-                    prev = value;
+                for (let c = 0; c < 3; c++) {
+                    let value;
+                    if (arith) {
+                        const neighbour = c > 0 ? (rgb[j * 3 + c - 1] << 24 >> 24) : prev0;
+                        value = dec.residual(models, ctx, c, prevContext(neighbour));
+                    } else {
+                        value = flatResidual[j * 3 + c];
+                    }
+                    // Parked as the raw residual until the rectangle is
+                    // known to have arrived whole; resolved just below.
+                    rgb[j * 3 + c] = value & 0xFF;
                 }
+                prev0 = rgb[j * 3] << 24 >> 24;
             }
-            if (dec.overrun) break;
-        } else {
-            const residualOffset = (header.splitBits[k] + 7) >> 3;
-            residual = new Int8Array(
-                stream.buffer, stream.byteOffset + residualOffset, n * 3);
+
+            if (arith && dec.overrun) {
+                rects.count = before;
+                stopped = true;
+                u--;
+                continue;
+            }
+
+            for (let j = before; j < rects.count; j++)
+                for (let c = 0; c < 3; c++)
+                    rgb[j * 3 + c] = clampByte(
+                        prev.rgb[i * 3 + c] + (rgb[j * 3 + c] << 24 >> 24) * step);
+            processed++;
         }
 
-        for (let i = 0; i < n; i++) {
-            for (let c = 0; c < 3; c++) {
-                rgb[i * 3 + c] = clampByte(
-                    base[i * 3 + c] + residual[c * n + i] * step);
-            }
-        }
+        if (processed === 0) break;
 
         levels.push({ rects, rgb });
         cursor += header.storedBytes[k];
+        if (stopped) break;
     }
 
     return { header, levels, levelsPresent: levels.length };

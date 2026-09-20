@@ -51,6 +51,43 @@ all three levels would buy a smaller file by destroying the only thing this
 format is for. Per level, the bytes on disk are the bytes on the wire and
 every prefix still ends on a boundary that decodes.
 
+## Delivering a level in pieces
+
+A level used to be one stream: every split bit, then three planes of
+residual. That made a truncated level worthless — a prefix gave the red
+channel and no green or blue — so the decoder threw it away and the
+truncation curve was a staircase. Holding 80% of the file bought exactly
+what holding 40% did.
+
+A level is now a sequence of independent **units**, one per rectangle of
+the level before, each carrying its own split bits followed by its own
+rectangles' residuals interleaved across channels. A prefix is a whole
+number of finished refinements; the units that never arrived keep the
+rectangle and colour they had at the previous level. Units are emitted
+largest-rectangle-first, an order both sides derive by sorting what they
+already have, so nothing about it is transmitted.
+
+    cut     before    after
+    10%     19.55     21.79
+    20%     19.55     23.07
+    30%     19.55     24.45
+    50%     25.15     25.62
+    75%     25.15     26.01
+    90%     25.15     26.13
+    100%    26.22     26.22
+
+Interleaving the residuals by rectangle costs nothing: measured at exactly
+88,486 bytes either way. That is only true because the entropy layer moved
+off deflate first — deflate leaned on runs of similar bytes, which the
+planar layout provided and interleaving would have destroyed, while the
+arithmetic coder's contexts are explicit and indifferent to grouping.
+
+Largest-first ordering costs 160 bytes, 0.18%, from slightly worse
+adaptation locality, and is worth up to +1.67 dB over tree order in the
+first tenth of the stream. Against an oracle that orders units by actual
+error reduction per byte — which cannot be shipped, since the decoder has
+no way to know the error — area ordering captures 65% to 82% of the gain.
+
 ## The entropy coder
 
 Levels are coded with an adaptive binary arithmetic coder (the LZMA range
@@ -239,8 +276,8 @@ improves it without the decoder ever needing to wait or restart.
 
     [header 72B]
     [level 0 : palette, then split flags and anchor tokens, coded]
-    [level 1 : split flags and 3 int8 residual planes, coded]
-    [level 2 : split flags and 3 int8 residual planes, coded]
+    [level 1 : units, each split flags + its rectangles' residuals, coded]
+    [level 2 : units, each split flags + its rectangles' residuals, coded]
 
 The palette rides ahead of level 0's coded stream: 48 bytes of genuinely
 incompressible colour are not worth modelling. `--codec deflate` selects

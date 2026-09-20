@@ -135,6 +135,14 @@ typedef struct {
      * dB; above that it is strictly worse. Zero, the default, disables it.
      */
     float texture;
+    /*
+     * The order refinement units are emitted in, which is also the order a
+     * truncated stream delivers them. 0 keeps the depth-first order the
+     * tree produces; 1 sends the largest rectangles first, so a prefix
+     * covers the whole canvas coarsely instead of one corner finely.
+     * Both sides derive it from the previous level, so nothing is sent.
+     */
+    int   order;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
@@ -161,9 +169,18 @@ typedef struct {
     uint32_t  count;
 } NvdrLevelData;
 
+#define NVDR_ORDER_DFS   0
+#define NVDR_ORDER_AREA  1
+
 typedef struct {
     NvdrLevelData level[NVDR_LEVELS];
     int           levels_present;   /* 1, 2 or 3 */
+    /*
+     * How much of the last level actually arrived. 1.0 when the stream was
+     * complete; less when it was cut, in which case the units that never
+     * came keep the rectangle and colour they had at the level before.
+     */
+    double        last_level_fraction;
 
     /* Anchor palette, shared by level 0 only. */
     unsigned char* palette;
@@ -177,7 +194,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     5
+#define NVDR_VERSION     6
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */
@@ -193,6 +210,7 @@ typedef struct {
     uint32_t stored_bytes[NVDR_LEVELS]; /* stream size on disk and on the wire */
     uint8_t  anchor_bits;
     uint8_t  compression;
+    uint8_t  order;
     uint8_t  step[NVDR_LEVELS];
 } NvdrHeader;
 

@@ -25,6 +25,9 @@ static void usage(const char* argv0) {
         "  --min-tile N       smallest tile edge (default 2)\n"
         "  --max-depth N      deepest subdivision (default 12)\n"
         "  --codec NAME       arith (default) or deflate, for comparison\n"
+        "  --order NAME       area (default) sends the largest rectangles\n"
+        "                     first so a cut stream covers the whole canvas;\n"
+        "                     dfs keeps tree order\n"
         "  --weber F          how much harder to push in dark regions\n"
         "                     (default 64; a huge value restores the old\n"
         "                      absolute-difference metric)\n"
@@ -72,6 +75,11 @@ int main(int argc, char** argv) {
             cfg.weber = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--texture") && i + 1 < argc) {
             cfg.texture = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
+            const char* name = argv[++i];
+            if (!strcmp(name, "area")) cfg.order = NVDR_ORDER_AREA;
+            else if (!strcmp(name, "dfs")) cfg.order = NVDR_ORDER_DFS;
+            else { fprintf(stderr, "--order takes area or dfs\n"); return 2; }
         } else if (!strcmp(argv[i], "--codec") && i + 1 < argc) {
             const char* name = argv[++i];
             if (!strcmp(name, "arith")) cfg.codec = NVDR_COMPRESS_ARITH;
