@@ -143,6 +143,21 @@ typedef struct {
      * Both sides derive it from the previous level, so nothing is sent.
      */
     int   order;
+    /*
+     * How much coarser the two chroma channels are quantised than luma.
+     *
+     * Residuals used to be RGB deltas with one step for all three, which
+     * spends the same precision on colour as on brightness even though the
+     * eye has far less resolution for the first. It also wastes bits on
+     * redundancy: R, G and B move together, which is exactly why
+     * conditioning each residual on the previous plane was worth 3.4% —
+     * that gain was the coder recovering correlation the representation
+     * should not have had.
+     *
+     * 1 keeps chroma as fine as luma. 0 drops the transform entirely and
+     * codes RGB, for comparison.
+     */
+    int   chroma;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
@@ -165,12 +180,23 @@ typedef struct {
     uint16_t* y;
     uint16_t* w;
     uint16_t* h;
-    uint8_t*  rgb;        /* 3 bytes per rectangle, the reconstruction */
+    uint8_t*  rgb;        /* 3 bytes per rectangle, what gets painted */
+    /*
+     * The same reconstruction in the space the residuals run in. The chain
+     * carries this rather than rgb because the round trip through RGB is
+     * lossy by a few units, and re-deriving it at every level would let
+     * that drift accumulate.
+     */
+    uint8_t*  chain;
     uint32_t  count;
 } NvdrLevelData;
 
 #define NVDR_ORDER_DFS   0
 #define NVDR_ORDER_AREA  1
+
+/* Colour space the residual chain runs in. */
+#define NVDR_SPACE_RGB   0
+#define NVDR_SPACE_YCC   1
 
 typedef struct {
     NvdrLevelData level[NVDR_LEVELS];
@@ -194,7 +220,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     6
+#define NVDR_VERSION     7
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */
@@ -211,7 +237,9 @@ typedef struct {
     uint8_t  anchor_bits;
     uint8_t  compression;
     uint8_t  order;
+    uint8_t  space;
     uint8_t  step[NVDR_LEVELS];
+    uint8_t  chroma_step[NVDR_LEVELS];
 } NvdrHeader;
 
 /* Encode an image straight to a container. */

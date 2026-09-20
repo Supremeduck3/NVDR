@@ -25,6 +25,8 @@ static void usage(const char* argv0) {
         "  --min-tile N       smallest tile edge (default 2)\n"
         "  --max-depth N      deepest subdivision (default 12)\n"
         "  --codec NAME       arith (default) or deflate, for comparison\n"
+        "  --chroma N         how much coarser chroma is than luma (default 2;\n"
+        "                     0 drops the transform and codes RGB)\n"
         "  --order NAME       area (default) sends the largest rectangles\n"
         "                     first so a cut stream covers the whole canvas;\n"
         "                     dfs keeps tree order\n"
@@ -75,6 +77,8 @@ int main(int argc, char** argv) {
             cfg.weber = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--texture") && i + 1 < argc) {
             cfg.texture = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
+            cfg.chroma = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
             const char* name = argv[++i];
             if (!strcmp(name, "area")) cfg.order = NVDR_ORDER_AREA;

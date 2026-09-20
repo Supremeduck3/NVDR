@@ -28,12 +28,13 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 6;
+const VERSION = 7;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
 const COMPRESS_ARITH = 2;
 const ORDER_AREA = 1;
+const SPACE_YCC = 1;
 
 /* --- entropy layer, mirroring nvdr/entropy.c ------------------------- */
 
@@ -248,6 +249,8 @@ export function readHeader(buffer) {
         anchorBits: view.getUint8(10),
         compression: view.getUint8(5),
         order: view.getUint8(14),
+        space: view.getUint8(15),
+        chromaStep: [],
         step: [],
         leafCount: [],
         splitBits: [],
@@ -260,6 +263,8 @@ export function readHeader(buffer) {
         header.splitBits.push(view.getUint32(28 + k * 4, true));
         header.rawBytes.push(view.getUint32(40 + k * 4, true));
         header.storedBytes.push(view.getUint32(52 + k * 4, true));
+        const cs = view.getUint8(64 + k);
+        header.chromaStep.push(cs || view.getUint8(11 + k));
     }
     return header;
 }
@@ -311,6 +316,25 @@ async function readStream(bytes, offset, header, k) {
 
 function clampByte(v) {
     return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+/*
+ * BT.601 in fixed point, matching nvdr.c exactly. Floating point here
+ * would be a portability bug waiting to happen: both sides have to land on
+ * the same byte, and they are verified against each other byte for byte.
+ */
+function rgbToYcc(src, si, dst, di) {
+    const r = src[si], g = src[si + 1], b = src[si + 2];
+    dst[di]     = clampByte((( 66*r + 129*g +  25*b + 128) >> 8) + 16);
+    dst[di + 1] = clampByte(((-38*r -  74*g + 112*b + 128) >> 8) + 128);
+    dst[di + 2] = clampByte(((112*r -  94*g -  18*b + 128) >> 8) + 128);
+}
+
+function yccToRgb(src, si, dst, di) {
+    const c = src[si] - 16, d = src[si + 1] - 128, e = src[si + 2] - 128;
+    dst[di]     = clampByte((298*c + 409*e + 128) >> 8);
+    dst[di + 1] = clampByte((298*c - 100*d - 208*e + 128) >> 8);
+    dst[di + 2] = clampByte((298*c + 516*d + 128) >> 8);
 }
 
 /**
@@ -374,14 +398,21 @@ export async function decode(buffer) {
         }
     }
 
+    const ycc = header.space === SPACE_YCC;
     const anchorRgb = new Uint8Array(anchorRects.count * 3);
+    // The chain carries the reconstruction in the space the residuals run
+    // in; the round trip through RGB is lossy, so re-deriving it at every
+    // level would let that drift accumulate.
+    const anchorChain = new Uint8Array(anchorRects.count * 3);
     for (let i = 0; i < anchorRects.count; i++) {
         const token = tokens[i] < paletteCount ? tokens[i] : 0;
         anchorRgb[i * 3] = palette[token * 3];
         anchorRgb[i * 3 + 1] = palette[token * 3 + 1];
         anchorRgb[i * 3 + 2] = palette[token * 3 + 2];
+        if (ycc) rgbToYcc(anchorRgb, i * 3, anchorChain, i * 3);
+        else anchorChain.set(anchorRgb.subarray(i * 3, i * 3 + 3), i * 3);
     }
-    levels.push({ rects: anchorRects, rgb: anchorRgb });
+    levels.push({ rects: anchorRects, rgb: anchorRgb, chain: anchorChain });
     cursor += header.storedBytes[0];
 
     /* --- every further level is a bonus the bytes may not have paid for --- */
@@ -402,6 +433,7 @@ export async function decode(buffer) {
         const capacity = header.leafCount[k] + prev.rects.count + 1;
         const rects = new RectSet(capacity);
         const rgb = new Uint8Array(capacity * 3);
+        const chain = new Uint8Array(capacity * 3);
 
         const models = arith ? newModels() : null;
         const dec = arith ? new ArithDecoder(stream, 0, stream.length) : null;
@@ -411,6 +443,7 @@ export async function decode(buffer) {
             header.leafCount[k] * 3);
 
         const step = header.step[k];
+        const chromaStep = header.chromaStep[k];
         let processed = 0, prev0 = 0, stopped = false;
 
         for (let u = 0; u < order.length; u++) {
@@ -422,7 +455,10 @@ export async function decode(buffer) {
                 rects.push(prev.rects.x[i], prev.rects.y[i],
                            prev.rects.w[i], prev.rects.h[i]);
                 const j = rects.count - 1;
-                for (let c = 0; c < 3; c++) rgb[j * 3 + c] = prev.rgb[i * 3 + c];
+                for (let c = 0; c < 3; c++) {
+                    rgb[j * 3 + c] = prev.rgb[i * 3 + c];
+                    chain[j * 3 + c] = prev.chain[i * 3 + c];
+                }
                 continue;
             }
 
@@ -446,16 +482,16 @@ export async function decode(buffer) {
                 for (let c = 0; c < 3; c++) {
                     let value;
                     if (arith) {
-                        const neighbour = c > 0 ? (rgb[j * 3 + c - 1] << 24 >> 24) : prev0;
+                        const neighbour = c > 0 ? (chain[j * 3 + c - 1] << 24 >> 24) : prev0;
                         value = dec.residual(models, ctx, c, prevContext(neighbour));
                     } else {
                         value = flatResidual[j * 3 + c];
                     }
                     // Parked as the raw residual until the rectangle is
                     // known to have arrived whole; resolved just below.
-                    rgb[j * 3 + c] = value & 0xFF;
+                    chain[j * 3 + c] = value & 0xFF;
                 }
-                prev0 = rgb[j * 3] << 24 >> 24;
+                prev0 = chain[j * 3] << 24 >> 24;
             }
 
             if (arith && dec.overrun) {
@@ -465,16 +501,20 @@ export async function decode(buffer) {
                 continue;
             }
 
-            for (let j = before; j < rects.count; j++)
+            for (let j = before; j < rects.count; j++) {
                 for (let c = 0; c < 3; c++)
-                    rgb[j * 3 + c] = clampByte(
-                        prev.rgb[i * 3 + c] + (rgb[j * 3 + c] << 24 >> 24) * step);
+                    chain[j * 3 + c] = clampByte(
+                        prev.chain[i * 3 + c] +
+                        (chain[j * 3 + c] << 24 >> 24) * (c === 0 ? step : chromaStep));
+                if (ycc) yccToRgb(chain, j * 3, rgb, j * 3);
+                else rgb.set(chain.subarray(j * 3, j * 3 + 3), j * 3);
+            }
             processed++;
         }
 
         if (processed === 0) break;
 
-        levels.push({ rects, rgb });
+        levels.push({ rects, rgb, chain });
         cursor += header.storedBytes[k];
         if (stopped) break;
     }

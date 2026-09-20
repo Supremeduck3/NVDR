@@ -178,6 +178,10 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
   de taxa**: desligado por padrão, porque também limita a qualidade
   máxima. Abaixo de ~metade da taxa padrão vale +3 a +4 dB contra
   simplesmente afrouxar a tolerância; acima disso é pior. Comece em `1`.
+- **`--chroma N`** — quanto mais grosso o croma é quantizado que a luma.
+  Default 2. Corta 28-44% dos bytes contra RGB por -0,13 a -0,32 dB, e a
+  maior parte disso vem da transformada em si, não da subamostragem.
+  Acima de 2 começa a aparecer desvio de cor. `0` volta para RGB.
 - **`--order area|dfs`** — `area` (default) manda os retângulos maiores
   primeiro, então um stream cortado cobre a tela inteira grosseiramente em
   vez de um canto em detalhe. Custa 0,18% em bytes e vale até +1,67 dB no

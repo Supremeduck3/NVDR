@@ -88,6 +88,41 @@ first tenth of the stream. Against an oracle that orders units by actual
 error reduction per byte — which cannot be shipped, since the decoder has
 no way to know the error — area ordering captures 65% to 82% of the gain.
 
+## Colour
+
+Residuals run in BT.601 YCbCr, with the two chroma channels quantised
+`--chroma` times coarser than luma. The transform is fixed-point integer
+on both sides, because encoder and decoder have to land on the same byte
+and a float would be a portability bug waiting to happen. The
+reconstruction is carried in YCbCr rather than re-derived from RGB at each
+level: that round trip is lossy by a few units, and re-deriving would let
+the drift accumulate.
+
+Against RGB residuals on `samples/`, at the default tolerances:
+
+    image                  source     RGB          YCbCr
+    OIP-1304511485.jpg       24K   18.5K 22.62   13.3K 22.49   -28%
+    OIP-3451121336.jpg       57K   55.5K 21.74   37.4K 21.60   -33%
+    OIP-3786546191.jpg       48K   55.4K 24.04   36.3K 23.80   -34%
+    OIP-4140498144.jpg       36K   45.1K 24.67   27.1K 24.43   -40%
+    macarrao.jpg             13K   16.3K 29.14   10.0K 28.86   -39%
+    montanha_pessoas.jpg    133K   86.6K 26.22   48.9K 25.90   -44%
+
+Held to the same size instead of the same settings, YCbCr is +1.03 dB;
+held to the same PSNR, it is 19% smaller. Note that most of this arrives
+before any chroma coarsening: the plain transform at `--chroma 1` already
+saves 30%, because R, G and B move together and coding them separately
+pays for the same information three times. The cross-plane context was
+worth 3.4% recovering exactly that redundancy after the fact — removing it
+at the source is worth ten times more.
+
+PSNR understates the case here. It weights the three channels equally
+while the eye does not, so chroma coarsening costs more on the meter than
+on screen. Measured by eye on the saturated regions, `--chroma 1` and `2`
+are indistinguishable, `3` puts a faint magenta cast in the sky, and `6`
+speckles colour across the backpack. The default is 2; `--chroma 0` drops
+the transform and codes RGB, for comparison.
+
 ## The entropy coder
 
 Levels are coded with an adaptive binary arithmetic coder (the LZMA range

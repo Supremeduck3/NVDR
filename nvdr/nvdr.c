@@ -176,6 +176,7 @@ NvdrConfig nvdr_default_config(void) {
     cfg.weber        = 64.0f;
     cfg.texture      = 0.0f;   /* off: see the crossover in the README */
     cfg.order        = NVDR_ORDER_AREA;
+    cfg.chroma       = 2;
     cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
     cfg.tolerance[1] = 0.040f;
     cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
@@ -596,6 +597,31 @@ static int build_palette(const NvdrTree* tree, const uint32_t* leaves,
 /* ============================================================== helpers */
 
 static int clamp_u8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+/*
+ * BT.601 in fixed point, the integer form both sides must agree on down to
+ * the rounding. Floating point here would be a portability bug waiting to
+ * happen: encoder and decoder have to land on the same byte.
+ */
+static void rgb_to_ycc(const uint8_t* rgb, uint8_t* ycc) {
+    int r = rgb[0], g = rgb[1], b = rgb[2];
+    ycc[0] = (uint8_t)clamp_u8((( 66 * r + 129 * g +  25 * b + 128) >> 8) + 16);
+    ycc[1] = (uint8_t)clamp_u8(((-38 * r -  74 * g + 112 * b + 128) >> 8) + 128);
+    ycc[2] = (uint8_t)clamp_u8(((112 * r -  94 * g -  18 * b + 128) >> 8) + 128);
+}
+
+static void ycc_to_rgb(const uint8_t* ycc, uint8_t* rgb) {
+    int c = (int)ycc[0] - 16, d = (int)ycc[1] - 128, e = (int)ycc[2] - 128;
+    rgb[0] = (uint8_t)clamp_u8((298 * c + 409 * e + 128) >> 8);
+    rgb[1] = (uint8_t)clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
+    rgb[2] = (uint8_t)clamp_u8((298 * c + 516 * d + 128) >> 8);
+}
+
+/* Luma keeps the level's step; the two chroma channels are coarser. */
+static int channel_step(const NvdrConfig* cfg, int k, int channel) {
+    if (cfg->chroma <= 0 || channel == 0) return cfg->step[k];
+    return cfg->step[k] * cfg->chroma;
+}
 static int clamp_i8(int v) { return v < -127 ? -127 : (v > 127 ? 127 : v); }
 static int div_round(int n, int d) {
     return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d);
@@ -706,7 +732,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
 
     BitWriter  bits[NVDR_LEVELS];
     IndexList  leaves[NVDR_LEVELS];
-    uint8_t*   recon[NVDR_LEVELS];       /* reconstructed rgb per leaf */
+    uint8_t*   recon[NVDR_LEVELS];       /* reconstruction in the chain space */
     int8_t*    residual[NVDR_LEVELS];    /* 3 planes, level >= 1 only */
     uint8_t*   split_ctx[NVDR_LEVELS];   /* 1 when the parent subdivided */
     Unit*      units[NVDR_LEVELS];
@@ -743,7 +769,8 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         const NvdrNode* n = &tree.nodes[leaves[0].items[i]];
         int token = nearest_entry(palette, palette_n, n->r, n->g, n->b);
         tokens[i] = (uint8_t)token;
-        memcpy(recon[0] + (size_t)i * 3, palette + token * 3, 3);
+        if (cfg->chroma > 0) rgb_to_ycc(palette + token * 3, recon[0] + (size_t)i * 3);
+        else memcpy(recon[0] + (size_t)i * 3, palette + token * 3, 3);
     }
 
     /* --- levels 1..N: re-cut each previous leaf at a finer tolerance --- */
@@ -810,16 +837,21 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
 
         for (uint32_t i = 0; i < total; i++) {
             const NvdrNode* n = &tree.nodes[leaves[k].items[i]];
-            int target[3] = { n->r, n->g, n->b };
+            uint8_t node_rgb[3] = { n->r, n->g, n->b };
+            uint8_t target[3];
+            if (cfg->chroma > 0) rgb_to_ycc(node_rgb, target);
+            else memcpy(target, node_rgb, 3);
+
             for (int c = 0; c < 3; c++) {
-                int delta = target[c] - (int)base[(size_t)i * 3 + c];
-                int q = clamp_i8(div_round(delta, cfg->step[k]));
+                int step = channel_step(cfg, k, c);
+                int delta = (int)target[c] - (int)base[(size_t)i * 3 + c];
+                int q = clamp_i8(div_round(delta, step));
                 /* Interleaved by rectangle rather than planar: a prefix has
                  * to end on a whole rectangle, and the coder's contexts are
                  * explicit so the grouping costs it nothing. */
                 residual[k][(size_t)i * 3 + c] = (int8_t)q;
                 recon[k][(size_t)i * 3 + c] =
-                    (uint8_t)clamp_u8((int)base[(size_t)i * 3 + c] + q * cfg->step[k]);
+                    (uint8_t)clamp_u8((int)base[(size_t)i * 3 + c] + q * step);
             }
         }
         free(base);
@@ -959,6 +991,9 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
         put_u16(header + 8, (uint16_t)img->height);
         header[10] = (uint8_t)cfg->anchor_bits;
         header[14] = (uint8_t)cfg->order;
+        header[15] = (uint8_t)(cfg->chroma > 0 ? NVDR_SPACE_YCC : NVDR_SPACE_RGB);
+        for (int k = 0; k < NVDR_LEVELS; k++)
+            header[64 + k] = (uint8_t)channel_step(cfg, k, 1);
         for (int k = 0; k < NVDR_LEVELS; k++) header[11 + k] = (uint8_t)cfg->step[k];
         for (int k = 0; k < NVDR_LEVELS; k++) {
             put_u32(header + 16 + k * 4, leaves[k].count);
@@ -979,6 +1014,9 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             hdr_out->anchor_bits = (uint8_t)cfg->anchor_bits;
             hdr_out->compression = (uint8_t)cfg->codec;
             hdr_out->order = (uint8_t)cfg->order;
+            hdr_out->space = (uint8_t)(cfg->chroma > 0 ? NVDR_SPACE_YCC : NVDR_SPACE_RGB);
+            for (int k = 0; k < NVDR_LEVELS; k++)
+                hdr_out->chroma_step[k] = (uint8_t)channel_step(cfg, k, 1);
             for (int k = 0; k < NVDR_LEVELS; k++) {
                 hdr_out->leaf_count[k]   = leaves[k].count;
                 hdr_out->split_bits[k]   = (uint32_t)bits[k].bit_count;
@@ -1071,6 +1109,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr) {
         free(pyr->level[k].x); free(pyr->level[k].y);
         free(pyr->level[k].w); free(pyr->level[k].h);
         free(pyr->level[k].rgb);
+        free(pyr->level[k].chain);
     }
     free(pyr->palette);
     memset(pyr, 0, sizeof(*pyr));
@@ -1137,6 +1176,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     hdr->anchor_bits = header[10];
     hdr->compression = header[5];
     hdr->order       = header[14];
+    hdr->space       = header[15];
+    for (int k = 0; k < NVDR_LEVELS; k++)
+        hdr->chroma_step[k] = header[64 + k] ? header[64 + k] : hdr->step[k];
     for (int k = 0; k < NVDR_LEVELS; k++) {
         hdr->step[k]         = header[11 + k];
         hdr->leaf_count[k]   = get_u32(header + 16 + k * 4);
@@ -1201,12 +1243,17 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     }
 
     pyr->level[0].rgb = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
-    if (!pyr->level[0].rgb) {
+    pyr->level[0].chain = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
+    if (!pyr->level[0].rgb || !pyr->level[0].chain) {
         free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
     }
     for (uint32_t i = 0; i < pyr->level[0].count; i++) {
         uint32_t token = tokens[i] < (uint32_t)pyr->palette_count ? tokens[i] : 0;
         memcpy(pyr->level[0].rgb + (size_t)i * 3, pyr->palette + token * 3, 3);
+        if (hdr->space == NVDR_SPACE_YCC)
+            rgb_to_ycc(pyr->palette + token * 3, pyr->level[0].chain + (size_t)i * 3);
+        else
+            memcpy(pyr->level[0].chain + (size_t)i * 3, pyr->palette + token * 3, 3);
     }
     free(tokens);
     free(stream);
@@ -1234,8 +1281,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
             qsort(order, prev->count, sizeof(Unit), cmp_unit_area);
 
         size_t cap = (size_t)hdr->leaf_count[k] + prev->count + 1;
+        uint8_t* chain = (uint8_t*)malloc(cap * 3);
         uint8_t* rgb = (uint8_t*)malloc(cap * 3);
-        if (!rgb) { free(order); free(buf); break; }
+        if (!chain || !rgb) { free(chain); free(rgb); free(order); free(buf); break; }
 
         RectSink sink = { &pyr->level[k], 0 };
         NvdrModels models;
@@ -1258,8 +1306,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
                  * rectangle and colour it had at the level before. */
                 if (sink_push(&sink, prev->x[i], prev->y[i], prev->w[i], prev->h[i]) != 0)
                     break;
-                memcpy(rgb + (size_t)(pyr->level[k].count - 1) * 3,
-                       prev->rgb + (size_t)i * 3, 3);
+                size_t at = (size_t)(pyr->level[k].count - 1) * 3;
+                memcpy(rgb + at, prev->rgb + (size_t)i * 3, 3);
+                memcpy(chain + at, prev->chain + (size_t)i * 3, 3);
                 continue;
             }
 
@@ -1284,7 +1333,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
                 for (int c = 0; c < 3; c++) {
                     int value;
                     if (arith) {
-                        int neighbour = c > 0 ? (int8_t)rgb[(size_t)j * 3 + c - 1] : prev0;
+                        int neighbour = c > 0 ? (int8_t)chain[(size_t)j * 3 + c - 1] : prev0;
                         value = nvdr_dec_residual(&ad, &models, ctx, c,
                                                   nvdr_prev_context(neighbour));
                     } else {
@@ -1295,9 +1344,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
                     /* Parked as the raw residual until the whole rectangle
                      * is known to have arrived; resolved against the parent
                      * colour just below. */
-                    rgb[(size_t)j * 3 + c] = (uint8_t)(int8_t)value;
+                    chain[(size_t)j * 3 + c] = (uint8_t)(int8_t)value;
                 }
-                prev0 = (int8_t)rgb[(size_t)j * 3];
+                prev0 = (int8_t)chain[(size_t)j * 3];
             }
 
             if (arith && ad.overrun) {
@@ -1307,11 +1356,18 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
                 continue;
             }
 
-            for (uint32_t j = before; j < pyr->level[k].count; j++)
-                for (int c = 0; c < 3; c++)
-                    rgb[(size_t)j * 3 + c] = (uint8_t)clamp_u8(
-                        (int)prev->rgb[(size_t)i * 3 + c] +
-                        (int)(int8_t)rgb[(size_t)j * 3 + c] * hdr->step[k]);
+            for (uint32_t j = before; j < pyr->level[k].count; j++) {
+                for (int c = 0; c < 3; c++) {
+                    int step = c == 0 ? hdr->step[k] : hdr->chroma_step[k];
+                    chain[(size_t)j * 3 + c] = (uint8_t)clamp_u8(
+                        (int)prev->chain[(size_t)i * 3 + c] +
+                        (int)(int8_t)chain[(size_t)j * 3 + c] * step);
+                }
+                if (hdr->space == NVDR_SPACE_YCC)
+                    ycc_to_rgb(chain + (size_t)j * 3, rgb + (size_t)j * 3);
+                else
+                    memcpy(rgb + (size_t)j * 3, chain + (size_t)j * 3, 3);
+            }
             processed++;
         }
 
@@ -1319,7 +1375,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         free(buf);
 
         if (processed == 0) {
-            free(rgb);
+            free(rgb); free(chain);
             free(pyr->level[k].x); free(pyr->level[k].y);
             free(pyr->level[k].w); free(pyr->level[k].h);
             memset(&pyr->level[k], 0, sizeof(pyr->level[k]));
@@ -1327,6 +1383,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         }
 
         pyr->level[k].rgb = rgb;
+        pyr->level[k].chain = chain;
         pyr->levels_present = k + 1;
         pyr->last_level_fraction = prev->count
             ? (double)processed / (double)prev->count : 1.0;
