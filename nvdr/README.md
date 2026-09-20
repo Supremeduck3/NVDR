@@ -212,6 +212,34 @@ rectangle. The fixed 4x4 window is what removes the confound, and raising
 the minimum tile rather than the threshold is what actually stops a
 descent that a multiplier never could.
 
+## Softening the seams
+
+A rectangle meets its neighbour at a hard step, and that step is the most
+visible thing the format does wrong. Averaging every pixel with its four
+neighbours at 0.40 each fixes the one-pixel band along every seam and
+leaves everything else alone — inside a rectangle the neighbours carry the
+same colour, so the average returns it unchanged. It is exactly a boundary
+blend without needing to know where the boundaries are.
+
+Costs no bytes and changes no format: `nvdr_smooth()` is a choice the
+decoder makes, and `--smooth 0` renders the seams hard. Worth +0.00 to
++0.77 dB across `samples/`, never negative.
+
+The obvious design was tried first and does not work. Scaling the blend
+width by the colour difference across the seam — wide where the step is
+big, nothing below a threshold — moved PSNR by 0.03 dB. A large colour
+difference is usually a real edge, so widening the blend there smears what
+should stay sharp, while the banding actually worth fixing sits in smooth
+regions where the differences are small and the threshold skips it. The
+rule is backwards. Scaling the width by rectangle size instead, on the
+theory that a big flat block's seam reads as an artefact, measured 26.91
+against the flat rule's 26.90 — no better either.
+
+    no blend                             26.22 dB
+    width by colour difference, max 8px  26.25 dB
+    width by rectangle size, max 8px     26.91 dB
+    one pixel, uniform                   26.90 dB
+
 ## The anchor palette
 
 Candidates come from a 5-bit-per-channel histogram of the level-0 leaf

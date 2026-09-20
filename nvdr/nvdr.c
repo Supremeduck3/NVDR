@@ -1339,6 +1339,32 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
 
 /* =============================================================== render */
 
+void nvdr_smooth(NvdrImage* img, float weight) {
+    if (weight <= 0.0f || img->width < 2 || img->height < 2) return;
+
+    size_t n = (size_t)img->width * img->height * 3;
+    unsigned char* source = (unsigned char*)malloc(n);
+    if (!source) return;
+    memcpy(source, img->pixels, n);
+
+    const int W = img->width, H = img->height;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            size_t p = ((size_t)y * W + x) * 3;
+            for (int c = 0; c < 3; c++) {
+                double acc = source[p + c];
+                double total = 1.0;
+                if (x > 0)     { acc += weight * source[p - 3 + c];         total += weight; }
+                if (x < W - 1) { acc += weight * source[p + 3 + c];         total += weight; }
+                if (y > 0)     { acc += weight * source[p - (size_t)W*3 + c]; total += weight; }
+                if (y < H - 1) { acc += weight * source[p + (size_t)W*3 + c]; total += weight; }
+                img->pixels[p + c] = (unsigned char)clamp_u8((int)(acc / total + 0.5));
+            }
+        }
+    }
+    free(source);
+}
+
 void nvdr_render_level(const NvdrLevelData* level, NvdrImage* out) {
     for (uint32_t i = 0; i < level->count; i++) {
         const uint8_t* rgb = level->rgb + (size_t)i * 3;

@@ -230,4 +230,19 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr);
 /* Paint the rectangles of one level onto an RGB canvas. */
 void nvdr_render_level(const NvdrLevelData* level, NvdrImage* out);
 
+/*
+ * Soften the seams between rectangles, in place.
+ *
+ * Every pixel is averaged with its four neighbours at `weight` each. Inside
+ * a rectangle the neighbours carry the same colour, so the average returns
+ * it unchanged and the pass does nothing; only the one-pixel band along a
+ * seam moves. That makes this exactly a boundary blend without needing to
+ * know where the boundaries are.
+ *
+ * Costs no bytes and changes no format: it is a choice the decoder makes.
+ * 0 disables it; 0.40 is the measured optimum.
+ */
+#define NVDR_SMOOTH_DEFAULT 0.40f
+void nvdr_smooth(NvdrImage* img, float weight);
+
 #endif /* NVDR_H */

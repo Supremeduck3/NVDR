@@ -97,6 +97,14 @@ Para ver um nível específico:
 ./nvdr/nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
 ```
 
+O decoder suaviza as emendas entre retângulos por padrão. `--smooth 0`
+desliga e mostra os retângulos duros — útil para ver o que o formato
+realmente gravou:
+
+```bash
+./nvdr/nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
+```
+
 Para medir a qualidade junto:
 
 ```bash
