@@ -97,6 +97,14 @@ Para ver um nível específico:
 ./nvdr/nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
 ```
 
+O decoder suaviza as emendas entre retângulos por padrão. `--smooth 0`
+desliga e mostra os retângulos duros — útil para ver o que o formato
+realmente gravou:
+
+```bash
+./nvdr/nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
+```
+
 Para medir a qualidade junto:
 
 ```bash
@@ -114,7 +122,16 @@ head -c 4000 /tmp/m.nvdr > /tmp/cortado.nvdr
 ```
 
 ```
-/tmp/cortado.nvdr  768x512  5941 rects  rendered at ANCHOR  (file carries only ANCHOR)
+/tmp/cortado.nvdr  768x512  9364 rects  rendered at ANCHOR  (file carries only ANCHOR)
+```
+
+A qualidade sobe continuamente com os bytes, sem degraus — um nível
+parcial é aproveitado até onde chegou:
+
+```
+ 10% -> 21.79 dB      50% -> 25.62 dB
+ 20% -> 23.07 dB      75% -> 26.01 dB
+ 30% -> 24.45 dB     100% -> 26.22 dB
 ```
 
 Varrendo vários cortes de uma vez:
@@ -156,6 +173,15 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--weber F`** — quanto mais a tolerância aperta nas sombras. O default
   64 equaliza a alocação de detalhe entre regiões escuras e claras; um
   valor enorme (`1e9`) volta à métrica de diferença absoluta antiga.
+- **`--texture F`** — gasta menos resolução em textura fina (grama
+  distante, folhagem) e mais em estrutura (rostos, bordas). É **controle
+  de taxa**: desligado por padrão, porque também limita a qualidade
+  máxima. Abaixo de ~metade da taxa padrão vale +3 a +4 dB contra
+  simplesmente afrouxar a tolerância; acima disso é pior. Comece em `1`.
+- **`--order area|dfs`** — `area` (default) manda os retângulos maiores
+  primeiro, então um stream cortado cobre a tela inteira grosseiramente em
+  vez de um canto em detalhe. Custa 0,18% em bytes e vale até +1,67 dB no
+  primeiro décimo. `dfs` mantém a ordem da árvore.
 - **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
   para comparação; os dois decodificam para imagens idênticas.
 

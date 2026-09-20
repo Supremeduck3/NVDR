@@ -51,6 +51,43 @@ all three levels would buy a smaller file by destroying the only thing this
 format is for. Per level, the bytes on disk are the bytes on the wire and
 every prefix still ends on a boundary that decodes.
 
+## Delivering a level in pieces
+
+A level used to be one stream: every split bit, then three planes of
+residual. That made a truncated level worthless — a prefix gave the red
+channel and no green or blue — so the decoder threw it away and the
+truncation curve was a staircase. Holding 80% of the file bought exactly
+what holding 40% did.
+
+A level is now a sequence of independent **units**, one per rectangle of
+the level before, each carrying its own split bits followed by its own
+rectangles' residuals interleaved across channels. A prefix is a whole
+number of finished refinements; the units that never arrived keep the
+rectangle and colour they had at the previous level. Units are emitted
+largest-rectangle-first, an order both sides derive by sorting what they
+already have, so nothing about it is transmitted.
+
+    cut     before    after
+    10%     19.55     21.79
+    20%     19.55     23.07
+    30%     19.55     24.45
+    50%     25.15     25.62
+    75%     25.15     26.01
+    90%     25.15     26.13
+    100%    26.22     26.22
+
+Interleaving the residuals by rectangle costs nothing: measured at exactly
+88,486 bytes either way. That is only true because the entropy layer moved
+off deflate first — deflate leaned on runs of similar bytes, which the
+planar layout provided and interleaving would have destroyed, while the
+arithmetic coder's contexts are explicit and indifferent to grouping.
+
+Largest-first ordering costs 160 bytes, 0.18%, from slightly worse
+adaptation locality, and is worth up to +1.67 dB over tree order in the
+first tenth of the stream. Against an oracle that orders units by actual
+error reduction per byte — which cannot be shipped, since the decoder has
+no way to know the error — area ordering captures 65% to 82% of the gain.
+
 ## The entropy coder
 
 Levels are coded with an adaptive binary arithmetic coder (the LZMA range
@@ -128,6 +165,81 @@ PSNR cannot see this improvement, by construction: it is an absolute-error
 metric, and absolute error is exactly the thing the old gate was already
 optimising. `--weber 1e9` restores the previous behaviour for comparison.
 
+## Spending less on fine grain
+
+Deviation says a region is not uniform. It does not say whether
+subdividing would help. Distant grass varies as much inside a 4x4 window
+as it does across the whole patch, so splitting reproduces noise nobody
+could pick out; a face varies across the region and barely within a
+window, so splitting is what resolves it. The ratio between the two — the
+region's grain — comes from a 4x4 deviation map summed into an integral
+image once per encode, so any region's is an O(1) query.
+
+`--texture F` raises a region's minimum tile by `1 + F * grain`, which
+spends grain at a coarser resolution and leaves structure at the full one.
+At matched bytes on `montanha_pessoas.jpg` against plain tolerance
+loosening, it moves 40% of the rectangles out of the highest-grain band
+and into smooth and structured regions:
+
+    band (source 8x8 deviation)   tolerance only      --texture 1
+    smooth  <10                    95 @ 591.7 px     486 @ 109.4 px
+    10-25                         561 @ 123.2 px    3473 @  19.6 px
+    25-45                        2937 @  44.3 px    6898 @  17.0 px
+    45-70                        7049 @  12.7 px    5588 @  17.1 px
+    grain   >70                  6921 @   7.0 px    4157 @  14.1 px
+
+**It is a rate control, not a free improvement.** Capping how fine
+anything can get also caps quality: with it on, tightening the tolerance
+saturates at 23.9 dB and cannot reach the 26.2 dB the default hits. The
+crossover, measured:
+
+    budget      tolerance only      --texture
+    <= 60 KB   58.0 KB / 24.89 dB   36.7 KB / 23.87 dB    tolerance wins
+    <= 40 KB   31.0 KB / 20.64 dB   36.7 KB / 23.87 dB    +3.2 dB
+    <= 25 KB   14.8 KB / 19.33 dB   23.6 KB / 23.11 dB    +3.8 dB
+    <= 15 KB   14.8 KB / 19.33 dB    7.0 KB / 19.61 dB    half the bytes
+
+So it is off by default and is the right mechanism below roughly half the
+default rate.
+
+Two formulations failed before this one, both because they measured grain
+by splitting a node and watching its children's deviation drop, which is
+confounded with scale. Scaling the threshold by that drop only bit the
+middle of the range and left the highest-grain band untouched at 6.1 px
+per leaf. A hard floor on the drop pruned the root — the drop is small at
+the top of the tree whatever the content — and collapsed the image to one
+rectangle. The fixed 4x4 window is what removes the confound, and raising
+the minimum tile rather than the threshold is what actually stops a
+descent that a multiplier never could.
+
+## Softening the seams
+
+A rectangle meets its neighbour at a hard step, and that step is the most
+visible thing the format does wrong. Averaging every pixel with its four
+neighbours at 0.40 each fixes the one-pixel band along every seam and
+leaves everything else alone — inside a rectangle the neighbours carry the
+same colour, so the average returns it unchanged. It is exactly a boundary
+blend without needing to know where the boundaries are.
+
+Costs no bytes and changes no format: `nvdr_smooth()` is a choice the
+decoder makes, and `--smooth 0` renders the seams hard. Worth +0.00 to
++0.77 dB across `samples/`, never negative.
+
+The obvious design was tried first and does not work. Scaling the blend
+width by the colour difference across the seam — wide where the step is
+big, nothing below a threshold — moved PSNR by 0.03 dB. A large colour
+difference is usually a real edge, so widening the blend there smears what
+should stay sharp, while the banding actually worth fixing sits in smooth
+regions where the differences are small and the threshold skips it. The
+rule is backwards. Scaling the width by rectangle size instead, on the
+theory that a big flat block's seam reads as an artefact, measured 26.91
+against the flat rule's 26.90 — no better either.
+
+    no blend                             26.22 dB
+    width by colour difference, max 8px  26.25 dB
+    width by rectangle size, max 8px     26.91 dB
+    one pixel, uniform                   26.90 dB
+
 ## The anchor palette
 
 Candidates come from a 5-bit-per-channel histogram of the level-0 leaf
@@ -192,8 +304,8 @@ improves it without the decoder ever needing to wait or restart.
 
     [header 72B]
     [level 0 : palette, then split flags and anchor tokens, coded]
-    [level 1 : split flags and 3 int8 residual planes, coded]
-    [level 2 : split flags and 3 int8 residual planes, coded]
+    [level 1 : units, each split flags + its rectangles' residuals, coded]
+    [level 2 : units, each split flags + its rectangles' residuals, coded]
 
 The palette rides ahead of level 0's coded stream: 48 bytes of genuinely
 incompressible colour are not worth modelling. `--codec deflate` selects

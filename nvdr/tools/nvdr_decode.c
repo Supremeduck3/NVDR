@@ -27,7 +27,9 @@ int main(int argc, char** argv) {
             "usage: %s <in.nvdr> <out.png|out.ppm> [--level N] [--compare source]\n"
             "  --level N      cap the render at level N; the file may carry\n"
             "                 less, and then less is what you get\n"
-            "  --compare IMG  also report PSNR against IMG\n",
+            "  --compare IMG  also report PSNR against IMG\n"
+            "  --smooth F     soften the seams between rectangles\n"
+            "                 (default 0.40; 0 renders them hard)\n",
             argv[0]);
         return 2;
     }
@@ -36,10 +38,12 @@ int main(int argc, char** argv) {
     const char* out_path     = argv[2];
     const char* compare_path = NULL;
     int requested = NVDR_LEVELS - 1;
+    float smooth = NVDR_SMOOTH_DEFAULT;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--level") && i + 1 < argc) requested = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--compare") && i + 1 < argc) compare_path = argv[++i];
+        else if (!strcmp(argv[i], "--smooth") && i + 1 < argc) smooth = (float)atof(argv[++i]);
     }
     if (requested < 0) requested = 0;
     if (requested > NVDR_LEVELS - 1) requested = NVDR_LEVELS - 1;
@@ -65,6 +69,7 @@ int main(int argc, char** argv) {
     }
 
     nvdr_render_level(&pyr.level[level], &out);
+    nvdr_smooth(&out, smooth);
 
     if (nvdr_image_write(&out, out_path) != 0) {
         fprintf(stderr, "cannot write '%s'\n", out_path);

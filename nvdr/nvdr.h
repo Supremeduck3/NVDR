@@ -87,6 +87,7 @@ typedef struct {
     uint16_t x, y, w, h;
     int32_t  first_child;    /* -1 when this node was never split */
     float    deviation;      /* mean perceptual distance from the mean colour */
+    float    penalty;        /* how much harder this region is to justify splitting */
     uint8_t  r, g, b;
 } NvdrNode;
 
@@ -117,6 +118,31 @@ typedef struct {
      * the old absolute metric.
      */
     float weber;
+    /*
+     * How coarsely fine grain is allowed to be resolved.
+     *
+     * Deviation says a region is not uniform; it does not say whether
+     * subdividing would help. Distant grass varies as much inside a 4x4
+     * window as across the whole patch, so splitting reproduces noise. A
+     * face varies across the region and barely within a window, so
+     * splitting resolves it. The ratio between the two is the grain of a
+     * region, and it raises that region's minimum tile by
+     * `1 + texture * grain`.
+     *
+     * This is a rate control, not a free improvement: it caps how fine
+     * anything can get, so it cannot reach the high-quality end at all.
+     * Below roughly half the default rate it beats plain tolerance by 3-4
+     * dB; above that it is strictly worse. Zero, the default, disables it.
+     */
+    float texture;
+    /*
+     * The order refinement units are emitted in, which is also the order a
+     * truncated stream delivers them. 0 keeps the depth-first order the
+     * tree produces; 1 sends the largest rectangles first, so a prefix
+     * covers the whole canvas coarsely instead of one corner finely.
+     * Both sides derive it from the previous level, so nothing is sent.
+     */
+    int   order;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
@@ -143,9 +169,18 @@ typedef struct {
     uint32_t  count;
 } NvdrLevelData;
 
+#define NVDR_ORDER_DFS   0
+#define NVDR_ORDER_AREA  1
+
 typedef struct {
     NvdrLevelData level[NVDR_LEVELS];
     int           levels_present;   /* 1, 2 or 3 */
+    /*
+     * How much of the last level actually arrived. 1.0 when the stream was
+     * complete; less when it was cut, in which case the units that never
+     * came keep the rectangle and colour they had at the level before.
+     */
+    double        last_level_fraction;
 
     /* Anchor palette, shared by level 0 only. */
     unsigned char* palette;
@@ -159,7 +194,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     5
+#define NVDR_VERSION     6
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */
@@ -175,6 +210,7 @@ typedef struct {
     uint32_t stored_bytes[NVDR_LEVELS]; /* stream size on disk and on the wire */
     uint8_t  anchor_bits;
     uint8_t  compression;
+    uint8_t  order;
     uint8_t  step[NVDR_LEVELS];
 } NvdrHeader;
 
@@ -193,5 +229,20 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr);
 
 /* Paint the rectangles of one level onto an RGB canvas. */
 void nvdr_render_level(const NvdrLevelData* level, NvdrImage* out);
+
+/*
+ * Soften the seams between rectangles, in place.
+ *
+ * Every pixel is averaged with its four neighbours at `weight` each. Inside
+ * a rectangle the neighbours carry the same colour, so the average returns
+ * it unchanged and the pass does nothing; only the one-pixel band along a
+ * seam moves. That makes this exactly a boundary blend without needing to
+ * know where the boundaries are.
+ *
+ * Costs no bytes and changes no format: it is a choice the decoder makes.
+ * 0 disables it; 0.40 is the measured optimum.
+ */
+#define NVDR_SMOOTH_DEFAULT 0.40f
+void nvdr_smooth(NvdrImage* img, float weight);
 
 #endif /* NVDR_H */
