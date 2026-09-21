@@ -188,18 +188,43 @@ NvdrConfig nvdr_default_config(void) {
      * the rate-distortion test. Swept at matched rate: step 16 lands 0.3 dB
      * above step 2 and stays flat from there.
      */
-    cfg.gradient     = 280.0f;
+    /*
+     * 280 was calibrated against the loosened tolerances that came with
+     * it and did not survive them. A ramp pays off in proportion to the
+     * area it covers, so at the tight tolerances the rectangles are small
+     * and each ramp explains less; the same lambda then buys quality at a
+     * rate the flat encoder was not asked for. 600 gains everywhere
+     * measured — +0.40 to +2.43 dB — for 2 to 33% more bytes.
+     */
+    cfg.gradient     = 600.0f;
     cfg.gradient_step = 16;
     /*
-     * Looser than they were, because ramps moved the optimum. These were
-     * tuned when every rectangle was a flat fill, where the only way to
-     * follow a gradient was to keep subdividing it. A rectangle that can
-     * ramp covers the same gradient in one piece, so the tree can stop
-     * earlier and spend the saved rectangles elsewhere.
+     * These were briefly loosened to 0.140/0.070/0.040, on the grounds
+     * that a rectangle able to ramp can stop subdividing earlier. Measured
+     * on six photographs it looked like a straight gain. It was not: those
+     * three numbers are one step apart, so the change shifted the whole
+     * pyramid down a level — the new level 2 came out with exactly the
+     * rectangle count the old level 1 had — and threw away a level of
+     * refinement.
+     *
+     * What hid it is that tolerance behaves completely differently
+     * depending on whether an image's tree saturates. Between tolerance
+     * 0.060 and 0.040 a star field goes from 4507 rectangles to 103891,
+     * because noise has detail at every scale and there is no tolerance at
+     * which it is resolved; the knob is a smooth, powerful rate dial and
+     * every setting looks reasonable. A picture of flat shapes goes from
+     * 1474 to 1744 over the same interval and from 16 to 16 across the
+     * entire range, because its structure is finite. There the knob is a
+     * cliff: below saturation it buys nothing, above it the edges — which
+     * carry half the squared error in 1% of the pixels — are destroyed.
+     * `circulos` lost 5.5 dB to save 7% of its bytes.
+     *
+     * So this is a rate control that has to stay separate from the ramp,
+     * and it stays where it was measured to belong.
      */
-    cfg.tolerance[0] = 0.140f;   /* anchor: only genuinely flat regions stay */
-    cfg.tolerance[1] = 0.070f;
-    cfg.tolerance[2] = 0.040f;   /* the tree is built to this */
+    cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
+    cfg.tolerance[1] = 0.040f;
+    cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
     cfg.anchor_bits  = 4;        /* the spec's int4 anchor */
     cfg.step[0]      = 0;        /* level 0 is palette-coded, not residual */
     /* A level's step is sized to the correction it carries. R1 moves a
@@ -717,10 +742,77 @@ static int cut_level(const NvdrTree* tree, int32_t idx, float tolerance,
 }
 
 /*
+ * One refinement unit, emitted with its colours interleaved into its
+ * geometry.
+ *
+ * The split bits used to go first and the residuals after. That made a
+ * half-delivered unit worthless — the decoder had the shape and no
+ * colours — so the whole unit was rolled back, and the truncation
+ * granularity of a level was one unit rather than one rectangle. On an
+ * image whose previous level has thirteen rectangles that meant thirteen
+ * all-or-nothing chunks: a star field sat at 21.59 dB through the first
+ * quarter of its container and only then moved.
+ *
+ * Interleaved, a cut anywhere leaves a valid partial subtree. The
+ * rectangles that arrived keep their own colour; the region below the cut
+ * falls back to what its parent was showing there. The symbols are the
+ * same ones in the same per-model order, so the models adapt identically
+ * and this costs nothing — only the interleaving changes, which is why it
+ * still needed a container version.
+ */
+typedef struct {
+    NvdrEncoder*    enc;
+    NvdrModels*     m;
+    const NvdrTree* tree;
+    const int8_t*   residual;
+    const uint8_t*  axis;
+    const int8_t*   slope;
+    float           tolerance;
+    uint32_t        at;          /* next slot in the level's arrays */
+    int             split_ctx;   /* the unit's root decision */
+    int             prev0;
+} EmitCtx;
+
+static void emit_unit(EmitCtx* e, int32_t idx, int depth) {
+    const NvdrNode* n = &e->tree->nodes[idx];
+    int split = n->first_child >= 0 && n->deviation > e->tolerance;
+    nvdr_enc_bit(e->enc, &e->m->split[nvdr_area_context(n->w, n->h)], split);
+    if (depth == 0) e->split_ctx = split;
+
+    if (split) {
+        for (int i = 0; i < 4; i++) emit_unit(e, n->first_child + i, depth + 1);
+        return;
+    }
+
+    uint32_t i = e->at++;
+    for (int c = 0; c < 3; c++) {
+        int value = e->residual[(size_t)i * 3 + c];
+        int neighbour = c > 0 ? e->residual[(size_t)i * 3 + c - 1] : e->prev0;
+        nvdr_enc_residual(e->enc, e->m, value, e->split_ctx, c,
+                          nvdr_prev_context(neighbour));
+    }
+    e->prev0 = e->residual[(size_t)i * 3];
+
+    if (e->axis) {
+        int ctx = nvdr_area_context(n->w, n->h);
+        int a = e->axis[i];
+        nvdr_enc_bit(e->enc, &e->m->grad[ctx], a != 0);
+        if (a) {
+            nvdr_enc_bit(e->enc, &e->m->grad_axis[ctx], a == 2);
+            for (int c = 0; c < 3; c++)
+                nvdr_enc_slope(e->enc, e->m, e->slope[(size_t)i * 3 + c], c);
+        }
+    }
+}
+
+/*
  * Re-code a level's split bitstream through the arithmetic coder, giving
  * each bit the area context of the rectangle it decides. The tree shape is
  * recovered by walking it again rather than stored, so nothing extra is
  * carried: the walk is deterministic from the canvas rectangle down.
+ *
+ * Only level 0 uses this now; levels above it interleave through
+ * emit_unit above.
  */
 static void transcode_split(BitReader* br, NvdrEncoder* enc, NvdrModels* m,
                             int w, int h) {
@@ -1147,41 +1239,20 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                      * residuals of every rectangle it produced. A decoder
                      * that runs out of bytes stops on a unit boundary with
                      * everything before it whole. */
-                    int prev0 = 0;
+                    EmitCtx e;
+                    memset(&e, 0, sizeof(e));
+                    e.enc = &ae;
+                    e.m = &models;
+                    e.tree = &tree;
+                    e.residual = residual[k];
+                    e.axis = axis[k];
+                    e.slope = slope[k];
+                    e.tolerance = cfg->tolerance[k];
                     for (uint32_t u = 0; u < unit_count[k]; u++) {
                         const Unit* unit = &units[k][u];
-                        const NvdrNode* n = &tree.nodes[leaves[k - 1].items[unit->index]];
-                        br.bit_pos = unit->bit_start;
-                        br.bit_count = unit->bit_end;
-                        transcode_split(&br, &ae, &models, n->w, n->h);
-
-                        for (uint32_t i = unit->leaf_start; i < unit->leaf_end; i++) {
-                            for (int c = 0; c < 3; c++) {
-                                int value = residual[k][(size_t)i * 3 + c];
-                                int neighbour = c > 0
-                                    ? residual[k][(size_t)i * 3 + c - 1] : prev0;
-                                nvdr_enc_residual(&ae, &models, value,
-                                                  split_ctx[k][i], c,
-                                                  nvdr_prev_context(neighbour));
-                            }
-                            prev0 = residual[k][(size_t)i * 3];
-
-                            if (axis[k]) {
-                                /* The flag rides the rectangle's area: a
-                                 * big rectangle spans more of whatever
-                                 * gradient is there, so it is far likelier
-                                 * to want one. Both sides know the area. */
-                                const NvdrNode* r = &tree.nodes[leaves[k].items[i]];
-                                int ctx = nvdr_area_context(r->w, r->h);
-                                int a = axis[k][i];
-                                nvdr_enc_bit(&ae, &models.grad[ctx], a != 0);
-                                if (!a) continue;
-                                nvdr_enc_bit(&ae, &models.grad_axis[ctx], a == 2);
-                                for (int c = 0; c < 3; c++)
-                                    nvdr_enc_slope(&ae, &models,
-                                                   slope[k][(size_t)i * 3 + c], c);
-                            }
-                        }
+                        e.at = unit->leaf_start;
+                        emit_unit(&e, (int32_t)leaves[k - 1].items[unit->index], 0);
+                        if (e.at != unit->leaf_end) goto write_done;
                     }
                 }
 
@@ -1333,6 +1404,125 @@ static int replay_arith(NvdrDecoder* dec, NvdrModels* m, RectSink* sink,
     if (replay_arith(dec, m, sink, x + hw, y,      rw, hh) != 0) return -1;
     if (replay_arith(dec, m, sink, x,      y + hh, hw, rh) != 0) return -1;
     if (replay_arith(dec, m, sink, x + hw, y + hh, rw, rh) != 0) return -1;
+    return 0;
+}
+
+/*
+ * The mirror of emit_unit: one unit, geometry and colour interleaved.
+ *
+ * Once the bytes run out the walk stops reading and paints the rest of the
+ * region from what the parent was showing there, so a unit cut in half
+ * still contributes everything that arrived. The overrun flag is checked
+ * immediately after every symbol and the symbol that tripped it is thrown
+ * away, which bounds the damage of a cut to the few rectangles inside the
+ * coder's five-byte lookahead.
+ */
+typedef struct {
+    NvdrDecoder*         dec;
+    NvdrModels*          m;
+    RectSink*            sink;
+    NvdrLevelData*       level;
+    const NvdrLevelData* prev;
+    uint32_t             prev_index;
+    uint8_t*             chain;
+    uint8_t*             axis;
+    int8_t*              slope;
+    size_t               cap;
+    int                  step, chroma_step, slope_step;
+    int                  ramped;
+    int                  split_ctx;
+    int                  prev0;
+    int                  stopped;
+    uint32_t             delivered;   /* rectangles whose colour really arrived */
+} UnitCtx;
+
+/* What the parent shows at a point, which is what an undelivered region
+ * falls back to and what a delivered one is predicted from. */
+static void unit_parent_colour(const UnitCtx* d, int px, int py, uint8_t* out) {
+    uint32_t i = d->prev_index;
+    chain_sample(d->prev->chain + (size_t)i * 3,
+                 d->prev->axis ? d->prev->axis[i] : 0,
+                 d->prev->slope ? d->prev->slope + (size_t)i * 3 : nvdr_no_slope,
+                 d->prev->slope_step,
+                 d->prev->x[i], d->prev->y[i], d->prev->w[i], d->prev->h[i],
+                 px, py, out);
+}
+
+static int replay_unit(UnitCtx* d, int x, int y, int w, int h, int depth) {
+    int split = 0;
+    if (!d->stopped) {
+        if ((size_t)d->level->count + 1 >= d->cap) {
+            d->stopped = 1;
+        } else {
+            split = nvdr_dec_bit(d->dec, &d->m->split[nvdr_area_context(w, h)]);
+            if (d->dec->overrun) { d->stopped = 1; split = 0; }
+            else if (depth == 0) d->split_ctx = split;
+        }
+    }
+
+    if (split) {
+        int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
+        if (replay_unit(d, x,      y,      hw, hh, depth + 1) != 0) return -1;
+        if (replay_unit(d, x + hw, y,      rw, hh, depth + 1) != 0) return -1;
+        if (replay_unit(d, x,      y + hh, hw, rh, depth + 1) != 0) return -1;
+        if (replay_unit(d, x + hw, y + hh, rw, rh, depth + 1) != 0) return -1;
+        return 0;
+    }
+
+    if (sink_push(d->sink, x, y, w, h) != 0) return -1;
+    uint32_t j = d->level->count - 1;
+    uint8_t parent[3];
+    unit_parent_colour(d, x + w / 2, y + h / 2, parent);
+
+    if (d->stopped) {
+        /* Never arrived: show what the level before showed here. The
+         * parent's ramp is sampled at this rectangle's centre rather than
+         * carried, so the fallback is flat but continuous with it. */
+        memcpy(d->chain + (size_t)j * 3, parent, 3);
+        if (d->ramped) d->axis[j] = 0;
+        return 0;
+    }
+
+    int8_t raw[3];
+    for (int c = 0; c < 3; c++) {
+        int neighbour = c > 0 ? raw[c - 1] : d->prev0;
+        raw[c] = (int8_t)nvdr_dec_residual(d->dec, d->m, d->split_ctx, c,
+                                           nvdr_prev_context(neighbour));
+    }
+    if (d->dec->overrun) {
+        d->stopped = 1;
+        memcpy(d->chain + (size_t)j * 3, parent, 3);
+        if (d->ramped) d->axis[j] = 0;
+        return 0;
+    }
+    d->prev0 = raw[0];
+
+    for (int c = 0; c < 3; c++)
+        d->chain[(size_t)j * 3 + c] = (uint8_t)clamp_u8(
+            (int)parent[c] + (int)raw[c] * (c == 0 ? d->step : d->chroma_step));
+
+    if (d->ramped) {
+        int ctx = nvdr_area_context(w, h);
+        d->axis[j] = 0;
+        if (nvdr_dec_bit(d->dec, &d->m->grad[ctx]) && !d->dec->overrun) {
+            int a = nvdr_dec_bit(d->dec, &d->m->grad_axis[ctx]) ? 2 : 1;
+            int8_t sl[3];
+            for (int c = 0; c < 3; c++)
+                sl[c] = (int8_t)clamp_i8(nvdr_dec_slope(d->dec, d->m, c));
+            if (!d->dec->overrun) {
+                d->axis[j] = (uint8_t)a;
+                memcpy(d->slope + (size_t)j * 3, sl, 3);
+            }
+        }
+        if (d->dec->overrun) {
+            d->stopped = 1;
+            memcpy(d->chain + (size_t)j * 3, parent, 3);
+            d->axis[j] = 0;
+            return 0;
+        }
+    }
+
+    d->delivered++;
     return 0;
 }
 
@@ -1546,21 +1736,37 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         }
 
         uint32_t processed = 0;
-        int prev0 = 0;
         int stopped = 0;
+
+        UnitCtx d;
+        memset(&d, 0, sizeof(d));
+        d.dec = &ad;
+        d.m = &models;
+        d.sink = &sink;
+        d.level = &pyr->level[k];
+        d.prev = prev;
+        d.chain = chain;
+        d.axis = lvl_axis;
+        d.slope = lvl_slope;
+        d.cap = cap;
+        d.step = hdr->step[k];
+        d.chroma_step = hdr->chroma_step[k];
+        d.slope_step = hdr->gradient_step;
+        d.ramped = lvl_axis != NULL;
 
         for (uint32_t u = 0; u < prev->count; u++) {
             uint32_t i = order[u].index;
 
             if (stopped) {
                 /* Past the end of what arrived: this unit keeps the
-                 * rectangle and colour it had at the level before. */
+                 * rectangle and colour it had at the level before, ramp
+                 * included, so it renders exactly as that level did. */
                 if (sink_push(&sink, prev->x[i], prev->y[i], prev->w[i], prev->h[i]) != 0)
                     break;
                 uint32_t j = pyr->level[k].count - 1;
                 size_t at = (size_t)j * 3;
-                memcpy(rgb + at, prev->rgb + (size_t)i * 3, 3);
                 memcpy(chain + at, prev->chain + (size_t)i * 3, 3);
+                memcpy(rgb + at, prev->rgb + (size_t)i * 3, 3);
                 if (lvl_axis && prev->axis) {
                     lvl_axis[j] = prev->axis[i];
                     memcpy(lvl_slope + at, prev->slope + (size_t)i * 3, 3);
@@ -1569,78 +1775,53 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
             }
 
             uint32_t before = pyr->level[k].count;
-            int rc = arith
-                ? replay_arith(&ad, &models, &sink, prev->x[i], prev->y[i],
-                               prev->w[i], prev->h[i])
-                : replay(&lbr, &sink, prev->x[i], prev->y[i], prev->w[i], prev->h[i]);
-            if (rc != 0 || (arith ? ad.overrun : lbr.overrun) ||
-                pyr->level[k].count > cap) {
-                /* This unit did not arrive whole. Roll it back and treat
-                 * every remaining one as absent. */
-                pyr->level[k].count = before;
-                stopped = 1;
-                u--;
-                continue;
-            }
+            d.prev_index = i;
+            d.stopped = 0;
+            d.delivered = 0;
 
-            uint32_t produced = pyr->level[k].count - before;
-            uint8_t ctx = (uint8_t)(produced > 1);
-            for (uint32_t j = before; j < pyr->level[k].count; j++) {
-                for (int c = 0; c < 3; c++) {
-                    int value;
-                    if (arith) {
-                        int neighbour = c > 0 ? (int8_t)chain[(size_t)j * 3 + c - 1] : prev0;
-                        value = nvdr_dec_residual(&ad, &models, ctx, c,
-                                                  nvdr_prev_context(neighbour));
-                    } else {
-                        const int8_t* res = (const int8_t*)
-                            (buf + (hdr->split_bits[k] + 7) / 8);
-                        value = res[(size_t)j * 3 + c];
-                    }
-                    /* Parked as the raw residual until the whole rectangle
-                     * is known to have arrived; resolved against the parent
-                     * colour just below. */
-                    chain[(size_t)j * 3 + c] = (uint8_t)(int8_t)value;
+            if (!arith) {
+                /* Deflate is all or nothing, so it keeps the old planar
+                 * layout: every split bit, then every residual. */
+                if (replay(&lbr, &sink, prev->x[i], prev->y[i],
+                           prev->w[i], prev->h[i]) != 0 || lbr.overrun ||
+                    pyr->level[k].count > cap) {
+                    pyr->level[k].count = before;
+                    stopped = 1;
+                    u--;
+                    continue;
                 }
-                prev0 = (int8_t)chain[(size_t)j * 3];
-
-                if (lvl_axis && arith) {
-                    int ctx = nvdr_area_context(pyr->level[k].w[j],
-                                                pyr->level[k].h[j]);
-                    if (nvdr_dec_bit(&ad, &models.grad[ctx])) {
-                        lvl_axis[j] = nvdr_dec_bit(&ad, &models.grad_axis[ctx]) ? 2 : 1;
-                        for (int c = 0; c < 3; c++)
-                            lvl_slope[(size_t)j * 3 + c] =
-                                (int8_t)clamp_i8(nvdr_dec_slope(&ad, &models, c));
-                    } else {
-                        lvl_axis[j] = 0;
+                const int8_t* res = (const int8_t*)(buf + (hdr->split_bits[k] + 7) / 8);
+                for (uint32_t j = before; j < pyr->level[k].count; j++) {
+                    uint8_t parent[3];
+                    chain_sample(prev->chain + (size_t)i * 3,
+                                 prev->axis ? prev->axis[i] : 0,
+                                 prev->slope ? prev->slope + (size_t)i * 3 : nvdr_no_slope,
+                                 prev->slope_step,
+                                 prev->x[i], prev->y[i], prev->w[i], prev->h[i],
+                                 pyr->level[k].x[j] + pyr->level[k].w[j] / 2,
+                                 pyr->level[k].y[j] + pyr->level[k].h[j] / 2,
+                                 parent);
+                    for (int c = 0; c < 3; c++) {
+                        int step = c == 0 ? hdr->step[k] : hdr->chroma_step[k];
+                        chain[(size_t)j * 3 + c] = (uint8_t)clamp_u8(
+                            (int)parent[c] + (int)res[(size_t)j * 3 + c] * step);
                     }
                 }
-            }
-
-            if (arith && ad.overrun) {
-                pyr->level[k].count = before;
-                stopped = 1;
-                u--;
-                continue;
+            } else {
+                if (replay_unit(&d, prev->x[i], prev->y[i],
+                                prev->w[i], prev->h[i], 0) != 0) break;
+                if (d.delivered == 0) {
+                    /* Not one rectangle of this unit arrived. Roll it
+                     * back and let the absent path above cover it. */
+                    pyr->level[k].count = before;
+                    stopped = 1;
+                    u--;
+                    continue;
+                }
+                if (d.stopped) stopped = 1;   /* this unit is the last, in part */
             }
 
             for (uint32_t j = before; j < pyr->level[k].count; j++) {
-                uint8_t parent_colour[3];
-                chain_sample(prev->chain + (size_t)i * 3,
-                             prev->axis ? prev->axis[i] : 0,
-                             prev->slope ? prev->slope + (size_t)i * 3 : nvdr_no_slope,
-                             prev->slope_step,
-                             prev->x[i], prev->y[i], prev->w[i], prev->h[i],
-                             pyr->level[k].x[j] + pyr->level[k].w[j] / 2,
-                             pyr->level[k].y[j] + pyr->level[k].h[j] / 2,
-                             parent_colour);
-                for (int c = 0; c < 3; c++) {
-                    int step = c == 0 ? hdr->step[k] : hdr->chroma_step[k];
-                    chain[(size_t)j * 3 + c] = (uint8_t)clamp_u8(
-                        (int)parent_colour[c] +
-                        (int)(int8_t)chain[(size_t)j * 3 + c] * step);
-                }
                 if (hdr->space == NVDR_SPACE_YCC)
                     ycc_to_rgb(chain + (size_t)j * 3, rgb + (size_t)j * 3);
                 else

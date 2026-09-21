@@ -1,36 +1,71 @@
 # Guia de teste
 
-## Por que existem dois pipelines
+## Onde está cada coisa
 
-O repositório carrega **dois codecs independentes**, e é isso que confunde
-na hora de testar. Eles não compartilham código, nem formato, nem Makefile:
+```
+src/        o codec: nvdr.c, entropy.c e os headers
+tools/      as duas CLIs, nvdr_encode e nvdr_decode
+public/     o decoder do navegador (nvdr.js) e a página que o usa
+scripts/    o gate de regressão, o crosscheck C×JS, e análises
+samples/    as imagens em que todo número do README foi medido
+vendor/     stb_image.h, o único código de terceiros
+reference/  dois módulos guardados de um pipeline removido; não compilam
+            no build
+```
 
-| | pipeline antigo | pipeline novo |
-|---|---|---|
-| código | `src/` | `nvdr/` |
-| formato | `.svbc` | `.nvdr` |
-| binário | `image_to_svg` | `nvdr/nvdr_encode`, `nvdr/nvdr_decode` |
-| build | `make` na raiz | `make` dentro de `nvdr/` |
-| página | `localhost:3000/` | `localhost:3000/nvdr.html` |
-
-O pipeline novo é o que implementa a Progressive Residual Stack do spec.
-O antigo continua no repositório porque ainda funciona e serve de
-comparação — nada depende dele.
+Havia um segundo codec no repositório (`src/` antigo, formato `.svbc`,
+binário `image_to_svg`). Ele foi removido: com a taxa casada o NVDR saía
+menor e 2,2 a 6,1 dB melhor nas seis imagens de `samples/`, e ainda tem
+truncagem progressiva, que o `.svbc` não tinha. Está tudo no histórico do
+git se precisar — veja `reference/README.md`.
 
 ---
 
 ## Build
 
-Os dois, uma vez cada:
-
 ```bash
-make               # image_to_svg   (pipeline antigo)
-cd nvdr && make    # nvdr_encode, nvdr_decode
-cd ..
+make
 ```
 
-Se algum falhar, é dependência faltando: ambos precisam de `gcc` e `zlib`
-(`libz-dev` no Debian/Ubuntu). O antigo também usa OpenMP.
+Precisa de `gcc` e `zlib` (`libz-dev` no Debian/Ubuntu). Sai
+`nvdr_encode` e `nvdr_decode` na raiz.
+
+Para rodar o gate de regressão:
+
+```bash
+make check
+```
+
+Ele checa cinco coisas em cada imagem de `samples/`:
+
+1. **Determinismo** — codifica duas vezes, os dois arquivos têm que sair
+   byte a byte iguais. Sem isso, qualquer medição A/B está medindo ruído.
+2. **Qualidade** — decodifica de volta e compara contra
+   `scripts/baseline.json`, **por imagem**. Piso global não serve: as
+   amostras vão de 21 a 30 dB, então uma queda que importa em uma some no
+   meio das outras.
+3. **Tamanho** — bytes contra a mesma baseline, para uma mudança que
+   compra qualidade com bytes aparecer como o que é.
+4. **Truncagem** — corta em 9 pontos; todo corte acima do anchor tem que
+   decodificar, e a qualidade não pode cair conforme os bytes aumentam.
+5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, em
+   todos os níveis e em arquivo cortado.
+
+Ele também **gera três imagens sintéticas** na hora (`blocos`, `circulos`,
+`degrade`) e passa elas pelos mesmos testes. Elas existem porque o
+`samples/` é só foto, e foto escondeu uma regressão que custou 5,5 dB numa
+imagem de formas chapadas — árvore que satura reage à tolerância no
+sentido oposto de árvore que não satura.
+
+Quando uma mudança for melhoria de verdade e não regressão, você regrava a
+baseline:
+
+```bash
+python3 scripts/verify.py --update
+```
+
+Conferi que ele pega: reintroduzindo a tolerância velha, ele reprova 7
+amostras e sai com código 1, com `circulos` acusando -4,60 dB.
 
 ---
 
@@ -40,7 +75,7 @@ Se algum falhar, é dependência faltando: ambos precisam de `gcc` e `zlib`
 node server.js
 ```
 
-Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
+Abre `http://localhost:3000`, arrasta uma imagem e pronto:
 
 - as três camadas lado a lado, com bytes acumulados e número de retângulos
 - um slider que corta o arquivo para simular download interrompido
@@ -56,15 +91,15 @@ Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
 ### Codificar
 
 ```bash
-./nvdr/nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr
+./nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr
 ```
 
 ```
 samples/montanha_pessoas.jpg  768x512
   level      rects        raw     stored  cumulative     PSNR
-  ANCHOR       1930       1336       1084        1156    17.37 dB
-  R1          17563     125788      10784       11940    22.30 dB
-  R2          37663     269187      32232       44172    26.40 dB
+  ANCHOR       9364       6292       4470        4542    19.55 dB
+  R1          37663     269528      12538       17080    24.30 dB
+  R2          53707     383331      34685       51765    26.30 dB
 ```
 
 Como ler cada coluna:
@@ -85,7 +120,7 @@ Compare `cumulative` do último nível com o tamanho da imagem de origem —
 ### Decodificar
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/saida.png
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png
 ```
 
 Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
@@ -93,8 +128,8 @@ Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
 Para ver um nível específico:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/anchor.png --level 0
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
+./nvdr_decode /tmp/m.nvdr /tmp/anchor.png --level 0
+./nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
 ```
 
 O decoder suaviza as emendas entre retângulos por padrão. `--smooth 0`
@@ -102,13 +137,13 @@ desliga e mostra os retângulos duros — útil para ver o que o formato
 realmente gravou:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
+./nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
 ```
 
 Para medir a qualidade junto:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/saida.png --compare samples/montanha_pessoas.jpg
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png --compare samples/montanha_pessoas.jpg
 ```
 
 ### Testar a garantia de truncagem
@@ -117,27 +152,27 @@ Esta é a propriedade central do formato: cortar o arquivo em qualquer
 ponto depois do anchor ainda produz imagem.
 
 ```bash
-head -c 1200 /tmp/m.nvdr > /tmp/cortado.nvdr
-./nvdr/nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
+head -c 4600 /tmp/m.nvdr > /tmp/cortado.nvdr
+./nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
 ```
 
 ```
-/tmp/cortado.nvdr  768x512  1930 rects  rendered at ANCHOR  (file carries only ANCHOR)
+/tmp/cortado.nvdr  768x512  9364 rects  rendered at ANCHOR  (file carries only ANCHOR)
 ```
 
-O anchor inteiro cabe em ~1,1 KB. Com 4000 bytes já entra parte do R1:
+O anchor inteiro cabe em ~4,5 KB. Com 12000 bytes já entra parte do R1:
 
 ```
-/tmp/cortado.nvdr  768x512  6193 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
+/tmp/cortado.nvdr  768x512  28705 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
 ```
 
 A qualidade sobe continuamente com os bytes, sem degraus — um nível
 parcial é aproveitado até onde chegou:
 
 ```
- 10% -> 19.85 dB      50% -> 25.46 dB
- 20% -> 21.91 dB      75% -> 26.56 dB
- 30% -> 23.46 dB     100% -> 26.95 dB
+ 10% -> 19.73 dB      50% -> 25.80 dB
+ 20% -> 23.30 dB      75% -> 26.42 dB
+ 30% -> 24.71 dB     100% -> 27.00 dB
 ```
 
 Varrendo vários cortes de uma vez:
@@ -147,7 +182,7 @@ SZ=$(stat -c%s /tmp/m.nvdr)
 for pct in 100 60 40 39 3; do
   head -c $((SZ*pct/100)) /tmp/m.nvdr > /tmp/t.nvdr
   printf "%3d%% -> " $pct
-  ./nvdr/nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
+  ./nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
 done
 ```
 
@@ -159,7 +194,7 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 ## Parâmetros que valem mexer
 
 ```bash
-./nvdr/nvdr_encode entrada.jpg saida.nvdr \
+./nvdr_encode entrada.jpg saida.nvdr \
     --tolerance 0.090,0.040,0.018 \
     --step 16,4 \
     --anchor-bits 4 \
@@ -169,9 +204,21 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--tolerance A,B,C`** — quão uniforme uma região precisa ser para
   parar de subdividir, por nível, do grosso para o fino. Valores maiores
   no primeiro número deixam o anchor menor e mais grosseiro. Têm que ser
-  decrescentes. O default é `0.140,0.070,0.040`; era mais apertado
-  (`0.090,0.040,0.018`) enquanto todo retângulo era chapado, porque a única
-  forma de seguir um degradê era subdividir. Com rampa o ótimo mudou.
+  decrescentes. Default `0.090,0.040,0.018`.
+
+  **Esse parâmetro não significa a mesma coisa em imagens diferentes**, e
+  isso confunde muito na hora de testar. Em foto com grão ou ruído (céu
+  estrelado, folhagem) a árvore nunca satura — entre 0,060 e 0,040 um céu
+  estrelado vai de 4.507 para 103.891 retângulos e continua crescendo até
+  0,010. Ali a tolerância é um dial de taxa suave e qualquer valor dá um
+  resultado razoável. Em imagem simples (formas chapadas, desenho, texto) a
+  árvore satura: `blocos` dá 16 retângulos em toda a faixa, de 0,200 a
+  0,010. Ali não é dial, é penhasco — abaixo da saturação não compra nada,
+  e acima destrói as bordas, que é onde a imagem está (1% dos pixels
+  carregam metade do erro quadrático). Afrouxar custou 5,5 dB para economizar
+  7% dos bytes numa dessas.
+
+  Ou seja: não calibre tolerância só em foto.
 - **`--step B,C`** — o passo de quantização do resíduo nos níveis 1 e 2.
   Menor = mais fiel e mais pesado.
 - **`--anchor-bits N`** — a paleta do anchor tem `2^N` cores. O default 4
@@ -198,9 +245,13 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
   cor** num eixo em vez de ser chapado. É decisão por retângulo: o encoder
   compara custo (um flag, um bit de eixo, três inclinações) contra o erro
   que a rampa tira, e `F` é o preço do bit. Por isso **nunca perde para o
-  chapado** — quando não compensa, o retângulo fica chapado. Default 280;
-  `0` desliga. Medido com a taxa igualada: +0,07 a +1,08 dB, e com um terço
-  menos retângulos.
+  chapado** — quando não compensa, o retângulo fica chapado. Default 600;
+  `0` desliga. No default ganha em todas as imagens medidas: +0,23 a
+  +2,43 dB por 2 a 33% mais bytes, inclusive nas sintéticas. Valores
+  menores (ex. `280`) gastam mais e rendem mais. A rampa rende em proporção
+  à **área** do retângulo, então com tolerância apertada os retângulos são
+  pequenos e cada rampa explica menos — foi por isso que o 280 original,
+  calibrado junto com tolerância frouxa, não sobreviveu à volta dela.
 - **`--gradient-step N`** — o passo de quantização das inclinações. Default
   16, que é grosso de propósito: a inclinação é codificada quase em unário,
   então um passo fino encarece justamente as rampas grandes, que são as que
@@ -213,8 +264,8 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 Comparando os dois codecs na mesma imagem:
 
 ```bash
-./nvdr/nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
-./nvdr/nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
+./nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
+./nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
 ```
 
 ---
@@ -237,7 +288,7 @@ cut 96% smooth=0.4: identical (768x512, level 2)
 ```
 
 Sai com código 1 e aponta o primeiro pixel divergente se algo quebrar.
-Vale rodar depois de mexer em `nvdr/entropy.c`, `nvdr/nvdr.c` ou
+Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
 `public/nvdr.js` — as três coisas que precisam concordar.
 
 ---
@@ -255,6 +306,22 @@ pode carregar uma rampa num eixo, e o encoder escolhe por retângulo. Isso
 tirou o teto do formato: com tudo chapado o montanha_pessoas empacava em
 ~26 dB por mais bytes que você jogasse nele.
 
+**Um corte no meio de uma unidade não perde mais o que já chegou.** Desde
+a v9 a cor de cada retângulo vai intercalada com a geometria dele, então
+uma unidade cortada pela metade entrega tudo que chegou e o resto cai para
+a cor do nível anterior. Não muda o tamanho do arquivo em nada. O ganho é
+pequeno e concentrado em cortes bem no começo (+0,88 dB no macarrão a 12%),
+zero no resto.
+
+**Céu estrelado / imagem com grão parece o melhor caso e é o pior.** Ela
+comprime bem e pontua bem porque a árvore nunca satura — dá para pedir
+qualquer taxa e ela entrega. Mas o anchor sai com **1 retângulo** e o R1
+com 13, então o arquivo não tem estado intermediário nenhum: truncar dá
+21,59 dB em 1% do arquivo e 21,75 dB em 25%, parado ao longo de um quarto
+dos bytes. Uma foto normal sobe 18,40 → 19,85 → 22,45 → 25,46 dB na mesma
+faixa. Bons números de taxa/qualidade ali escondem que a escada
+progressiva, que é o ponto do formato, não existe naquela imagem.
+
 **PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
 com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número
 está lá justamente para não esconder isso.
@@ -264,10 +331,3 @@ o erro está. Uma mudança que tira detalhe do céu e dá para as sombras
 melhora a imagem e não move o PSNR — foi exatamente o caso do `--weber`.
 Quando avaliar uma mudança de alocação, olhe a imagem, não só o número.
 
-**O servidor não testa o codec novo em `/`.** A página raiz é o pipeline
-antigo, que devolve `.svbc`. O codec novo está em `/nvdr.html`.
-
-**`scripts/verify.py` não existe nesta branch.** O gate de regressão e
-determinismo ficou em `claude/fix-core-pipeline` e nunca foi mergeado —
-o PR #6 levou só o primeiro commit daquela branch. Se quiser o gate,
-falta mergear `aad53da`.

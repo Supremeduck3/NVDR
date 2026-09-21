@@ -210,43 +210,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // --- SVBC pipeline (src/, image_to_svg) ---
-    if (req.url === '/convert') {
-        const minTile = req.headers['x-min-tile'] || '-1';
-        const homoThresh = req.headers['x-homo-thresh'] || '-1.0';
-        const logoMode = req.headers['x-logo-mode'] === '1';
-
-        receiveUpload(req, res, (inputPath, fileId) => {
-            const outBase = path.join(outDir, `temp_${fileId}.svg`);
-            const outSvbc = path.join(outDir, `temp_${fileId}.svbc`);
-            const outSvbcz = path.join(outDir, `temp_${fileId}.svbcz`);
-            const artifacts = [inputPath, outBase, outSvbc, outSvbcz];
-
-            const exePath = findExecutable(__dirname, 'image_to_svg');
-            if (!exePath) {
-                console.error('Conversion failed: image_to_svg not found');
-                if (!res.writableEnded) {
-                    res.writeHead(500);
-                    res.end(`image_to_svg not found in ${__dirname}. Build it with \`make\`.`);
-                }
-                setTimeout(() => artifacts.forEach(safeUnlink), 5000);
-                return;
-            }
-
-            console.log(`SVBC conversion for ${inputPath} ` +
-                        `(Tile: ${minTile}, Thresh: ${homoThresh}, Logo: ${logoMode})...`);
-
-            const args = [inputPath, outBase, minTile, homoThresh, '--format', 'svbc'];
-            if (logoMode) args.push('--logo');
-
-            runConverter(res, {
-                exePath, args, resultPath: outSvbc, artifacts, label: 'SVBC'
-            });
-        });
-        return;
-    }
-
-    // --- PRS pipeline (nvdr/, nvdr_encode) ---
     if (req.url === '/nvdr') {
         const anchorBits = req.headers['x-anchor-bits'];
         const tolerance = req.headers['x-tolerance'];
@@ -255,13 +218,12 @@ const server = http.createServer((req, res) => {
             const outNvdr = path.join(outDir, `temp_${fileId}.nvdr`);
             const artifacts = [inputPath, outNvdr];
 
-            const exeDir = path.join(__dirname, 'nvdr');
-            const exePath = findExecutable(exeDir, 'nvdr_encode');
+            const exePath = findExecutable(__dirname, 'nvdr_encode');
             if (!exePath) {
                 console.error('PRS encode failed: nvdr_encode not found');
                 if (!res.writableEnded) {
                     res.writeHead(500);
-                    res.end(`nvdr_encode not found in ${exeDir}. Build it with \`cd nvdr && make\`.`);
+                    res.end(`nvdr_encode not found in ${__dirname}. Build it with \`make\`.`);
                 }
                 setTimeout(() => artifacts.forEach(safeUnlink), 5000);
                 return;
@@ -288,7 +250,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
     console.log(`\n==========================================`);
     console.log(`🚀 NVDR server running!`);
-    console.log(`➡️  SVBC studio:  http://localhost:${PORT}/`);
-    console.log(`➡️  PRS viewer:   http://localhost:${PORT}/nvdr.html`);
+    console.log(`➡️  http://localhost:${PORT}/`);
     console.log(`==========================================\n`);
 });

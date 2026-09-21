@@ -37,19 +37,38 @@ function readPPM(path) {
     return { width: +fields[1], height: +fields[2], pixels: buf.subarray(at) };
 }
 
+const decoder = new URL('../nvdr_decode', import.meta.url).pathname;
 let failures = 0;
+
 async function check(label, file, level, smooth) {
     const bytes = readFileSync(file);
     const args = [file, '/tmp/cc.ppm', '--smooth', String(smooth)];
     if (level !== null) args.push('--level', String(level));
-    execFileSync(new URL('../nvdr/nvdr_decode', import.meta.url).pathname, args, { stdio: 'ignore' });
-    const ref = readPPM('/tmp/cc.ppm');
+
+    // A cut that lands below the anchor stream is the format's contract,
+    // not a failure: neither side may produce a picture, and whether they
+    // agree about that is exactly what needs checking.
+    let cDecoded = true;
+    try {
+        execFileSync(decoder, args, { stdio: 'ignore' });
+    } catch {
+        cDecoded = false;
+    }
 
     const result = await decode(bytes.buffer.slice(bytes.byteOffset,
                                                    bytes.byteOffset + bytes.length));
-    if (!result || result.levelsPresent === 0) {
-        console.log(`${label}: JS decoded nothing, C did`); failures++; return;
+    const jsDecoded = !!result && result.levelsPresent > 0;
+    if (!cDecoded || !jsDecoded) {
+        if (cDecoded !== jsDecoded) {
+            console.log(`${label}: C ${cDecoded ? 'decoded' : 'refused'}, ` +
+                        `JS ${jsDecoded ? 'decoded' : 'refused'}`);
+            failures++;
+        } else {
+            console.log(`${label}: both refuse (cut is below the anchor)`);
+        }
+        return;
     }
+    const ref = readPPM('/tmp/cc.ppm');
     const k = level === null ? result.levelsPresent - 1
                              : Math.min(level, result.levelsPresent - 1);
     const { width, height } = result.header;

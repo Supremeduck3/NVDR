@@ -1,115 +1,252 @@
 #!/usr/bin/env python3
 """
-verify.py — regression gate for the NVDR pipeline.
+verify.py — regression gate for NVDR.
 
-For every sample image it checks the three things that have to hold before
-any optimisation work can be trusted:
+Checks the things that have to hold before any measurement on top of them
+can be trusted:
 
-  1. Determinism — the encoder is run twice and the two containers must be
-     byte-identical. The parallel build used to make every run differ,
-     which silently invalidated any A/B measurement.
-  2. Structure — svbc_check decodes the container through the public
-     reader and verifies codebook bounds, full canvas coverage and PSNR.
-  3. Size — the gzipped container against the source file, so a change
-     that trades fidelity for bytes is visible instead of implied.
+  1. Determinism — the encoder runs twice and the two containers must be
+     byte-identical. Without this an A/B measurement is measuring noise.
+  2. Quality — every sample decoded back and compared against a recorded
+     baseline, per image. A global floor is too weak: the samples sit
+     anywhere between 21 and 30 dB, so a drop that matters on one is
+     invisible against the others.
+  3. Size — container bytes against the same baseline, so a change that
+     buys quality with bytes shows up as what it is rather than as a win.
+  4. Truncation — the guarantee the format exists for. Cut at several
+     points; every cut past the anchor must decode, and quality must not
+     fall as bytes are added.
+  5. C against JS — the two decoders must produce identical pixels, at
+     every level and on cut files, or the viewer shows something the
+     container does not contain.
+
+Synthetic probes are generated here rather than committed. They exist
+because the sample set is six photographs, and photographs hid a
+regression that cost a flat-shape image 5.5 dB: a tree that saturates
+reacts to the tolerance knob in the opposite direction to one that does
+not. `blocos` saturates immediately, `circulos` is edge-dominated,
+`degrade` is pure ramp.
 
 Usage:
-    python3 scripts/verify.py [--images DIR] [--min-psnr X] [--jobs N]
+    python3 scripts/verify.py                # check against the baseline
+    python3 scripts/verify.py --update       # record a new baseline
+    python3 scripts/verify.py --psnr-slack 0.5 --size-slack 0.05
 
 Exit code is non-zero if any check fails, so it works as a CI gate.
 """
 import argparse
 import hashlib
+import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASELINE = ROOT / "scripts" / "baseline.json"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tga", ".ppm"}
+PSNR_RE = re.compile(r"psnr\s+([0-9.]+)\s*dB")
 
 
 def find_binary(name):
     for candidate in (ROOT / name, ROOT / f"{name}.exe"):
         if candidate.exists():
             return candidate
-    sys.exit(f"{name} not built — run `make` (and `make svbc_check`) first")
+    sys.exit(f"{name} not built — run `make` first")
 
 
-def encode(binary, image, out_base):
-    result = subprocess.run(
-        [str(binary), str(image), str(out_base), "--format", "svbc"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None, result.stderr.strip() or "encoder failed"
-    svbc = out_base.with_suffix(".svbc")
-    if not svbc.exists():
-        return None, "encoder produced no .svbc"
-    return svbc, None
+def write_ppm(path, width, height, fn):
+    rows = bytearray()
+    for y in range(height):
+        for x in range(width):
+            rows += bytes(fn(x, y))
+    path.write_bytes(b"P6\n%d %d\n255\n" % (width, height) + bytes(rows))
 
 
-def gzip_size(path):
-    import gzip
-    return len(gzip.compress(path.read_bytes(), 9))
+def make_probes(directory):
+    """The three failure modes six photographs do not cover."""
+    size = 256
+
+    palette = [(255, 255, 255), (20, 20, 20), (200, 40, 40), (40, 80, 200),
+               (250, 220, 40), (30, 160, 90), (150, 60, 180), (240, 240, 240),
+               (10, 10, 10), (90, 90, 90), (255, 140, 0), (0, 150, 160),
+               (180, 180, 180), (60, 20, 20), (230, 230, 180), (35, 35, 70)]
+
+    def blocos(x, y):
+        return palette[(y * 4 // size) * 4 + (x * 4 // size)]
+
+    circles = [(65, 65, 40, (220, 40, 40)), (190, 75, 30, (40, 90, 220)),
+               (100, 190, 50, (250, 200, 30)), (200, 200, 25, (30, 160, 90))]
+
+    def circulos(x, y):
+        for cx, cy, r, colour in circles:
+            if (x - cx) ** 2 + (y - cy) ** 2 < r * r:
+                return colour
+        return (245, 245, 245)
+
+    def degrade(x, y):
+        return (255 * x // (size - 1), 255 * y // (size - 1), 128)
+
+    out = []
+    for name, fn in (("blocos", blocos), ("circulos", circulos),
+                     ("degrade", degrade)):
+        path = directory / f"{name}.ppm"
+        write_ppm(path, size, size, fn)
+        out.append(path)
+    return out
+
+
+def encode(encoder, image, out):
+    r = subprocess.run([str(encoder), str(image), str(out)],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        return None, (r.stderr.strip() or "encoder failed")
+    return out, None
+
+
+def decode_psnr(decoder, container, image, tmp, level=None):
+    """PSNR of the decoded container, or None when it refuses to decode."""
+    args = [str(decoder), str(container), str(tmp / "out.ppm"),
+            "--compare", str(image)]
+    if level is not None:
+        args += ["--level", str(level)]
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    m = PSNR_RE.search(r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def check_truncation(decoder, container, image, tmp):
+    """Every cut past the anchor decodes, and quality never falls."""
+    data = container.read_bytes()
+    cut = tmp / "cut.nvdr"
+    previous, decoded, problems = None, 0, []
+    for pct in (5, 12, 20, 30, 45, 60, 75, 90, 100):
+        cut.write_bytes(data[: len(data) * pct // 100])
+        psnr = decode_psnr(decoder, cut, image, tmp)
+        if psnr is None:
+            # Below the anchor stream there is no picture, and saying so is
+            # the contract. Past a cut that decoded, it is a failure.
+            if decoded:
+                problems.append(f"{pct}% refused after {previous:.2f} dB decoded")
+            continue
+        decoded += 1
+        if previous is not None and psnr < previous - 0.15:
+            problems.append(f"{pct}% fell {previous:.2f} -> {psnr:.2f} dB")
+        previous = psnr
+    if not decoded:
+        problems.append("no cut decoded at all")
+    return problems
+
+
+def check_crosscheck(container):
+    script = ROOT / "scripts" / "crosscheck.mjs"
+    r = subprocess.run(["node", str(script), str(container)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        bad = [l for l in r.stdout.splitlines()
+               if "identical" not in l and "both refuse" not in l]
+        return bad[:2] or [r.stderr.strip()[:120] or "crosscheck failed"]
+    return []
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--images", default=str(ROOT / "samples"))
-    ap.add_argument("--min-psnr", type=float, default=0.0,
-                    help="fail a sample whose reconstruction falls below this PSNR")
+    ap.add_argument("--update", action="store_true",
+                    help="record the current numbers as the new baseline")
+    ap.add_argument("--psnr-slack", type=float, default=0.25,
+                    help="dB a sample may lose before it fails")
+    ap.add_argument("--size-slack", type=float, default=0.03,
+                    help="fraction a container may grow before it fails")
+    ap.add_argument("--skip-crosscheck", action="store_true")
     args = ap.parse_args()
 
-    encoder = find_binary("image_to_svg")
-    checker = find_binary("svbc_check")
+    encoder = find_binary("nvdr_encode")
+    decoder = find_binary("nvdr_decode")
 
-    images = sorted(
-        p for p in pathlib.Path(args.images).iterdir()
-        if p.suffix.lower() in IMAGE_EXTS
-    )
+    images = sorted(p for p in pathlib.Path(args.images).iterdir()
+                    if p.suffix.lower() in IMAGE_EXTS)
     if not images:
         sys.exit(f"no images found in {args.images}")
 
-    failures = []
+    baseline = {}
+    if BASELINE.exists() and not args.update:
+        baseline = json.loads(BASELINE.read_text())
+
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="nvdr-verify-"))
+    failures, recorded = [], {}
     try:
-        print(f"{'image':<28} {'gzip/source':>12} {'determinism':>12}  structure")
-        print("-" * 78)
+        images += make_probes(tmp)
+
+        print(f"{'image':<26} {'bytes':>9} {'PSNR':>8} {'vs base':>16} "
+              f"{'det':>7}  truncation / C-vs-JS")
+        print("-" * 96)
+
         for image in images:
             name = image.name
-
-            first, err = encode(encoder, image, tmp / f"{image.stem}_a.svg")
+            first, err = encode(encoder, image, tmp / "a.nvdr")
             if err:
                 failures.append(f"{name}: {err}")
-                print(f"{name:<28} {'-':>12} {'-':>12}  ENCODE FAILED: {err}")
+                print(f"{name:<26} ENCODE FAILED: {err}")
                 continue
-            second, err = encode(encoder, image, tmp / f"{image.stem}_b.svg")
-            if err:
-                failures.append(f"{name}: {err}")
-                continue
+            payload = first.read_bytes()
+            first = tmp / f"{image.stem}.nvdr"
+            first.write_bytes(payload)
 
-            digest_a = hashlib.sha256(first.read_bytes()).hexdigest()
-            digest_b = hashlib.sha256(second.read_bytes()).hexdigest()
-            stable = digest_a == digest_b
+            second, err = encode(encoder, image, tmp / "b.nvdr")
+            stable = not err and (
+                hashlib.sha256(payload).hexdigest()
+                == hashlib.sha256(second.read_bytes()).hexdigest())
             if not stable:
                 failures.append(f"{name}: encoder is not deterministic")
 
-            ratio = gzip_size(first) / image.stat().st_size
+            size = len(payload)
+            psnr = decode_psnr(decoder, first, image, tmp)
+            if psnr is None:
+                failures.append(f"{name}: complete container does not decode")
+                print(f"{name:<26} {size:>9} {'-':>8}  DECODE FAILED")
+                continue
+            recorded[name] = {"bytes": size, "psnr": round(psnr, 2)}
 
-            check = subprocess.run(
-                [str(checker), str(image), str(first),
-                 "--min-psnr", str(args.min_psnr), "--quiet"],
-                capture_output=True, text=True,
-            )
-            if check.returncode != 0:
-                failures.append(f"{name}: {check.stdout.strip() or 'structural check failed'}")
+            delta = ""
+            if name in baseline:
+                was = baseline[name]
+                d_psnr = psnr - was["psnr"]
+                d_size = (size - was["bytes"]) / was["bytes"]
+                delta = f"{d_psnr:+.2f}dB {d_size:+.1%}"
+                if d_psnr < -args.psnr_slack:
+                    failures.append(
+                        f"{name}: PSNR {was['psnr']:.2f} -> {psnr:.2f} dB")
+                if d_size > args.size_slack:
+                    failures.append(
+                        f"{name}: {was['bytes']} -> {size} bytes ({d_size:+.1%})")
+            elif baseline:
+                delta = "new"
 
-            print(f"{name:<28} {ratio:>11.0%} {'stable' if stable else 'VARIES':>12}  "
-                  f"{'ok' if check.returncode == 0 else check.stdout.strip()}")
+            notes = check_truncation(decoder, first, image, tmp)
+            if notes:
+                failures += [f"{name}: {n}" for n in notes]
+            if not args.skip_crosscheck:
+                cc = check_crosscheck(first)
+                if cc:
+                    failures += [f"{name}: C vs JS {c}" for c in cc]
+                    notes += cc
+
+            print(f"{name:<26} {size:>9} {psnr:>7.2f}dB {delta:>16} "
+                  f"{'stable' if stable else 'VARIES':>7}  "
+                  f"{'ok' if not notes else '; '.join(notes)[:34]}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    if args.update:
+        BASELINE.write_text(json.dumps(recorded, indent=2, sort_keys=True) + "\n")
+        print(f"\nbaseline written to {BASELINE.relative_to(ROOT)} "
+              f"({len(recorded)} entries)")
+        return 0
 
     print()
     if failures:
@@ -117,7 +254,7 @@ def main():
         for f in failures:
             print(f"  - {f}")
         return 1
-    print(f"all {len(images)} samples passed")
+    print(f"all {len(recorded)} samples passed")
     return 0
 
 
