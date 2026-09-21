@@ -248,7 +248,70 @@ static unsigned char* pixel_at(const NvdrImage* img, int x, int y) {
  * deviation accumulates in double because a 4K region is millions of
  * terms and a float accumulator starts dropping the small ones.
  */
-static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
+/*
+ * Prefix sums of R, G and B, so a region's mean colour costs four lookups
+ * instead of a sweep.
+ *
+ * The tree computed each node's mean by adding up its pixels and then
+ * swept the region a second time for the deviation, which made the build
+ * two passes per node at every depth — 27 Mpx read for a 2.67 Mpx image.
+ * The deviation still needs its sweep, because a mean absolute deviation
+ * cannot be recovered from sums, but the first one does not.
+ *
+ * uint32 holds a full-frame sum up to 16.8 Mpx, which covers 4K. Past
+ * that the table is not built and the old two-sweep path runs, so the
+ * only thing at stake is speed.
+ */
+typedef struct {
+    uint32_t* sum;      /* three per cell, (w+1) x (h+1), row-major */
+    int       w, h;
+} NvdrSums;
+
+static void sums_free(NvdrSums* s) { free(s->sum); s->sum = NULL; }
+
+static int sums_build(NvdrSums* s, const NvdrImage* img) {
+    memset(s, 0, sizeof(*s));
+    size_t pixels = (size_t)img->width * img->height;
+    if (pixels == 0 || pixels > 16700000u) return -1;   /* uint32 would wrap */
+
+    int w1 = img->width + 1, h1 = img->height + 1;
+    s->sum = (uint32_t*)calloc((size_t)w1 * h1 * 3, sizeof(uint32_t));
+    if (!s->sum) return -1;
+    s->w = img->width; s->h = img->height;
+
+    for (int y = 0; y < img->height; y++) {
+        const unsigned char* src = img->pixels + (size_t)y * img->width * 3;
+        uint32_t* prev = s->sum + (size_t)y * w1 * 3;
+        uint32_t* cur  = s->sum + (size_t)(y + 1) * w1 * 3;
+        uint32_t run[3] = { 0, 0, 0 };
+        for (int x = 0; x < img->width; x++, src += 3) {
+            run[0] += src[0]; run[1] += src[1]; run[2] += src[2];
+            uint32_t* c = cur + (size_t)(x + 1) * 3;
+            const uint32_t* p = prev + (size_t)(x + 1) * 3;
+            c[0] = p[0] + run[0];
+            c[1] = p[1] + run[1];
+            c[2] = p[2] + run[2];
+        }
+    }
+    return 0;
+}
+
+/* Sum over [x, x+w) x [y, y+h), clipped to the image. */
+static void sums_region(const NvdrSums* s, int x, int y, int w, int h,
+                        uint64_t* out) {
+    int x1 = x + w > s->w ? s->w : x + w;
+    int y1 = y + h > s->h ? s->h : y + h;
+    int w1 = s->w + 1;
+    const uint32_t* a = s->sum + ((size_t)y1 * w1 + x1) * 3;
+    const uint32_t* b = s->sum + ((size_t)y  * w1 + x1) * 3;
+    const uint32_t* c = s->sum + ((size_t)y1 * w1 + x ) * 3;
+    const uint32_t* d = s->sum + ((size_t)y  * w1 + x ) * 3;
+    for (int k = 0; k < 3; k++)
+        out[k] = (uint64_t)a[k] - b[k] - c[k] + d[k];
+}
+
+static float region_stats_full(const NvdrImage* img, const NvdrSums* sums,
+                               int x, int y, int w, int h,
                                float weber, float pivot, double* out_raw,
                                uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
     int x1 = x + w > img->width  ? img->width  : x + w;
@@ -260,12 +323,17 @@ static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
     }
 
     uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
-    uint32_t count = 0;
-    for (int py = y; py < y1; py++) {
-        const unsigned char* p = pixel_at(img, x, py);
-        for (int px = x; px < x1; px++, p += 3) {
-            sum_r += p[0]; sum_g += p[1]; sum_b += p[2];
-            count++;
+    uint32_t count = (uint32_t)((x1 - x) * (y1 - y));
+    if (sums && sums->sum) {
+        uint64_t t[3];
+        sums_region(sums, x, y, w, h, t);
+        sum_r = t[0]; sum_g = t[1]; sum_b = t[2];
+    } else {
+        for (int py = y; py < y1; py++) {
+            const unsigned char* p = pixel_at(img, x, py);
+            for (int px = x; px < x1; px++, p += 3) {
+                sum_r += p[0]; sum_g += p[1]; sum_b += p[2];
+            }
         }
     }
     uint8_t mr = (uint8_t)((sum_r + count / 2) / count);
@@ -273,17 +341,33 @@ static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
     uint8_t mb = (uint8_t)((sum_b + count / 2) / count);
     *out_r = mr; *out_g = mg; *out_b = mb;
 
-    double deviation = 0.0;
+    /*
+     * The three channels accumulate as exact integers and the luma
+     * weighting is applied once at the end, instead of a double multiply
+     * and add per pixel. This is the hot loop of the whole encoder — it
+     * sweeps roughly ten times the image over a build — and it is also
+     * more accurate this way, since an integer sum has no rounding at all
+     * where the old one rounded on every pixel.
+     *
+     * There is no guarantee this is bit-identical to what it replaces,
+     * since floating point is not associative and summing per-pixel
+     * products is not the same as weighting summed integers. It happens to
+     * be, byte for byte, on every sample and on both video containers —
+     * checked rather than assumed, because a speed change that quietly
+     * moves the output is a quality change in disguise.
+     */
+    uint64_t acc_r = 0, acc_g = 0, acc_b = 0;
     for (int py = y; py < y1; py++) {
         const unsigned char* p = pixel_at(img, x, py);
         for (int px = x; px < x1; px++, p += 3) {
             int dr = (int)p[0] - mr, dg = (int)p[1] - mg, db = (int)p[2] - mb;
-            if (dr < 0) dr = -dr;
-            if (dg < 0) dg = -dg;
-            if (db < 0) db = -db;
-            deviation += 0.30 * dr + 0.59 * dg + 0.11 * db;
+            acc_r += (unsigned)(dr < 0 ? -dr : dr);
+            acc_g += (unsigned)(dg < 0 ? -dg : dg);
+            acc_b += (unsigned)(db < 0 ? -db : db);
         }
     }
+    double deviation = 0.30 * (double)acc_r + 0.59 * (double)acc_g
+                     + 0.11 * (double)acc_b;
     /* Weber normalisation: the same absolute deviation counts for more in
      * a dark region than a bright one, which is the whole difference
      * between "this region is uniform" and "this region looks uniform". */
@@ -402,6 +486,7 @@ static int32_t tree_alloc(NvdrTree* tree) {
 }
 
 static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
+                          const NvdrSums* sums,
                           const NvdrConfig* cfg, float pivot,
                           const NvdrTextureMap* texture,
                           int32_t idx, int x, int y, int w, int h, int depth) {
@@ -411,7 +496,7 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
     node->first_child = -1;
 
     double raw = 0.0;
-    node->deviation = region_stats_full(img, x, y, w, h, cfg->weber, pivot, &raw,
+    node->deviation = region_stats_full(img, sums, x, y, w, h, cfg->weber, pivot, &raw,
                                         &node->r, &node->g, &node->b);
 
     /* The share of this region's variation that lives inside 4x4 windows.
@@ -444,10 +529,10 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
 
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     int rc = 0;
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 0, x,      y,      hw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 1, x + hw, y,      rw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 2, x,      y + hh, hw, rh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 3, x + hw, y + hh, rw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 0, x,      y,      hw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 1, x + hw, y,      rw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 2, x,      y + hh, hw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 3, x + hw, y + hh, rw, rh, depth + 1);
     return rc;
 }
 
@@ -475,10 +560,17 @@ int nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg)
         return -1;
     }
 
+    NvdrSums sums;
+    sums_build(&sums, img);   /* optional: too large an image runs without it */
+
     int32_t root = tree_alloc(tree);
-    if (root < 0) { texture_map_free(&texture); nvdr_tree_free(tree); return -1; }
-    int rc = tree_build_rec(tree, img, cfg, pivot, &texture, root,
+    if (root < 0) {
+        sums_free(&sums); texture_map_free(&texture);
+        nvdr_tree_free(tree); return -1;
+    }
+    int rc = tree_build_rec(tree, img, &sums, cfg, pivot, &texture, root,
                             0, 0, img->width, img->height, 0);
+    sums_free(&sums);
     texture_map_free(&texture);
     if (rc != 0) { nvdr_tree_free(tree); return -1; }
     return 0;
@@ -879,20 +971,50 @@ static uint32_t get_u32(const uint8_t* p) {
  *
  * Returns 0 for flat, 1 for a ramp along x, 2 along y.
  */
+/*
+ * The largest ramp whose fill values are worth tabulating rather than
+ * recomputing per pixel. Leaves are small at the tolerances this runs at,
+ * so this covers nearly all of them and the rest fall back.
+ */
+#define NVDR_RAMP_LUT 512
+
 static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h,
                     const uint8_t* dc, int slope_step, double lambda,
                     int8_t* slope_out) {
     slope_out[0] = slope_out[1] = slope_out[2] = 0;
     if (w < 2 && h < 2) return 0;
 
+    /*
+     * One pass for everything the decision needs before quantisation: the
+     * flat fill's error, and the least-squares numerator and denominator
+     * of both axes against t = 2*pos - len + 1, the ramp's shape without
+     * its scale. These used to be three separate sweeps of the rectangle.
+     * The terms are accumulated in the order they were before — rows
+     * outer, columns inner, channels innermost — because summing the same
+     * doubles in a different order gives a different double, and the
+     * output has to stay byte for byte what it was.
+     */
     double flat_sse = 0.0;
+    double num_x[3] = { 0.0, 0.0, 0.0 }, num_y[3] = { 0.0, 0.0, 0.0 };
+    double den_x = 0.0, den_y = 0.0;
+    const double d0 = dc[0], d1 = dc[1], d2 = dc[2];
+
     for (int yy = 0; yy < h; yy++) {
         const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-        for (int xx = 0; xx < w; xx++, row += 3)
-            for (int c = 0; c < 3; c++) {
-                double d = (double)row[c] - (double)dc[c];
-                flat_sse += d * d;
-            }
+        const double ty = (double)(2 * yy - h + 1);
+        for (int xx = 0; xx < w; xx++, row += 3) {
+            const double tx = (double)(2 * xx - w + 1);
+            const double e0 = (double)row[0] - d0;
+            const double e1 = (double)row[1] - d1;
+            const double e2 = (double)row[2] - d2;
+            flat_sse += e0 * e0;
+            flat_sse += e1 * e1;
+            flat_sse += e2 * e2;
+            den_x += tx * tx;
+            den_y += ty * ty;
+            num_x[0] += e0 * tx; num_x[1] += e1 * tx; num_x[2] += e2 * tx;
+            num_y[0] += e0 * ty; num_y[1] += e1 * ty; num_y[2] += e2 * ty;
+        }
     }
 
     int    best_axis = 0;
@@ -902,19 +1024,8 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
     for (int axis = 1; axis <= 2; axis++) {
         int len = axis == 1 ? w : h;
         if (len < 2) continue;
-
-        /* Least squares against t = 2*pos - len + 1, which is the ramp
-         * shape without its scale. */
-        double num[3] = { 0.0, 0.0, 0.0 }, den = 0.0;
-        for (int yy = 0; yy < h; yy++) {
-            const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-            for (int xx = 0; xx < w; xx++, row += 3) {
-                double t = (double)(2 * (axis == 1 ? xx : yy) - len + 1);
-                den += t * t;
-                for (int c = 0; c < 3; c++)
-                    num[c] += ((double)row[c] - (double)dc[c]) * t;
-            }
-        }
+        const double* num = axis == 1 ? num_x : num_y;
+        double den = axis == 1 ? den_x : den_y;
         if (den <= 0.0) continue;
 
         int8_t q[3];
@@ -927,17 +1038,43 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
         }
         if (!any) continue;
 
+        /*
+         * The exact error of the ramp as the renderer will draw it,
+         * quantisation and clamping included, because the fitted optimum
+         * and the coded one are not always the same choice. A ramp's fill
+         * depends only on the position along its axis, so it is tabulated
+         * once per rectangle instead of recomputed at every pixel.
+         */
+        uint8_t lut[NVDR_RAMP_LUT][3];
+        int use_lut = len <= NVDR_RAMP_LUT;
+        if (use_lut)
+            for (int pos = 0; pos < len; pos++)
+                for (int c = 0; c < 3; c++)
+                    lut[pos][c] = (uint8_t)clamp_u8((int)dc[c] +
+                        ramp_offset(q[c] * slope_step, pos, len));
+
         double sse = 0.0;
         for (int yy = 0; yy < h; yy++) {
             const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-            for (int xx = 0; xx < w; xx++, row += 3) {
-                int pos = axis == 1 ? xx : yy;
-                for (int c = 0; c < 3; c++) {
-                    int fill = clamp_u8((int)dc[c] +
-                        ramp_offset(q[c] * slope_step, pos, len));
-                    double d = (double)row[c] - (double)fill;
-                    sse += d * d;
-                }
+            if (axis == 2) {
+                /* One fill for the whole row. */
+                uint8_t f[3];
+                for (int c = 0; c < 3; c++)
+                    f[c] = use_lut ? lut[yy][c] : (uint8_t)clamp_u8((int)dc[c] +
+                        ramp_offset(q[c] * slope_step, yy, len));
+                for (int xx = 0; xx < w; xx++, row += 3)
+                    for (int c = 0; c < 3; c++) {
+                        double d = (double)row[c] - (double)f[c];
+                        sse += d * d;
+                    }
+            } else {
+                for (int xx = 0; xx < w; xx++, row += 3)
+                    for (int c = 0; c < 3; c++) {
+                        int fill = use_lut ? lut[xx][c] : clamp_u8((int)dc[c] +
+                            ramp_offset(q[c] * slope_step, xx, len));
+                        double d = (double)row[c] - (double)fill;
+                        sse += d * d;
+                    }
             }
         }
 

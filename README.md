@@ -527,6 +527,46 @@ Where this is still unproven: the frames are synthetic, the motion model
 is one vector, the chain is eight frames rather than a shot, and nothing
 here has been tried on footage with real lighting changes or a cut.
 
+## Speed
+
+Encoding runs at about 117 ms per megapixel, down from 136, with the
+container byte for byte what it was — checked against a recorded hash on
+every sample and on both video containers, because a speed change that
+quietly moves the output is a quality change in disguise.
+
+Where it went, measured on a 2.67 Mpx frame rather than guessed:
+
+    fase                antes    depois
+    arvore              163 ms   169 ms   (integral 17, desvio 92)
+    rampa               157 ms   113 ms
+    entropia             52 ms    53 ms
+
+Two changes. The ramp fit swept its rectangle five times — once for the
+flat error, once per axis for the least-squares fit, once per axis for the
+exact error — and now sweeps it three, with the moments of both axes
+accumulated together in the order they were summed before, since adding
+the same doubles in a different order gives a different double. The fill
+values of a candidate ramp depend only on the position along its axis, so
+they are tabulated per rectangle instead of recomputed per pixel.
+
+The tree used to compute every node's mean by adding up its pixels and
+then sweep the region again for the deviation, which is two passes per
+node at every depth. An integral image makes the mean four lookups. The
+deviation still needs its sweep — a mean absolute deviation cannot be
+recovered from sums — but it now accumulates the three channels as exact
+integers and applies the luma weighting once at the end, instead of a
+double multiply-add per pixel. That loop is the hot one in the whole
+encoder, sweeping roughly ten times the image over a build.
+
+Predicted right, measured wrong: the integral image was supposed to halve
+the tree and moved it by 9%. The deviation sweep is what the tree actually
+costs, and it is irreducible at 92 ms for 27 Mpx of reading.
+
+Four cores sit idle. The ramp fit is per-leaf and independent, so it
+parallelises without touching the output; the tree needs per-subtree
+arenas merged in a fixed order to stay deterministic, which the regression
+gate would catch if it were not.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
@@ -617,9 +657,17 @@ improvement, and costs 8.90 dB by frame 12.
     ./nvdrv_encode frames/ out.nvdrv
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
 
-Not here yet: per-block motion, B-frames, and a native residual mode. The
-error is currently coded as an image, which pushes it through an anchor
-palette built for photographs.
+A predicted frame's levels look broken and are not. Its anchor comes out
+as one rectangle costing 9 bytes and its R1 as one more, with all 31585
+rectangles in R2 — the same shape that made a star field's truncation
+ladder flat. Here it is correct: a flat grey error means "no correction
+yet", which renders as the previous frame, so a predicted frame cut short
+falls back to what was already on screen. Tightening the tolerance does
+restore a ladder, and costs 59% more bytes for 0.15 dB, so it stays as it
+is. The anchor palette was the suspect before this was measured, and it
+is not: 9 bytes is not where the waste would be.
+
+Not here yet: per-block motion and B-frames.
 
 ## Layout
 
