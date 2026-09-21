@@ -71,6 +71,14 @@
 
 typedef struct {
     uint16_t split[NVDR_AREA_CTX];
+    /* Whether a rectangle carries a ramp, and along which axis. Both are
+     * conditioned on area: a big rectangle spans more of a gradient, so it
+     * is far likelier to want one. */
+    uint16_t grad[NVDR_AREA_CTX];
+    uint16_t grad_axis[NVDR_AREA_CTX];
+    uint16_t slope_sig[NVDR_CHANNELS];
+    uint16_t slope_sign[NVDR_CHANNELS];
+    uint16_t slope_mag[NVDR_CHANNELS][NVDR_MAG_CTX];
     uint16_t token[256];                 /* binary tree over anchor_bits */
     uint16_t sig[NVDR_SPLIT_CTX][NVDR_CHANNELS][NVDR_PREV_CTX];
     uint16_t sign[NVDR_SPLIT_CTX][NVDR_CHANNELS];
@@ -124,5 +132,13 @@ uint32_t nvdr_dec_direct(NvdrDecoder* dec, int bit_count);
 uint32_t nvdr_dec_tree(NvdrDecoder* dec, uint16_t* probs, int bit_count);
 int      nvdr_dec_residual(NvdrDecoder* dec, NvdrModels* m,
                            int split_ctx, int channel, int prev_ctx);
+
+/* Ramp slopes use their own models: their distribution has nothing to do
+ * with the residuals', and sharing would pollute both. */
+void nvdr_enc_slope(NvdrEncoder* enc, NvdrModels* m, int value, int channel);
+int  nvdr_dec_slope(NvdrDecoder* dec, NvdrModels* m, int channel);
+
+/* Bits a slope would cost, for the encoder's rate-distortion decision. */
+double nvdr_slope_bits(int value);
 
 #endif /* NVDR_ENTROPY_H */

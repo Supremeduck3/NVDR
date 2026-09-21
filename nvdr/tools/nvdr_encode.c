@@ -25,6 +25,8 @@ static void usage(const char* argv0) {
         "  --min-tile N       smallest tile edge (default 2)\n"
         "  --max-depth N      deepest subdivision (default 12)\n"
         "  --codec NAME       arith (default) or deflate, for comparison\n"
+        "  --chroma N         how much coarser chroma is than luma (default 2;\n"
+        "                     0 drops the transform and codes RGB)\n"
         "  --order NAME       area (default) sends the largest rectangles\n"
         "                     first so a cut stream covers the whole canvas;\n"
         "                     dfs keeps tree order\n"
@@ -32,7 +34,11 @@ static void usage(const char* argv0) {
         "                     (default 64; a huge value restores the old\n"
         "                      absolute-difference metric)\n"
         "  --texture F        how much to penalise regions that do not get\n"
-        "                     better when split (default 1.0; 0 disables)\n",
+        "                     better when split (default 1.0; 0 disables)\n"
+        "  --gradient F       how readily a rectangle carries a one-axis colour\n"
+        "                     ramp instead of a flat fill: the Lagrange\n"
+        "                     multiplier on its bits (0 disables)\n"
+        "  --gradient-step N  quantisation step of the ramp slopes (default 2)\n",
         argv0);
 }
 
@@ -75,6 +81,12 @@ int main(int argc, char** argv) {
             cfg.weber = (float)atof(argv[++i]);
         } else if (!strcmp(argv[i], "--texture") && i + 1 < argc) {
             cfg.texture = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--gradient") && i + 1 < argc) {
+            cfg.gradient = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--gradient-step") && i + 1 < argc) {
+            cfg.gradient_step = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
+            cfg.chroma = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
             const char* name = argv[++i];
             if (!strcmp(name, "area")) cfg.order = NVDR_ORDER_AREA;

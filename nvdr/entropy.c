@@ -137,6 +137,32 @@ void nvdr_enc_residual(NvdrEncoder* enc, NvdrModels* m, int value,
     nvdr_enc_direct(enc, (uint32_t)(remaining - NVDR_MAG_CTX), 7);
 }
 
+void nvdr_enc_slope(NvdrEncoder* enc, NvdrModels* m, int value, int channel) {
+    int significant = value != 0;
+    nvdr_enc_bit(enc, &m->slope_sig[channel], significant);
+    if (!significant) return;
+    nvdr_enc_bit(enc, &m->slope_sign[channel], value < 0);
+
+    int remaining = (value < 0 ? -value : value) - 1;
+    int i = 0;
+    for (; i < NVDR_MAG_CTX; i++) {
+        int more = remaining > i;
+        nvdr_enc_bit(enc, &m->slope_mag[channel][i], more);
+        if (!more) return;
+    }
+    nvdr_enc_direct(enc, (uint32_t)(remaining - NVDR_MAG_CTX), 7);
+}
+
+/* A rough count matching the binarisation above: enough for the encoder to
+ * compare a ramp against a flat fill without running the coder twice. */
+double nvdr_slope_bits(int value) {
+    if (value == 0) return 1.0;
+    int magnitude = value < 0 ? -value : value;
+    int remaining = magnitude - 1;
+    if (remaining < NVDR_MAG_CTX) return 2.0 + (double)(remaining + 1);
+    return 2.0 + (double)NVDR_MAG_CTX + 7.0;
+}
+
 int nvdr_enc_finish(NvdrEncoder* enc) {
     for (int i = 0; i < 5; i++) enc_shift_low(enc);
     return enc->failed ? -1 : 0;
@@ -206,6 +232,22 @@ uint32_t nvdr_dec_tree(NvdrDecoder* dec, uint16_t* probs, int bit_count) {
     for (int i = 0; i < bit_count; i++)
         node = (node << 1) | (uint32_t)nvdr_dec_bit(dec, &probs[node]);
     return node - ((uint32_t)1 << bit_count);
+}
+
+int nvdr_dec_slope(NvdrDecoder* dec, NvdrModels* m, int channel) {
+    if (!nvdr_dec_bit(dec, &m->slope_sig[channel])) return 0;
+    int negative = nvdr_dec_bit(dec, &m->slope_sign[channel]);
+
+    int remaining = 0, i = 0;
+    for (; i < NVDR_MAG_CTX; i++) {
+        if (!nvdr_dec_bit(dec, &m->slope_mag[channel][i])) break;
+        remaining = i + 1;
+    }
+    if (i == NVDR_MAG_CTX)
+        remaining = NVDR_MAG_CTX + (int)nvdr_dec_direct(dec, 7);
+
+    int magnitude = remaining + 1;
+    return negative ? -magnitude : magnitude;
 }
 
 int nvdr_dec_residual(NvdrDecoder* dec, NvdrModels* m,
