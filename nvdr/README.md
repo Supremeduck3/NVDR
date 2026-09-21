@@ -247,6 +247,73 @@ rectangle. The fixed 4x4 window is what removes the confound, and raising
 the minimum tile rather than the threshold is what actually stops a
 descent that a multiplier never could.
 
+## Ramps
+
+Every rectangle used to be a flat fill, and that is what set the format's
+ceiling. On montanha_pessoas the flat encoder stops at roughly 26 dB and
+stays there: tightening the tolerance to 0.050/0.020/0.004 and the step to
+8/2 buys 79 KB of container and 26.25 dB, against 50 KB and 25.90 dB at the
+defaults. More bytes do not help, because the thing being approximated is a
+gradient and a flat rectangle cannot represent one at any size. The only
+way out was to subdivide until each piece was small enough that its slope
+did not matter, which is expensive in exactly the regions — sky, skin,
+out-of-focus background — that ought to be cheap.
+
+So a rectangle may now carry a one-axis colour ramp instead: a flag, an
+axis bit, and one slope per channel, giving the total edge-to-edge change
+in the chain's colour space. The DC stays the region mean the residual
+already paid for, because the ramp has zero mean by construction, so the
+two never compete for the same bits.
+
+It is optional per rectangle, decided by rate-distortion. The encoder fits
+both axes by least squares, re-evaluates each with the exact integer ramp
+the renderer will use, and keeps the ramp only when the squared error it
+removes beats `--gradient` times the bits it costs. A ramp that quantises
+to all zeros costs four bits and buys nothing, so the comparison rejects it
+on its own. **This version never loses to the flat one**: the flat fill is
+always on the table and wins whenever it should.
+
+Rate-matched against the flat encoder — tolerance tuned so the containers
+come out the same size — across `samples/`:
+
+    image                    flat              ramp
+    OIP-1304511485.jpg   13640 B  22.49 dB  15711 B  23.57 dB
+    OIP-3451121336.jpg   38310 B  21.60 dB  38605 B  22.33 dB
+    OIP-3786546191.jpg   37209 B  23.80 dB  37162 B  23.87 dB
+    OIP-4140498144.jpg   27748 B  24.43 dB  27691 B  25.44 dB
+    macarrao.jpg         10215 B  28.86 dB  10343 B  29.43 dB
+    montanha_pessoas.jpg 50030 B  25.90 dB  50397 B  26.80 dB
+
++0.07 to +1.08 dB at matched rate, and it arrives with a third fewer
+rectangles, so there are fewer seams for the blend to clean up afterwards.
+
+The slope step is deliberately coarse — 16, where the residuals run at 16
+and 4. A slope is coded roughly unary, so its cost grows with its
+magnitude, and a fine step prices the large ramps out of the
+rate-distortion test. Those are precisely the ramps worth having. Swept at
+matched rate on montanha_pessoas:
+
+    step  lambda    bytes     PSNR
+       1     150    56603    26.61 dB
+       2     160    56051    26.59 dB
+       6     200    56265    26.67 dB
+      12     280    56577    26.92 dB
+      16     320    55381    26.85 dB
+      24     400    54460    26.77 dB
+
+Ramps also moved the default tolerances. They were tuned when the only way
+to follow a gradient was to keep subdividing it; a rectangle that can ramp
+covers the same gradient in one piece, so the tree can stop earlier and
+spend the rectangles elsewhere. 0.090/0.040/0.018 became 0.140/0.070/0.040.
+
+Two alternatives lost. A full 2D plane fits better but needs two slopes per
+channel and comes out behind per byte. Gating the tree on ramp fit rather
+than mean fit — only splitting where a ramp would not do — makes the
+surviving rectangles precisely the ones with large, expensive slopes.
+
+Ramps live in the coded stream, so `--codec deflate` keeps every rectangle
+flat and the two codecs are only comparable with `--gradient 0`.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
@@ -313,26 +380,37 @@ guarantee can be watched rather than described.
 
 ## Measured
 
-Container bytes at full quality, on `samples/`:
+What the entropy coder is worth, at `--gradient 0` so both codecs carry
+the same thing:
 
     image                   source   deflate     arith
-    OIP-1304511485.jpg         24K     22.6K     18.5K   -18.1%
-    OIP-3451121336.jpg         57K     71.2K     55.8K   -21.6%
-    OIP-3786546191.jpg         48K     71.3K     54.8K   -23.1%
-    OIP-4140498144.jpg         36K     56.7K     42.6K   -24.9%
-    macarrao.jpg               13K     19.1K     15.7K   -17.7%
-    montanha_pessoas.jpg      133K    112.8K     84.0K   -25.5%
+    OIP-1304511485.jpg       23.7K     12.9K     10.6K   -17.8%
+    OIP-3451121336.jpg       56.7K     44.5K     32.8K   -26.2%
+    OIP-3786546191.jpg       48.4K     45.5K     33.2K   -27.1%
+    OIP-4140498144.jpg       36.2K     31.0K     22.6K   -27.1%
+    macarrao.jpg             12.7K      7.6K      6.0K   -20.9%
+    montanha_pessoas.jpg    133.4K     52.0K     36.8K   -29.3%
+
+At the defaults — arith, ramps on:
+
+    image                   source  container     PSNR
+    OIP-1304511485.jpg       23.7K     17.7K   24.86 dB
+    OIP-3451121336.jpg       56.7K     40.3K   22.48 dB
+    OIP-3786546191.jpg       48.4K     38.9K   24.31 dB
+    OIP-4140498144.jpg       36.2K     27.0K   25.44 dB
+    macarrao.jpg             12.7K      7.0K   28.54 dB
+    montanha_pessoas.jpg    133.4K     43.1K   26.40 dB
 
 Cumulative bytes and PSNR per level, montanha_pessoas.jpg:
 
-    ANCHOR    3.1K  20.19 dB
-    +R1      31.4K  25.11 dB
-    +R2      84.0K  26.26 dB
+    ANCHOR    1.1K  17.37 dB
+    +R1      11.9K  22.30 dB
+    +R2      43.1K  26.40 dB
 
 Read this honestly: **JPEG wins on rate-distortion for photographs.** At
-113 KB the source JPEG of montanha_pessoas sits far above 26.3 dB. What
+133 KB the source JPEG of montanha_pessoas sits far above 26.4 dB. What
 this format buys is not a smaller file at equal quality — it is that the
-first 3.7 KB are already a whole picture, and every byte after that
+first 1.1 KB are already a whole picture, and every byte after that
 improves it without the decoder ever needing to wait or restart.
 
 ## Format
@@ -341,6 +419,9 @@ improves it without the decoder ever needing to wait or restart.
     [level 0 : palette, then split flags and anchor tokens, coded]
     [level 1 : units, each split flags + its rectangles' residuals, coded]
     [level 2 : units, each split flags + its rectangles' residuals, coded]
+
+A rectangle's residual is three signed deltas, followed by a ramp flag and,
+when it is set, an axis bit and three slopes.
 
 The palette rides ahead of level 0's coded stream: 48 bytes of genuinely
 incompressible colour are not worth modelling. `--codec deflate` selects

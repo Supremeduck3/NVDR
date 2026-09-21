@@ -62,9 +62,9 @@ Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
 ```
 samples/montanha_pessoas.jpg  768x512
   level      rects        raw     stored  cumulative     PSNR
-  ANCHOR       5941       4011       3123        3195    20.19 dB
-  R1          33592     106128      28919       32114    25.11 dB
-  R2          52216     163951      53925       86039    26.26 dB
+  ANCHOR       1930       1336       1084        1156    17.37 dB
+  R1          17563     125788      10784       11940    22.30 dB
+  R2          37663     269187      32232       44172    26.40 dB
 ```
 
 Como ler cada coluna:
@@ -117,21 +117,27 @@ Esta é a propriedade central do formato: cortar o arquivo em qualquer
 ponto depois do anchor ainda produz imagem.
 
 ```bash
-head -c 4000 /tmp/m.nvdr > /tmp/cortado.nvdr
+head -c 1200 /tmp/m.nvdr > /tmp/cortado.nvdr
 ./nvdr/nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
 ```
 
 ```
-/tmp/cortado.nvdr  768x512  9364 rects  rendered at ANCHOR  (file carries only ANCHOR)
+/tmp/cortado.nvdr  768x512  1930 rects  rendered at ANCHOR  (file carries only ANCHOR)
+```
+
+O anchor inteiro cabe em ~1,1 KB. Com 4000 bytes já entra parte do R1:
+
+```
+/tmp/cortado.nvdr  768x512  6193 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
 ```
 
 A qualidade sobe continuamente com os bytes, sem degraus — um nível
 parcial é aproveitado até onde chegou:
 
 ```
- 10% -> 21.79 dB      50% -> 25.62 dB
- 20% -> 23.07 dB      75% -> 26.01 dB
- 30% -> 24.45 dB     100% -> 26.22 dB
+ 10% -> 19.85 dB      50% -> 25.46 dB
+ 20% -> 21.91 dB      75% -> 26.56 dB
+ 30% -> 23.46 dB     100% -> 26.95 dB
 ```
 
 Varrendo vários cortes de uma vez:
@@ -163,7 +169,9 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--tolerance A,B,C`** — quão uniforme uma região precisa ser para
   parar de subdividir, por nível, do grosso para o fino. Valores maiores
   no primeiro número deixam o anchor menor e mais grosseiro. Têm que ser
-  decrescentes.
+  decrescentes. O default é `0.140,0.070,0.040`; era mais apertado
+  (`0.090,0.040,0.018`) enquanto todo retângulo era chapado, porque a única
+  forma de seguir um degradê era subdividir. Com rampa o ótimo mudou.
 - **`--step B,C`** — o passo de quantização do resíduo nos níveis 1 e 2.
   Menor = mais fiel e mais pesado.
 - **`--anchor-bits N`** — a paleta do anchor tem `2^N` cores. O default 4
@@ -186,8 +194,21 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
   primeiro, então um stream cortado cobre a tela inteira grosseiramente em
   vez de um canto em detalhe. Custa 0,18% em bytes e vale até +1,67 dB no
   primeiro décimo. `dfs` mantém a ordem da árvore.
+- **`--gradient F`** — quanto um retângulo pode carregar uma **rampa de
+  cor** num eixo em vez de ser chapado. É decisão por retângulo: o encoder
+  compara custo (um flag, um bit de eixo, três inclinações) contra o erro
+  que a rampa tira, e `F` é o preço do bit. Por isso **nunca perde para o
+  chapado** — quando não compensa, o retângulo fica chapado. Default 280;
+  `0` desliga. Medido com a taxa igualada: +0,07 a +1,08 dB, e com um terço
+  menos retângulos.
+- **`--gradient-step N`** — o passo de quantização das inclinações. Default
+  16, que é grosso de propósito: a inclinação é codificada quase em unário,
+  então um passo fino encarece justamente as rampas grandes, que são as que
+  valem a pena.
 - **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
-  para comparação; os dois decodificam para imagens idênticas.
+  para comparação e **não carrega rampas**, então para comparar os dois
+  codecs de verdade use `--gradient 0` nos dois. Com rampas desligadas em
+  ambos, `arith` corta 18 a 29% dos bytes.
 
 Comparando os dois codecs na mesma imagem:
 
@@ -198,6 +219,29 @@ Comparando os dois codecs na mesma imagem:
 
 ---
 
+## Conferindo que C e JS decodificam igual
+
+O decoder em C e o do navegador têm que produzir **os mesmos bytes** — se
+divergirem, a página mostra algo que o formato não gravou. O script
+compara os dois em todos os níveis e em vários cortes, com e sem
+suavização:
+
+```bash
+node scripts/crosscheck.mjs /tmp/m.nvdr
+```
+
+```
+whole smooth=0 level=0: identical (768x512, level 0)
+...
+cut 96% smooth=0.4: identical (768x512, level 2)
+```
+
+Sai com código 1 e aponta o primeiro pixel divergente se algo quebrar.
+Vale rodar depois de mexer em `nvdr/entropy.c`, `nvdr/nvdr.c` ou
+`public/nvdr.js` — as três coisas que precisam concordar.
+
+---
+
 ## Coisas que confundem
 
 **O `.nvdr` às vezes é maior que o JPEG de origem.** É esperado em
@@ -205,6 +249,11 @@ imagens pequenas e detalhadas. O formato não ganha de JPEG em
 rate-distortion para foto — o que ele entrega é que os primeiros
 poucos KB já são uma imagem inteira. Se o objetivo for arquivo menor
 com qualidade igual, JPEG ainda vence.
+
+**Um retângulo não é necessariamente uma cor chapada.** Desde a v8 ele
+pode carregar uma rampa num eixo, e o encoder escolhe por retângulo. Isso
+tirou o teto do formato: com tudo chapado o montanha_pessoas empacava em
+~26 dB por mais bytes que você jogasse nele.
 
 **PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
 com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número

@@ -28,7 +28,7 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 7;
+const VERSION = 8;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
@@ -53,7 +53,15 @@ function newModels() {
         // [split][channel][prevBucket] and [split][channel][prevBucket][magBit]
         sig: grid([2, 3], () => new Uint16Array(PREV_CTX).fill(PROB_INIT)),
         sign: grid([2], () => new Uint16Array(3).fill(PROB_INIT)),
-        mag: grid([2, 3, PREV_CTX], () => new Uint16Array(MAG_CTX).fill(PROB_INIT))
+        mag: grid([2, 3, PREV_CTX], () => new Uint16Array(MAG_CTX).fill(PROB_INIT)),
+        // Ramp models. The flag and the axis share the split flag's area
+        // bucketing: a big rectangle spans more of whatever gradient is
+        // there, so it is far likelier to want one.
+        grad: new Uint16Array(AREA_CTX).fill(PROB_INIT),
+        gradAxis: new Uint16Array(AREA_CTX).fill(PROB_INIT),
+        slopeSig: new Uint16Array(3).fill(PROB_INIT),
+        slopeSign: new Uint16Array(3).fill(PROB_INIT),
+        slopeMag: grid([3], () => new Uint16Array(MAG_CTX).fill(PROB_INIT))
     };
 }
 
@@ -165,6 +173,23 @@ class ArithDecoder {
         const magnitude = remaining + 1;
         return negative ? -magnitude : magnitude;
     }
+
+    /* The mirror of nvdr_dec_slope: same binarisation, its own models. */
+    slope(models, channel) {
+        if (!this.bit(models.slopeSig, channel)) return 0;
+        const negative = this.bit(models.slopeSign, channel);
+
+        let remaining = 0;
+        let i = 0;
+        for (; i < MAG_CTX; i++) {
+            if (!this.bit(models.slopeMag[channel], i)) break;
+            remaining = i + 1;
+        }
+        if (i === MAG_CTX) remaining = MAG_CTX + this.direct(7);
+
+        const magnitude = remaining + 1;
+        return negative ? -magnitude : magnitude;
+    }
 }
 
 /* The mirror of replay(), reading split decisions from the arithmetic coder. */
@@ -250,6 +275,8 @@ export function readHeader(buffer) {
         compression: view.getUint8(5),
         order: view.getUint8(14),
         space: view.getUint8(15),
+        // 0 means every rectangle is flat and no ramp data was coded.
+        gradientStep: view.getUint8(67),
         chromaStep: [],
         step: [],
         leafCount: [],
@@ -318,6 +345,40 @@ function clampByte(v) {
     return v < 0 ? 0 : (v > 255 ? 255 : v);
 }
 
+/* Must match div_round in nvdr.c: rounding away from zero on both sides. */
+function divRound(n, d) {
+    return n >= 0 ? Math.floor((n + (d >> 1)) / d)
+                  : -Math.floor((-n + (d >> 1)) / d);
+}
+
+/*
+ * The ramp, in integers so this and nvdr.c land on the same byte.
+ *
+ * `span` is the total edge-to-edge change: position 0 sits at -span/2 and
+ * position len-1 at +span/2, so the mean offset is zero and the DC the
+ * residual already paid for stays the region mean.
+ */
+function rampOffset(span, pos, len) {
+    if (span === 0 || len < 2) return 0;
+    return divRound(span * (2 * pos - len + 1), 2 * (len - 1));
+}
+
+/* The colour one rectangle shows at a given pixel, ramp included. The
+ * decoder predicts each child from this, exactly as the encoder did. */
+function chainSample(level, i, px, py, out) {
+    const base = i * 3;
+    out[0] = level.chain[base];
+    out[1] = level.chain[base + 1];
+    out[2] = level.chain[base + 2];
+    const axis = level.axis ? level.axis[i] : 0;
+    if (!axis) return;
+    const len = axis === 1 ? level.rects.w[i] : level.rects.h[i];
+    const pos = axis === 1 ? px - level.rects.x[i] : py - level.rects.y[i];
+    for (let c = 0; c < 3; c++)
+        out[c] = clampByte(out[c] +
+            rampOffset(level.slope[base + c] * level.slopeStep, pos, len));
+}
+
 /*
  * BT.601 in fixed point, matching nvdr.c exactly. Floating point here
  * would be a portability bug waiting to happen: both sides have to land on
@@ -356,7 +417,15 @@ export async function decode(buffer) {
     /* --- level 0: the contract --- */
     const anchorStream = await readStream(bytes, cursor, header, 0);
     // The anchor is the contract: a partial one is no picture at all.
-    if (!anchorStream || anchorStream.length < header.storedBytes[0])
+    //
+    // Only the arith path can hand over a partial stream — a deflate one
+    // that did not arrive whole comes back null — and on that path the
+    // length is the inflated size, which says nothing about how many bytes
+    // arrived. Comparing the two rejected every deflate container whose
+    // anchor actually compressed.
+    const anchorShort = header.compression !== COMPRESS_DEFLATE &&
+                        anchorStream && anchorStream.length < header.storedBytes[0];
+    if (!anchorStream || anchorShort)
         return { header, levels, levelsPresent: 0 };
 
     const arith = header.compression === COMPRESS_ARITH;
@@ -412,7 +481,8 @@ export async function decode(buffer) {
         if (ycc) rgbToYcc(anchorRgb, i * 3, anchorChain, i * 3);
         else anchorChain.set(anchorRgb.subarray(i * 3, i * 3 + 3), i * 3);
     }
-    levels.push({ rects: anchorRects, rgb: anchorRgb, chain: anchorChain });
+    levels.push({ rects: anchorRects, rgb: anchorRgb, chain: anchorChain,
+                  axis: null, slope: null, slopeStep: 0, space: header.space });
     cursor += header.storedBytes[0];
 
     /* --- every further level is a bonus the bytes may not have paid for --- */
@@ -434,6 +504,9 @@ export async function decode(buffer) {
         const rects = new RectSet(capacity);
         const rgb = new Uint8Array(capacity * 3);
         const chain = new Uint8Array(capacity * 3);
+        const ramped = header.gradientStep > 0;
+        const axis = ramped ? new Uint8Array(capacity) : null;
+        const slope = ramped ? new Int8Array(capacity * 3) : null;
 
         const models = arith ? newModels() : null;
         const dec = arith ? new ArithDecoder(stream, 0, stream.length) : null;
@@ -458,6 +531,13 @@ export async function decode(buffer) {
                 for (let c = 0; c < 3; c++) {
                     rgb[j * 3 + c] = prev.rgb[i * 3 + c];
                     chain[j * 3 + c] = prev.chain[i * 3 + c];
+                }
+                // An absent unit keeps the parent's ramp along with its
+                // colour, so the pixels it shows are exactly the ones the
+                // level before showed.
+                if (ramped && prev.axis) {
+                    axis[j] = prev.axis[i];
+                    for (let c = 0; c < 3; c++) slope[j * 3 + c] = prev.slope[i * 3 + c];
                 }
                 continue;
             }
@@ -492,6 +572,23 @@ export async function decode(buffer) {
                     chain[j * 3 + c] = value & 0xFF;
                 }
                 prev0 = chain[j * 3] << 24 >> 24;
+
+                if (ramped && arith) {
+                    const gctx = areaContext(rects.w[j], rects.h[j]);
+                    if (dec.bit(models.grad, gctx)) {
+                        axis[j] = dec.bit(models.gradAxis, gctx) ? 2 : 1;
+                        for (let c = 0; c < 3; c++) {
+                            // Clamped, not wrapped: the binarisation can
+                            // express magnitudes past 127 and a cut stream
+                            // will eventually decode one. C clamps, so the
+                            // two only agree if this does too.
+                            const v = dec.slope(models, c);
+                            slope[j * 3 + c] = v < -127 ? -127 : (v > 127 ? 127 : v);
+                        }
+                    } else {
+                        axis[j] = 0;
+                    }
+                }
             }
 
             if (arith && dec.overrun) {
@@ -501,10 +598,14 @@ export async function decode(buffer) {
                 continue;
             }
 
+            const parent = new Uint8Array(3);
             for (let j = before; j < rects.count; j++) {
+                chainSample(prev, i,
+                            rects.x[j] + (rects.w[j] >> 1),
+                            rects.y[j] + (rects.h[j] >> 1), parent);
                 for (let c = 0; c < 3; c++)
                     chain[j * 3 + c] = clampByte(
-                        prev.chain[i * 3 + c] +
+                        parent[c] +
                         (chain[j * 3 + c] << 24 >> 24) * (c === 0 ? step : chromaStep));
                 if (ycc) yccToRgb(chain, j * 3, rgb, j * 3);
                 else rgb.set(chain.subarray(j * 3, j * 3 + 3), j * 3);
@@ -514,7 +615,8 @@ export async function decode(buffer) {
 
         if (processed === 0) break;
 
-        levels.push({ rects, rgb, chain });
+        levels.push({ rects, rgb, chain, axis, slope,
+                      slopeStep: header.gradientStep, space: header.space });
         cursor += header.storedBytes[k];
         if (stopped) break;
     }
@@ -567,16 +669,50 @@ export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) 
     const image = ctx.createImageData(width, height);
     const pixels = image.data;
     const { rects, rgb } = level;
+    const ycc = level.space === SPACE_YCC;
+    const c3 = new Uint8Array(3), fill = new Uint8Array(3);
 
     for (let i = 0; i < rects.count; i++) {
-        const r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
         const x0 = rects.x[i], y0 = rects.y[i];
         const x1 = Math.min(x0 + rects.w[i], width);
         const y1 = Math.min(y0 + rects.h[i], height);
+        const axis = level.axis ? level.axis[i] : 0;
+
+        if (!axis) {
+            const r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+            for (let y = y0; y < y1; y++) {
+                let p = (y * width + x0) * 4;
+                for (let x = x0; x < x1; x++) {
+                    pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b;
+                    pixels[p + 3] = 255;
+                    p += 4;
+                }
+            }
+            continue;
+        }
+
+        // A ramp varies along one axis only, so the rectangle is one row
+        // (or one column) of colours repeated. It is evaluated in the
+        // chain's space and converted per position, not per pixel.
+        const len = axis === 1 ? rects.w[i] : rects.h[i];
+        const step = level.slopeStep;
         for (let y = y0; y < y1; y++) {
             let p = (y * width + x0) * 4;
+            if (axis === 2) {
+                for (let c = 0; c < 3; c++)
+                    c3[c] = clampByte(level.chain[i * 3 + c] +
+                        rampOffset(level.slope[i * 3 + c] * step, y - y0, len));
+                if (ycc) yccToRgb(c3, 0, fill, 0); else fill.set(c3);
+            }
             for (let x = x0; x < x1; x++) {
-                pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b; pixels[p + 3] = 255;
+                if (axis === 1) {
+                    for (let c = 0; c < 3; c++)
+                        c3[c] = clampByte(level.chain[i * 3 + c] +
+                            rampOffset(level.slope[i * 3 + c] * step, x - x0, len));
+                    if (ycc) yccToRgb(c3, 0, fill, 0); else fill.set(c3);
+                }
+                pixels[p] = fill[0]; pixels[p + 1] = fill[1]; pixels[p + 2] = fill[2];
+                pixels[p + 3] = 255;
                 p += 4;
             }
         }

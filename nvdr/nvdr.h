@@ -158,6 +158,23 @@ typedef struct {
      * codes RGB, for comparison.
      */
     int   chroma;
+    /*
+     * How readily a rectangle is allowed to carry a one-axis colour ramp
+     * instead of a flat fill.
+     *
+     * A ramp costs a flag, an axis bit and one slope per channel, and buys
+     * whatever squared error the ramp removes. The encoder compares the
+     * two per rectangle and takes the better deal, so this is a Lagrange
+     * multiplier rather than a switch: higher spends more bits on ramps,
+     * 0 disables them and every rectangle stays flat.
+     *
+     * Measured against the alternatives: a full 2D plane fits better but
+     * needs two slopes per channel and loses to the one-axis ramp per
+     * byte, and gating the tree on ramp fit rather than mean fit makes the
+     * surviving rectangles precisely the ones with expensive slopes.
+     */
+    float gradient;
+    int   gradient_step;
     float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
     int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
     int   step[NVDR_LEVELS];        /* residual quantisation step per level */
@@ -188,6 +205,17 @@ typedef struct {
      * that drift accumulate.
      */
     uint8_t*  chain;
+    /*
+     * Optional one-axis ramp per rectangle: 0 means flat, 1 ramps along x,
+     * 2 along y. `slope` holds the total change from one edge to the other,
+     * three channels per rectangle, in the chain's colour space.
+     */
+    uint8_t*  axis;
+    int8_t*   slope;
+    uint8_t   slope_step;
+    /* Which space `chain` is in, so the renderer can evaluate a ramp there
+     * and convert per pixel. A flat rectangle never needs it. */
+    uint8_t   space;
     uint32_t  count;
 } NvdrLevelData;
 
@@ -220,7 +248,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     7
+#define NVDR_VERSION     8
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */
@@ -238,6 +266,7 @@ typedef struct {
     uint8_t  compression;
     uint8_t  order;
     uint8_t  space;
+    uint8_t  gradient_step;
     uint8_t  step[NVDR_LEVELS];
     uint8_t  chroma_step[NVDR_LEVELS];
 } NvdrHeader;
