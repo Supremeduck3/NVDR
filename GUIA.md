@@ -3,8 +3,9 @@
 ## Onde está cada coisa
 
 ```
-src/        o codec: nvdr.c, entropy.c e os headers
-tools/      as duas CLIs, nvdr_encode e nvdr_decode
+src/        o codec: nvdr.c e entropy.c, mais nvdrv.c para sequências
+tools/      quatro CLIs: nvdr_encode/decode (imagem) e nvdrv_encode/decode
+            (sequência)
 public/     o decoder do navegador (nvdr.js) e a página que o usa
 scripts/    o gate de regressão, o crosscheck C×JS, e análises
 samples/    as imagens em que todo número do README foi medido
@@ -50,6 +51,14 @@ Ele checa cinco coisas em cada imagem de `samples/`:
    decodificar, e a qualidade não pode cair conforme os bytes aumentam.
 5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, em
    todos os níveis e em arquivo cortado.
+
+E mais uma, sobre uma sequência de 12 quadros que ele também gera na hora:
+**deriva**. O encoder tem que predizer da própria reconstrução, nunca do
+quadro fonte, porque é só isso que o decoder tem. Errar isso é a forma
+clássica de um codec derivar. Conferi que o gate pega: trocando o laço de
+reconstrução pelo quadro fonte, o arquivo fica **78,7% menor** — um teste
+que só olhasse tamanho chamaria de melhoria — e custa **8,90 dB** até o
+quadro 12.
 
 Ele também **gera três imagens sintéticas** na hora (`blocos`, `circulos`,
 `degrade`) e passa elas pelos mesmos testes. Elas existem porque o
@@ -267,6 +276,42 @@ Comparando os dois codecs na mesma imagem:
 ./nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
 ./nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
 ```
+
+---
+
+## Vídeo
+
+```bash
+./nvdrv_encode pasta_de_quadros/ saida.nvdrv
+./nvdrv_decode saida.nvdrv --out reproduzido/ --compare pasta_de_quadros/
+```
+
+Os quadros são lidos em ordem de nome (`f000.png`, `f001.png`, …), em PNG,
+JPG, BMP ou PPM. O encoder imprime por quadro se ele saiu INTRA ou predito,
+quanto custou e qual vetor de movimento achou — se um quadro predito fica
+do tamanho de um intra, a predição não está funcionando e isso tem que
+aparecer, não ser diluído numa taxa média.
+
+Parâmetros:
+
+- **`--gop N`** — força um quadro intra a cada N (default 48, dois segundos
+  a 24 fps). Serve para entrar no meio do stream e para um erro não
+  contaminar o resto do filme. `0` deixa só o quadro 0 intra: menor e sem
+  busca.
+- **`--search N`** — raio da busca de movimento global, em pixels (default
+  12). `0` fixa a referência no lugar, o que medido **não presta**: com um
+  pan de 3 px/quadro a referência co-localizada vale 7%, e com um vetor
+  global vale 61%.
+- **`--intra-thresh F`** — erro médio absoluto acima do qual o quadro vai
+  intra mesmo fora do GOP (default 24). É assim que corte de cena é
+  detectado, não declarado.
+
+Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
+a −75,1% com qualidade igual ou melhor**.
+
+A truncagem agora vale nos **dois eixos** — um prefixo do arquivo é um
+prefixo do filme, e o quadro em que o corte cai ainda aparece, na qualidade
+que os bytes dele pagaram.
 
 ---
 

@@ -276,11 +276,26 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                      const NvdrConfig* cfg, NvdrHeader* hdr_out);
 
 /*
+ * The same container as a buffer the caller owns and frees.
+ *
+ * A sequence holds a frame in memory rather than on disk, and the bytes
+ * are identical either way, so this is what actually builds the container
+ * and the file version is a wrapper over it.
+ */
+int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                    const NvdrConfig* cfg, NvdrHeader* hdr_out);
+
+/*
  * Read whatever is there. `levels_present` on the returned pyramid says how
  * far the bytes on disk actually reach: a file truncated mid-stream decodes
  * at the last level whose bytes are all present, rather than failing.
  */
 int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr);
+
+/* The same, from a buffer. Passing fewer bytes than the container holds is
+ * the truncation case and decodes as far as they reach. */
+int nvdr_decode_mem(const uint8_t* data, size_t size,
+                    NvdrPyramid* pyr, NvdrHeader* hdr);
 
 /* --------------------------------------------------------------- render */
 

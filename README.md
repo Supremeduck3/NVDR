@@ -576,10 +576,55 @@ smaller residuals behind it.
 The anchor is 1.5% of a typical container, so almost any surviving prefix
 carries it.
 
+## Sequences
+
+`src/nvdrv.c` codes a sequence of frames, and the frame codec does not
+change to make it work: a predicted frame is an ordinary NVDR container
+whose image happens to be the prediction error, biased to the middle of
+the range. Frame 0 is coded on its own; every frame after it is the error
+against what the decoder holds, moved by one global translation.
+
+Against coding every frame on its own, on the synthetic sequences:
+
+    sequence      so intra              NVDRV                  bytes
+    pan        984247 B  27.17 dB   245517 B  28.66 dB       -75.1%
+    object     995208 B  27.08 dB   311216 B  27.07 dB       -68.7%
+    pan+noise 1008011 B  27.09 dB   337152 B  28.58 dB       -66.6%
+
+Truncation now holds on two axes. A prefix of the file is a prefix of the
+movie, and the frame the cut lands in is handed to the still decoder as-is,
+so it shows at whatever quality its bytes paid for:
+
+    corte    bytes   quadros   PSNR medio
+       5%    12275         1     24.75 dB
+      15%    36827         1     27.12 dB
+      30%    73655         4     28.04 dB
+      50%   122758         9     28.40 dB
+     100%   245517        24     28.66 dB
+
+Scene cuts are found rather than declared: when the mean absolute
+prediction error passes `--intra-thresh`, the frame is coded intra. On a
+sequence spliced from two different sources the encoder puts an intra
+frame exactly at the splice without being told where it is.
+
+The encoder predicts from its own decoded output and never from the source
+frame, because that is all a decoder has. Getting this wrong is the
+classic way a codec drifts, and it is the reason the regression gate
+checks a sequence: replacing the reconstruction loop with the source frame
+makes the container **78.7% smaller**, which a size check would call an
+improvement, and costs 8.90 dB by frame 12.
+
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+
+Not here yet: per-block motion, B-frames, and a native residual mode. The
+error is currently coded as an image, which pushes it through an anchor
+palette built for photographs.
+
 ## Layout
 
-    src/        the codec: nvdr.c, entropy.c and their headers
-    tools/      the two CLIs, nvdr_encode and nvdr_decode
+    src/        the codec: nvdr.c and entropy.c, plus nvdrv.c for sequences
+    tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
     public/     the browser decoder (nvdr.js) and its viewer
     scripts/    the regression gate, the C-vs-JS cross-check, analysis
     samples/    the images every number in this file was measured on
@@ -593,6 +638,8 @@ carries it.
     make
     ./nvdr_encode image.jpg out.nvdr
     ./nvdr_decode out.nvdr out.ppm --level 1 --compare image.jpg
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     make check          # the regression gate
 
 `nvdr_encode` prints the raw and stored size and the PSNR of each layer,

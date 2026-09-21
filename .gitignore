@@ -1,5 +1,7 @@
 # Build artifacts
 nvdr_encode
+nvdrv_encode
+nvdrv_decode
 nvdr_decode
 *.exe
 *.o

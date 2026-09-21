@@ -958,8 +958,8 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
     return best_axis;
 }
 
-int nvdr_encode_file(const char* out_path, const NvdrImage* img,
-                     const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+static int encode_to_memory(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                            const NvdrConfig* cfg, NvdrHeader* hdr_out) {
     /* The deflate path writes its split bits in tree order, so it cannot
      * also carry a reordered emission. It exists for comparison, and the
      * comparison is fair either way. */
@@ -1276,9 +1276,6 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             }
         }
 
-        FILE* f = fopen(out_path, "wb");
-        if (!f) goto write_done;
-
         uint8_t header[NVDR_HEADER_SIZE];
         memset(header, 0, sizeof(header));
         memcpy(header, NVDR_MAGIC, 4);
@@ -1300,10 +1297,22 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             put_u32(header + 40 + k * 4, (uint32_t)raw_size[k]);
             put_u32(header + 52 + k * 4, (uint32_t)stored_size[k]);
         }
-        fwrite(header, 1, sizeof(header), f);
-        for (int k = 0; k < NVDR_LEVELS; k++)
-            fwrite(stored[k], 1, stored_size[k], f);
-        fclose(f);
+        /* One contiguous container. A sequence needs to hold a frame in
+         * memory rather than on disk, and the still path is the same bytes
+         * either way, so the buffer is what gets built and the file is a
+         * wrapper over it. */
+        size_t total = NVDR_HEADER_SIZE;
+        for (int k = 0; k < NVDR_LEVELS; k++) total += stored_size[k];
+        uint8_t* blob = (uint8_t*)malloc(total);
+        if (!blob) goto write_done;
+        memcpy(blob, header, NVDR_HEADER_SIZE);
+        size_t at = NVDR_HEADER_SIZE;
+        for (int k = 0; k < NVDR_LEVELS; k++) {
+            memcpy(blob + at, stored[k], stored_size[k]);
+            at += stored_size[k];
+        }
+        *out_buf = blob;
+        *out_len = total;
         wrote = 1;
 
         if (hdr_out) {
@@ -1348,6 +1357,25 @@ done:
     free(space_img);
     nvdr_tree_free(&tree);
     return rc;
+}
+
+int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                    const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+    *out_buf = NULL; *out_len = 0;
+    return encode_to_memory(out_buf, out_len, img, cfg, hdr_out);
+}
+
+int nvdr_encode_file(const char* out_path, const NvdrImage* img,
+                     const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+    uint8_t* blob = NULL;
+    size_t len = 0;
+    if (encode_to_memory(&blob, &len, img, cfg, hdr_out) != 0) return -1;
+    FILE* f = fopen(out_path, "wb");
+    if (!f) { free(blob); return -1; }
+    size_t wrote = fwrite(blob, 1, len, f);
+    fclose(f);
+    free(blob);
+    return wrote == len ? 0 : -1;
 }
 
 /* ============================================================== decoder */
@@ -1547,21 +1575,28 @@ void nvdr_pyramid_free(NvdrPyramid* pyr) {
  * stream has no such property — a prefix of it inflates to nothing — so
  * that one stays all or nothing.
  */
-static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
+typedef struct {
+    const uint8_t* data;
+    size_t         size;
+    size_t         pos;
+} MemReader;
+
+static uint8_t* read_stream(MemReader* mr, uint32_t stored_bytes,
                             uint32_t raw_bytes, uint8_t compression,
                             size_t* out_size) {
-    if (stored_bytes == 0 || *available <= 0) return NULL;
+    size_t available = mr->size - mr->pos;
+    if (stored_bytes == 0 || available == 0) return NULL;
 
     size_t want = stored_bytes;
-    if (*available < (long)stored_bytes) {
+    if (available < stored_bytes) {
         if (compression == NVDR_COMPRESS_DEFLATE) return NULL;
-        want = (size_t)*available;
+        want = available;
     }
 
     uint8_t* packed = (uint8_t*)malloc(want);
     if (!packed) return NULL;
-    if (fread(packed, 1, want, f) != want) { free(packed); return NULL; }
-    *available -= (long)want;
+    memcpy(packed, mr->data + mr->pos, want);
+    mr->pos += want;
     if (out_size) *out_size = want;
 
     if (compression != NVDR_COMPRESS_DEFLATE) return packed;
@@ -1576,23 +1611,20 @@ static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
     return raw;
 }
 
-int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
+int nvdr_decode_mem(const uint8_t* data, size_t size,
+                    NvdrPyramid* pyr, NvdrHeader* hdr) {
     memset(pyr, 0, sizeof(*pyr));
     pyr->last_level_fraction = 1.0;
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    MemReader mr = { data, size, 0 };
 
     uint8_t header[NVDR_HEADER_SIZE];
-    if (file_size < NVDR_HEADER_SIZE ||
-        fread(header, 1, sizeof(header), f) != sizeof(header) ||
-        memcmp(header, NVDR_MAGIC, 4) != 0 || header[4] != NVDR_VERSION) {
-        fclose(f);
+    if (size < NVDR_HEADER_SIZE ||
+        memcmp(data, NVDR_MAGIC, 4) != 0 || data[4] != NVDR_VERSION) {
         return -1;
     }
+    memcpy(header, data, NVDR_HEADER_SIZE);
+    mr.pos = NVDR_HEADER_SIZE;
 
     memset(hdr, 0, sizeof(*hdr));
     hdr->width       = get_u16(header + 6);
@@ -1614,11 +1646,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     pyr->anchor_bits = hdr->anchor_bits;
     for (int k = 0; k < NVDR_LEVELS; k++) pyr->step[k] = hdr->step[k];
 
-    long available = file_size - NVDR_HEADER_SIZE;
-
     /* --- level 0 is the contract; without it there is no picture --- */
     size_t anchor_size = 0;
-    uint8_t* stream = read_stream(f, &available, hdr->stored_bytes[0],
+    uint8_t* stream = read_stream(&mr, hdr->stored_bytes[0],
                                   hdr->raw_bytes[0], hdr->compression, &anchor_size);
     /*
      * The anchor is the contract: a partial one is no picture at all.
@@ -1632,19 +1662,19 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     int anchor_short = hdr->compression != NVDR_COMPRESS_DEFLATE &&
                        anchor_size < hdr->stored_bytes[0];
     if (!stream || anchor_short) {
-        free(stream); fclose(f); return -1;
+        free(stream); return -1;
     }
 
     size_t off = 0;
     pyr->palette_count = (int)stream[off++] + 1;   /* stored biased by one */
     pyr->palette = (unsigned char*)malloc((size_t)pyr->palette_count * 3);
-    if (!pyr->palette) { free(stream); fclose(f); return -1; }
+    if (!pyr->palette) { free(stream); return -1; }
     memcpy(pyr->palette, stream + off, (size_t)pyr->palette_count * 3);
     off += (size_t)pyr->palette_count * 3;
 
     RectSink sink = { &pyr->level[0], 0 };
     uint32_t* tokens = (uint32_t*)malloc((size_t)hdr->leaf_count[0] * sizeof(uint32_t));
-    if (!tokens) { free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1; }
+    if (!tokens) { free(stream); nvdr_pyramid_free(pyr); return -1; }
 
     if (hdr->compression == NVDR_COMPRESS_ARITH) {
         NvdrModels models;
@@ -1653,18 +1683,18 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         nvdr_dec_init(&ad, stream + off, hdr->stored_bytes[0] - off);
         if (replay_arith(&ad, &models, &sink, 0, 0, hdr->width, hdr->height) != 0 ||
             ad.overrun || pyr->level[0].count != hdr->leaf_count[0]) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
         for (uint32_t i = 0; i < hdr->leaf_count[0]; i++)
             tokens[i] = nvdr_dec_tree(&ad, models.token, hdr->anchor_bits);
         if (ad.overrun) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
     } else {
         BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
         if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
             pyr->level[0].count != hdr->leaf_count[0]) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
         off += (hdr->split_bits[0] + 7) / 8;
         for (uint32_t i = 0; i < hdr->leaf_count[0]; i++) {
@@ -1680,7 +1710,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     pyr->level[0].rgb = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
     pyr->level[0].chain = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
     if (!pyr->level[0].rgb || !pyr->level[0].chain) {
-        free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+        free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
     }
     for (uint32_t i = 0; i < pyr->level[0].count; i++) {
         uint32_t token = tokens[i] < (uint32_t)pyr->palette_count ? tokens[i] : 0;
@@ -1698,7 +1728,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     /* --- every further level is a bonus the bytes may not have paid for -- */
     for (int k = 1; k < NVDR_LEVELS; k++) {
         size_t buf_size = 0;
-        uint8_t* buf = read_stream(f, &available, hdr->stored_bytes[k],
+        uint8_t* buf = read_stream(&mr, hdr->stored_bytes[k],
                                    hdr->raw_bytes[k], hdr->compression, &buf_size);
         if (!buf) break;
 
@@ -1853,8 +1883,27 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         if (stopped) break;
     }
 
-    fclose(f);
     return 0;
+}
+
+int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return -1; }
+
+    uint8_t* data = (uint8_t*)malloc((size_t)size);
+    if (!data) { fclose(f); return -1; }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+
+    /* A short read is a truncated file, which is a thing this format
+     * decodes rather than rejects, so it is passed on as it arrived. */
+    int rc = nvdr_decode_mem(data, got, pyr, hdr);
+    free(data);
+    return rc;
 }
 
 /* =============================================================== render */
