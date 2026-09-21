@@ -36,10 +36,36 @@ Para rodar o gate de regressão:
 make check
 ```
 
-Ele codifica todas as imagens de `samples/`, checa que o PSNR não caiu
-abaixo do piso, que o encoder é determinístico (mesmo arquivo byte a byte
-em execuções repetidas) e que os decoders C e JS concordam byte a byte,
-inclusive em arquivos truncados.
+Ele checa cinco coisas em cada imagem de `samples/`:
+
+1. **Determinismo** — codifica duas vezes, os dois arquivos têm que sair
+   byte a byte iguais. Sem isso, qualquer medição A/B está medindo ruído.
+2. **Qualidade** — decodifica de volta e compara contra
+   `scripts/baseline.json`, **por imagem**. Piso global não serve: as
+   amostras vão de 21 a 30 dB, então uma queda que importa em uma some no
+   meio das outras.
+3. **Tamanho** — bytes contra a mesma baseline, para uma mudança que
+   compra qualidade com bytes aparecer como o que é.
+4. **Truncagem** — corta em 9 pontos; todo corte acima do anchor tem que
+   decodificar, e a qualidade não pode cair conforme os bytes aumentam.
+5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, em
+   todos os níveis e em arquivo cortado.
+
+Ele também **gera três imagens sintéticas** na hora (`blocos`, `circulos`,
+`degrade`) e passa elas pelos mesmos testes. Elas existem porque o
+`samples/` é só foto, e foto escondeu uma regressão que custou 5,5 dB numa
+imagem de formas chapadas — árvore que satura reage à tolerância no
+sentido oposto de árvore que não satura.
+
+Quando uma mudança for melhoria de verdade e não regressão, você regrava a
+baseline:
+
+```bash
+python3 scripts/verify.py --update
+```
+
+Conferi que ele pega: reintroduzindo a tolerância velha, ele reprova 7
+amostras e sai com código 1, com `circulos` acusando -4,60 dB.
 
 ---
 
