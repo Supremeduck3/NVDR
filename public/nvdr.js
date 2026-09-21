@@ -28,7 +28,7 @@
  */
 
 const MAGIC = 0x5244564e; // "NVDR" read as a little-endian uint32
-const VERSION = 8;
+const VERSION = 9;
 const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
@@ -517,14 +517,108 @@ export async function decode(buffer) {
 
         const step = header.step[k];
         const chromaStep = header.chromaStep[k];
-        let processed = 0, prev0 = 0, stopped = false;
+        let processed = 0, stopped = false;
+
+        // The mirror of replay_unit in nvdr.c: one unit with its geometry
+        // and its colours interleaved. Once the bytes run out the walk
+        // stops reading and paints the rest of the region from what the
+        // parent was showing there, so a unit cut in half still
+        // contributes everything that arrived.
+        const d = {
+            prevIndex: 0, splitCtx: 0, prev0: 0, stopped: false, delivered: 0
+        };
+        const parent = new Uint8Array(3);
+
+        function parentColour(px, py) {
+            chainSample(prev, d.prevIndex, px, py, parent);
+        }
+
+        function replayUnit(x, y, w, h, depth) {
+            let split = 0;
+            if (!d.stopped) {
+                if (rects.count + 1 >= capacity) {
+                    d.stopped = true;
+                } else {
+                    split = dec.bit(models.split, areaContext(w, h));
+                    if (dec.overrun) { d.stopped = true; split = 0; }
+                    else if (depth === 0) d.splitCtx = split;
+                }
+            }
+
+            if (split) {
+                const hw = w >> 1, hh = h >> 1, rw = w - hw, rh = h - hh;
+                if (!replayUnit(x,      y,      hw, hh, depth + 1)) return false;
+                if (!replayUnit(x + hw, y,      rw, hh, depth + 1)) return false;
+                if (!replayUnit(x,      y + hh, hw, rh, depth + 1)) return false;
+                if (!replayUnit(x + hw, y + hh, rw, rh, depth + 1)) return false;
+                return true;
+            }
+
+            if (!rects.push(x, y, w, h)) return false;
+            const j = rects.count - 1;
+            parentColour(x + (w >> 1), y + (h >> 1));
+
+            if (d.stopped) {
+                // Never arrived: show what the level before showed here.
+                for (let c = 0; c < 3; c++) chain[j * 3 + c] = parent[c];
+                if (ramped) axis[j] = 0;
+                return true;
+            }
+
+            const raw = [0, 0, 0];
+            for (let c = 0; c < 3; c++) {
+                const neighbour = c > 0 ? raw[c - 1] : d.prev0;
+                raw[c] = dec.residual(models, d.splitCtx, c, prevContext(neighbour));
+            }
+            if (dec.overrun) {
+                d.stopped = true;
+                for (let c = 0; c < 3; c++) chain[j * 3 + c] = parent[c];
+                if (ramped) axis[j] = 0;
+                return true;
+            }
+            d.prev0 = raw[0];
+
+            for (let c = 0; c < 3; c++)
+                chain[j * 3 + c] = clampByte(
+                    parent[c] + raw[c] * (c === 0 ? step : chromaStep));
+
+            if (ramped) {
+                const gctx = areaContext(w, h);
+                axis[j] = 0;
+                if (dec.bit(models.grad, gctx) && !dec.overrun) {
+                    const a = dec.bit(models.gradAxis, gctx) ? 2 : 1;
+                    const sl = [0, 0, 0];
+                    for (let c = 0; c < 3; c++) {
+                        // Clamped, not wrapped: the binarisation can express
+                        // magnitudes past 127 and a cut stream will decode
+                        // one. C clamps, so the two only agree if this does.
+                        const v = dec.slope(models, c);
+                        sl[c] = v < -127 ? -127 : (v > 127 ? 127 : v);
+                    }
+                    if (!dec.overrun) {
+                        axis[j] = a;
+                        for (let c = 0; c < 3; c++) slope[j * 3 + c] = sl[c];
+                    }
+                }
+                if (dec.overrun) {
+                    d.stopped = true;
+                    for (let c = 0; c < 3; c++) chain[j * 3 + c] = parent[c];
+                    axis[j] = 0;
+                    return true;
+                }
+            }
+
+            d.delivered++;
+            return true;
+        }
 
         for (let u = 0; u < order.length; u++) {
             const i = order[u];
 
             if (stopped) {
                 // Past the end of what arrived: this unit keeps the
-                // rectangle and colour it had at the level before.
+                // rectangle and colour it had at the level before, ramp
+                // included, so it renders exactly as that level did.
                 rects.push(prev.rects.x[i], prev.rects.y[i],
                            prev.rects.w[i], prev.rects.h[i]);
                 const j = rects.count - 1;
@@ -532,9 +626,6 @@ export async function decode(buffer) {
                     rgb[j * 3 + c] = prev.rgb[i * 3 + c];
                     chain[j * 3 + c] = prev.chain[i * 3 + c];
                 }
-                // An absent unit keeps the parent's ramp along with its
-                // colour, so the pixels it shows are exactly the ones the
-                // level before showed.
                 if (ramped && prev.axis) {
                     axis[j] = prev.axis[i];
                     for (let c = 0; c < 3; c++) slope[j * 3 + c] = prev.slope[i * 3 + c];
@@ -543,70 +634,39 @@ export async function decode(buffer) {
             }
 
             const before = rects.count;
-            const ok = arith
-                ? replayArith(dec, models, rects, prev.rects.x[i], prev.rects.y[i],
-                              prev.rects.w[i], prev.rects.h[i]) && !dec.overrun
-                : replay(reader, rects, prev.rects.x[i], prev.rects.y[i],
-                         prev.rects.w[i], prev.rects.h[i]) && !reader.overrun;
-            if (!ok) {
-                // This unit did not arrive whole. Roll it back and treat
-                // every remaining one as absent.
-                rects.count = before;
-                stopped = true;
-                u--;
-                continue;
-            }
+            d.prevIndex = i;
+            d.stopped = false;
+            d.delivered = 0;
 
-            const ctx = rects.count - before > 1 ? 1 : 0;
-            for (let j = before; j < rects.count; j++) {
-                for (let c = 0; c < 3; c++) {
-                    let value;
-                    if (arith) {
-                        const neighbour = c > 0 ? (chain[j * 3 + c - 1] << 24 >> 24) : prev0;
-                        value = dec.residual(models, ctx, c, prevContext(neighbour));
-                    } else {
-                        value = flatResidual[j * 3 + c];
-                    }
-                    // Parked as the raw residual until the rectangle is
-                    // known to have arrived whole; resolved just below.
-                    chain[j * 3 + c] = value & 0xFF;
+            if (!arith) {
+                // Deflate is all or nothing, so it keeps the old planar
+                // layout: every split bit, then every residual.
+                const ok = replay(reader, rects, prev.rects.x[i], prev.rects.y[i],
+                                  prev.rects.w[i], prev.rects.h[i]) && !reader.overrun;
+                if (!ok) { rects.count = before; stopped = true; u--; continue; }
+                for (let j = before; j < rects.count; j++) {
+                    chainSample(prev, i, rects.x[j] + (rects.w[j] >> 1),
+                                rects.y[j] + (rects.h[j] >> 1), parent);
+                    for (let c = 0; c < 3; c++)
+                        chain[j * 3 + c] = clampByte(
+                            parent[c] +
+                            flatResidual[j * 3 + c] * (c === 0 ? step : chromaStep));
                 }
-                prev0 = chain[j * 3] << 24 >> 24;
-
-                if (ramped && arith) {
-                    const gctx = areaContext(rects.w[j], rects.h[j]);
-                    if (dec.bit(models.grad, gctx)) {
-                        axis[j] = dec.bit(models.gradAxis, gctx) ? 2 : 1;
-                        for (let c = 0; c < 3; c++) {
-                            // Clamped, not wrapped: the binarisation can
-                            // express magnitudes past 127 and a cut stream
-                            // will eventually decode one. C clamps, so the
-                            // two only agree if this does too.
-                            const v = dec.slope(models, c);
-                            slope[j * 3 + c] = v < -127 ? -127 : (v > 127 ? 127 : v);
-                        }
-                    } else {
-                        axis[j] = 0;
-                    }
+            } else {
+                if (!replayUnit(prev.rects.x[i], prev.rects.y[i],
+                                prev.rects.w[i], prev.rects.h[i], 0)) break;
+                if (d.delivered === 0) {
+                    // Not one rectangle of this unit arrived. Roll it back
+                    // and let the absent path above cover it.
+                    rects.count = before;
+                    stopped = true;
+                    u--;
+                    continue;
                 }
+                if (d.stopped) stopped = true;   // this unit is the last, in part
             }
 
-            if (arith && dec.overrun) {
-                rects.count = before;
-                stopped = true;
-                u--;
-                continue;
-            }
-
-            const parent = new Uint8Array(3);
             for (let j = before; j < rects.count; j++) {
-                chainSample(prev, i,
-                            rects.x[j] + (rects.w[j] >> 1),
-                            rects.y[j] + (rects.h[j] >> 1), parent);
-                for (let c = 0; c < 3; c++)
-                    chain[j * 3 + c] = clampByte(
-                        parent[c] +
-                        (chain[j * 3 + c] << 24 >> 24) * (c === 0 ? step : chromaStep));
                 if (ycc) yccToRgb(chain, j * 3, rgb, j * 3);
                 else rgb.set(chain.subarray(j * 3, j * 3 + 3), j * 3);
             }

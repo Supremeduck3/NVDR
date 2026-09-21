@@ -374,6 +374,42 @@ thirteen of them. The photograph next to it climbs 18.40 -> 19.85 -> 22.45
 are hiding the fact that the progressive ladder, which is the entire point
 of the format, is not there.
 
+## Delivering a unit in pieces
+
+A unit used to be all or nothing. Its split bits were emitted first and its
+residuals after, so a decoder that ran out halfway had the shape and no
+colours and had to throw the whole unit away. The truncation granularity of
+a level was therefore one unit, and a level has exactly as many units as
+the level before it has rectangles.
+
+Interleaving the colours into the geometry removes that. Each rectangle's
+residual and ramp are emitted the moment its split decision says it is a
+leaf, so a cut anywhere leaves a valid partial subtree: what arrived keeps
+its own colour and the region below the cut falls back to what its parent
+was showing there. The symbols are the same ones in the same per-model
+order, so the models adapt identically and the containers come out byte for
+byte the same size — 4470 / 12538 / 34685 on montanha_pessoas either way.
+
+Measured honestly, it is worth less than it looks. Across the sample set at
+six cut points it moves nothing at all in most cells, and its two real
+gains are at early cuts, where one unit is a large share of everything that
+arrived:
+
+    image                  12%    20%    30%    45%    65%    85%
+    macarrao.jpg         +0.88  +0.07  +0.02  +0.01   0.00   0.00
+    circulos (synthetic)     -  +0.89  +0.02  +0.39   0.00   0.00
+    montanha_pessoas.jpg +0.21  +0.01   0.00   0.00   0.00   0.00
+    everything else      +0.05  +0.01   0.00   0.00   0.00   0.00
+
+This was built to fix the flat truncation ladder a star field showed —
+21.59 dB at 1% of the container and 21.75 dB at 25% — and it does not fix
+it. That image had thirteen rectangles at level 1 and therefore thirteen
+units at level 2, and finer delivery inside those units is worth 0.16 dB
+there. The flat ladder was the broken tolerance schedule described above,
+not the delivery, and reverting the schedule is what fixed it. What
+interleaving actually buys is that a cut can no longer discard work that
+already arrived, which is worth keeping because it costs nothing.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most

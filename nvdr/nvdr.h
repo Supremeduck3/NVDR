@@ -248,7 +248,7 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 /* ------------------------------------------------------------ container */
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     8
+#define NVDR_VERSION     9
 #define NVDR_HEADER_SIZE 72
 
 /* Compression applied to each level stream independently. */

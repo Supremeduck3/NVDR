@@ -271,6 +271,13 @@ pode carregar uma rampa num eixo, e o encoder escolhe por retângulo. Isso
 tirou o teto do formato: com tudo chapado o montanha_pessoas empacava em
 ~26 dB por mais bytes que você jogasse nele.
 
+**Um corte no meio de uma unidade não perde mais o que já chegou.** Desde
+a v9 a cor de cada retângulo vai intercalada com a geometria dele, então
+uma unidade cortada pela metade entrega tudo que chegou e o resto cai para
+a cor do nível anterior. Não muda o tamanho do arquivo em nada. O ganho é
+pequeno e concentrado em cortes bem no começo (+0,88 dB no macarrão a 12%),
+zero no resto.
+
 **Céu estrelado / imagem com grão parece o melhor caso e é o pior.** Ela
 comprime bem e pontua bem porque a árvore nunca satura — dá para pedir
 qualquer taxa e ela entrega. Mas o anchor sai com **1 retângulo** e o R1
