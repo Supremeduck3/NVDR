@@ -248,7 +248,70 @@ static unsigned char* pixel_at(const NvdrImage* img, int x, int y) {
  * deviation accumulates in double because a 4K region is millions of
  * terms and a float accumulator starts dropping the small ones.
  */
-static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
+/*
+ * Prefix sums of R, G and B, so a region's mean colour costs four lookups
+ * instead of a sweep.
+ *
+ * The tree computed each node's mean by adding up its pixels and then
+ * swept the region a second time for the deviation, which made the build
+ * two passes per node at every depth — 27 Mpx read for a 2.67 Mpx image.
+ * The deviation still needs its sweep, because a mean absolute deviation
+ * cannot be recovered from sums, but the first one does not.
+ *
+ * uint32 holds a full-frame sum up to 16.8 Mpx, which covers 4K. Past
+ * that the table is not built and the old two-sweep path runs, so the
+ * only thing at stake is speed.
+ */
+typedef struct {
+    uint32_t* sum;      /* three per cell, (w+1) x (h+1), row-major */
+    int       w, h;
+} NvdrSums;
+
+static void sums_free(NvdrSums* s) { free(s->sum); s->sum = NULL; }
+
+static int sums_build(NvdrSums* s, const NvdrImage* img) {
+    memset(s, 0, sizeof(*s));
+    size_t pixels = (size_t)img->width * img->height;
+    if (pixels == 0 || pixels > 16700000u) return -1;   /* uint32 would wrap */
+
+    int w1 = img->width + 1, h1 = img->height + 1;
+    s->sum = (uint32_t*)calloc((size_t)w1 * h1 * 3, sizeof(uint32_t));
+    if (!s->sum) return -1;
+    s->w = img->width; s->h = img->height;
+
+    for (int y = 0; y < img->height; y++) {
+        const unsigned char* src = img->pixels + (size_t)y * img->width * 3;
+        uint32_t* prev = s->sum + (size_t)y * w1 * 3;
+        uint32_t* cur  = s->sum + (size_t)(y + 1) * w1 * 3;
+        uint32_t run[3] = { 0, 0, 0 };
+        for (int x = 0; x < img->width; x++, src += 3) {
+            run[0] += src[0]; run[1] += src[1]; run[2] += src[2];
+            uint32_t* c = cur + (size_t)(x + 1) * 3;
+            const uint32_t* p = prev + (size_t)(x + 1) * 3;
+            c[0] = p[0] + run[0];
+            c[1] = p[1] + run[1];
+            c[2] = p[2] + run[2];
+        }
+    }
+    return 0;
+}
+
+/* Sum over [x, x+w) x [y, y+h), clipped to the image. */
+static void sums_region(const NvdrSums* s, int x, int y, int w, int h,
+                        uint64_t* out) {
+    int x1 = x + w > s->w ? s->w : x + w;
+    int y1 = y + h > s->h ? s->h : y + h;
+    int w1 = s->w + 1;
+    const uint32_t* a = s->sum + ((size_t)y1 * w1 + x1) * 3;
+    const uint32_t* b = s->sum + ((size_t)y  * w1 + x1) * 3;
+    const uint32_t* c = s->sum + ((size_t)y1 * w1 + x ) * 3;
+    const uint32_t* d = s->sum + ((size_t)y  * w1 + x ) * 3;
+    for (int k = 0; k < 3; k++)
+        out[k] = (uint64_t)a[k] - b[k] - c[k] + d[k];
+}
+
+static float region_stats_full(const NvdrImage* img, const NvdrSums* sums,
+                               int x, int y, int w, int h,
                                float weber, float pivot, double* out_raw,
                                uint8_t* out_r, uint8_t* out_g, uint8_t* out_b) {
     int x1 = x + w > img->width  ? img->width  : x + w;
@@ -260,12 +323,17 @@ static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
     }
 
     uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
-    uint32_t count = 0;
-    for (int py = y; py < y1; py++) {
-        const unsigned char* p = pixel_at(img, x, py);
-        for (int px = x; px < x1; px++, p += 3) {
-            sum_r += p[0]; sum_g += p[1]; sum_b += p[2];
-            count++;
+    uint32_t count = (uint32_t)((x1 - x) * (y1 - y));
+    if (sums && sums->sum) {
+        uint64_t t[3];
+        sums_region(sums, x, y, w, h, t);
+        sum_r = t[0]; sum_g = t[1]; sum_b = t[2];
+    } else {
+        for (int py = y; py < y1; py++) {
+            const unsigned char* p = pixel_at(img, x, py);
+            for (int px = x; px < x1; px++, p += 3) {
+                sum_r += p[0]; sum_g += p[1]; sum_b += p[2];
+            }
         }
     }
     uint8_t mr = (uint8_t)((sum_r + count / 2) / count);
@@ -273,17 +341,33 @@ static float region_stats_full(const NvdrImage* img, int x, int y, int w, int h,
     uint8_t mb = (uint8_t)((sum_b + count / 2) / count);
     *out_r = mr; *out_g = mg; *out_b = mb;
 
-    double deviation = 0.0;
+    /*
+     * The three channels accumulate as exact integers and the luma
+     * weighting is applied once at the end, instead of a double multiply
+     * and add per pixel. This is the hot loop of the whole encoder — it
+     * sweeps roughly ten times the image over a build — and it is also
+     * more accurate this way, since an integer sum has no rounding at all
+     * where the old one rounded on every pixel.
+     *
+     * There is no guarantee this is bit-identical to what it replaces,
+     * since floating point is not associative and summing per-pixel
+     * products is not the same as weighting summed integers. It happens to
+     * be, byte for byte, on every sample and on both video containers —
+     * checked rather than assumed, because a speed change that quietly
+     * moves the output is a quality change in disguise.
+     */
+    uint64_t acc_r = 0, acc_g = 0, acc_b = 0;
     for (int py = y; py < y1; py++) {
         const unsigned char* p = pixel_at(img, x, py);
         for (int px = x; px < x1; px++, p += 3) {
             int dr = (int)p[0] - mr, dg = (int)p[1] - mg, db = (int)p[2] - mb;
-            if (dr < 0) dr = -dr;
-            if (dg < 0) dg = -dg;
-            if (db < 0) db = -db;
-            deviation += 0.30 * dr + 0.59 * dg + 0.11 * db;
+            acc_r += (unsigned)(dr < 0 ? -dr : dr);
+            acc_g += (unsigned)(dg < 0 ? -dg : dg);
+            acc_b += (unsigned)(db < 0 ? -db : db);
         }
     }
+    double deviation = 0.30 * (double)acc_r + 0.59 * (double)acc_g
+                     + 0.11 * (double)acc_b;
     /* Weber normalisation: the same absolute deviation counts for more in
      * a dark region than a bright one, which is the whole difference
      * between "this region is uniform" and "this region looks uniform". */
@@ -402,6 +486,7 @@ static int32_t tree_alloc(NvdrTree* tree) {
 }
 
 static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
+                          const NvdrSums* sums,
                           const NvdrConfig* cfg, float pivot,
                           const NvdrTextureMap* texture,
                           int32_t idx, int x, int y, int w, int h, int depth) {
@@ -411,7 +496,7 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
     node->first_child = -1;
 
     double raw = 0.0;
-    node->deviation = region_stats_full(img, x, y, w, h, cfg->weber, pivot, &raw,
+    node->deviation = region_stats_full(img, sums, x, y, w, h, cfg->weber, pivot, &raw,
                                         &node->r, &node->g, &node->b);
 
     /* The share of this region's variation that lives inside 4x4 windows.
@@ -444,10 +529,10 @@ static int tree_build_rec(NvdrTree* tree, const NvdrImage* img,
 
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     int rc = 0;
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 0, x,      y,      hw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 1, x + hw, y,      rw, hh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 2, x,      y + hh, hw, rh, depth + 1);
-    rc |= tree_build_rec(tree, img, cfg, pivot, texture, first + 3, x + hw, y + hh, rw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 0, x,      y,      hw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 1, x + hw, y,      rw, hh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 2, x,      y + hh, hw, rh, depth + 1);
+    rc |= tree_build_rec(tree, img, sums, cfg, pivot, texture, first + 3, x + hw, y + hh, rw, rh, depth + 1);
     return rc;
 }
 
@@ -475,10 +560,17 @@ int nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg)
         return -1;
     }
 
+    NvdrSums sums;
+    sums_build(&sums, img);   /* optional: too large an image runs without it */
+
     int32_t root = tree_alloc(tree);
-    if (root < 0) { texture_map_free(&texture); nvdr_tree_free(tree); return -1; }
-    int rc = tree_build_rec(tree, img, cfg, pivot, &texture, root,
+    if (root < 0) {
+        sums_free(&sums); texture_map_free(&texture);
+        nvdr_tree_free(tree); return -1;
+    }
+    int rc = tree_build_rec(tree, img, &sums, cfg, pivot, &texture, root,
                             0, 0, img->width, img->height, 0);
+    sums_free(&sums);
     texture_map_free(&texture);
     if (rc != 0) { nvdr_tree_free(tree); return -1; }
     return 0;
@@ -879,20 +971,50 @@ static uint32_t get_u32(const uint8_t* p) {
  *
  * Returns 0 for flat, 1 for a ramp along x, 2 along y.
  */
+/*
+ * The largest ramp whose fill values are worth tabulating rather than
+ * recomputing per pixel. Leaves are small at the tolerances this runs at,
+ * so this covers nearly all of them and the rest fall back.
+ */
+#define NVDR_RAMP_LUT 512
+
 static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h,
                     const uint8_t* dc, int slope_step, double lambda,
                     int8_t* slope_out) {
     slope_out[0] = slope_out[1] = slope_out[2] = 0;
     if (w < 2 && h < 2) return 0;
 
+    /*
+     * One pass for everything the decision needs before quantisation: the
+     * flat fill's error, and the least-squares numerator and denominator
+     * of both axes against t = 2*pos - len + 1, the ramp's shape without
+     * its scale. These used to be three separate sweeps of the rectangle.
+     * The terms are accumulated in the order they were before — rows
+     * outer, columns inner, channels innermost — because summing the same
+     * doubles in a different order gives a different double, and the
+     * output has to stay byte for byte what it was.
+     */
     double flat_sse = 0.0;
+    double num_x[3] = { 0.0, 0.0, 0.0 }, num_y[3] = { 0.0, 0.0, 0.0 };
+    double den_x = 0.0, den_y = 0.0;
+    const double d0 = dc[0], d1 = dc[1], d2 = dc[2];
+
     for (int yy = 0; yy < h; yy++) {
         const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-        for (int xx = 0; xx < w; xx++, row += 3)
-            for (int c = 0; c < 3; c++) {
-                double d = (double)row[c] - (double)dc[c];
-                flat_sse += d * d;
-            }
+        const double ty = (double)(2 * yy - h + 1);
+        for (int xx = 0; xx < w; xx++, row += 3) {
+            const double tx = (double)(2 * xx - w + 1);
+            const double e0 = (double)row[0] - d0;
+            const double e1 = (double)row[1] - d1;
+            const double e2 = (double)row[2] - d2;
+            flat_sse += e0 * e0;
+            flat_sse += e1 * e1;
+            flat_sse += e2 * e2;
+            den_x += tx * tx;
+            den_y += ty * ty;
+            num_x[0] += e0 * tx; num_x[1] += e1 * tx; num_x[2] += e2 * tx;
+            num_y[0] += e0 * ty; num_y[1] += e1 * ty; num_y[2] += e2 * ty;
+        }
     }
 
     int    best_axis = 0;
@@ -902,19 +1024,8 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
     for (int axis = 1; axis <= 2; axis++) {
         int len = axis == 1 ? w : h;
         if (len < 2) continue;
-
-        /* Least squares against t = 2*pos - len + 1, which is the ramp
-         * shape without its scale. */
-        double num[3] = { 0.0, 0.0, 0.0 }, den = 0.0;
-        for (int yy = 0; yy < h; yy++) {
-            const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-            for (int xx = 0; xx < w; xx++, row += 3) {
-                double t = (double)(2 * (axis == 1 ? xx : yy) - len + 1);
-                den += t * t;
-                for (int c = 0; c < 3; c++)
-                    num[c] += ((double)row[c] - (double)dc[c]) * t;
-            }
-        }
+        const double* num = axis == 1 ? num_x : num_y;
+        double den = axis == 1 ? den_x : den_y;
         if (den <= 0.0) continue;
 
         int8_t q[3];
@@ -927,17 +1038,43 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
         }
         if (!any) continue;
 
+        /*
+         * The exact error of the ramp as the renderer will draw it,
+         * quantisation and clamping included, because the fitted optimum
+         * and the coded one are not always the same choice. A ramp's fill
+         * depends only on the position along its axis, so it is tabulated
+         * once per rectangle instead of recomputed at every pixel.
+         */
+        uint8_t lut[NVDR_RAMP_LUT][3];
+        int use_lut = len <= NVDR_RAMP_LUT;
+        if (use_lut)
+            for (int pos = 0; pos < len; pos++)
+                for (int c = 0; c < 3; c++)
+                    lut[pos][c] = (uint8_t)clamp_u8((int)dc[c] +
+                        ramp_offset(q[c] * slope_step, pos, len));
+
         double sse = 0.0;
         for (int yy = 0; yy < h; yy++) {
             const uint8_t* row = space + ((size_t)(y + yy) * stride + x) * 3;
-            for (int xx = 0; xx < w; xx++, row += 3) {
-                int pos = axis == 1 ? xx : yy;
-                for (int c = 0; c < 3; c++) {
-                    int fill = clamp_u8((int)dc[c] +
-                        ramp_offset(q[c] * slope_step, pos, len));
-                    double d = (double)row[c] - (double)fill;
-                    sse += d * d;
-                }
+            if (axis == 2) {
+                /* One fill for the whole row. */
+                uint8_t f[3];
+                for (int c = 0; c < 3; c++)
+                    f[c] = use_lut ? lut[yy][c] : (uint8_t)clamp_u8((int)dc[c] +
+                        ramp_offset(q[c] * slope_step, yy, len));
+                for (int xx = 0; xx < w; xx++, row += 3)
+                    for (int c = 0; c < 3; c++) {
+                        double d = (double)row[c] - (double)f[c];
+                        sse += d * d;
+                    }
+            } else {
+                for (int xx = 0; xx < w; xx++, row += 3)
+                    for (int c = 0; c < 3; c++) {
+                        int fill = use_lut ? lut[xx][c] : clamp_u8((int)dc[c] +
+                            ramp_offset(q[c] * slope_step, xx, len));
+                        double d = (double)row[c] - (double)fill;
+                        sse += d * d;
+                    }
             }
         }
 
@@ -958,8 +1095,8 @@ static int fit_ramp(const uint8_t* space, int stride, int x, int y, int w, int h
     return best_axis;
 }
 
-int nvdr_encode_file(const char* out_path, const NvdrImage* img,
-                     const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+static int encode_to_memory(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                            const NvdrConfig* cfg, NvdrHeader* hdr_out) {
     /* The deflate path writes its split bits in tree order, so it cannot
      * also carry a reordered emission. It exists for comparison, and the
      * comparison is fair either way. */
@@ -1135,6 +1272,21 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             axis[k] = (uint8_t*)calloc(total ? total : 1, 1);
             slope[k] = (int8_t*)calloc((size_t)(total ? total : 1) * 3, 1);
             if (!axis[k] || !slope[k]) goto done;
+            /*
+             * Every rectangle's ramp is fitted from its own pixels and
+             * written to its own slot, so this loop has no order and no
+             * sharing. Threading it changes nothing about the output — the
+             * regression gate checks the container is byte for byte the
+             * same and that two runs agree, which is exactly the property
+             * a parallel loop is able to break.
+             *
+             * Without OpenMP the pragma is ignored and the loop runs as it
+             * always did, so the build keeps working on a compiler that
+             * does not have it.
+             */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 256)
+#endif
             for (uint32_t i = 0; i < total; i++) {
                 const NvdrNode* n = &tree.nodes[leaves[k].items[i]];
                 axis[k][i] = (uint8_t)fit_ramp(space_img, img->width,
@@ -1276,9 +1428,6 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             }
         }
 
-        FILE* f = fopen(out_path, "wb");
-        if (!f) goto write_done;
-
         uint8_t header[NVDR_HEADER_SIZE];
         memset(header, 0, sizeof(header));
         memcpy(header, NVDR_MAGIC, 4);
@@ -1300,10 +1449,22 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
             put_u32(header + 40 + k * 4, (uint32_t)raw_size[k]);
             put_u32(header + 52 + k * 4, (uint32_t)stored_size[k]);
         }
-        fwrite(header, 1, sizeof(header), f);
-        for (int k = 0; k < NVDR_LEVELS; k++)
-            fwrite(stored[k], 1, stored_size[k], f);
-        fclose(f);
+        /* One contiguous container. A sequence needs to hold a frame in
+         * memory rather than on disk, and the still path is the same bytes
+         * either way, so the buffer is what gets built and the file is a
+         * wrapper over it. */
+        size_t total = NVDR_HEADER_SIZE;
+        for (int k = 0; k < NVDR_LEVELS; k++) total += stored_size[k];
+        uint8_t* blob = (uint8_t*)malloc(total);
+        if (!blob) goto write_done;
+        memcpy(blob, header, NVDR_HEADER_SIZE);
+        size_t at = NVDR_HEADER_SIZE;
+        for (int k = 0; k < NVDR_LEVELS; k++) {
+            memcpy(blob + at, stored[k], stored_size[k]);
+            at += stored_size[k];
+        }
+        *out_buf = blob;
+        *out_len = total;
         wrote = 1;
 
         if (hdr_out) {
@@ -1348,6 +1509,25 @@ done:
     free(space_img);
     nvdr_tree_free(&tree);
     return rc;
+}
+
+int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                    const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+    *out_buf = NULL; *out_len = 0;
+    return encode_to_memory(out_buf, out_len, img, cfg, hdr_out);
+}
+
+int nvdr_encode_file(const char* out_path, const NvdrImage* img,
+                     const NvdrConfig* cfg, NvdrHeader* hdr_out) {
+    uint8_t* blob = NULL;
+    size_t len = 0;
+    if (encode_to_memory(&blob, &len, img, cfg, hdr_out) != 0) return -1;
+    FILE* f = fopen(out_path, "wb");
+    if (!f) { free(blob); return -1; }
+    size_t wrote = fwrite(blob, 1, len, f);
+    fclose(f);
+    free(blob);
+    return wrote == len ? 0 : -1;
 }
 
 /* ============================================================== decoder */
@@ -1547,21 +1727,28 @@ void nvdr_pyramid_free(NvdrPyramid* pyr) {
  * stream has no such property — a prefix of it inflates to nothing — so
  * that one stays all or nothing.
  */
-static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
+typedef struct {
+    const uint8_t* data;
+    size_t         size;
+    size_t         pos;
+} MemReader;
+
+static uint8_t* read_stream(MemReader* mr, uint32_t stored_bytes,
                             uint32_t raw_bytes, uint8_t compression,
                             size_t* out_size) {
-    if (stored_bytes == 0 || *available <= 0) return NULL;
+    size_t available = mr->size - mr->pos;
+    if (stored_bytes == 0 || available == 0) return NULL;
 
     size_t want = stored_bytes;
-    if (*available < (long)stored_bytes) {
+    if (available < stored_bytes) {
         if (compression == NVDR_COMPRESS_DEFLATE) return NULL;
-        want = (size_t)*available;
+        want = available;
     }
 
     uint8_t* packed = (uint8_t*)malloc(want);
     if (!packed) return NULL;
-    if (fread(packed, 1, want, f) != want) { free(packed); return NULL; }
-    *available -= (long)want;
+    memcpy(packed, mr->data + mr->pos, want);
+    mr->pos += want;
     if (out_size) *out_size = want;
 
     if (compression != NVDR_COMPRESS_DEFLATE) return packed;
@@ -1576,23 +1763,20 @@ static uint8_t* read_stream(FILE* f, long* available, uint32_t stored_bytes,
     return raw;
 }
 
-int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
+int nvdr_decode_mem(const uint8_t* data, size_t size,
+                    NvdrPyramid* pyr, NvdrHeader* hdr) {
     memset(pyr, 0, sizeof(*pyr));
     pyr->last_level_fraction = 1.0;
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    MemReader mr = { data, size, 0 };
 
     uint8_t header[NVDR_HEADER_SIZE];
-    if (file_size < NVDR_HEADER_SIZE ||
-        fread(header, 1, sizeof(header), f) != sizeof(header) ||
-        memcmp(header, NVDR_MAGIC, 4) != 0 || header[4] != NVDR_VERSION) {
-        fclose(f);
+    if (size < NVDR_HEADER_SIZE ||
+        memcmp(data, NVDR_MAGIC, 4) != 0 || data[4] != NVDR_VERSION) {
         return -1;
     }
+    memcpy(header, data, NVDR_HEADER_SIZE);
+    mr.pos = NVDR_HEADER_SIZE;
 
     memset(hdr, 0, sizeof(*hdr));
     hdr->width       = get_u16(header + 6);
@@ -1614,11 +1798,9 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     pyr->anchor_bits = hdr->anchor_bits;
     for (int k = 0; k < NVDR_LEVELS; k++) pyr->step[k] = hdr->step[k];
 
-    long available = file_size - NVDR_HEADER_SIZE;
-
     /* --- level 0 is the contract; without it there is no picture --- */
     size_t anchor_size = 0;
-    uint8_t* stream = read_stream(f, &available, hdr->stored_bytes[0],
+    uint8_t* stream = read_stream(&mr, hdr->stored_bytes[0],
                                   hdr->raw_bytes[0], hdr->compression, &anchor_size);
     /*
      * The anchor is the contract: a partial one is no picture at all.
@@ -1632,19 +1814,19 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     int anchor_short = hdr->compression != NVDR_COMPRESS_DEFLATE &&
                        anchor_size < hdr->stored_bytes[0];
     if (!stream || anchor_short) {
-        free(stream); fclose(f); return -1;
+        free(stream); return -1;
     }
 
     size_t off = 0;
     pyr->palette_count = (int)stream[off++] + 1;   /* stored biased by one */
     pyr->palette = (unsigned char*)malloc((size_t)pyr->palette_count * 3);
-    if (!pyr->palette) { free(stream); fclose(f); return -1; }
+    if (!pyr->palette) { free(stream); return -1; }
     memcpy(pyr->palette, stream + off, (size_t)pyr->palette_count * 3);
     off += (size_t)pyr->palette_count * 3;
 
     RectSink sink = { &pyr->level[0], 0 };
     uint32_t* tokens = (uint32_t*)malloc((size_t)hdr->leaf_count[0] * sizeof(uint32_t));
-    if (!tokens) { free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1; }
+    if (!tokens) { free(stream); nvdr_pyramid_free(pyr); return -1; }
 
     if (hdr->compression == NVDR_COMPRESS_ARITH) {
         NvdrModels models;
@@ -1653,18 +1835,18 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         nvdr_dec_init(&ad, stream + off, hdr->stored_bytes[0] - off);
         if (replay_arith(&ad, &models, &sink, 0, 0, hdr->width, hdr->height) != 0 ||
             ad.overrun || pyr->level[0].count != hdr->leaf_count[0]) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
         for (uint32_t i = 0; i < hdr->leaf_count[0]; i++)
             tokens[i] = nvdr_dec_tree(&ad, models.token, hdr->anchor_bits);
         if (ad.overrun) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
     } else {
         BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
         if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
             pyr->level[0].count != hdr->leaf_count[0]) {
-            free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
         off += (hdr->split_bits[0] + 7) / 8;
         for (uint32_t i = 0; i < hdr->leaf_count[0]; i++) {
@@ -1680,7 +1862,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     pyr->level[0].rgb = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
     pyr->level[0].chain = (uint8_t*)malloc((size_t)pyr->level[0].count * 3);
     if (!pyr->level[0].rgb || !pyr->level[0].chain) {
-        free(tokens); free(stream); fclose(f); nvdr_pyramid_free(pyr); return -1;
+        free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
     }
     for (uint32_t i = 0; i < pyr->level[0].count; i++) {
         uint32_t token = tokens[i] < (uint32_t)pyr->palette_count ? tokens[i] : 0;
@@ -1698,7 +1880,7 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
     /* --- every further level is a bonus the bytes may not have paid for -- */
     for (int k = 1; k < NVDR_LEVELS; k++) {
         size_t buf_size = 0;
-        uint8_t* buf = read_stream(f, &available, hdr->stored_bytes[k],
+        uint8_t* buf = read_stream(&mr, hdr->stored_bytes[k],
                                    hdr->raw_bytes[k], hdr->compression, &buf_size);
         if (!buf) break;
 
@@ -1853,8 +2035,27 @@ int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
         if (stopped) break;
     }
 
-    fclose(f);
     return 0;
+}
+
+int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) { fclose(f); return -1; }
+
+    uint8_t* data = (uint8_t*)malloc((size_t)size);
+    if (!data) { fclose(f); return -1; }
+    size_t got = fread(data, 1, (size_t)size, f);
+    fclose(f);
+
+    /* A short read is a truncated file, which is a thing this format
+     * decodes rather than rejects, so it is passed on as it arrived. */
+    int rc = nvdr_decode_mem(data, got, pyr, hdr);
+    free(data);
+    return rc;
 }
 
 /* =============================================================== render */

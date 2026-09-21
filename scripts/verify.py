@@ -98,6 +98,74 @@ def make_probes(directory):
     return out
 
 
+def make_sequence(directory, frames=12, size=128):
+    """A frame sequence, for the same reason the still probes exist.
+
+    A codec that predicts from the wrong reference looks correct on frame 1
+    and walks away from the source by frame 12, so the sequence has to be
+    long enough for drift to show and cheap enough to run every time. The
+    background is textured so the prediction has something to be wrong
+    about, and the block moves so the motion search has work to do."""
+    paths = []
+    for n in range(frames):
+        bx, by = 20 + n * 4, 40
+        def fn(x, y, bx=bx, by=by):
+            if bx <= x < bx + 30 and by <= y < by + 30:
+                return (230, 60, 40)
+            v = 40 + ((x * 7 + y * 13) % 53) + ((x // 16 + y // 16) % 3) * 40
+            return (v, min(255, v + 25), 255 - v)
+        path = directory / f"seq{n:03d}.ppm"
+        write_ppm(path, size, size, fn)
+        paths.append(path)
+    return paths
+
+
+def check_sequence(tmp, psnr_slack):
+    """Encode the sequence, decode it, and report bytes, quality and drift."""
+    enc = find_binary("nvdrv_encode")
+    dec = find_binary("nvdrv_decode")
+    srcdir = tmp / "seq"
+    srcdir.mkdir(exist_ok=True)
+    make_sequence(srcdir)
+
+    out = tmp / "seq.nvdrv"
+    r = subprocess.run([str(enc), str(srcdir), str(out), "--gop", "0"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        return None, [r.stderr.strip() or "sequence encode failed"]
+
+    # Determinism, same rule as the stills.
+    out_b = tmp / "seq_b.nvdrv"
+    subprocess.run([str(enc), str(srcdir), str(out_b), "--gop", "0"],
+                   capture_output=True, text=True)
+    stable = (out_b.exists() and
+              hashlib.sha256(out.read_bytes()).hexdigest()
+              == hashlib.sha256(out_b.read_bytes()).hexdigest())
+
+    r = subprocess.run([str(dec), str(out), "--compare", str(srcdir)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, [r.stderr.strip() or "sequence decode failed"]
+
+    per_frame = [float(m) for m in
+                 re.findall(r"(?:INTRA|pred)\s+([0-9.]+) dB", r.stdout)]
+    if len(per_frame) < 12:
+        return None, [f"only {len(per_frame)} of 12 frames decoded"]
+
+    problems = []
+    if not stable:
+        problems.append("sequence encoder is not deterministic")
+    # Drift: the last frames must not be worse than the first. Predicting
+    # from the wrong reference shows up here and nowhere else.
+    drift = min(per_frame[1:]) - per_frame[0]
+    if drift < -psnr_slack:
+        problems.append(f"drifts {drift:+.2f} dB by the end")
+
+    return {"bytes": out.stat().st_size,
+            "psnr": round(sum(per_frame) / len(per_frame), 2),
+            "drift": round(drift, 2)}, problems
+
+
 def encode(encoder, image, out):
     r = subprocess.run([str(encoder), str(image), str(out)],
                        capture_output=True, text=True)
@@ -239,6 +307,29 @@ def main():
             print(f"{name:<26} {size:>9} {psnr:>7.2f}dB {delta:>16} "
                   f"{'stable' if stable else 'VARIES':>7}  "
                   f"{'ok' if not notes else '; '.join(notes)[:34]}")
+
+        seq, seq_problems = check_sequence(tmp, args.psnr_slack)
+        failures += [f"sequence: {p}" for p in seq_problems]
+        if seq:
+            recorded["<sequence>"] = {k: seq[k] for k in ("bytes", "psnr")}
+            delta = ""
+            if "<sequence>" in baseline:
+                was = baseline["<sequence>"]
+                d_psnr = seq["psnr"] - was["psnr"]
+                d_size = (seq["bytes"] - was["bytes"]) / was["bytes"]
+                delta = f"{d_psnr:+.2f}dB {d_size:+.1%}"
+                if d_psnr < -args.psnr_slack:
+                    failures.append(
+                        f"sequence: PSNR {was['psnr']:.2f} -> {seq['psnr']:.2f} dB")
+                if d_size > args.size_slack:
+                    failures.append(
+                        f"sequence: {was['bytes']} -> {seq['bytes']} bytes ({d_size:+.1%})")
+            elif baseline:
+                delta = "new"
+            print(f"{'<sequence> 12 frames':<26} {seq['bytes']:>9} {seq['psnr']:>7.2f}dB "
+                  f"{delta:>16} {'stable':>7}  "
+                  f"{'ok' if not seq_problems else '; '.join(seq_problems)[:34]} "
+                  f"(deriva {seq['drift']:+.2f} dB)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

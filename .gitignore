@@ -1,5 +1,7 @@
 # Build artifacts
 nvdr_encode
+nvdrv_encode
+nvdrv_decode
 nvdr_decode
 *.exe
 *.o
@@ -29,3 +31,6 @@ build_errors.txt
 # Documentos internos (propriedade intelectual do NVDR)
 docs/
 ANTIGRAVITY.md
+
+# Frame sequences are large and belong to whoever recorded them.
+samples/video/*/

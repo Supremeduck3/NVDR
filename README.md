@@ -459,6 +459,135 @@ the recognition removed, since every boundary is locally a line, and it
 composes with the tree, the levels, the truncation guarantee and the ramps
 as they already stand.
 
+## Measured: reusing the previous frame
+
+The project's target is video, so the question that matters is what frame
+N-1 is worth to frame N. There is no video here and nothing that can
+decode one, so the frames are synthesised: a window cropped out of a
+larger still and moved, which reproduces the camera translating, the
+camera zooming, and a region moving against a still background.
+`--noise` puts a deterministic per-pixel perturbation back to stand in for
+a sensor. Read every number below knowing they are built rather than
+filmed, so they are optimistic; the noise row is the honest one.
+
+The first thing measured was the obvious primitive — copy the region when
+it has not changed — and it does not work. Even between two **identical**
+frames only 38% of the area can be copied and only 16% of the leaves
+disappear, because the reference is the previous frame *decoded*, at
+26.5 dB, and that loss already exceeds the tolerance across most of the
+picture. Under a 3 px pan it collapses to 0.5%.
+
+What does work is the thing the format already does between levels: code
+the frame as a **residual against the previous frame's reconstruction**.
+Measured end to end with the codec exactly as it stands — encode frame
+N-1, decode it, subtract, encode the error, add it back:
+
+    sequencia          intra              inter           bytes    PSNR
+    static        40853 B  26.53 dB   12138 B  26.60 dB  -70.3%  +0.07
+    object        40484 B  26.50 dB   13822 B  26.51 dB  -65.9%  +0.01
+    pan           41643 B  26.52 dB   38668 B  26.43 dB   -7.1%  -0.09
+
+Motion is not optional. A co-located reference is worth almost nothing the
+moment the camera moves, and **one global motion vector** for the whole
+frame fixes it:
+
+    pan           41643 B  26.52 dB   16339 B  27.49 dB  -60.8%  +0.97
+    pan + noise   42488 B  26.45 dB   17996 B  27.38 dB  -57.6%  +0.93
+
+That is the crudest motion model there is — a single vector, found by
+minimising absolute difference over a lattice. Per-block vectors can only
+improve it.
+
+The failure mode that decides whether this is a codec or a demo is drift:
+frame 3 is predicted from a reconstruction of a reconstruction, and if
+each step loses a little the picture walks away from the source. Over an
+eight-frame chain, with the decoder's state carried forward exactly as a
+decoder would hold it, it does not drift — it improves:
+
+    quadro     bytes      PSNR    intra seria
+        0      40853   26.53 dB      40853 B
+        1      16339   27.49 dB      41643 B
+        3      11086   28.04 dB      41578 B
+        5       9958   28.29 dB      41299 B
+        7       9078   28.41 dB      41224 B
+                                     -63.2% total
+
+Quality climbs 1.89 dB while the cost per frame falls to a fifth. That is
+the truncation property working along the time axis rather than down the
+container: every residual adds detail on top of what the last one left, so
+a shot that holds still gets better and cheaper the longer it runs. With
+sensor noise the same chain gives -57.9% and +1.79 dB, so the effect is
+not an artefact of frames being perfect copies.
+
+It is faster too, though less than it looks: the error image encodes in
+25 ms against the frame's 46 ms, 1.8x, because at 26.5 dB the reference
+still leaves plenty of structure behind.
+
+Where this is still unproven: the frames are synthetic, the motion model
+is one vector, the chain is eight frames rather than a shot, and nothing
+here has been tried on footage with real lighting changes or a cut.
+
+## Speed
+
+Encoding runs at about 80 ms per megapixel, down from 136, with the
+container byte for byte what it was — checked against a recorded hash on
+every sample and on both video containers, because a speed change that
+quietly moves the output is a quality change in disguise.
+
+Where it went, measured on a 2.67 Mpx frame rather than guessed:
+
+    fase                antes    depois
+    arvore              163 ms   169 ms   (integral 17, desvio 92)
+    rampa               157 ms   113 ms
+    entropia             52 ms    53 ms
+
+Two changes. The ramp fit swept its rectangle five times — once for the
+flat error, once per axis for the least-squares fit, once per axis for the
+exact error — and now sweeps it three, with the moments of both axes
+accumulated together in the order they were summed before, since adding
+the same doubles in a different order gives a different double. The fill
+values of a candidate ramp depend only on the position along its axis, so
+they are tabulated per rectangle instead of recomputed per pixel.
+
+The tree used to compute every node's mean by adding up its pixels and
+then sweep the region again for the deviation, which is two passes per
+node at every depth. An integral image makes the mean four lookups. The
+deviation still needs its sweep — a mean absolute deviation cannot be
+recovered from sums — but it now accumulates the three channels as exact
+integers and applies the luma weighting once at the end, instead of a
+double multiply-add per pixel. That loop is the hot one in the whole
+encoder, sweeping roughly ten times the image over a build.
+
+Predicted right, measured wrong: the integral image was supposed to halve
+the tree and moved it by 9%. The deviation sweep is what the tree actually
+costs, and it is irreducible at 92 ms for 27 Mpx of reading.
+
+The ramp fit is now threaded, which is the rest of it:
+
+    imagem                  inicio    agora    ganho
+    macarrao.jpg             82.7     44.1    46.7%
+    montanha_pessoas.jpg    136.4     80.5    41.0%
+    starfield               139.5     92.9    33.4%
+
+Every rectangle's ramp is fitted from its own pixels into its own slot, so
+the loop has no order and nothing shared. The container has to come out
+identical anyway, and it does: checked against a recorded hash, and
+checked for determinism over 70 runs across three images and a video
+container, each producing exactly one hash. OpenMP is optional — without
+it the pragma is ignored and the loop runs as it did.
+
+ThreadSanitizer reports races here and they are libgomp's, not the code's.
+Every report crosses the runtime boundary, where TSan has no visibility
+into the barrier that `parallel for` ends with, and all of them disappear
+at `OMP_NUM_THREADS=1` with the same binary. What clears it is not that
+argument but the bit-identical runs; the argument only says why the tool
+cannot see it.
+
+The tree is not threaded. Its subtrees allocate nodes from one arena as
+they descend, so running them in parallel makes the numbering depend on
+which finished first — which is the bug the old pipeline had, and would
+need per-subtree arenas merged in fixed order to avoid.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
@@ -508,10 +637,63 @@ smaller residuals behind it.
 The anchor is 1.5% of a typical container, so almost any surviving prefix
 carries it.
 
+## Sequences
+
+`src/nvdrv.c` codes a sequence of frames, and the frame codec does not
+change to make it work: a predicted frame is an ordinary NVDR container
+whose image happens to be the prediction error, biased to the middle of
+the range. Frame 0 is coded on its own; every frame after it is the error
+against what the decoder holds, moved by one global translation.
+
+Against coding every frame on its own, on the synthetic sequences:
+
+    sequence      so intra              NVDRV                  bytes
+    pan        984247 B  27.17 dB   245517 B  28.66 dB       -75.1%
+    object     995208 B  27.08 dB   311216 B  27.07 dB       -68.7%
+    pan+noise 1008011 B  27.09 dB   337152 B  28.58 dB       -66.6%
+
+Truncation now holds on two axes. A prefix of the file is a prefix of the
+movie, and the frame the cut lands in is handed to the still decoder as-is,
+so it shows at whatever quality its bytes paid for:
+
+    corte    bytes   quadros   PSNR medio
+       5%    12275         1     24.75 dB
+      15%    36827         1     27.12 dB
+      30%    73655         4     28.04 dB
+      50%   122758         9     28.40 dB
+     100%   245517        24     28.66 dB
+
+Scene cuts are found rather than declared: when the mean absolute
+prediction error passes `--intra-thresh`, the frame is coded intra. On a
+sequence spliced from two different sources the encoder puts an intra
+frame exactly at the splice without being told where it is.
+
+The encoder predicts from its own decoded output and never from the source
+frame, because that is all a decoder has. Getting this wrong is the
+classic way a codec drifts, and it is the reason the regression gate
+checks a sequence: replacing the reconstruction loop with the source frame
+makes the container **78.7% smaller**, which a size check would call an
+improvement, and costs 8.90 dB by frame 12.
+
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+
+A predicted frame's levels look broken and are not. Its anchor comes out
+as one rectangle costing 9 bytes and its R1 as one more, with all 31585
+rectangles in R2 — the same shape that made a star field's truncation
+ladder flat. Here it is correct: a flat grey error means "no correction
+yet", which renders as the previous frame, so a predicted frame cut short
+falls back to what was already on screen. Tightening the tolerance does
+restore a ladder, and costs 59% more bytes for 0.15 dB, so it stays as it
+is. The anchor palette was the suspect before this was measured, and it
+is not: 9 bytes is not where the waste would be.
+
+Not here yet: per-block motion and B-frames.
+
 ## Layout
 
-    src/        the codec: nvdr.c, entropy.c and their headers
-    tools/      the two CLIs, nvdr_encode and nvdr_decode
+    src/        the codec: nvdr.c and entropy.c, plus nvdrv.c for sequences
+    tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
     public/     the browser decoder (nvdr.js) and its viewer
     scripts/    the regression gate, the C-vs-JS cross-check, analysis
     samples/    the images every number in this file was measured on
@@ -525,6 +707,8 @@ carries it.
     make
     ./nvdr_encode image.jpg out.nvdr
     ./nvdr_decode out.nvdr out.ppm --level 1 --compare image.jpg
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     make check          # the regression gate
 
 `nvdr_encode` prints the raw and stored size and the PSNR of each layer,
