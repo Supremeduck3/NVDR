@@ -4,10 +4,20 @@ Two modules pulled out of the SVBC pipeline before it was deleted. Neither
 is part of the build. They are here because the work in them is on the
 roadmap, not because anything calls them.
 
-Everything else from that pipeline is in git history and nothing is lost:
+Everything else from that pipeline is in git history and nothing is lost.
+`c0410ab` is the last commit on main that carries all of it — the codec,
+its SVG and SVBC writers, `tools/svbc_check.c` (the only reader that can
+measure a `.svbc` container's PSNR) and the SVBC regression gate:
 
-    git show 4e36ba0:src/optimizer.c
-    git checkout 4e36ba0 -- src/          # to bring the whole thing back
+    git show c0410ab:src/optimizer.c
+    git checkout c0410ab -- src/ tools/svbc_check.c
+
+That commit also carries the determinism fix from `aad53da`
+(`quadtree_canonicalize`), which renumbers the tree into depth-first
+pre-order after the parallel build so the output stops depending on how
+OpenMP happened to schedule. Anyone reviving the pipeline wants it: without
+it eight consecutive runs of the same image produced eight different
+containers.
 
 ## SVBC_v0_3.md
 
