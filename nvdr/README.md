@@ -410,6 +410,55 @@ not the delivery, and reverting the schedule is what fixed it. What
 interleaving actually buys is that a cut can no longer discard work that
 already arrived, which is worth keeping because it costs nothing.
 
+## Measured but not built: cutting along a line
+
+Everything here partitions into axis-aligned rectangles, so any boundary
+that is not horizontal or vertical is approximated by a staircase, and the
+staircase costs rectangles without bound as the tolerance tightens. On a
+picture of four flat circles, 21% of the leaves sit on 0.76% of the area —
+they are the outlines — and each of them has a deviation of 0.23 against a
+tolerance of 0.04. They stopped splitting because they ran out of room, not
+because they were resolved.
+
+So the question is what one oblique cut would be worth against the 4-way
+split the tree actually does. At every node that decides to split, with the
+line searched over 8 angles and 7 offsets and both regions given their mean
+colour:
+
+    image                  erro removido      razao   custo   corte
+                          corte     split                     vence
+    circulos (synth)      37.5%     29.5%     1.27x   0.67x   88.8%
+    blocos   (synth)      30.6%     53.3%     0.58x   0.67x    0.0%
+    macarrao.jpg          36.6%     27.9%     1.31x   0.67x   76.0%
+    OIP-4140498144.jpg    39.1%     31.6%     1.24x   0.67x   69.4%
+    montanha_pessoas.jpg  33.9%     31.7%     1.07x   0.67x   63.2%
+    starfield             34.1%     33.6%     1.01x   0.67x   74.5%
+
+A cut removes 1.0 to 1.3 times the error of a full 4-way split while
+costing roughly two thirds of the bits — two residuals and a line instead
+of four residuals and four flags. It wins on 63 to 89% of decision nodes on
+real images. `blocos` is the honest exception: its edges are axis-aligned
+by construction, the quad split is exactly the right move there, and a
+rate-distortion test would keep it.
+
+Three caveats, because this is a ceiling and not a result. The line
+parameters are unquantised and the region colours free, so real coding
+costs more than the 10 bits assumed for angle and offset. The comparison is
+one step deep: whether a cut actually prevents the staircase from forming,
+rather than merely beating one split, cannot be measured without building
+the alternative encoder. And the search is 56 passes over each node's
+pixels.
+
+A shape vocabulary — circle, ellipse, polygon — was the starting point for
+this and is the narrower idea. On `circulos` it is worth far more: four
+centres, radii and colours plus a background is about 31 bytes against the
+3851 the container spends, a factor of 124. But it needs the shapes to be
+found, which is a recognition problem rather than a coding one, and a
+photograph contains none of them. The oblique cut is the same insight with
+the recognition removed, since every boundary is locally a line, and it
+composes with the tree, the levels, the truncation guarantee and the ramps
+as they already stand.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
