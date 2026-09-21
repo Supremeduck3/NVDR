@@ -37,7 +37,7 @@ function readPPM(path) {
     return { width: +fields[1], height: +fields[2], pixels: buf.subarray(at) };
 }
 
-const decoder = new URL('../nvdr/nvdr_decode', import.meta.url).pathname;
+const decoder = new URL('../nvdr_decode', import.meta.url).pathname;
 let failures = 0;
 
 async function check(label, file, level, smooth) {

@@ -1,12 +1,31 @@
-CC = gcc
-CFLAGS = -std=c11 -O2 -Wall -Wextra -Ivendor -Isrc -fopenmp
-TARGET = image_to_svg
-SRCS = src/main.c src/image_io.c src/quadtree.c src/color.c src/svg_writer.c src/optimizer.c src/svbc_writer.c src/svbc_reader.c src/contour.c src/sat.c src/color_hash.c src/codebook_db.c
+# NVDR — Progressive Residual Stack, still-image implementation.
+#
+# Deliberately dependency-free: C11, libm, zlib and stb_image. Nothing
+# here needs a GPU, and nothing here should start needing one.
 
-$(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) -lm -lz -fopenmp
+CC      = gcc
+CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor
+LDLIBS  = -lm -lz
+
+CODEC   = src/nvdr.c src/entropy.c
+HEADERS = src/nvdr.h src/entropy.h
+TOOLS   = nvdr_encode nvdr_decode
+
+all: $(TOOLS)
+
+nvdr_encode: tools/nvdr_encode.c $(CODEC) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_encode.c $(CODEC) $(LDLIBS)
+
+nvdr_decode: tools/nvdr_decode.c $(CODEC) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_decode.c $(CODEC) $(LDLIBS)
+
+# The regression gate: encodes every sample, checks quality against a
+# floor, checks the encoder is deterministic, and checks the C and JS
+# decoders agree byte for byte.
+check: $(TOOLS)
+	python3 scripts/verify.py
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TOOLS)
 
-.PHONY: clean
+.PHONY: all check clean

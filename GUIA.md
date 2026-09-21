@@ -1,36 +1,45 @@
 # Guia de teste
 
-## Por que existem dois pipelines
+## Onde está cada coisa
 
-O repositório carrega **dois codecs independentes**, e é isso que confunde
-na hora de testar. Eles não compartilham código, nem formato, nem Makefile:
+```
+src/        o codec: nvdr.c, entropy.c e os headers
+tools/      as duas CLIs, nvdr_encode e nvdr_decode
+public/     o decoder do navegador (nvdr.js) e a página que o usa
+scripts/    o gate de regressão, o crosscheck C×JS, e análises
+samples/    as imagens em que todo número do README foi medido
+vendor/     stb_image.h, o único código de terceiros
+reference/  dois módulos guardados de um pipeline removido; não compilam
+            no build
+```
 
-| | pipeline antigo | pipeline novo |
-|---|---|---|
-| código | `src/` | `nvdr/` |
-| formato | `.svbc` | `.nvdr` |
-| binário | `image_to_svg` | `nvdr/nvdr_encode`, `nvdr/nvdr_decode` |
-| build | `make` na raiz | `make` dentro de `nvdr/` |
-| página | `localhost:3000/` | `localhost:3000/nvdr.html` |
-
-O pipeline novo é o que implementa a Progressive Residual Stack do spec.
-O antigo continua no repositório porque ainda funciona e serve de
-comparação — nada depende dele.
+Havia um segundo codec no repositório (`src/` antigo, formato `.svbc`,
+binário `image_to_svg`). Ele foi removido: com a taxa casada o NVDR saía
+menor e 2,2 a 6,1 dB melhor nas seis imagens de `samples/`, e ainda tem
+truncagem progressiva, que o `.svbc` não tinha. Está tudo no histórico do
+git se precisar — veja `reference/README.md`.
 
 ---
 
 ## Build
 
-Os dois, uma vez cada:
-
 ```bash
-make               # image_to_svg   (pipeline antigo)
-cd nvdr && make    # nvdr_encode, nvdr_decode
-cd ..
+make
 ```
 
-Se algum falhar, é dependência faltando: ambos precisam de `gcc` e `zlib`
-(`libz-dev` no Debian/Ubuntu). O antigo também usa OpenMP.
+Precisa de `gcc` e `zlib` (`libz-dev` no Debian/Ubuntu). Sai
+`nvdr_encode` e `nvdr_decode` na raiz.
+
+Para rodar o gate de regressão:
+
+```bash
+make check
+```
+
+Ele codifica todas as imagens de `samples/`, checa que o PSNR não caiu
+abaixo do piso, que o encoder é determinístico (mesmo arquivo byte a byte
+em execuções repetidas) e que os decoders C e JS concordam byte a byte,
+inclusive em arquivos truncados.
 
 ---
 
@@ -40,7 +49,7 @@ Se algum falhar, é dependência faltando: ambos precisam de `gcc` e `zlib`
 node server.js
 ```
 
-Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
+Abre `http://localhost:3000`, arrasta uma imagem e pronto:
 
 - as três camadas lado a lado, com bytes acumulados e número de retângulos
 - um slider que corta o arquivo para simular download interrompido
@@ -56,7 +65,7 @@ Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
 ### Codificar
 
 ```bash
-./nvdr/nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr
+./nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr
 ```
 
 ```
@@ -85,7 +94,7 @@ Compare `cumulative` do último nível com o tamanho da imagem de origem —
 ### Decodificar
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/saida.png
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png
 ```
 
 Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
@@ -93,8 +102,8 @@ Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
 Para ver um nível específico:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/anchor.png --level 0
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
+./nvdr_decode /tmp/m.nvdr /tmp/anchor.png --level 0
+./nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
 ```
 
 O decoder suaviza as emendas entre retângulos por padrão. `--smooth 0`
@@ -102,13 +111,13 @@ desliga e mostra os retângulos duros — útil para ver o que o formato
 realmente gravou:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
+./nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
 ```
 
 Para medir a qualidade junto:
 
 ```bash
-./nvdr/nvdr_decode /tmp/m.nvdr /tmp/saida.png --compare samples/montanha_pessoas.jpg
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png --compare samples/montanha_pessoas.jpg
 ```
 
 ### Testar a garantia de truncagem
@@ -118,7 +127,7 @@ ponto depois do anchor ainda produz imagem.
 
 ```bash
 head -c 4600 /tmp/m.nvdr > /tmp/cortado.nvdr
-./nvdr/nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
+./nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
 ```
 
 ```
@@ -147,7 +156,7 @@ SZ=$(stat -c%s /tmp/m.nvdr)
 for pct in 100 60 40 39 3; do
   head -c $((SZ*pct/100)) /tmp/m.nvdr > /tmp/t.nvdr
   printf "%3d%% -> " $pct
-  ./nvdr/nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
+  ./nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
 done
 ```
 
@@ -159,7 +168,7 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 ## Parâmetros que valem mexer
 
 ```bash
-./nvdr/nvdr_encode entrada.jpg saida.nvdr \
+./nvdr_encode entrada.jpg saida.nvdr \
     --tolerance 0.090,0.040,0.018 \
     --step 16,4 \
     --anchor-bits 4 \
@@ -229,8 +238,8 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 Comparando os dois codecs na mesma imagem:
 
 ```bash
-./nvdr/nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
-./nvdr/nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
+./nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
+./nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
 ```
 
 ---
@@ -253,7 +262,7 @@ cut 96% smooth=0.4: identical (768x512, level 2)
 ```
 
 Sai com código 1 e aponta o primeiro pixel divergente se algo quebrar.
-Vale rodar depois de mexer em `nvdr/entropy.c`, `nvdr/nvdr.c` ou
+Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
 `public/nvdr.js` — as três coisas que precisam concordar.
 
 ---
@@ -296,10 +305,3 @@ o erro está. Uma mudança que tira detalhe do céu e dá para as sombras
 melhora a imagem e não move o PSNR — foi exatamente o caso do `--weber`.
 Quando avaliar uma mudança de alocação, olhe a imagem, não só o número.
 
-**O servidor não testa o codec novo em `/`.** A página raiz é o pipeline
-antigo, que devolve `.svbc`. O codec novo está em `/nvdr.html`.
-
-**`scripts/verify.py` não existe nesta branch.** O gate de regressão e
-determinismo ficou em `claude/fix-core-pipeline` e nunca foi mergeado —
-o PR #6 levou só o primeiro commit daquela branch. Se quiser o gate,
-falta mergear `aad53da`.

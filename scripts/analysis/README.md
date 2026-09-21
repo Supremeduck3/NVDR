@@ -1,10 +1,10 @@
 # Analysis tools
 
 Throwaway measurements, kept because the numbers they produced are cited in
-`nvdr/README.md` and should be reproducible rather than trusted.
+`../../README.md` and should be reproducible rather than trusted.
 
-    gcc -std=c11 -O2 -I../../nvdr -I../../vendor -o edges   edges.c   ../../nvdr/nvdr.c ../../nvdr/entropy.c -lm -lz
-    gcc -std=c11 -O2 -I../../nvdr -I../../vendor -o oblique oblique.c ../../nvdr/nvdr.c ../../nvdr/entropy.c -lm -lz
+    gcc -std=c11 -O2 -I../../src -I../../vendor -o edges   edges.c   ../../src/nvdr.c ../../src/entropy.c -lm -lz
+    gcc -std=c11 -O2 -I../../src -I../../vendor -o oblique oblique.c ../../src/nvdr.c ../../src/entropy.c -lm -lz
 
 - `edges` — how many leaves stopped because they ran out of room rather
   than because they were uniform. Those are the staircase.

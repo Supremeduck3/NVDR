@@ -1,906 +1,287 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SVBC Studio | Neural Vector Renderer</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-dark: #0a0a0c;
-            --panel-bg: rgba(20, 20, 24, 0.7);
-            --border-glass: rgba(255, 255, 255, 0.08);
-            --brand: #6366f1;
-            --brand-glow: rgba(99, 102, 241, 0.5);
-            --text-main: #f8f9fa;
-            --text-muted: #a1a1aa;
-            --btn-bg: rgba(255, 255, 255, 0.1);
-            --btn-hover: rgba(255, 255, 255, 0.15);
-        }
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVDR — Progressive Residual Stack</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #2a323d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4b9fff;
+    --warn: #e3a008;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 16px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1120px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+  .sub code { color: var(--text); }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
 
-        body {
-            font-family: 'Outfit', sans-serif;
-            background-color: var(--bg-dark);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow-x: hidden;
-            background-image: 
-                radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.15), transparent 25%),
-                radial-gradient(circle at 85% 30%, rgba(236, 72, 153, 0.1), transparent 25%);
-            background-attachment: fixed;
-        }
+  #drop {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #drop.hot { border-color: var(--accent); background: #12243a; }
+  #drop p { margin: 0; color: var(--muted); }
+  #drop strong { color: var(--text); }
 
-        header {
-            padding: 1.5rem 3rem;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            border-bottom: 1px solid var(--border-glass);
-            background: rgba(10, 10, 12, 0.7);
-            backdrop-filter: blur(12px);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
+  #status { margin-top: 14px; color: var(--muted); min-height: 1.5em; }
+  #status .err { color: #f85149; }
 
-        .logo {
-            font-size: 1.5rem;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .logo span { color: var(--brand); }
+  .levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .levels { grid-template-columns: 1fr; } }
 
-        main {
-            padding: 2rem;
-            max-width: 1600px;
-            margin: 0 auto;
-            width: 100%;
-            display: flex;
-            flex-direction: column;
-            gap: 2rem;
-        }
+  .level h3 { margin: 0 0 2px; font-size: .95rem; font-weight: 600; }
+  .level .meta { color: var(--muted); font-size: .84rem; margin-bottom: 10px; }
+  canvas {
+    width: 100%; height: auto; display: block;
+    background: #000; border-radius: 6px; border: 1px solid var(--border);
+    image-rendering: pixelated;
+  }
 
-        .top-controls {
-            display: flex;
-            gap: 2rem;
-            align-items: stretch;
-            flex-wrap: wrap;
-        }
+  .slider-row { display: flex; align-items: center; gap: 16px; margin-top: 4px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .readout { font-variant-numeric: tabular-nums; min-width: 190px; color: var(--muted); font-size: .88rem; }
+  .readout b { color: var(--text); }
 
-        .drop-section {
-            flex: 1;
-            min-width: 300px;
-            border: 2px dashed var(--border-glass);
-            border-radius: 16px;
-            background: var(--panel-bg);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 2rem;
-            text-align: center;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            cursor: pointer;
-            backdrop-filter: blur(8px);
-            position: relative;
-        }
-
-        .drop-section:hover, .drop-section.dragover {
-            border-color: var(--brand);
-            box-shadow: 0 0 20px var(--brand-glow), inset 0 0 20px rgba(99, 102, 241, 0.1);
-            background: rgba(30, 30, 38, 0.8);
-        }
-
-        .upload-icon {
-            width: 50px;
-            height: 50px;
-            background: rgba(99, 102, 241, 0.2);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-bottom: 1rem;
-            color: var(--brand);
-        }
-
-        .upload-icon svg { width: 24px; height: 24px; fill: currentColor; }
-        .drop-section h3 { margin-bottom: 0.5rem; font-weight: 600; }
-        .drop-section p { color: var(--text-muted); font-size: 0.9rem; }
-        #fileInput { display: none; }
-
-        .settings-panel {
-            flex: 1;
-            min-width: 300px;
-            background: var(--panel-bg);
-            border: 1px solid var(--border-glass);
-            border-radius: 16px;
-            padding: 1.5rem 2rem;
-            backdrop-filter: blur(8px);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            gap: 1.5rem;
-        }
-
-        .setting-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .setting-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 0.95rem;
-            font-weight: 600;
-        }
-
-        .setting-val { color: var(--brand); font-weight: 700; }
-
-        input[type=range] {
-            -webkit-appearance: none;
-            width: 100%;
-            background: transparent;
-        }
-
-        input[type=range]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            height: 16px; width: 16px;
-            border-radius: 50%;
-            background: var(--brand);
-            cursor: pointer;
-            margin-top: -6px;
-            box-shadow: 0 0 10px var(--brand-glow);
-        }
-
-        input[type=range]::-webkit-slider-runnable-track {
-            width: 100%; height: 4px;
-            cursor: pointer;
-            background: rgba(255,255,255,0.1);
-            border-radius: 2px;
-        }
-
-        .gallery {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-            gap: 2rem;
-            align-items: start;
-        }
-
-        .card {
-            background: var(--panel-bg);
-            border: 1px solid var(--border-glass);
-            border-radius: 16px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            backdrop-filter: blur(8px);
-            position: relative;
-            animation: fadeIn 0.4s ease forwards;
-        }
-
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-        .card-header {
-            padding: 1rem;
-            border-bottom: 1px solid var(--border-glass);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: rgba(0,0,0,0.3);
-        }
-
-        .card-title {
-            font-size: 0.9rem;
-            font-weight: 600;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 200px;
-        }
-
-        .badge {
-            background: rgba(99, 102, 241, 0.2);
-            color: var(--brand);
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            font-weight: 700;
-        }
-
-        .canvas-container {
-            width: 100%;
-            aspect-ratio: 4/3;
-            background: #000;
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-        }
-
-        .canvas-container canvas {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-            opacity: 0;
-            transform: scale(0.95);
-            transition: opacity 0.5s ease, transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        .canvas-container canvas.loaded {
-            opacity: 1; transform: scale(1);
-        }
-
-        .card-metrics {
-            padding: 1rem;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0.8rem;
-            font-size: 0.85rem;
-        }
-
-        .metrics-row { display: flex; justify-content: space-between; }
-        .metric-label { color: var(--text-muted); }
-        .metric-value { font-weight: 600; }
-        .metric-value.highlight { color: #ec4899; }
-
-        .card-actions {
-            padding: 0 1rem 1rem 1rem;
-            display: flex;
-            gap: 10px;
-        }
-
-        .btn {
-            flex: 1;
-            padding: 0.6rem 0;
-            background: var(--btn-bg);
-            border: 1px solid var(--border-glass);
-            color: var(--text-main);
-            border-radius: 8px;
-            cursor: pointer;
-            font-family: 'Outfit', sans-serif;
-            font-size: 0.85rem;
-            font-weight: 600;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-        }
-
-        .btn:hover:not(:disabled) {
-            background: var(--btn-hover);
-            transform: translateY(-1px);
-        }
-
-        .btn.primary {
-            background: rgba(99, 102, 241, 0.2);
-            border-color: rgba(99, 102, 241, 0.4);
-            color: #fff;
-        }
-
-        .btn.primary:hover:not(:disabled) {
-            background: rgba(99, 102, 241, 0.3);
-            box-shadow: 0 0 15px var(--brand-glow);
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .overlay-loader {
-            position: absolute;
-            inset: 0;
-            background: rgba(0,0,0,0.7);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
-        }
-
-        .spinner {
-            width: 30px; height: 30px;
-            border: 2px solid rgba(255,255,255,0.2);
-            border-top-color: var(--brand);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-bottom: 10px;
-        }
-        @keyframes spin { 100% { transform: rotate(360deg); } }
-
-        /* Icon buttons */
-        .icon-btn {
-            background: none;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s;
-        }
-        .icon-btn:hover {
-            background: rgba(255,255,255,0.1);
-            color: var(--text-main);
-        }
-        .icon-btn.close:hover {
-            color: #ef4444;
-            background: rgba(239, 68, 68, 0.15);
-        }
-
-        /* Modal Focus */
-        .modal-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.9);
-            backdrop-filter: blur(8px);
-            z-index: 1000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            opacity: 0;
-            pointer-events: none;
-            transition: opacity 0.3s ease;
-        }
-        .modal-overlay.active {
-            opacity: 1;
-            pointer-events: all;
-        }
-        .modal-content {
-            position: relative;
-            width: 90vw;
-            height: 90vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .modal-content canvas {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-            box-shadow: 0 0 50px rgba(0,0,0,0.5);
-            background: #000;
-            border-radius: 8px;
-        }
-        .modal-close {
-            position: absolute;
-            top: -40px;
-            right: 0;
-            background: none;
-            border: none;
-            color: white;
-            font-size: 2rem;
-            cursor: pointer;
-        }
-
-        /* Toggle Switch */
-        .toggle-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .toggle-row label {
-            font-size: 0.95rem;
-            font-weight: 600;
-        }
-        .toggle-row .toggle-desc {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            font-weight: 400;
-        }
-        .toggle-switch {
-            position: relative;
-            width: 44px;
-            height: 24px;
-            flex-shrink: 0;
-        }
-        .toggle-switch input {
-            opacity: 0;
-            width: 0;
-            height: 0;
-        }
-        .toggle-slider {
-            position: absolute;
-            cursor: pointer;
-            inset: 0;
-            background: rgba(255,255,255,0.1);
-            border-radius: 24px;
-            transition: 0.3s;
-        }
-        .toggle-slider::before {
-            content: '';
-            position: absolute;
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: #fff;
-            left: 3px;
-            bottom: 3px;
-            transition: 0.3s;
-        }
-        .toggle-switch input:checked + .toggle-slider {
-            background: var(--brand);
-            box-shadow: 0 0 12px var(--brand-glow);
-        }
-        .toggle-switch input:checked + .toggle-slider::before {
-            transform: translateX(20px);
-        }
-        .badge-logo {
-            background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            font-weight: 700;
-        }
-
-    </style>
+  pre {
+    background: #0b0e13; border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; overflow-x: auto; font-size: .82rem; color: var(--muted);
+    margin: 0;
+  }
+  .note { color: var(--muted); font-size: .88rem; margin: 10px 0 0; }
+  .hidden { display: none; }
+</style>
 </head>
 <body>
-    <header>
-        <div class="logo">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--brand)"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
-            SVBC <span>Studio</span>
-        </div>
-        <div style="color: var(--text-muted); font-size: 0.9rem;">
-            Mult-Image Concurrent Engine
-        </div>
-    </header>
+<main>
+  <h1>Progressive Residual Stack</h1>
+  <p class="sub">
+    Codifica uma imagem em <code>.nvdr</code> e decodifica cada camada no navegador.
+    O anchor sozinho já é uma imagem inteira; cada resíduo melhora o que já está na tela.
+  </p>
 
-    <main>
-        <div class="top-controls">
-            <div class="drop-section" id="dropZone">
-                <div class="upload-icon">
-                    <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                </div>
-                <h3>Drag & Drop</h3>
-                <p>Upload mutiple images for parallel conversion</p>
-                <input type="file" id="fileInput" accept="image/jpeg, image/png, image/webp" multiple>
-            </div>
+  <div class="panel">
+    <div id="drop">
+      <p><strong>Solte uma imagem aqui</strong> ou clique para escolher</p>
+      <p style="font-size:.85rem;margin-top:6px">JPG, PNG, BMP, WEBP, GIF ou TGA</p>
+    </div>
+    <input type="file" id="file" accept="image/*" class="hidden">
+    <div id="status"></div>
+  </div>
 
-            <div class="settings-panel">
-                <div class="setting-group">
-                    <div class="setting-header">
-                        <span>Min Tile Size (Quality)</span>
-                        <span class="setting-val" id="valTile">2px</span>
-                    </div>
-                    <input type="range" id="minTile" min="1" max="8" step="1" value="2">
-                </div>
-                
-                <div class="setting-group">
-                    <div class="setting-header">
-                        <span>Homogeneity Threshold (Compression)</span>
-                        <span class="setting-val" id="valThresh">0.010</span>
-                    </div>
-                    <input type="range" id="homoThresh" min="0.001" max="0.05" step="0.001" value="0.01">
-                </div>
-                <div class="setting-group">
-                    <div class="toggle-row">
-                        <div>
-                            <label>Logo / Icon Mode</label><br>
-                            <span class="toggle-desc">Pixel-perfect edges, exact colors, no gradients</span>
-                        </div>
-                        <label class="toggle-switch">
-                            <input type="checkbox" id="logoMode">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
-                </div>
-                <p style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
-                    Configure settings before dropping. SVBC conversions execute using these parameters.
-                </p>
-            </div>
-        </div>
-
-        <div class="gallery" id="gallery">
-            <!-- Render Cards will be injected here dynamically -->
-        </div>
-    </main>
-
-    <!-- Fullscreen Modal -->
-    <div class="modal-overlay" id="fullscreenModal">
-        <div class="modal-content">
-            <button class="modal-close" id="modalClose">&times;</button>
-            <canvas id="modalCanvas"></canvas>
-        </div>
+  <section id="results" class="hidden">
+    <div class="panel">
+      <h3 style="margin:0 0 4px;font-size:.95rem">Camadas</h3>
+      <p class="note" style="margin:0 0 14px">
+        Cada nível é deflacionado separadamente, então os bytes acumulados
+        são exatamente o que o arquivo ocupa e o que trafegaria na rede.
+      </p>
+      <div class="levels" id="levels"></div>
     </div>
 
-    <script>
-        // Settings Binding
-        const inpTile = document.getElementById('minTile');
-        const valTile = document.getElementById('valTile');
-        inpTile.addEventListener('input', e => valTile.textContent = e.target.value + 'px');
+    <div class="panel">
+      <h3 style="margin:0 0 6px;font-size:.95rem">Entrega parcial</h3>
+      <p class="note" style="margin:0 0 14px">
+        Arraste para simular um download interrompido. O decoder mostra o último nível
+        Cada nível é entregue em unidades independentes, dos retângulos
+        maiores para os menores, então o corte cai numa fronteira de unidade
+        e o que não chegou simplesmente mantém o retângulo que tinha antes.
+        A imagem melhora continuamente conforme os bytes entram, sem degraus.
+      </p>
+      <div class="slider-row">
+        <input type="range" id="trunc" min="0" max="100" value="100" step="0.5">
+        <span class="readout" id="truncOut"></span>
+      </div>
+      <canvas id="truncCanvas" style="margin-top:14px"></canvas>
+    </div>
 
-        const inpThresh = document.getElementById('homoThresh');
-        const valThresh = document.getElementById('valThresh');
-        inpThresh.addEventListener('input', e => valThresh.textContent = parseFloat(e.target.value).toFixed(3));
+    <div class="panel">
+      <h3 style="margin:0 0 12px;font-size:.95rem">Relatório do encoder</h3>
+      <pre id="report"></pre>
+    </div>
+  </section>
+</main>
 
-        // UI Modals
-        const modal = document.getElementById('fullscreenModal');
-        const modalClose = document.getElementById('modalClose');
-        const modalCanvas = document.getElementById('modalCanvas');
-        const modalCtx = modalCanvas.getContext('2d');
+<script type="module">
+import { decode, renderLevel, readHeader, levelThresholds, LEVEL_NAMES }
+    from './nvdr.js';
 
-        function closeFullscreen() {
-            modal.classList.remove('active');
-        }
-        modalClose.addEventListener('click', closeFullscreen);
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal || e.target.classList.contains('modal-content')) closeFullscreen();
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+const statusEl = document.getElementById('status');
+const results = document.getElementById('results');
+const levelsEl = document.getElementById('levels');
+const reportEl = document.getElementById('report');
+const truncInput = document.getElementById('trunc');
+const truncOut = document.getElementById('truncOut');
+const truncCanvas = document.getElementById('truncCanvas');
+
+let container = null;   // the full ArrayBuffer of the last encode
+let sourceSize = 0;
+
+const setStatus = (text, isError) => {
+    statusEl.innerHTML = isError ? `<span class="err">${text}</span>` : text;
+};
+
+const formatBytes = (n) =>
+    n >= 1024 * 1024 ? `${(n / 1048576).toFixed(2)} MB`
+  : n >= 1024        ? `${(n / 1024).toFixed(1)} KB`
+  :                    `${n} B`;
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('hot'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('hot'));
+drop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    drop.classList.remove('hot');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleFile(fileInput.files[0]);
+});
+
+async function handleFile(file) {
+    const dot = file.name.lastIndexOf('.');
+    const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+    if (!ext) { setStatus('Arquivo sem extensão reconhecível.', true); return; }
+
+    setStatus(`Codificando ${file.name} (${formatBytes(file.size)})…`);
+    results.classList.add('hidden');
+
+    let response;
+    try {
+        response = await fetch('/nvdr', {
+            method: 'POST',
+            headers: { 'x-file-ext': ext },
+            body: file
         });
+    } catch (err) {
+        setStatus(`Falha de rede: ${err.message}`, true);
+        return;
+    }
 
-        // Drag & Drop Handling
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('fileInput');
-        const gallery = document.getElementById('gallery');
+    if (!response.ok) {
+        setStatus(`Encoder falhou: ${await response.text()}`, true);
+        return;
+    }
 
-        dropZone.addEventListener('click', () => fileInput.click());
-        
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-            dropZone.addEventListener(eventName, e => {
-                e.preventDefault(); e.stopPropagation();
-            }, false);
-        });
+    container = await response.arrayBuffer();
+    sourceSize = file.size;
 
-        ['dragenter', 'dragover'].forEach(eventName => {
-            dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
-        });
+    const encoded = response.headers.get('X-Encoder-Report');
+    // The encoder names the server's temp upload; show the real filename.
+    reportEl.textContent = encoded
+        ? atob(encoded).trim().replace(/^\S*temp_[0-9a-f-]+\.\w+/, file.name)
+        : '(sem relatório)';
 
-        ['dragleave', 'drop'].forEach(eventName => {
-            dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
-        });
+    setStatus(`${formatBytes(container.byteLength)} para qualidade cheia, ` +
+              `${(100 * container.byteLength / file.size).toFixed(0)}% do original.`);
+    results.classList.remove('hidden');
 
-        dropZone.addEventListener('drop', (e) => {
-            const files = e.dataTransfer.files;
-            handleFiles(files);
-        });
+    await showLevels();
+    truncInput.value = 100;
+    await showTruncated();
+}
 
-        fileInput.addEventListener('change', function() {
-            handleFiles(this.files);
-            this.value = ''; // reset
-        });
+async function showLevels() {
+    const t0 = performance.now();
+    const result = await decode(container);
+    const decodeMs = performance.now() - t0;
 
-        function handleFiles(files) {
-            Array.from(files).forEach(file => {
-                if (file.type.startsWith('image/')) {
-                    createRenderCard(file);
-                }
-            });
-        }
+    if (!result || result.levelsPresent === 0) {
+        setStatus('Container ilegível.', true);
+        return;
+    }
 
-        const inpLogo = document.getElementById('logoMode');
+    const { header, levels } = result;
+    const thresholds = levelThresholds(header);
+    levelsEl.innerHTML = '';
 
-        async function createRenderCard(file) {
-            const tile = inpTile.value;
-            const thresh = inpThresh.value;
-            const isLogo = inpLogo.checked;
-            const cardId = 'card_' + Math.random().toString(36).substr(2, 9);
-            
-            // Build UI
-            const card = document.createElement('div');
-            card.className = 'card';
-            card.id = cardId;
-            card.innerHTML = `
-                <div class="card-header">
-                    <span class="card-title" title="${file.name}">${file.name}</span>
-                    <div style="display:flex; align-items:center; gap:8px;">
-                        ${isLogo ? '<span class="badge-logo">LOGO</span>' : ''}
-                        <span class="badge">T${tile} / H${thresh}</span>
-                        <button class="icon-btn fullscreen" id="fs_${cardId}" title="Expand" disabled>
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>
-                        </button>
-                        <button class="icon-btn close" id="close_${cardId}" title="Remove">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                        </button>
-                    </div>
-                </div>
-                <div class="canvas-container">
-                    <div class="overlay-loader" id="loader_${cardId}">
-                        <div class="spinner"></div>
-                        <span style="font-size:0.8rem">Processing NVDR</span>
-                    </div>
-                    <canvas id="canvas_${cardId}"></canvas>
-                </div>
-                <div class="card-metrics">
-                    <div class="metrics-row">
-                        <span class="metric-label">Nodes</span>
-                        <span class="metric-value" id="n_${cardId}">-</span>
-                    </div>
-                    <div class="metrics-row">
-                        <span class="metric-label">SVBC Size</span>
-                        <span class="metric-value" id="s_${cardId}">-</span>
-                    </div>
-                    <div class="metrics-row">
-                        <span class="metric-label">Resolution</span>
-                        <span class="metric-value" id="r_${cardId}">-</span>
-                    </div>
-                    <div class="metrics-row">
-                        <span class="metric-label">Render Time</span>
-                        <span class="metric-value highlight" id="t_${cardId}">-</span>
-                    </div>
-                </div>
-                <div class="card-actions">
-                    <button class="btn primary" id="dl_${cardId}" disabled>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path></svg>
-                        Download SVBC
-                    </button>
-                </div>
-            `;
-            
-            // Prepend new card directly below top controls
-            gallery.prepend(card);
+    levels.forEach((level, k) => {
+        const wrap = document.createElement('div');
+        wrap.className = 'level';
+        wrap.innerHTML = `
+            <h3>${LEVEL_NAMES[k]}</h3>
+            <div class="meta">
+              ${formatBytes(thresholds[k])} acumulados
+              ${sourceSize ? `· ${(100 * thresholds[k] / sourceSize).toFixed(0)}% do original` : ''}
+              · ${level.rects.count.toLocaleString('pt-BR')} retângulos
+            </div>`;
+        const canvas = document.createElement('canvas');
+        canvas.width = header.width;
+        canvas.height = header.height;
+        wrap.appendChild(canvas);
+        levelsEl.appendChild(wrap);
+        renderLevel(level, header.width, header.height, canvas.getContext('2d'));
+    });
 
-            const loader = document.getElementById(`loader_${cardId}`);
-            const canvas = document.getElementById(`canvas_${cardId}`);
-            const btnDownload = document.getElementById(`dl_${cardId}`);
-            const btnClose = document.getElementById(`close_${cardId}`);
-            const btnExpand = document.getElementById(`fs_${cardId}`);
-            const ctx = canvas.getContext('2d');
+    truncCanvas.width = header.width;
+    truncCanvas.height = header.height;
 
-            btnClose.onclick = () => { card.remove(); };
+    setStatus(statusEl.textContent +
+              ` Decodificado em ${decodeMs.toFixed(0)}ms.`);
+}
 
-            try {
-                const ext = file.name.substring(file.name.lastIndexOf('.'));
-                const arrayBuffer = await file.arrayBuffer();
+let pending = false;
+truncInput.addEventListener('input', async () => {
+    if (pending) return;
+    pending = true;
+    await showTruncated();
+    pending = false;
+});
 
-                // Call local backend server
-                const response = await fetch('/convert', {
-                    method: 'POST',
-                    headers: {
-                        'x-file-ext': ext,
-                        'x-min-tile': tile,
-                        'x-homo-thresh': thresh,
-                        'x-logo-mode': isLogo ? '1' : '0',
-                        'Content-Type': 'application/octet-stream'
-                    },
-                    body: arrayBuffer
-                });
+async function showTruncated() {
+    if (!container) return;
 
-                if (!response.ok) throw new Error('Server error: ' + response.status);
+    const fraction = Number(truncInput.value) / 100;
+    const kept = Math.floor(container.byteLength * fraction);
+    const prefix = container.slice(0, kept);
 
-                const svbcBuffer = await response.arrayBuffer();
-                loader.style.display = 'none';
+    const result = await decode(prefix);
+    const ctx = truncCanvas.getContext('2d');
 
-                // Setup Download SVBC Button mapping logic
-                const blob = new Blob([svbcBuffer], { type: 'application/octet-stream' });
-                const objUrl = URL.createObjectURL(blob);
-                
-                btnDownload.removeAttribute('disabled');
-                btnDownload.onclick = () => {
-                    const a = document.createElement('a');
-                    a.href = objUrl;
-                    a.download = file.name.replace(/\.[^/.]+$/, "") + ".svbc";
-                    a.click();
-                };
+    if (!result || result.levelsPresent === 0) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, truncCanvas.width, truncCanvas.height);
+        const header = readHeader(container);
+        const need = header ? levelThresholds(header)[0] : 0;
+        truncOut.innerHTML =
+            `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +
+            `sem imagem (anchor precisa de ${formatBytes(need)})`;
+        return;
+    }
 
-                btnExpand.removeAttribute('disabled');
-                btnExpand.onclick = () => {
-                    modal.classList.add('active');
-                    renderSvbc(svbcBuffer, modalCanvas, modalCtx, 'dummy', true); // Render to master HD modal canvas
-                };
-
-                // Render loop
-                renderSvbc(svbcBuffer, canvas, ctx, cardId, false);
-
-            } catch (err) {
-                console.error(err);
-                if (loader) loader.innerHTML = `<span style="color:#ef4444; font-size:0.9rem">❌ Error: ${err.message}</span>`;
-            }
-        }
-
-        function renderSvbc(buffer, canvas, ctx, cId, isModal) {
-            const kbSize = (buffer.byteLength / 1024).toFixed(1);
-            const view = new DataView(buffer);
-
-            const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-            if (magic !== "SVBC") {
-                console.error("Invalid magic");
-                return;
-            }
-            
-            const version = view.getUint8(4);
-            if (version !== 3 && version !== 4) {
-                console.error(`SVBC Viewer supports v0.3 and v0.4; got v${version}.`);
-                return;
-            }
-
-            const codebookCount = view.getUint16(6, true);
-            const w = view.getUint16(8, true);
-            const h = view.getUint16(10, true);
-            const nodeCount = view.getUint32(12, true);
-            
-            const HEADER_SIZE = 20;
-
-            const palette = [];
-            for (let i = 0; i < codebookCount; i++) {
-                const off = HEADER_SIZE + (i * 3);
-                palette.push([
-                    view.getUint8(off),
-                    view.getUint8(off + 1),
-                    view.getUint8(off + 2)
-                ]);
-            }
-
-            canvas.width = w; canvas.height = h;
-            ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, w, h);
-
-            const start = performance.now();
-            const NODES_OFFSET = HEADER_SIZE + (codebookCount * 3);
-
-            // v0.3 stored nodes as interleaved 11-byte records; v0.4 stores
-            // them as separate planes (all x, then all y, ...), which gzips
-            // about twice as well. Both are decoded into the same array.
-            const readNodes = (view, version, nodesOffset, nodeCount) => {
-                const out = new Array(nodeCount);
-                if (version >= 4) {
-                    const xOff = nodesOffset;
-                    const yOff = xOff + nodeCount * 2;
-                    const wOff = yOff + nodeCount * 2;
-                    const hOff = wOff + nodeCount * 2;
-                    const tOff = hOff + nodeCount * 2;
-                    const lOff = tOff + nodeCount * 2;
-                    for (let i = 0; i < nodeCount; i++) {
-                        out[i] = {
-                            nx: view.getUint16(xOff + i * 2, true),
-                            ny: view.getUint16(yOff + i * 2, true),
-                            nw: view.getUint16(wOff + i * 2, true),
-                            nh: view.getUint16(hOff + i * 2, true),
-                            token: view.getUint16(tOff + i * 2, true),
-                            layerByte: view.getUint8(lOff + i)
-                        };
-                    }
-                } else {
-                    for (let i = 0; i < nodeCount; i++) {
-                        const off = nodesOffset + i * 11;
-                        out[i] = {
-                            nx: view.getUint16(off, true),
-                            ny: view.getUint16(off + 2, true),
-                            nw: view.getUint16(off + 4, true),
-                            nh: view.getUint16(off + 6, true),
-                            token: view.getUint16(off + 8, true),
-                            layerByte: view.getUint8(off + 10)
-                        };
-                    }
-                }
-                return out;
-            };
-
-            // Parse ALL node data first (no GPU interaction yet)
-            const allNodes = readNodes(view, version, NODES_OFFSET, nodeCount);
-            for (let i = 0; i < nodeCount; i++) {
-                const entry = palette[allNodes[i].token] || [0, 0, 0];
-                allNodes[i].r = entry[0];
-                allNodes[i].g = entry[1];
-                allNodes[i].b = entry[2];
-            }
-
-            // Pass 1: Render all nodes
-            // For large images (>10K nodes), use ImageData pixel buffer for O(1) per pixel
-            // For small images, use fillRect (simpler, GPU-accelerated for large rects)
-            if (nodeCount > 10000) {
-                // Fast path: write directly to pixel buffer
-                const imgData = ctx.createImageData(w, h);
-                const pixels = imgData.data; // Uint8ClampedArray [R,G,B,A, R,G,B,A, ...]
-
-                for (let i = 0; i < nodeCount; i++) {
-                    const nd = allNodes[i];
-                    const r = nd.r, g = nd.g, b = nd.b;
-                    const x1 = nd.nx, y1 = nd.ny;
-                    const x2 = Math.min(x1 + nd.nw, w);
-                    const y2 = Math.min(y1 + nd.nh, h);
-                    for (let py = y1; py < y2; py++) {
-                        let idx = (py * w + x1) * 4;
-                        for (let px = x1; px < x2; px++) {
-                            pixels[idx]     = r;
-                            pixels[idx + 1] = g;
-                            pixels[idx + 2] = b;
-                            pixels[idx + 3] = 255;
-                            idx += 4;
-                        }
-                    }
-                }
-                ctx.putImageData(imgData, 0, 0);
-            } else {
-                // Standard path: fillRect per node
-                for (let i = 0; i < nodeCount; i++) {
-                    const nd = allNodes[i];
-                    ctx.fillStyle = `rgb(${nd.r},${nd.g},${nd.b})`;
-                    ctx.fillRect(nd.nx, nd.ny, nd.nw, nd.nh);
-                }
-            }
-
-            // Pass 2: Blend strips using parsed node colors (NO getImageData)
-            // Build spatial index: grid of node indices by position
-            // For blend-right: find node at (nx+nw, ny) 
-            // For blend-below: find node at (nx, ny+nh)
-            const BLEND_RIGHT = 0x40;
-            const BLEND_BELOW = 0x80;
-
-            // Collect blend candidates and cap at MAX_BLENDS for performance
-            // Only blend nodes with area >= 64px (visible at normal zoom)
-            const MAX_BLENDS = 500;
-            const blendNodes = [];
-            for (let i = 0; i < nodeCount; i++) {
-                const nd = allNodes[i];
-                if (!(nd.layerByte & 0xC0)) continue;
-                if (nd.nw * nd.nh < 64) continue; // skip tiny nodes
-                blendNodes.push(nd);
-            }
-            // Sort by area descending — blend largest borders first
-            blendNodes.sort((a, b) => (b.nw * b.nh) - (a.nw * a.nh));
-            const blendCount = Math.min(blendNodes.length, MAX_BLENDS);
-
-            if (blendCount > 0) {
-                // Build a map: "x,y" → node index for fast neighbor lookup
-                const posMap = new Map();
-                for (let i = 0; i < nodeCount; i++) {
-                    const nd = allNodes[i];
-                    posMap.set(`${nd.nx},${nd.ny}`, i);
-                }
-
-                for (let bi = 0; bi < blendCount; bi++) {
-                    const nd = blendNodes[bi];
-
-                    if (nd.layerByte & BLEND_RIGHT) {
-                        const key = `${nd.nx + nd.nw},${nd.ny}`;
-                        const ni = posMap.get(key);
-                        if (ni !== undefined) {
-                            const nb = allNodes[ni];
-                            const bpx = Math.max(1, Math.min(3, Math.floor(nd.nw / 8)));
-                            const grad = ctx.createLinearGradient(
-                                nd.nx + nd.nw - bpx, nd.ny,
-                                nd.nx + nd.nw + bpx, nd.ny
-                            );
-                            grad.addColorStop(0, `rgb(${nd.r},${nd.g},${nd.b})`);
-                            grad.addColorStop(1, `rgb(${nb.r},${nb.g},${nb.b})`);
-                            ctx.fillStyle = grad;
-                            ctx.fillRect(nd.nx + nd.nw - bpx, nd.ny, bpx * 2, nd.nh);
-                        }
-                    }
-                    if (nd.layerByte & BLEND_BELOW) {
-                        const key = `${nd.nx},${nd.ny + nd.nh}`;
-                        const ni = posMap.get(key);
-                        if (ni !== undefined) {
-                            const nb = allNodes[ni];
-                            const bpx = Math.max(1, Math.min(3, Math.floor(nd.nh / 8)));
-                            const grad = ctx.createLinearGradient(
-                                nd.nx, nd.ny + nd.nh - bpx,
-                                nd.nx, nd.ny + nd.nh + bpx
-                            );
-                            grad.addColorStop(0, `rgb(${nd.r},${nd.g},${nd.b})`);
-                            grad.addColorStop(1, `rgb(${nb.r},${nb.g},${nb.b})`);
-                            ctx.fillStyle = grad;
-                            ctx.fillRect(nd.nx, nd.ny + nd.nh - bpx, nd.nw, bpx * 2);
-                        }
-                    }
-                }
-            }
-
-            const end = performance.now();
-            const timeMs = (end - start).toFixed(1);
-
-            if (!isModal) {
-                document.getElementById(`n_${cId}`).textContent = nodeCount.toLocaleString();
-                document.getElementById(`s_${cId}`).textContent = `${kbSize} KB`;
-                document.getElementById(`r_${cId}`).textContent = `${w}x${h}`;
-                document.getElementById(`t_${cId}`).textContent = `${timeMs}ms`;
-            }
-
-            requestAnimationFrame(() => canvas.classList.add('loaded'));
-        }
-    </script>
+    const level = result.levels[result.levelsPresent - 1];
+    renderLevel(level, result.header.width, result.header.height, ctx);
+    truncOut.innerHTML =
+        `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +
+        `${LEVEL_NAMES[result.levelsPresent - 1]} · ` +
+        `${level.rects.count.toLocaleString('pt-BR')} retângulos`;
+}
+</script>
 </body>
 </html>
