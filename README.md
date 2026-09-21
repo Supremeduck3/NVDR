@@ -529,7 +529,7 @@ here has been tried on footage with real lighting changes or a cut.
 
 ## Speed
 
-Encoding runs at about 117 ms per megapixel, down from 136, with the
+Encoding runs at about 80 ms per megapixel, down from 136, with the
 container byte for byte what it was — checked against a recorded hash on
 every sample and on both video containers, because a speed change that
 quietly moves the output is a quality change in disguise.
@@ -562,10 +562,31 @@ Predicted right, measured wrong: the integral image was supposed to halve
 the tree and moved it by 9%. The deviation sweep is what the tree actually
 costs, and it is irreducible at 92 ms for 27 Mpx of reading.
 
-Four cores sit idle. The ramp fit is per-leaf and independent, so it
-parallelises without touching the output; the tree needs per-subtree
-arenas merged in a fixed order to stay deterministic, which the regression
-gate would catch if it were not.
+The ramp fit is now threaded, which is the rest of it:
+
+    imagem                  inicio    agora    ganho
+    macarrao.jpg             82.7     44.1    46.7%
+    montanha_pessoas.jpg    136.4     80.5    41.0%
+    starfield               139.5     92.9    33.4%
+
+Every rectangle's ramp is fitted from its own pixels into its own slot, so
+the loop has no order and nothing shared. The container has to come out
+identical anyway, and it does: checked against a recorded hash, and
+checked for determinism over 70 runs across three images and a video
+container, each producing exactly one hash. OpenMP is optional — without
+it the pragma is ignored and the loop runs as it did.
+
+ThreadSanitizer reports races here and they are libgomp's, not the code's.
+Every report crosses the runtime boundary, where TSan has no visibility
+into the barrier that `parallel for` ends with, and all of them disappear
+at `OMP_NUM_THREADS=1` with the same binary. What clears it is not that
+argument but the bit-identical runs; the argument only says why the tool
+cannot see it.
+
+The tree is not threaded. Its subtrees allocate nodes from one arena as
+they descend, so running them in parallel makes the numbering depend on
+which finished first — which is the bug the old pipeline had, and would
+need per-subtree arenas merged in fixed order to avoid.
 
 ## Softening the seams
 

@@ -1272,6 +1272,21 @@ static int encode_to_memory(uint8_t** out_buf, size_t* out_len, const NvdrImage*
             axis[k] = (uint8_t*)calloc(total ? total : 1, 1);
             slope[k] = (int8_t*)calloc((size_t)(total ? total : 1) * 3, 1);
             if (!axis[k] || !slope[k]) goto done;
+            /*
+             * Every rectangle's ramp is fitted from its own pixels and
+             * written to its own slot, so this loop has no order and no
+             * sharing. Threading it changes nothing about the output — the
+             * regression gate checks the container is byte for byte the
+             * same and that two runs agree, which is exactly the property
+             * a parallel loop is able to break.
+             *
+             * Without OpenMP the pragma is ignored and the loop runs as it
+             * always did, so the build keeps working on a compiler that
+             * does not have it.
+             */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 256)
+#endif
             for (uint32_t i = 0; i < total; i++) {
                 const NvdrNode* n = &tree.nodes[leaves[k].items[i]];
                 axis[k][i] = (uint8_t)fit_ramp(space_img, img->width,

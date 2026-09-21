@@ -28,8 +28,14 @@ git se precisar — veja `reference/README.md`.
 make
 ```
 
-Precisa de `gcc` e `zlib` (`libz-dev` no Debian/Ubuntu). Sai
-`nvdr_encode` e `nvdr_decode` na raiz.
+Precisa de `gcc` e `zlib` (`libz-dev` no Debian/Ubuntu). Saem quatro
+binários na raiz: `nvdr_encode`, `nvdr_decode`, `nvdrv_encode` e
+`nvdrv_decode`.
+
+OpenMP é usado se estiver disponível (o Makefile detecta sozinho) e
+paraleliza o ajuste de rampa. Sem ele compila igual, só mais devagar. A
+saída é **idêntica bit a bit** nos dois casos — conferido contra hash
+gravado e em 70 execuções.
 
 Para rodar o gate de regressão:
 
