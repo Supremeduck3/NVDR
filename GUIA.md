@@ -62,9 +62,9 @@ Abre `http://localhost:3000/nvdr.html`, arrasta uma imagem e pronto:
 ```
 samples/montanha_pessoas.jpg  768x512
   level      rects        raw     stored  cumulative     PSNR
-  ANCHOR       1930       1336       1084        1156    17.37 dB
-  R1          17563     125788      10784       11940    22.30 dB
-  R2          37663     269187      32232       44172    26.40 dB
+  ANCHOR       9364       6292       4470        4542    19.55 dB
+  R1          37663     269528      12538       17080    24.30 dB
+  R2          53707     383331      34685       51765    26.30 dB
 ```
 
 Como ler cada coluna:
@@ -117,27 +117,27 @@ Esta é a propriedade central do formato: cortar o arquivo em qualquer
 ponto depois do anchor ainda produz imagem.
 
 ```bash
-head -c 1200 /tmp/m.nvdr > /tmp/cortado.nvdr
+head -c 4600 /tmp/m.nvdr > /tmp/cortado.nvdr
 ./nvdr/nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
 ```
 
 ```
-/tmp/cortado.nvdr  768x512  1930 rects  rendered at ANCHOR  (file carries only ANCHOR)
+/tmp/cortado.nvdr  768x512  9364 rects  rendered at ANCHOR  (file carries only ANCHOR)
 ```
 
-O anchor inteiro cabe em ~1,1 KB. Com 4000 bytes já entra parte do R1:
+O anchor inteiro cabe em ~4,5 KB. Com 12000 bytes já entra parte do R1:
 
 ```
-/tmp/cortado.nvdr  768x512  6193 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
+/tmp/cortado.nvdr  768x512  28705 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
 ```
 
 A qualidade sobe continuamente com os bytes, sem degraus — um nível
 parcial é aproveitado até onde chegou:
 
 ```
- 10% -> 19.85 dB      50% -> 25.46 dB
- 20% -> 21.91 dB      75% -> 26.56 dB
- 30% -> 23.46 dB     100% -> 26.95 dB
+ 10% -> 19.73 dB      50% -> 25.80 dB
+ 20% -> 23.30 dB      75% -> 26.42 dB
+ 30% -> 24.71 dB     100% -> 27.00 dB
 ```
 
 Varrendo vários cortes de uma vez:
@@ -169,9 +169,21 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
 - **`--tolerance A,B,C`** — quão uniforme uma região precisa ser para
   parar de subdividir, por nível, do grosso para o fino. Valores maiores
   no primeiro número deixam o anchor menor e mais grosseiro. Têm que ser
-  decrescentes. O default é `0.140,0.070,0.040`; era mais apertado
-  (`0.090,0.040,0.018`) enquanto todo retângulo era chapado, porque a única
-  forma de seguir um degradê era subdividir. Com rampa o ótimo mudou.
+  decrescentes. Default `0.090,0.040,0.018`.
+
+  **Esse parâmetro não significa a mesma coisa em imagens diferentes**, e
+  isso confunde muito na hora de testar. Em foto com grão ou ruído (céu
+  estrelado, folhagem) a árvore nunca satura — entre 0,060 e 0,040 um céu
+  estrelado vai de 4.507 para 103.891 retângulos e continua crescendo até
+  0,010. Ali a tolerância é um dial de taxa suave e qualquer valor dá um
+  resultado razoável. Em imagem simples (formas chapadas, desenho, texto) a
+  árvore satura: `blocos` dá 16 retângulos em toda a faixa, de 0,200 a
+  0,010. Ali não é dial, é penhasco — abaixo da saturação não compra nada,
+  e acima destrói as bordas, que é onde a imagem está (1% dos pixels
+  carregam metade do erro quadrático). Afrouxar custou 5,5 dB para economizar
+  7% dos bytes numa dessas.
+
+  Ou seja: não calibre tolerância só em foto.
 - **`--step B,C`** — o passo de quantização do resíduo nos níveis 1 e 2.
   Menor = mais fiel e mais pesado.
 - **`--anchor-bits N`** — a paleta do anchor tem `2^N` cores. O default 4
@@ -198,9 +210,13 @@ caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
   cor** num eixo em vez de ser chapado. É decisão por retângulo: o encoder
   compara custo (um flag, um bit de eixo, três inclinações) contra o erro
   que a rampa tira, e `F` é o preço do bit. Por isso **nunca perde para o
-  chapado** — quando não compensa, o retângulo fica chapado. Default 280;
-  `0` desliga. Medido com a taxa igualada: +0,07 a +1,08 dB, e com um terço
-  menos retângulos.
+  chapado** — quando não compensa, o retângulo fica chapado. Default 600;
+  `0` desliga. No default ganha em todas as imagens medidas: +0,23 a
+  +2,43 dB por 2 a 33% mais bytes, inclusive nas sintéticas. Valores
+  menores (ex. `280`) gastam mais e rendem mais. A rampa rende em proporção
+  à **área** do retângulo, então com tolerância apertada os retângulos são
+  pequenos e cada rampa explica menos — foi por isso que o 280 original,
+  calibrado junto com tolerância frouxa, não sobreviveu à volta dela.
 - **`--gradient-step N`** — o passo de quantização das inclinações. Default
   16, que é grosso de propósito: a inclinação é codificada quase em unário,
   então um passo fino encarece justamente as rampas grandes, que são as que
@@ -254,6 +270,15 @@ com qualidade igual, JPEG ainda vence.
 pode carregar uma rampa num eixo, e o encoder escolhe por retângulo. Isso
 tirou o teto do formato: com tudo chapado o montanha_pessoas empacava em
 ~26 dB por mais bytes que você jogasse nele.
+
+**Céu estrelado / imagem com grão parece o melhor caso e é o pior.** Ela
+comprime bem e pontua bem porque a árvore nunca satura — dá para pedir
+qualquer taxa e ela entrega. Mas o anchor sai com **1 retângulo** e o R1
+com 13, então o arquivo não tem estado intermediário nenhum: truncar dá
+21,59 dB em 1% do arquivo e 21,75 dB em 25%, parado ao longo de um quarto
+dos bytes. Uma foto normal sobe 18,40 → 19,85 → 22,45 → 25,46 dB na mesma
+faixa. Bons números de taxa/qualidade ali escondem que a escada
+progressiva, que é o ponto do formato, não existe naquela imagem.
 
 **PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
 com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número

@@ -301,10 +301,9 @@ matched rate on montanha_pessoas:
       16     320    55381    26.85 dB
       24     400    54460    26.77 dB
 
-Ramps also moved the default tolerances. They were tuned when the only way
-to follow a gradient was to keep subdividing it; a rectangle that can ramp
-covers the same gradient in one piece, so the tree can stop earlier and
-spend the rectangles elsewhere. 0.090/0.040/0.018 became 0.140/0.070/0.040.
+The lambda above is 600. The first cut of this shipped 280 together with
+loosened tolerances, and that pairing was wrong in a way worth recording —
+see **Why tolerance is not one knob** below.
 
 Two alternatives lost. A full 2D plane fits better but needs two slopes per
 channel and comes out behind per byte. Gating the tree on ramp fit rather
@@ -313,6 +312,67 @@ surviving rectangles precisely the ones with large, expensive slopes.
 
 Ramps live in the coded stream, so `--codec deflate` keeps every rectangle
 flat and the two codecs are only comparable with `--gradient 0`.
+
+## Why tolerance is not one knob
+
+Ramps arrived with the default tolerances loosened from 0.090/0.040/0.018
+to 0.140/0.070/0.040, on the reasoning that a rectangle able to follow a
+gradient does not need to be subdivided as far. Measured across the six
+photographs in `samples/` it looked like a straight gain. It was not.
+
+Those three numbers are one step apart from each other, so the change did
+not loosen the pyramid — it **shifted it down a level**. The new level 2
+came out with exactly the rectangle count the old level 1 had, on every
+image:
+
+    image              tol .09/.04/.018      tol .14/.07/.04
+    circulos         1018  1744  2308        196  1318  1744
+    macarrao          670  4843  9475          1  2209  4843
+    montanha_pessoas 9364 37663 53707       1930 17563 37663
+    starfield           7 103891 606430        1    13 103891
+
+A level of refinement was thrown away, and six photographs did not show it.
+
+What hid it is that the tolerance knob does not mean the same thing on
+different content. Rectangles produced as tolerance tightens:
+
+    tolerance        0.200  0.140  0.090  0.060  0.040  0.018  0.010
+    blocos              16     16     16     16     16     16     16
+    circulos             1    196   1018   1474   1744   2308   2626
+    macarrao.jpg         1      1    670   2746   4843   9475  11689
+    montanha_pessoas     4   1930   9364  23167  37663  53707  57415
+    starfield            1      1      7   4507 103891 606430 721771
+
+A star field multiplies by 23 between 0.060 and 0.040 and has still not
+saturated at 0.010, because noise has detail at every scale and there is no
+tolerance at which it is resolved. There the knob is a smooth, powerful
+rate dial: it lands anywhere on the curve, and PSNR degrades gracefully
+because the error is spread — 80% of the squared error is spread over 22%
+of the pixels.
+
+A picture of flat shapes is the opposite. `blocos` is 16 rectangles at
+every tolerance in the range: its structure is finite and the tree finds
+all of it immediately. `circulos` moves by a factor of 1.5 across the whole
+sweep. There the knob is a cliff, not a dial — below saturation it buys
+nothing, and above it the edges go, which is where the picture is: 1% of
+`circulos`' pixels carry half its squared error. Loosening cost it 5.5 dB
+to save 7% of its bytes.
+
+So tolerance is a rate control whose behaviour is a property of the image,
+not of the format, and it cannot be retuned on photographs alone. It stays
+where it was measured to belong, and the ramp is tuned separately through
+`--gradient`.
+
+The same asymmetry is why a star field looks like this codec's best case
+and is really its worst. It compresses well and scores well, but its anchor
+is **one rectangle** and its level 1 is thirteen — so the container has no
+usable intermediate states at all. Truncating it gives 21.59 dB at 1% of
+the file and 21.75 dB at 25%, flat across a quarter of the bytes, because
+level 2 is delivered as one unit per level-1 rectangle and there are only
+thirteen of them. The photograph next to it climbs 18.40 -> 19.85 -> 22.45
+-> 25.46 dB over the same range. Good rate-distortion numbers on that image
+are hiding the fact that the progressive ladder, which is the entire point
+of the format, is not there.
 
 ## Softening the seams
 
@@ -391,26 +451,29 @@ the same thing:
     macarrao.jpg             12.7K      7.6K      6.0K   -20.9%
     montanha_pessoas.jpg    133.4K     52.0K     36.8K   -29.3%
 
-At the defaults — arith, ramps on:
+At the defaults, against the same encoder with ramps off:
 
-    image                   source  container     PSNR
-    OIP-1304511485.jpg       23.7K     17.7K   24.86 dB
-    OIP-3451121336.jpg       56.7K     40.3K   22.48 dB
-    OIP-3786546191.jpg       48.4K     38.9K   24.31 dB
-    OIP-4140498144.jpg       36.2K     27.0K   25.44 dB
-    macarrao.jpg             12.7K      7.0K   28.54 dB
-    montanha_pessoas.jpg    133.4K     43.1K   26.40 dB
+    image                     flat            ramps on
+    OIP-1304511485.jpg   13640 B  22.49   18126 B  24.92 dB
+    OIP-3451121336.jpg   38310 B  21.60   39852 B  21.83 dB
+    OIP-3786546191.jpg   37209 B  23.80   38501 B  24.15 dB
+    OIP-4140498144.jpg   27748 B  24.43   29253 B  25.20 dB
+    macarrao.jpg         10215 B  28.86   10826 B  30.00 dB
+    montanha_pessoas.jpg 50030 B  25.90   51765 B  26.30 dB
+    blocos (synthetic)     156 B  52.64     160 B  52.64 dB
+    circulos (synthetic)  3084 B  29.22    3851 B  30.19 dB
+    linhas (synthetic)    4725 B  17.70   24334 B  36.75 dB
 
 Cumulative bytes and PSNR per level, montanha_pessoas.jpg:
 
-    ANCHOR    1.1K  17.37 dB
-    +R1      11.9K  22.30 dB
-    +R2      43.1K  26.40 dB
+    ANCHOR    4.5K  19.55 dB
+    +R1      17.1K  24.30 dB
+    +R2      51.8K  26.30 dB
 
 Read this honestly: **JPEG wins on rate-distortion for photographs.** At
-133 KB the source JPEG of montanha_pessoas sits far above 26.4 dB. What
+133 KB the source JPEG of montanha_pessoas sits far above 26.3 dB. What
 this format buys is not a smaller file at equal quality — it is that the
-first 1.1 KB are already a whole picture, and every byte after that
+first 4.5 KB are already a whole picture, and every byte after that
 improves it without the decoder ever needing to wait or restart.
 
 ## Format

@@ -188,18 +188,43 @@ NvdrConfig nvdr_default_config(void) {
      * the rate-distortion test. Swept at matched rate: step 16 lands 0.3 dB
      * above step 2 and stays flat from there.
      */
-    cfg.gradient     = 280.0f;
+    /*
+     * 280 was calibrated against the loosened tolerances that came with
+     * it and did not survive them. A ramp pays off in proportion to the
+     * area it covers, so at the tight tolerances the rectangles are small
+     * and each ramp explains less; the same lambda then buys quality at a
+     * rate the flat encoder was not asked for. 600 gains everywhere
+     * measured — +0.40 to +2.43 dB — for 2 to 33% more bytes.
+     */
+    cfg.gradient     = 600.0f;
     cfg.gradient_step = 16;
     /*
-     * Looser than they were, because ramps moved the optimum. These were
-     * tuned when every rectangle was a flat fill, where the only way to
-     * follow a gradient was to keep subdividing it. A rectangle that can
-     * ramp covers the same gradient in one piece, so the tree can stop
-     * earlier and spend the saved rectangles elsewhere.
+     * These were briefly loosened to 0.140/0.070/0.040, on the grounds
+     * that a rectangle able to ramp can stop subdividing earlier. Measured
+     * on six photographs it looked like a straight gain. It was not: those
+     * three numbers are one step apart, so the change shifted the whole
+     * pyramid down a level — the new level 2 came out with exactly the
+     * rectangle count the old level 1 had — and threw away a level of
+     * refinement.
+     *
+     * What hid it is that tolerance behaves completely differently
+     * depending on whether an image's tree saturates. Between tolerance
+     * 0.060 and 0.040 a star field goes from 4507 rectangles to 103891,
+     * because noise has detail at every scale and there is no tolerance at
+     * which it is resolved; the knob is a smooth, powerful rate dial and
+     * every setting looks reasonable. A picture of flat shapes goes from
+     * 1474 to 1744 over the same interval and from 16 to 16 across the
+     * entire range, because its structure is finite. There the knob is a
+     * cliff: below saturation it buys nothing, above it the edges — which
+     * carry half the squared error in 1% of the pixels — are destroyed.
+     * `circulos` lost 5.5 dB to save 7% of its bytes.
+     *
+     * So this is a rate control that has to stay separate from the ramp,
+     * and it stays where it was measured to belong.
      */
-    cfg.tolerance[0] = 0.140f;   /* anchor: only genuinely flat regions stay */
-    cfg.tolerance[1] = 0.070f;
-    cfg.tolerance[2] = 0.040f;   /* the tree is built to this */
+    cfg.tolerance[0] = 0.090f;   /* anchor: only genuinely flat regions stay */
+    cfg.tolerance[1] = 0.040f;
+    cfg.tolerance[2] = 0.018f;   /* the tree is built to this */
     cfg.anchor_bits  = 4;        /* the spec's int4 anchor */
     cfg.step[0]      = 0;        /* level 0 is palette-coded, not residual */
     /* A level's step is sized to the correction it carries. R1 moves a
