@@ -14,6 +14,13 @@ frames are neither identical nor unrelated.
     python3 scripts/import_frames.py clipe.zip meu_clipe
     python3 scripts/import_frames.py https://host/clipe.zip meu_clipe
     python3 scripts/import_frames.py /path/to/folder meu_clipe --limit 60
+
+This runs wherever the repository is checked out, which for an agent
+session is the sandbox and not the machine the footage came from. A
+sandbox's outbound access is usually restricted — in the one this was
+written in, only GitHub answers and every other host refuses the
+connection — so the URL form is for a GitHub URL, and getting a clip in
+otherwise means pushing it to a branch and fetching it.
 """
 import argparse
 import pathlib
