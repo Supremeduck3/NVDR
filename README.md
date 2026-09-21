@@ -459,6 +459,74 @@ the recognition removed, since every boundary is locally a line, and it
 composes with the tree, the levels, the truncation guarantee and the ramps
 as they already stand.
 
+## Measured: reusing the previous frame
+
+The project's target is video, so the question that matters is what frame
+N-1 is worth to frame N. There is no video here and nothing that can
+decode one, so the frames are synthesised: a window cropped out of a
+larger still and moved, which reproduces the camera translating, the
+camera zooming, and a region moving against a still background.
+`--noise` puts a deterministic per-pixel perturbation back to stand in for
+a sensor. Read every number below knowing they are built rather than
+filmed, so they are optimistic; the noise row is the honest one.
+
+The first thing measured was the obvious primitive — copy the region when
+it has not changed — and it does not work. Even between two **identical**
+frames only 38% of the area can be copied and only 16% of the leaves
+disappear, because the reference is the previous frame *decoded*, at
+26.5 dB, and that loss already exceeds the tolerance across most of the
+picture. Under a 3 px pan it collapses to 0.5%.
+
+What does work is the thing the format already does between levels: code
+the frame as a **residual against the previous frame's reconstruction**.
+Measured end to end with the codec exactly as it stands — encode frame
+N-1, decode it, subtract, encode the error, add it back:
+
+    sequencia          intra              inter           bytes    PSNR
+    static        40853 B  26.53 dB   12138 B  26.60 dB  -70.3%  +0.07
+    object        40484 B  26.50 dB   13822 B  26.51 dB  -65.9%  +0.01
+    pan           41643 B  26.52 dB   38668 B  26.43 dB   -7.1%  -0.09
+
+Motion is not optional. A co-located reference is worth almost nothing the
+moment the camera moves, and **one global motion vector** for the whole
+frame fixes it:
+
+    pan           41643 B  26.52 dB   16339 B  27.49 dB  -60.8%  +0.97
+    pan + noise   42488 B  26.45 dB   17996 B  27.38 dB  -57.6%  +0.93
+
+That is the crudest motion model there is — a single vector, found by
+minimising absolute difference over a lattice. Per-block vectors can only
+improve it.
+
+The failure mode that decides whether this is a codec or a demo is drift:
+frame 3 is predicted from a reconstruction of a reconstruction, and if
+each step loses a little the picture walks away from the source. Over an
+eight-frame chain, with the decoder's state carried forward exactly as a
+decoder would hold it, it does not drift — it improves:
+
+    quadro     bytes      PSNR    intra seria
+        0      40853   26.53 dB      40853 B
+        1      16339   27.49 dB      41643 B
+        3      11086   28.04 dB      41578 B
+        5       9958   28.29 dB      41299 B
+        7       9078   28.41 dB      41224 B
+                                     -63.2% total
+
+Quality climbs 1.89 dB while the cost per frame falls to a fifth. That is
+the truncation property working along the time axis rather than down the
+container: every residual adds detail on top of what the last one left, so
+a shot that holds still gets better and cheaper the longer it runs. With
+sensor noise the same chain gives -57.9% and +1.79 dB, so the effect is
+not an artefact of frames being perfect copies.
+
+It is faster too, though less than it looks: the error image encodes in
+25 ms against the frame's 46 ms, 1.8x, because at 26.5 dB the reference
+still leaves plenty of structure behind.
+
+Where this is still unproven: the frames are synthetic, the motion model
+is one vector, the chain is eight frames rather than a shot, and nothing
+here has been tried on footage with real lighting changes or a cut.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
