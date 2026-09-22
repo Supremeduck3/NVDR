@@ -1,6 +1,10 @@
 {
-  "<album>": {
-    "bytes": 169241,
+  "<album fotos>": {
+    "bytes": 169247,
+    "psnr": 0.0
+  },
+  "<album rajada>": {
+    "bytes": 7798,
     "psnr": 0.0
   },
   "<sequence default>": {

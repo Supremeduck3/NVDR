@@ -46,7 +46,7 @@ function check(label, file) {
     try {
         const r = new AlbumReader(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
         let e;
-        while ((e = r.next())) js.push(e.result.rgb);
+        while ((e = r.next())) js.push(e.rgb);
     } catch (err) { /* both sides stop on damage */ }
     if (c.length !== js.length) {
         console.log(`${label}: C ${c.length} images, JS ${js.length}`); failures++; return;

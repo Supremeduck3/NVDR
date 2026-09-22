@@ -2,11 +2,12 @@
  * nvdr_album — many still images in one .nvda file, each coded with what
  * the codec learned on the ones before it (see src/nvda.h).
  *
- *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--cold]
+ *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--cold] [--no-predict]
  *   nvdr_album unpack <in.nvda> <out-dir>    [--compare <dir>]
  *
- * pack reports every image's bytes against what it costs coded alone, so
- * what the shared context is worth is printed rather than assumed.
+ * pack reports every image's bytes against what it costs coded alone, and
+ * whether it was coded alone or predicted from the one before, so what
+ * the album is worth is printed rather than assumed.
  * unpack writes each image as <out-dir>/<name>.png; --compare looks for a
  * file of the same name in <dir> and reports PSNR.
  */
@@ -18,9 +19,10 @@
 
 static void usage(const char* a0) {
     fprintf(stderr,
-        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--cold]\n"
+        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--cold] [--no-predict]\n"
         "       %s unpack <in.nvda> <out-dir> [--compare <dir>]\n"
-        "  --cold   code every image on its own, without the shared context\n", a0, a0);
+        "  --cold         no shared context between images\n"
+        "  --no-predict   never predict an image from the one before\n", a0, a0);
 }
 
 static const char* base_name(const char* p) {
@@ -47,7 +49,7 @@ static void safe_stem(const char* name, char* out, size_t cap) {
 
 static int pack(int argc, char** argv) {
     NvdrConfig cfg = nvdr_default_config();
-    int fluid = 1;
+    int fluid = 1, predict = 1;
     const char* out = argv[2];
     const char** paths = (const char**)calloc((size_t)argc, sizeof(char*));
     int n = 0;
@@ -55,6 +57,7 @@ static int pack(int argc, char** argv) {
         if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cold")) fluid = 0;
+        else if (!strcmp(argv[i], "--no-predict")) predict = 0;
         else paths[n++] = argv[i];
     }
     if (!n || n > NVDA_MAX_IMAGES) { usage(argv[0]); return 2; }
@@ -62,6 +65,7 @@ static int pack(int argc, char** argv) {
     const char** names = (const char**)calloc((size_t)n, sizeof(char*));
     size_t* bytes = (size_t*)calloc((size_t)n, sizeof(size_t));
     size_t* cold = (size_t*)calloc((size_t)n, sizeof(size_t));
+    int* kinds = (int*)calloc((size_t)n, sizeof(int));
     for (int i = 0; i < n; i++) {
         if (nvdr_image_load(&imgs[i], paths[i]) != 0 || imgs[i].width > 65535 || imgs[i].height > 65535) {
             fprintf(stderr, "cannot read image '%s'\n", paths[i]);
@@ -69,7 +73,7 @@ static int pack(int argc, char** argv) {
         }
         names[i] = base_name(paths[i]);
     }
-    if (nvda_write(out, n, names, imgs, &cfg, fluid, bytes, cold) != 0) {
+    if (nvda_write(out, n, names, imgs, &cfg, fluid, predict, bytes, cold, kinds) != 0) {
         fprintf(stderr, "cannot write '%s'\n", out);
         return 1;
     }
@@ -81,22 +85,24 @@ static int pack(int argc, char** argv) {
     fclose(f);
     NvdaReader r;
     nvda_open(&r, data, got);
-    printf("%s  %d imagens  %s\n", out, n, fluid ? "codebook fluido" : "cada imagem sozinha");
-    printf("  %-32s %9s %9s %8s %9s\n", "imagem", "bytes", "sozinha", "ganho", "PSNR");
+    printf("%s  %d imagens  %s%s\n", out, n, fluid ? "codebook fluido" : "sem contexto",
+           predict ? ", previsao entre imagens" : "");
+    printf("  %-32s %-8s %9s %9s %8s %9s\n", "imagem", "tipo", "bytes", "sozinha", "ganho", "PSNR");
     size_t tb = 0, tc = 0;
     for (int i = 0; i < n; i++) {
         NvdrImage dec; char nm[256];
         double p = 0;
         if (nvda_next(&r, nm, sizeof nm, &dec, NULL, NULL) == 1) { p = nvdr_psnr(&imgs[i], &dec); nvdr_image_free(&dec); }
-        printf("  %-32.32s %9zu %9zu %+7.2f%% %6.2f dB\n", names[i], bytes[i], cold[i],
+        printf("  %-32.32s %-8s %9zu %9zu %+7.2f%% %6.2f dB\n", names[i],
+               kinds[i] == NVDA_KIND_PRED ? "prevista" : "sozinha", bytes[i], cold[i],
                cold[i] ? 100.0 * ((double)bytes[i] - cold[i]) / cold[i] : 0.0, p);
         tb += bytes[i]; tc += cold[i];
         nvdr_image_free(&imgs[i]);
     }
-    printf("  %-32s %9zu %9zu %+7.2f%%   arquivo %ld B\n", "total", tb, tc,
+    printf("  %-32s %-8s %9zu %9zu %+7.2f%%   arquivo %ld B\n", "total", "", tb, tc,
            tc ? 100.0 * ((double)tb - tc) / tc : 0.0, sz);
     nvda_close(&r);
-    free(data); free(imgs); free(names); free(bytes); free(cold); free(paths);
+    free(data); free(imgs); free(names); free(bytes); free(cold); free(kinds); free(paths);
     return 0;
 }
 
@@ -119,12 +125,13 @@ static int unpack(int argc, char** argv) {
     int rc, k = 0, partial;
     char name[256], stem[256], path[1024];
     NvdrImage img;
-    NvdrHeader h;
-    while ((rc = nvda_next(&r, name, sizeof name, &img, &h, &partial)) == 1) {
+    int kind;
+    while ((rc = nvda_next(&r, name, sizeof name, &img, &kind, &partial)) == 1) {
         safe_stem(name, stem, sizeof stem);
         snprintf(path, sizeof path, "%s/%03d_%s.png", dir, k, stem);
         nvdr_image_write(&img, path);
-        printf("  %3d  %-32.32s %dx%d%s", k, name, img.width, img.height, partial ? "  (parcial)" : "");
+        printf("  %3d  %-32.32s %-8s %dx%d%s", k, name, kind == NVDA_KIND_PRED ? "prevista" : "sozinha",
+               img.width, img.height, partial ? "  (parcial)" : "");
         if (cmp) {
             char src[1024]; NvdrImage s;
             snprintf(src, sizeof src, "%s/%s", cmp, name);

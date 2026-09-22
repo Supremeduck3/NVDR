@@ -236,15 +236,42 @@ The large win between images is in their content, not in their
 statistics: a photo that repeats most of the one before it could be
 predicted from it the way a video frame is.
 
-`.nvda` is the album: many images in one file, in order, each coded with
-the context the one before left (`src/nvda.h`). `nvdr_album pack` and
-`unpack` make and open one, and `pack` prints each image's bytes next to
-what it costs alone. On the page, dropping several images at once sends
-them to `/album` and shows the result; a `.nvda` file opens directly.
-`scripts/crosscheck_album.mjs` holds C and JS to the same pixels on
-every image, whole and cut. The regression gate packs the photographs
-and fails if the context ever makes them bigger. The fuzzer mutates an
-album as well.
+`.nvda` is the album: many images in one file, in order (`src/nvda.h`).
+Each image is coded one of two ways:
+
+- **on its own**, as a v11 container, carrying the context the last
+  coded image left;
+- **predicted from the image before it**, when that one is the same size.
+  This uses the machinery of a sequence's predicted frames, exposed as
+  `nvdrv_predict_encode` / `nvdrv_predict_decode`: block motion in
+  quarter pixels with the 6-tap filter, the residual as a container with
+  colours predicted as 128 and blocks that need nothing left alone.
+
+This is the reuse that pays. The encoder tries both ways at equal
+quality. It codes the prediction with a finer step, up to 2.4 times
+finer, until its squared error is within 0.1 dB of the image coded
+alone, and keeps the prediction only if it is still smaller. At the same
+step the prediction always won on bytes and lost about 1 dB, which is
+not a comparison. On photos of the clean clip:
+
+    album                                  alone      album
+    six photos 0.4 s apart (pan + zoom)   168367 B   103338 B   -38.6%
+    six photos 0.12 s apart (a burst)     169584 B    71702 B   -57.7%
+    the six unrelated samples             170229 B   169084 B    -0.7%
+
+Every photo of both bursts matched or beat its standalone PSNR. Unrelated
+photos are never predicted, so an album is never worse than its images
+coded alone.
+
+`nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
+image, whether it was predicted, its bytes, and what it would cost alone.
+On the page, dropping several images at once sends them to `/album` and
+shows the result; a `.nvda` file opens directly. The JS side
+(`public/nvda.js`) mirrors both kinds, and `scripts/crosscheck_album.mjs`
+holds it to the C pixels on every image, whole and cut. The regression
+gate packs the photographs, where the context must not make them bigger,
+and the 12-frame sequence as a burst, where every image after the first
+must be predicted. The fuzzer mutates an album that holds both kinds.
 
 ### Frequency bands (format v11)
 

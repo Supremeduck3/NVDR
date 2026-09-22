@@ -25,8 +25,8 @@ nvdr_encode: tools/nvdr_encode.c $(CODEC) $(HEADERS)
 nvdr_decode: tools/nvdr_decode.c $(CODEC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ tools/nvdr_decode.c $(CODEC) $(LDLIBS)
 
-nvdr_album: tools/nvdr_album.c src/nvda.c src/nvda.h $(CODEC) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ tools/nvdr_album.c src/nvda.c $(CODEC) $(LDLIBS)
+nvdr_album: tools/nvdr_album.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_album.c src/nvda.c $(SEQ) $(LDLIBS)
 
 nvdrv_encode: tools/nvdrv_encode.c $(SEQ) $(SEQ_H)
 	$(CC) $(CFLAGS) -o $@ tools/nvdrv_encode.c $(SEQ) $(LDLIBS)

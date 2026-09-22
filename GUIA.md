@@ -248,20 +248,34 @@ não uma falha.
 ./nvdr_album unpack /tmp/album.nvda /tmp/saida --compare samples
 ```
 
-As imagens vão em ordem num `.nvda`, e cada uma é codificada a partir do
-que o codec aprendeu nas anteriores (o **codebook fluido**: as
-probabilidades do codificador aritmético, em vez de começar do zero). O
-`pack` mostra, por imagem, quanto ela custou e quanto custaria sozinha.
+As imagens vão em ordem num `.nvda`. Cada uma é codificada de um de dois
+jeitos, e o encoder escolhe:
+
+- **prevista da anterior**, quando é do mesmo tamanho e parecida (rajada,
+  mesmo cenário, capturas de tela). Usa o mesmo mecanismo dos quadros de
+  vídeo: movimento em quarto de pixel, skip e só o que mudou.
+- **sozinha**, aproveitando o que o codec aprendeu nas anteriores (o
+  **codebook fluido**: as probabilidades do codificador aritmético, em vez
+  de começar do zero).
+
+A comparação é feita **com a mesma qualidade**: a versão prevista é
+refinada até ficar tão boa quanto a sozinha, e só ganha se continuar
+menor. O `pack` mostra, por imagem, o tipo escolhido, quanto ela custou e
+quanto custaria sozinha.
 
 Na página, solte **várias imagens de uma vez** na aba Imagem: elas viram
 um álbum, mostrado em grade com o tamanho de cada uma. Um `.nvda` pronto
 abre direto.
 
-**Expectativa honesta:** nas amostras o ganho é de **0,7%** (até 1,5%
-numa imagem). O codec reaprende essas estatísticas em poucas dezenas de
-símbolos, então começar do zero custa pouco. O ganho grande entre imagens
-viria do **conteúdo**: fotos parecidas (rajada, mesmo cenário) podendo ser
-previstas uma da outra, como quadros de vídeo.
+**Quanto economiza:**
+
+| álbum | economia |
+|---|---|
+| fotos sem relação | ~0,7% (só o codebook fluido) |
+| fotos do mesmo cenário, 0,4 s entre elas | ~39% |
+| rajada, 0,12 s entre elas | ~58% |
+
+Um álbum nunca sai maior que as imagens codificadas sozinhas.
 
 ---
 

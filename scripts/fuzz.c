@@ -145,16 +145,21 @@ int main(int argc, char** argv) {
         nvdr_image_free(&img);
     }
 
-    /* The first three images as an album, the fluid context on. */
+    /* The first images as an album, the fluid context and prediction on,
+     * with the last of them repeated so the seed holds a predicted entry
+     * as well as coded ones. The repeat shares the pixels it copies. */
     uint8_t* album = NULL;
     size_t album_len = 0;
     if (nalbum >= 2) {
-        NvdrImage imgs[3];
+        NvdrImage imgs[4];
+        const char* names[4];
         int ok = 1;
-        for (int k = 0; k < nalbum; k++) ok &= nvdr_image_load(&imgs[k], album_paths[k]) == 0;
+        for (int k = 0; k < nalbum; k++) { ok &= nvdr_image_load(&imgs[k], album_paths[k]) == 0; names[k] = album_paths[k]; }
+        imgs[nalbum] = imgs[nalbum - 1];
+        names[nalbum] = album_paths[nalbum - 1];
         NvdrConfig c = cfg;
         c.q = 60;   /* small seeds mutate into more distinct inputs */
-        if (ok && nvda_write("fuzz_album_seed.nvda", nalbum, album_paths, imgs, &c, 1, NULL, NULL) == 0)
+        if (ok && nvda_write("fuzz_album_seed.nvda", nalbum + 1, names, imgs, &c, 1, 1, NULL, NULL, NULL) == 0)
             album = read_all("fuzz_album_seed.nvda", &album_len);
         remove("fuzz_album_seed.nvda");
         for (int k = 0; k < nalbum; k++) nvdr_image_free(&imgs[k]);

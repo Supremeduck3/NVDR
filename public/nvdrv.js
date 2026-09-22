@@ -274,6 +274,29 @@ function reconstruct(bytes, out, width, height) {
 }
 
 /**
+ * One image predicted from another of the same size, outside a sequence:
+ * an album's photo. Mirrors nvdrv_predict_decode(). `ref` is the RGB image
+ * before; returns the new RGB image, or null where the C side returns -1.
+ */
+export function predictDecode(ref, width, height, data) {
+    if (data.length < 9) return null;
+    const v = new DataView(data.buffer, data.byteOffset, data.length);
+    const block = v.getUint8(0);
+    if (block < 4 || block > 128) return null;
+    const dx = v.getInt16(1, true), dy = v.getInt16(3, true);
+    const fieldLen = v.getUint32(5, true);
+    if (fieldLen > data.length - 9) return null;
+    const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
+    const vx = new Int8Array(nbx * nby), vy = new Int8Array(nbx * nby);
+    if (!unpackField(data, 9, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy)) return null;
+    const pred = new Uint8Array(width * height * 3), err = new Uint8Array(width * height * 3);
+    blockPredict(ref, pred, width, height, block, vx, vy);
+    if (!reconstruct(data.subarray(9 + fieldLen), err, width, height)) return null;
+    for (let i = 0; i < pred.length; i++) pred[i] = clamp255(err[i] - 128 + pred[i]);
+    return pred;
+}
+
+/**
  * Plays a sequence frame by frame. `next()` resolves to
  *   { kind, partial, pixels }   — a frame; `pixels` is the decoder state
  *   null                        — the stream ended
