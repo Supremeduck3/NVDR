@@ -588,6 +588,51 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+## Damaged input
+
+Every test until this point fed the decoders valid files, or valid files
+cut short. A file that crosses a network can also arrive damaged, and one
+from an untrusted source can be damaged on purpose, so `make fuzz` builds
+a harness that mutates real containers — bit flips, overwritten bytes,
+header fields set to extremes, runs copied over other runs, truncation —
+and decodes each result under AddressSanitizer and
+UndefinedBehaviorSanitizer. Seeds cover every path the decoder has: arith
+and deflate, with and without ramps, YCbCr and RGB, and a sequence.
+
+It found heap-buffer overflows in the still decoder on its first run, in
+code that predates the sequence format. The per-rectangle arrays of a level
+were sized from the leaf count in the header, while the rectangle list
+itself grew on demand. A damaged split stream that subdivided past what the
+header promised wrote colours straight past the end of those arrays, both
+while replaying a unit and while filling in the units that never arrived.
+
+Reading the decoder for the same pattern turned up five more of its
+family that the fuzzer had not reached yet:
+
+  - a split bit on a rectangle under two pixels wide is accepted, and the
+    walk then descends through zero-area rectangles for as long as the
+    bits say so
+  - `anchor_bits` indexes a 256-entry model table and was never checked
+  - the palette is copied by a count the stream supplies, without checking
+    the stream holds that many bytes
+  - the deflate layout's split and token lengths come from the header and
+    were trusted against the inflated buffer
+  - `ramp_offset` multiplies a slope step from the header by an axis length
+    in `int`, which overflows on a damaged file — undefined behaviour, and
+    a value the JS decoder would compute differently
+
+All fixed on both sides, C and JS. A level that says something impossible
+is dropped whole and the last good level is shown, since nothing after the
+damage can be trusted to cover the canvas. The header is validated before
+anything is allocated from it, with a hard ceiling of 134 Mpx. None of it
+touches a valid file: every sample decodes to the same pixels, the
+regression gate is unchanged on the stills, and C and JS still agree byte
+for byte on every level and every cut.
+
+The original crashing inputs are the proof. Fifteen of them — two still
+containers and thirteen frame containers pulled out of sequences — overflow
+the heap in the decoder before this change and decode cleanly after it.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most

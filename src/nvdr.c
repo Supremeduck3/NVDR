@@ -776,7 +776,14 @@ static int div_round(int n, int d) {
  */
 static int ramp_offset(int span, int pos, int len) {
     if (span == 0 || len < 2) return 0;
-    return div_round(span * (2 * pos - len + 1), 2 * (len - 1));
+    /* In 64 bits: a slope step read from a damaged header, times an axis
+     * tens of thousands of pixels long, overflows an int — undefined
+     * behaviour, and a value the JS decoder would compute differently.
+     * Every product an honest encoder makes fits either way, so this
+     * changes no output. */
+    long long n = (long long)span * (2LL * pos - len + 1);
+    long long d = 2LL * (len - 1);
+    return (int)(n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d));
 }
 
 /* The colour one rectangle actually shows at a given pixel, ramp included.
@@ -1535,10 +1542,14 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
 typedef struct {
     NvdrLevelData* out;
     uint32_t       capacity;
+    /* No level can hold more rectangles than the canvas has pixels, since
+     * every rectangle covers at least one. Past this the stream is lying. */
+    uint32_t       limit;
 } RectSink;
 
 static int sink_push(RectSink* sink, int x, int y, int w, int h) {
     NvdrLevelData* d = sink->out;
+    if (sink->limit && d->count >= sink->limit) return -1;
     if (d->count == sink->capacity) {
         uint32_t grown = sink->capacity ? sink->capacity * 2 : 4096;
         uint16_t* nx = (uint16_t*)realloc(d->x, (size_t)grown * sizeof(uint16_t));
@@ -1565,6 +1576,10 @@ static int sink_push(RectSink* sink, int x, int y, int w, int h) {
 static int replay(BitReader* br, RectSink* sink, int x, int y, int w, int h) {
     if (br->overrun) return -1;
     if (!br_get(br)) return sink_push(sink, x, y, w, h);
+    /* The encoder never splits a rectangle narrower than two pixels, so a
+     * split bit here is damage. Accepting it would descend into
+     * zero-area rectangles for as long as the bits kept saying so. */
+    if (w < 2 || h < 2) return -1;
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     if (replay(br, sink, x,      y,      hw, hh) != 0) return -1;
     if (replay(br, sink, x + hw, y,      rw, hh) != 0) return -1;
@@ -1579,6 +1594,8 @@ static int replay_arith(NvdrDecoder* dec, NvdrModels* m, RectSink* sink,
     if (dec->overrun) return -1;
     if (!nvdr_dec_bit(dec, &m->split[nvdr_area_context(w, h)]))
         return sink_push(sink, x, y, w, h);
+    if (w < 2 || h < 2) return -1;        /* see replay() */
+    if (sink->out->count > sink->limit) return -1;
     int hw = w / 2, hh = h / 2, rw = w - hw, rh = h - hh;
     if (replay_arith(dec, m, sink, x,      y,      hw, hh) != 0) return -1;
     if (replay_arith(dec, m, sink, x + hw, y,      rw, hh) != 0) return -1;
@@ -1613,6 +1630,7 @@ typedef struct {
     int                  split_ctx;
     int                  prev0;
     int                  stopped;
+    int                  corrupt;     /* the stream said something impossible */
     uint32_t             delivered;   /* rectangles whose colour really arrived */
 } UnitCtx;
 
@@ -1631,13 +1649,11 @@ static void unit_parent_colour(const UnitCtx* d, int px, int py, uint8_t* out) {
 static int replay_unit(UnitCtx* d, int x, int y, int w, int h, int depth) {
     int split = 0;
     if (!d->stopped) {
-        if ((size_t)d->level->count + 1 >= d->cap) {
-            d->stopped = 1;
-        } else {
-            split = nvdr_dec_bit(d->dec, &d->m->split[nvdr_area_context(w, h)]);
-            if (d->dec->overrun) { d->stopped = 1; split = 0; }
-            else if (depth == 0) d->split_ctx = split;
-        }
+        split = nvdr_dec_bit(d->dec, &d->m->split[nvdr_area_context(w, h)]);
+        if (d->dec->overrun) { d->stopped = 1; split = 0; }
+        else if (depth == 0) d->split_ctx = split;
+        /* An honest encoder never splits below two pixels. */
+        if (split && (w < 2 || h < 2)) { d->corrupt = 1; return -1; }
     }
 
     if (split) {
@@ -1649,7 +1665,12 @@ static int replay_unit(UnitCtx* d, int x, int y, int w, int h, int depth) {
         return 0;
     }
 
-    if (sink_push(d->sink, x, y, w, h) != 0) return -1;
+    /* Every array below is sized to `cap`. The rectangle list grows on
+     * its own, so it is the write into the others that has to be checked:
+     * a damaged stream that subdivides past what the header promised used
+     * to write straight past the end of them. */
+    if ((size_t)d->level->count >= d->cap) { d->corrupt = 1; return -1; }
+    if (sink_push(d->sink, x, y, w, h) != 0) { d->corrupt = 1; return -1; }
     uint32_t j = d->level->count - 1;
     uint8_t parent[3];
     unit_parent_colour(d, x + w / 2, y + h / 2, parent);
@@ -1795,6 +1816,24 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
         hdr->raw_bytes[k]    = get_u32(header + 40 + k * 4);
         hdr->stored_bytes[k] = get_u32(header + 52 + k * 4);
     }
+    /*
+     * The header is data from outside like everything after it. Each of
+     * these is a value some later line trusts: the anchor width indexes a
+     * 256-entry model table, the canvas sizes every allocation, and every
+     * leaf covers at least one pixel so no level can claim more leaves than
+     * the canvas has. An honest encoder never writes any of them out of
+     * range, so refusing them costs a valid file nothing.
+     */
+    size_t canvas = (size_t)hdr->width * hdr->height;
+    if (hdr->width == 0 || hdr->height == 0 || canvas > NVDR_MAX_PIXELS ||
+        hdr->anchor_bits < 1 || hdr->anchor_bits > 8 ||
+        (hdr->compression != NVDR_COMPRESS_ARITH &&
+         hdr->compression != NVDR_COMPRESS_DEFLATE &&
+         hdr->compression != NVDR_COMPRESS_NONE))
+        return -1;
+    for (int k = 0; k < NVDR_LEVELS; k++)
+        if (hdr->leaf_count[k] > canvas) return -1;
+
     pyr->anchor_bits = hdr->anchor_bits;
     for (int k = 0; k < NVDR_LEVELS; k++) pyr->step[k] = hdr->step[k];
 
@@ -1819,12 +1858,15 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
 
     size_t off = 0;
     pyr->palette_count = (int)stream[off++] + 1;   /* stored biased by one */
+    /* The palette is copied out of the stream by a count the stream itself
+     * supplies, so the stream has to be long enough to hold it. */
+    if (1 + (size_t)pyr->palette_count * 3 > anchor_size) { free(stream); return -1; }
     pyr->palette = (unsigned char*)malloc((size_t)pyr->palette_count * 3);
     if (!pyr->palette) { free(stream); return -1; }
     memcpy(pyr->palette, stream + off, (size_t)pyr->palette_count * 3);
     off += (size_t)pyr->palette_count * 3;
 
-    RectSink sink = { &pyr->level[0], 0 };
+    RectSink sink = { &pyr->level[0], 0, (uint32_t)canvas };
     uint32_t* tokens = (uint32_t*)malloc((size_t)hdr->leaf_count[0] * sizeof(uint32_t));
     if (!tokens) { free(stream); nvdr_pyramid_free(pyr); return -1; }
 
@@ -1843,6 +1885,13 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
             free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
         }
     } else {
+        /* Split bits and tokens both come after the palette, at lengths the
+         * header states; both have to fit in what actually inflated. */
+        size_t split_bytes = ((size_t)hdr->split_bits[0] + 7) / 8;
+        size_t token_bytes = ((size_t)hdr->leaf_count[0] * hdr->anchor_bits + 7) / 8;
+        if (off + split_bytes + token_bytes > anchor_size) {
+            free(tokens); free(stream); nvdr_pyramid_free(pyr); return -1;
+        }
         BitReader br = { stream + off, hdr->split_bits[0], 0, 0 };
         if (replay(&br, &sink, 0, 0, hdr->width, hdr->height) != 0 || br.overrun ||
             pyr->level[0].count != hdr->leaf_count[0]) {
@@ -1908,7 +1957,18 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
             free(order); free(buf); break;
         }
 
-        RectSink sink = { &pyr->level[k], 0 };
+        RectSink sink = { &pyr->level[k], 0,
+                          (uint32_t)(cap < canvas ? cap : canvas) };
+        int corrupt = 0;
+
+        /* The planar layout keeps its split bits and then three residuals
+         * per rectangle; both lengths come from the header and both have
+         * to fit in what inflated. */
+        if (!arith && ((size_t)hdr->split_bits[k] + 7) / 8 +
+                      (size_t)hdr->leaf_count[k] * 3 > buf_size) {
+            free(chain); free(rgb); free(lvl_axis); free(lvl_slope);
+            free(order); free(buf); break;
+        }
         NvdrModels models;
         NvdrDecoder ad;
         BitReader lbr = { buf, hdr->split_bits[k], 0, 0 };
@@ -1943,8 +2003,11 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
                 /* Past the end of what arrived: this unit keeps the
                  * rectangle and colour it had at the level before, ramp
                  * included, so it renders exactly as that level did. */
-                if (sink_push(&sink, prev->x[i], prev->y[i], prev->w[i], prev->h[i]) != 0)
+                if ((size_t)pyr->level[k].count >= cap ||
+                    sink_push(&sink, prev->x[i], prev->y[i], prev->w[i], prev->h[i]) != 0) {
+                    corrupt = 1;
                     break;
+                }
                 uint32_t j = pyr->level[k].count - 1;
                 size_t at = (size_t)j * 3;
                 memcpy(chain + at, prev->chain + (size_t)i * 3, 3);
@@ -1966,7 +2029,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
                  * layout: every split bit, then every residual. */
                 if (replay(&lbr, &sink, prev->x[i], prev->y[i],
                            prev->w[i], prev->h[i]) != 0 || lbr.overrun ||
-                    pyr->level[k].count > cap) {
+                    pyr->level[k].count > hdr->leaf_count[k]) {
                     pyr->level[k].count = before;
                     stopped = 1;
                     u--;
@@ -1991,7 +2054,10 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
                 }
             } else {
                 if (replay_unit(&d, prev->x[i], prev->y[i],
-                                prev->w[i], prev->h[i], 0) != 0) break;
+                                prev->w[i], prev->h[i], 0) != 0) {
+                    corrupt = 1;
+                    break;
+                }
                 if (d.delivered == 0) {
                     /* Not one rectangle of this unit arrived. Roll it
                      * back and let the absent path above cover it. */
@@ -2015,7 +2081,11 @@ int nvdr_decode_mem(const uint8_t* data, size_t size,
         free(order);
         free(buf);
 
-        if (processed == 0) {
+        /* A level that said something impossible is not shown at all. The
+         * rectangles before the damage may be fine, but nothing after it
+         * can be trusted to cover the canvas, and the last good level
+         * always does. */
+        if (processed == 0 || corrupt) {
             free(rgb); free(chain); free(lvl_axis); free(lvl_slope);
             free(pyr->level[k].x); free(pyr->level[k].y);
             free(pyr->level[k].w); free(pyr->level[k].h);

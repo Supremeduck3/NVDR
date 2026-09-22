@@ -127,6 +127,13 @@ static int reconstruct(const uint8_t* blob, size_t len, NvdrImage* out) {
     NvdrPyramid pyr;
     NvdrHeader hdr;
     if (nvdr_decode_mem(blob, len, &pyr, &hdr) != 0) return -1;
+    /* A frame's container has to be the size of the sequence it sits in.
+     * Rendering clips, so a mismatch is not unsafe, but it is not a frame
+     * of this sequence either. */
+    if (hdr.width != out->width || hdr.height != out->height) {
+        nvdr_pyramid_free(&pyr);
+        return -1;
+    }
     memset(out->pixels, 0, (size_t)out->width * out->height * 3);
     for (int k = 0; k < pyr.levels_present; k++) nvdr_render_level(&pyr.level[k], out);
     nvdr_pyramid_free(&pyr);
@@ -307,7 +314,10 @@ int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
     d->data = data; d->size = got; d->pos = NVDRV_HEADER_SIZE;
     d->width = get_u16v(data + 6);
     d->height = get_u16v(data + 8);
+    /* Every frame buffer is allocated at this size before a single frame
+     * is read, so a damaged header gets refused here rather than trusted. */
     if (d->width <= 0 || d->height <= 0 ||
+        (size_t)d->width * d->height > NVDR_MAX_PIXELS ||
         alloc_image(&d->state, d->width, d->height) != 0 ||
         alloc_image(&d->scratch, d->width, d->height) != 0) {
         nvdrv_decode_close(d); return -1;

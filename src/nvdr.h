@@ -247,6 +247,10 @@ void nvdr_pyramid_free(NvdrPyramid* pyr);
 
 /* ------------------------------------------------------------ container */
 
+/* The largest canvas the decoders will allocate for: 134 Mpx, well past
+ * 8K. A damaged header claiming more is refused rather than trusted. */
+#define NVDR_MAX_PIXELS  ((size_t)1 << 27)
+
 #define NVDR_MAGIC       "NVDR"
 #define NVDR_VERSION     9
 #define NVDR_HEADER_SIZE 72
