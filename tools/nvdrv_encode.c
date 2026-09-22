@@ -61,6 +61,9 @@ static void usage(const char* a0) {
         "  --block N        per-block motion with NxN blocks (0 = one global vector)\n"
         "  --fps N          recorded in the header (default 24)\n"
         "  --tolerance A,B,C  per-frame tolerance, coarse to fine\n"
+        "  --pred-tolerance A,B,C  tolerance for predicted frames only\n"
+        "  --mv-lambda N    weight of one motion-field bit against block error\n"
+        "                   (default 8; 0 keeps each block's best-matching vector)\n"
         "  --gradient F     per-frame ramp multiplier (0 disables)\n"
         "  --limit N        stop after N frames\n", a0);
 }
@@ -79,7 +82,15 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--intra-thresh") && i+1 < argc) cfg.intra_threshold = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i+1 < argc) cfg.fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gradient") && i+1 < argc) cfg.frame.gradient = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--mv-lambda") && i+1 < argc) cfg.mv_lambda = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pred-tolerance") && i+1 < argc) {
+            char buf[128]; snprintf(buf, sizeof(buf), "%s", argv[++i]);
+            int k = 0;
+            for (char* t = strtok(buf, ","); t && k < NVDR_LEVELS; t = strtok(NULL, ","))
+                cfg.pred_tolerance[k++] = (float)atof(t);
+            if (k != NVDR_LEVELS) { fprintf(stderr, "--pred-tolerance needs %d values\n", NVDR_LEVELS); return 2; }
+        }
         else if (!strcmp(argv[i], "--tolerance") && i+1 < argc) {
             char buf[128]; snprintf(buf, sizeof(buf), "%s", argv[++i]);
             int k = 0;

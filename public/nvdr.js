@@ -40,7 +40,7 @@ const SPACE_YCC = 1;
 /* --- entropy layer, mirroring nvdr/entropy.c ------------------------- */
 
 const PROB_BITS = 11;
-const PROB_INIT = 1 << (PROB_BITS - 1);
+export const PROB_INIT = 1 << (PROB_BITS - 1);
 const MOVE_BITS = 5;
 const TOP_VALUE = 1 << 24;
 const AREA_CTX = 16;
@@ -98,7 +98,7 @@ function areaContext(w, h) {
  * coder works on unsigned 32-bit words and JavaScript's bitwise operators
  * are signed.
  */
-class ArithDecoder {
+export class ArithDecoder {
     constructor(bytes, offset, size) {
         this.bytes = bytes;
         this.pos = offset;
@@ -758,16 +758,17 @@ function smooth(pixels, width, height, weight) {
 }
 
 /**
- * Paint one level onto a canvas. Writes straight into an ImageData buffer
- * rather than issuing a fillRect per rectangle, which matters once a level
- * runs to tens of thousands of them.
+ * Paint one level into a pixel buffer, flat — no seam blend. `channels` is
+ * 3 for an RGB buffer laid out like the C decoder's, 4 for canvas
+ * ImageData. This is the one a sequence predicts from: smoothing is a
+ * display choice, and if it entered the prediction loop the two decoders
+ * would have to agree about it as well as about the pixels.
  */
-export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) {
-    const image = ctx.createImageData(width, height);
-    const pixels = image.data;
+export function paintLevel(level, width, height, pixels, channels = 4) {
     const { rects, rgb } = level;
     const ycc = level.space === SPACE_YCC;
     const c3 = new Uint8Array(3), fill = new Uint8Array(3);
+    const alpha = channels === 4;
 
     for (let i = 0; i < rects.count; i++) {
         const x0 = rects.x[i], y0 = rects.y[i];
@@ -778,11 +779,11 @@ export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) 
         if (!axis) {
             const r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
             for (let y = y0; y < y1; y++) {
-                let p = (y * width + x0) * 4;
+                let p = (y * width + x0) * channels;
                 for (let x = x0; x < x1; x++) {
                     pixels[p] = r; pixels[p + 1] = g; pixels[p + 2] = b;
-                    pixels[p + 3] = 255;
-                    p += 4;
+                    if (alpha) pixels[p + 3] = 255;
+                    p += channels;
                 }
             }
             continue;
@@ -794,7 +795,7 @@ export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) 
         const len = axis === 1 ? rects.w[i] : rects.h[i];
         const step = level.slopeStep;
         for (let y = y0; y < y1; y++) {
-            let p = (y * width + x0) * 4;
+            let p = (y * width + x0) * channels;
             if (axis === 2) {
                 for (let c = 0; c < 3; c++)
                     c3[c] = clampByte(level.chain[i * 3 + c] +
@@ -809,11 +810,38 @@ export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) 
                     if (ycc) yccToRgb(c3, 0, fill, 0); else fill.set(c3);
                 }
                 pixels[p] = fill[0]; pixels[p + 1] = fill[1]; pixels[p + 2] = fill[2];
-                pixels[p + 3] = 255;
-                p += 4;
+                if (alpha) pixels[p + 3] = 255;
+                p += channels;
             }
         }
     }
+}
+
+/**
+ * Put an RGB buffer on a canvas, with the seam blend applied on the way.
+ * The buffer itself is left alone, because for a sequence it is the
+ * decoder's state and the next frame predicts from it.
+ */
+export function showRGB(rgb, width, height, ctx, weight = SMOOTH_DEFAULT) {
+    const image = ctx.createImageData(width, height);
+    const pixels = image.data;
+    for (let i = 0, j = 0; i < width * height * 3; i += 3, j += 4) {
+        pixels[j] = rgb[i]; pixels[j + 1] = rgb[i + 1]; pixels[j + 2] = rgb[i + 2];
+        pixels[j + 3] = 255;
+    }
     smooth(pixels, width, height, weight);
+    ctx.putImageData(image, 0, 0);
+    return image;
+}
+
+/**
+ * Paint one level onto a canvas. Writes straight into an ImageData buffer
+ * rather than issuing a fillRect per rectangle, which matters once a level
+ * runs to tens of thousands of them.
+ */
+export function renderLevel(level, width, height, ctx, weight = SMOOTH_DEFAULT) {
+    const image = ctx.createImageData(width, height);
+    paintLevel(level, width, height, image.data, 4);
+    smooth(image.data, width, height, weight);
     ctx.putImageData(image, 0, 0);
 }

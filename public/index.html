@@ -36,7 +36,7 @@
     margin-bottom: 20px;
   }
 
-  #drop {
+  #drop, .drop {
     border: 1.5px dashed var(--border);
     border-radius: 10px;
     padding: 36px 20px;
@@ -44,12 +44,12 @@
     cursor: pointer;
     transition: border-color .15s, background .15s;
   }
-  #drop.hot { border-color: var(--accent); background: #12243a; }
-  #drop p { margin: 0; color: var(--muted); }
-  #drop strong { color: var(--text); }
+  #drop.hot, .drop.hot { border-color: var(--accent); background: #12243a; }
+  #drop p, .drop p { margin: 0; color: var(--muted); }
+  #drop strong, .drop strong { color: var(--text); }
 
-  #status { margin-top: 14px; color: var(--muted); min-height: 1.5em; }
-  #status .err { color: #f85149; }
+  #status, .status { margin-top: 14px; color: var(--muted); min-height: 1.5em; }
+  #status .err, .status .err { color: #f85149; }
 
   .levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
   @media (max-width: 860px) { .levels { grid-template-columns: 1fr; } }
@@ -74,16 +74,46 @@
   }
   .note { color: var(--muted); font-size: .88rem; margin: 10px 0 0; }
   .hidden { display: none; }
+
+  .tabs { display: flex; gap: 6px; margin: 0 0 18px; }
+  .tabs button {
+    background: transparent; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 16px; font: inherit; cursor: pointer;
+  }
+  .tabs button.on { color: var(--text); background: var(--panel); border-color: var(--accent); }
+
+  .opts { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; color: var(--muted); font-size: .88rem; }
+  .opts select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 6px; font: inherit; margin-left: 6px;
+  }
+  .player-bar { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; flex-wrap: wrap; }
+  .player-bar button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 7px 18px; font: inherit; font-weight: 600; cursor: pointer; min-width: 92px;
+  }
+  .player-bar button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .hud { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .86rem; }
+  .hud b { color: var(--text); }
+  .hud .ok { color: #3fb950; }
+  .hud .bad { color: #f85149; }
+  #strip { height: 46px; margin-top: 14px; image-rendering: auto; cursor: pointer; }
 </style>
 </head>
 <body>
 <main>
   <h1>Progressive Residual Stack</h1>
   <p class="sub">
-    Codifica uma imagem em <code>.nvdr</code> e decodifica cada camada no navegador.
-    O anchor sozinho já é uma imagem inteira; cada resíduo melhora o que já está na tela.
+    Codifica imagem em <code>.nvdr</code> e vídeo em <code>.nvdrv</code>, e decodifica no navegador.
+    O primeiro pedaço do arquivo já é uma imagem inteira; cada byte depois dele melhora o que está na tela.
   </p>
 
+  <nav class="tabs">
+    <button id="tabImage" class="on">Imagem</button>
+    <button id="tabVideo">Vídeo</button>
+  </nav>
+
+  <div id="imageTab">
   <div class="panel">
     <div id="drop">
       <p><strong>Solte uma imagem aqui</strong> ou clique para escolher</p>
@@ -106,7 +136,7 @@
     <div class="panel">
       <h3 style="margin:0 0 6px;font-size:.95rem">Entrega parcial</h3>
       <p class="note" style="margin:0 0 14px">
-        Arraste para simular um download interrompido. O decoder mostra o último nível
+        Arraste para simular um download interrompido.
         Cada nível é entregue em unidades independentes, dos retângulos
         maiores para os menores, então o corte cai numa fronteira de unidade
         e o que não chegou simplesmente mantém o retângulo que tinha antes.
@@ -124,6 +154,66 @@
       <pre id="report"></pre>
     </div>
   </section>
+  </div>
+
+  <div id="videoTab" class="hidden">
+    <div class="panel">
+      <div id="vdrop" class="drop">
+        <p><strong>Solte um vídeo aqui</strong> ou clique para escolher</p>
+        <p style="font-size:.85rem;margin-top:6px">
+          MP4, WebM, MOV, MKV ou AVI — o servidor extrai os quadros com ffmpeg.
+          Um <code>.nvdrv</code> pronto toca direto, sem passar pelo servidor.
+        </p>
+      </div>
+      <input type="file" id="vfile" accept="video/*,.nvdrv" class="hidden">
+      <div class="opts">
+        <label>Duração
+          <select id="vseconds">
+            <option value="3">3 s</option><option value="5" selected>5 s</option>
+            <option value="10">10 s</option><option value="20">20 s</option>
+          </select>
+        </label>
+        <label>Largura máxima
+          <select id="vwidth">
+            <option value="640">640 px</option><option value="960">960 px</option>
+            <option value="1280" selected>1280 px (720p)</option><option value="1920">1920 px (1080p)</option>
+          </select>
+        </label>
+      </div>
+      <div id="vstatus" class="status"></div>
+    </div>
+
+    <section id="vresults" class="hidden">
+      <div class="panel">
+        <canvas id="vcanvas"></canvas>
+        <div class="player-bar">
+          <button id="vplay">▶ Tocar</button>
+          <button id="vrestart" class="ghost">⟲ Início</button>
+          <span class="hud" id="vhud"></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3 style="margin:0 0 6px;font-size:.95rem">Entrega parcial, no tempo e na qualidade</h3>
+        <p class="note" style="margin:0 0 12px">
+          Cada barra é um quadro, com largura proporcional aos bytes que custou —
+          as altas são quadros intra, as baixas são preditos. Arraste para cortar o
+          arquivo: um prefixo do arquivo é um prefixo do filme, e o quadro em que o
+          corte cai ainda aparece, na qualidade que os bytes dele pagaram.
+        </p>
+        <div class="slider-row">
+          <input type="range" id="vtrunc" min="0" max="100" value="100" step="0.25">
+          <span class="readout" id="vtruncOut"></span>
+        </div>
+        <canvas id="strip"></canvas>
+      </div>
+
+      <div class="panel">
+        <h3 style="margin:0 0 12px;font-size:.95rem">Relatório do encoder</h3>
+        <pre id="vreport"></pre>
+      </div>
+    </section>
+  </div>
 </main>
 
 <script type="module">
@@ -282,6 +372,284 @@ async function showTruncated() {
         `${LEVEL_NAMES[result.levelsPresent - 1]} · ` +
         `${level.rects.count.toLocaleString('pt-BR')} retângulos`;
 }
+</script>
+
+<script type="module">
+/*
+ * The video tab. Decodes a .nvdrv frame by frame on the main thread and
+ * shows it at the rate the source was shot, one decode per animation tick,
+ * so the timing it reports is the real cost of playing the file here.
+ */
+import { SequenceDecoder, readSequenceHeader, showRGB, INTRA } from './nvdrv.js';
+
+const $ = (id) => document.getElementById(id);
+const AHEAD = 6;          // frames decoded ahead of the one on screen
+const WINDOW = 30;        // frames the timing readout averages over
+
+const formatBytes = (n) =>
+    n >= 1024 * 1024 ? `${(n / 1048576).toFixed(2)} MB`
+  : n >= 1024        ? `${(n / 1024).toFixed(1)} KB`
+  :                    `${n} B`;
+
+/* --- tabs ------------------------------------------------------------ */
+function showTab(video) {
+    $('tabImage').classList.toggle('on', !video);
+    $('tabVideo').classList.toggle('on', video);
+    $('imageTab').classList.toggle('hidden', video);
+    $('videoTab').classList.toggle('hidden', !video);
+    if (!video) pause();
+}
+$('tabImage').onclick = () => showTab(false);
+$('tabVideo').onclick = () => showTab(true);
+
+/* --- loading --------------------------------------------------------- */
+const vstatus = $('vstatus');
+const setStatus = (html, err) => { vstatus.innerHTML = err ? `<span class="err">${html}</span>` : html; };
+
+const vdrop = $('vdrop'), vfile = $('vfile');
+vdrop.onclick = () => vfile.click();
+vdrop.ondragover = (e) => { e.preventDefault(); vdrop.classList.add('hot'); };
+vdrop.ondragleave = () => vdrop.classList.remove('hot');
+vdrop.ondrop = (e) => {
+    e.preventDefault(); vdrop.classList.remove('hot');
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+};
+vfile.onchange = () => { if (vfile.files[0]) loadFile(vfile.files[0]); };
+
+async function loadFile(file) {
+    pause();
+    const dot = file.name.lastIndexOf('.');
+    const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+
+    if (ext === '.nvdrv') {
+        // Already encoded: it plays here and never touches the server.
+        openSequence(await file.arrayBuffer(), file.name, 0, '(arquivo aberto localmente, sem relatório)');
+        return;
+    }
+
+    $('vresults').classList.add('hidden');
+    const t0 = performance.now();
+    const timer = setInterval(() => setStatus(
+        `Enviando ${file.name} (${formatBytes(file.size)}) — o servidor extrai os quadros e ` +
+        `codifica… ${((performance.now() - t0) / 1000).toFixed(0)} s`), 500);
+
+    let response;
+    try {
+        response = await fetch('/video', {
+            method: 'POST',
+            headers: {
+                'x-file-ext': ext,
+                'x-seconds': $('vseconds').value,
+                'x-max-width': $('vwidth').value
+            },
+            body: file
+        });
+    } catch (err) {
+        clearInterval(timer);
+        setStatus(`Falha de rede: ${err.message}`, true);
+        return;
+    }
+    clearInterval(timer);
+    if (!response.ok) {
+        setStatus(await response.text(), true);
+        return;
+    }
+    const encoded = response.headers.get('X-Encoder-Report');
+    const report = encoded
+        ? new TextDecoder().decode(Uint8Array.from(atob(encoded), c => c.charCodeAt(0)))
+        : '(sem relatório)';
+    openSequence(await response.arrayBuffer(), file.name, file.size, report,
+                 (performance.now() - t0) / 1000);
+}
+
+/* --- the sequence ---------------------------------------------------- */
+let seq = null;           // { buffer, info, frames, name }
+const player = {
+    kept: 0, dec: null, queue: [], ended: false, error: null, decoding: false,
+    playing: false, due: 0, shown: -1, current: null, stalled: false, stalls: 0,
+    decodeMs: [], showMs: []
+};
+
+/* Frame boundaries from the headers alone, without decoding anything. */
+function indexFrames(bytes) {
+    const out = [];
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let pos = 24;
+    while (pos + 12 <= bytes.length) {
+        const len = dv.getUint32(pos + 6, true);
+        out.push({ kind: bytes[pos], start: pos, end: pos + 12 + len });
+        pos += 12 + len;
+    }
+    return out;
+}
+
+function openSequence(buffer, name, sourceSize, report, seconds) {
+    const info = readSequenceHeader(buffer);
+    if (!info) { setStatus('Não é um arquivo NVDRV v3.', true); return; }
+    const frames = indexFrames(new Uint8Array(buffer));
+    const intra = frames.filter(f => f.kind === INTRA).length;
+    seq = { buffer, info, frames, name };
+
+    const canvas = $('vcanvas');
+    canvas.width = info.width; canvas.height = info.height;
+    $('vreport').textContent = report;
+    $('vtrunc').value = 100;
+    $('vresults').classList.remove('hidden');
+
+    const bitrate = buffer.byteLength * 8 * info.fps / Math.max(1, frames.length) / 1000;
+    setStatus(
+        `<b>${name}</b> · ${info.width}×${info.height} · ${frames.length} quadros a ${info.fps} fps ` +
+        `(${intra} intra) · ${formatBytes(buffer.byteLength)} ≈ ${bitrate.toFixed(0)} kbit/s` +
+        (sourceSize ? ` · ${(100 * buffer.byteLength / sourceSize).toFixed(0)}% do vídeo enviado` : '') +
+        (seconds ? ` · codificado em ${seconds.toFixed(1)} s` : ''));
+
+    setKept(buffer.byteLength);
+    play();
+}
+
+function setKept(bytes) {
+    player.kept = bytes;
+    rewind();
+    const whole = seq.frames.filter(f => f.end <= bytes).length;
+    const partial = seq.frames.some(f => f.start + 12 < bytes && f.end > bytes);
+    $('vtruncOut').innerHTML =
+        `<b>${formatBytes(bytes)}</b> de ${formatBytes(seq.buffer.byteLength)} — ` +
+        `${whole} quadro${whole === 1 ? '' : 's'} inteiro${whole === 1 ? '' : 's'}` +
+        (partial ? ' + 1 parcial' : '');
+    drawStrip();
+}
+
+function rewind() {
+    player.dec = new SequenceDecoder(seq.buffer.slice(0, player.kept));
+    player.queue = [];
+    player.ended = false;
+    player.error = null;
+    player.shown = -1;
+    player.stalled = false;
+}
+
+/* --- decoding, one frame per tick ------------------------------------ */
+async function pump() {
+    if (player.decoding || player.ended || player.queue.length >= AHEAD) return;
+    player.decoding = true;
+    const dec = player.dec;
+    try {
+        const t0 = performance.now();
+        let f = null;
+        try { f = await dec.next(); }
+        catch (e) { if (dec === player.dec) { player.ended = true; player.error = e.message; } }
+        // A rewind while this was in flight makes the frame stale.
+        if (dec !== player.dec) return;
+        if (!f) { player.ended = true; return; }
+        remember(player.decodeMs, performance.now() - t0);
+        player.queue.push({ index: f.index, kind: f.kind, partial: f.partial,
+                            pixels: f.pixels.slice() });
+    } finally {
+        player.decoding = false;
+    }
+}
+
+function remember(list, v) { list.push(v); if (list.length > WINDOW) list.shift(); }
+const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+
+/* --- playback -------------------------------------------------------- */
+function play() {
+    if (!seq) return;
+    player.playing = true;
+    player.due = performance.now();
+    $('vplay').textContent = '⏸ Pausar';
+    requestAnimationFrame(tick);
+}
+function pause() {
+    player.playing = false;
+    $('vplay').textContent = '▶ Tocar';
+}
+$('vplay').onclick = () => (player.playing ? pause() : play());
+$('vrestart').onclick = () => { if (seq) { rewind(); if (!player.playing) play(); } };
+
+function tick(now) {
+    if (!player.playing) return;
+    const period = 1000 / seq.info.fps;
+
+    if (now >= player.due) {
+        if (player.queue.length) {
+            const f = player.queue.shift();
+            const t0 = performance.now();
+            showRGB(f.pixels, seq.info.width, seq.info.height, $('vcanvas').getContext('2d'));
+            remember(player.showMs, performance.now() - t0);
+            player.current = f;
+            player.stalled = false;
+            player.due += period;
+            // After a long stall, pick the clock up from now rather than
+            // racing through every frame that was due in the meantime.
+            if (now - player.due > 4 * period) player.due = now + period;
+            drawStrip();
+        } else if (player.ended) {
+            // Loop. The last frame stays up while the start decodes.
+            rewind();
+            player.due = now + period;
+        } else if (!player.stalled) {
+            // Due and not decoded yet: the decoder is behind real time.
+            player.stalled = true;
+            player.stalls++;
+        }
+    }
+    updateHud();
+    pump();
+    requestAnimationFrame(tick);
+}
+
+function updateHud() {
+    const f = player.current;
+    if (!f) { $('vhud').textContent = ''; return; }
+    const dec = mean(player.decodeMs), show = mean(player.showMs);
+    const budget = 1000 / seq.info.fps;
+    const realtime = dec + show <= budget;
+    $('vhud').innerHTML =
+        `quadro <b>${f.index + 1}</b>/${seq.frames.length} · ${f.kind === INTRA ? 'intra' : 'predito'}` +
+        (f.partial ? ' · <b>parcial</b>' : '') +
+        ` · decodificar <b>${dec.toFixed(1)} ms</b> + exibir ${show.toFixed(1)} ms` +
+        ` de ${budget.toFixed(1)} ms por quadro · ` +
+        `<span class="${realtime ? 'ok' : 'bad'}">${realtime ? 'tempo real' : 'abaixo do tempo real'}</span>` +
+        ` · ${player.stalls} travada${player.stalls === 1 ? '' : 's'}` +
+        (player.error ? ` · parou: ${player.error}` : '');
+}
+
+/* --- the byte strip -------------------------------------------------- */
+function drawStrip() {
+    if (!seq) return;
+    const canvas = $('strip');
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 800, h = 46;
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    const total = seq.buffer.byteLength;
+    const x = (b) => (b / total) * w;
+    const cur = player.current ? player.current.index : -1;
+    seq.frames.forEach((f, i) => {
+        const x0 = x(f.start), x1 = Math.max(x0 + 1, x(f.end) - 0.5);
+        const hh = f.kind === INTRA ? h : h * 0.5;
+        ctx.fillStyle = i === cur ? '#e6edf3' : (f.kind === INTRA ? '#4b9fff' : '#3a4a5e');
+        ctx.globalAlpha = f.start >= player.kept ? 0.25 : 1;
+        ctx.fillRect(x0, h - hh, x1 - x0, hh);
+    });
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#e3a008';
+    ctx.fillRect(Math.min(w - 2, x(player.kept)), 0, 2, h);
+}
+$('strip').onclick = (e) => {
+    if (!seq) return;
+    const r = e.target.getBoundingClientRect();
+    const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    $('vtrunc').value = (f * 100).toFixed(2);
+    setKept(Math.floor(seq.buffer.byteLength * f));
+};
+$('vtrunc').oninput = () => {
+    if (seq) setKept(Math.floor(seq.buffer.byteLength * Number($('vtrunc').value) / 100));
+};
+window.addEventListener('resize', drawStrip);
 </script>
 </body>
 </html>

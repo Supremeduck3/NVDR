@@ -588,6 +588,109 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+## Playing it
+
+`public/nvdrv.js` is the sequence decoder in the browser, and the page has
+a video tab that plays a `.nvdrv` at the source's frame rate. A video
+dropped on the page goes to `POST /video`, where the server's ffmpeg cuts
+it into frames, `nvdrv_encode` codes them, and the container comes back.
+
+The JS decoder has to hold the same state as the C one after every frame,
+not just draw something similar: a predicted frame is a residual on top of
+that state, so one pixel apart at frame 1 is a different reference at
+frame 2 and the difference compounds. `scripts/crosscheck_seq.mjs` compares
+the two frame by frame, whole and cut at seven points, and the gate runs
+it. Across 35 containers — every synthetic sequence, global and block
+motion, three block sizes, short GOPs, ramps off, scene cuts — 280 checks,
+no divergence. Moving the residual bias from 128 to 127 in the JS alone
+fails the gate at frame 1.
+
+### Against a real codec
+
+Tested end to end with a real ffmpeg on a real VP8 file: a 960x540 clip
+Playwright recorded from an animated page — a pan and a slow zoom over a
+photograph, with a region moving against it — at 25 fps. Unlike the
+synthetic sequences, it has the frame-to-frame noise a lossy codec leaves
+behind. Checked first for the trap that would flatter the result: no
+frame of the 144 is a duplicate, the smallest difference between
+consecutive frames is 2.5 levels.
+
+It is the first comparison against a video codec, and it loses:
+
+    tolerancia            bytes    kbit/s     PSNR vs the VP8 frames
+    0.090,0.040,0.018   2255789     3133      33.77 dB
+    0.120,0.060,0.030    671234      932      30.47 dB
+    VP8 itself           678729      943      (the reference)
+
+At VP8's own bitrate, NVDRV reproduces VP8's frames at 30.5 dB. A
+predicted frame costs 15 KB against an intra frame's 38 KB — 40%, where on
+the synthetic sequences it was 25% and falling.
+
+Two early explanations are wrong, and the measurements that ruled them out
+are worth keeping. Sub-pixel motion is not the cause: the best
+quarter-pixel shift lowers the mean frame-to-frame error from 3.56 levels
+to 3.24, 9%. Noise is not the cause either. A clean clip, rendered
+deterministically from the same page (`window.render(t)`, 125 frames,
+JPEG q100, no codec in between), loses worse. Both codecs are measured
+against that source with `scripts/analysis/psnr_dirs`:
+
+    VP8 target   kbit/s   PSNR        NVDRV tolerance      kbit/s   PSNR
+    150k            174   30.57 dB    0.200,0.100,0.050       925   28.72 dB
+    300k            309   33.52 dB    0.120,0.060,0.030       947   29.85 dB
+    600k            605   37.19 dB    0.090,0.040,0.018      3402   33.36 dB
+    1200k          1202   39.41 dB    0.050,0.020,0.008      6174   34.45 dB
+
+At equal quality NVDRV spends about 11 times the bits, and it has a floor:
+no tolerance takes it under about 925 kbit/s.
+
+`scripts/analysis/webm_frames.py` reads VP8's frame sizes out of the WebM,
+and they put the gap in one place:
+
+                       intra frame    predicted frame
+    VP8 300k             55333 B          1099 B
+    NVDRV default        56993 B         16029 B
+
+The intra frames are close. The predicted frames, which are 124 of 125,
+are fifteen times larger. `scripts/analysis/loopcost` explains why: at
+the default tolerance, a predicted frame coded against the *source*
+previous frame costs 91 bytes, and coded against the *reconstructed*
+previous frame, as the closed loop must, about 20 KB. The genuine change
+between frames is 3.6 levels. The reference's own coding error is 5.9.
+Between 97% and 100% of every predicted frame is the codec re-coding
+texture the intra frame left out. Flat rectangles cannot converge on
+texture, so the error never goes away, and every frame pays for it again.
+That is the rate floor.
+
+Loosening only the predicted frames (`--pred-tolerance`, intra left at
+the default) stops that re-coding. Every loose setting gives the same
+file, 999 kbit/s at 30.29 dB. A predicted frame is then 91 bytes of
+residual and 3607 bytes of motion field. The field is now the cost, and
+it is coded naively, as deltas from the global vector:
+
+    block    kbit/s   PSNR
+    8           999   30.29 dB
+    16          473   28.20 dB
+    32          345   26.00 dB
+    global      405   20.19 dB
+
+So the gap has three parts, in order of size. The residual is decided by
+a tolerance, not by rate against distortion, so predicted frames
+re-code errors they cannot remove. The motion field ignores that
+neighbouring vectors agree. And there is no rate control. What to fix
+follows from that: predict each vector from its neighbours (done in v3,
+under "Coding the field"), skip blocks that need nothing, decide
+the residual per block by rate and distortion, and add a zoom/affine
+global model. `--pred-tolerance`
+stays off by default, because on its own it trades 3 dB for the rate.
+
+### Real time
+
+In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
+to display against a 40 ms budget at 25 fps: not real time, and the
+display is the larger half. The seam blend runs in JS over every pixel,
+after a copy from RGB to RGBA, on the main thread. The decoder in C runs
+at about 28 ms per megapixel, which is 38 fps at 720p and 17 at 1080p.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
@@ -742,9 +845,10 @@ is right for one of them and wrong for the other. Each 8x8 block now
 carries its own vector, searched in two windows — around the global
 vector, where most blocks are, and around zero, because what moves against
 a pan is very often something holding still relative to the camera. The
-field goes in the frame as deltas against the global vector, in two
-deflated planes, so a shot with nothing moving against the camera pays a
-few dozen bytes for it.
+field went in the frame as deltas against the global vector, in two
+deflated planes, so a shot with nothing moving against the camera paid a
+few dozen bytes for it. Version 3 codes it predictively instead; see
+below.
 
 Measured with the field's cost inside the bytes:
 
@@ -762,13 +866,61 @@ way — is the case one vector cannot describe, and it is only 4% of the
 area there. Real footage, where far more of the frame moves independently,
 is where this should matter most and is exactly what has not been measured.
 
+### Coding the field
+
+On the clean benchmark clip, once predicted frames stopped re-coding the
+intra frame's texture, the motion field was most of what was left: 3607
+of a predicted frame's 3714 bytes. Deflate over deltas against the global
+vector sees runs of equal bytes. It cannot see that the likeliest vector
+is the one next door.
+
+Version 3 predicts each vector from the median of its left, top and
+top-right neighbours, as H.264 does, and codes it with the same adaptive
+arithmetic coder as the stills. A block that matches its prediction costs
+one bit, conditioned on whether its left and top neighbours matched. Any
+other block codes the difference, x then y, as zero flag, sign and
+adaptive unary magnitude.
+
+A better coder for the field does little while the search ignores it,
+because the search picks each vector by prediction error alone. Among
+near-equal matches on texture, the winner flickers from block to block.
+A second pass therefore walks the blocks in coding order, when each
+block's prediction is known. It weighs a handful of candidates (the
+search's pick, the prediction and its four neighbours at one pixel, the
+global vector, the left and top vectors) by block error plus
+`--mv-lambda` times the bits the vector would cost. That pass is
+sequential, because every choice moves the prediction of the blocks
+after it. It is cheap, because it only evaluates candidates.
+
+On the clean clip, against v2:
+
+                               v2                    v3, lambda 8
+    default tolerance     3402 kbit/s 33.36 dB    3143 kbit/s 33.39 dB   -7.6%
+    --pred-tolerance loose 999 kbit/s 30.29 dB     816 kbit/s 30.36 dB  -18.3%
+
+    field per predicted frame, loose:  3607 B  ->  2674 B
+
+The coder alone, with lambda 0, gives 905 kbit/s. The rest comes from the
+rate-aware pass. Larger lambdas keep trading quality for rate (715 kbit/s
+at 16 and 30.17 dB; 593 at 32 and 29.81 dB). 8 is the default because it
+is the largest that costs no quality at the default tolerance. The
+12-frame sequence in the regression gate is 4.1% smaller at -0.02 dB.
+
+That is not the gap to VP8 closed. The field is still about 2.3 bits per
+8x8 block. VP8 spends its whole predicted frame, 637 bytes at 150 kbit/s,
+on 16x16 macroblocks that split only where it pays. The next step for
+the field is the same thing in this codec's own terms: a quadtree over
+the motion that stays whole where the vectors agree. At the default
+tolerance the residual is still 12 KB of the 15 KB frame, and that is
+fix (b).
+
 Not here yet: B-frames.
 
 ## Layout
 
     src/        the codec: nvdr.c and entropy.c, plus nvdrv.c for sequences
     tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
-    public/     the browser decoder (nvdr.js) and its viewer
+    public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-check, analysis
     samples/    the images every number in this file was measured on
     vendor/     stb_image.h, the only third-party code

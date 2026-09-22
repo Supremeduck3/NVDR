@@ -11,6 +11,13 @@ const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 // before reaching the file system — protects shell, sanitize path.
 const ALLOWED_EXTS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tga']);
 
+// Video goes through ffmpeg, which is looked up on PATH unless these say
+// otherwise. It runs on the machine serving the page, not in the browser.
+const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+const FFMPEG = process.env.NVDR_FFMPEG || 'ffmpeg';
+const FFPROBE = process.env.NVDR_FFPROBE || 'ffprobe';
+
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const STATIC_TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -27,10 +34,10 @@ if (!fs.existsSync(outDir)) {
 // B1: extension passed by the client is validated against an allow-list
 // to keep it from being interpreted as a shell fragment. Returns null
 // on anything other than a known image extension.
-function sanitizeExtension(raw) {
+function sanitizeExtension(raw, allowed = ALLOWED_EXTS) {
     if (typeof raw !== 'string') return null;
     const ext = raw.trim().toLowerCase();
-    if (!ALLOWED_EXTS.has(ext)) return null;
+    if (!allowed.has(ext)) return null;
     if (ext.includes('/') || ext.includes('\\') || ext.includes('\0')) return null;
     return ext;
 }
@@ -66,8 +73,9 @@ function findExecutable(dir, name) {
  * never consumed, 'finish' never fires, and the connection hangs until the
  * client times out.
  */
-function receiveUpload(req, res, onReady) {
-    const fileExtension = sanitizeExtension(req.headers['x-file-ext']);
+function receiveUpload(req, res, onReady,
+                       { exts = ALLOWED_EXTS, limit = MAX_UPLOAD_BYTES } = {}) {
+    const fileExtension = sanitizeExtension(req.headers['x-file-ext'], exts);
     if (!fileExtension) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Invalid or missing x-file-ext header');
@@ -99,12 +107,12 @@ function receiveUpload(req, res, onReady) {
     // Guard against unbounded uploads filling the disk.
     req.on('data', (chunk) => {
         received += chunk.length;
-        if (received > MAX_UPLOAD_BYTES && !aborted) {
+        if (received > limit && !aborted) {
             aborted = true;
             writeStream.destroy();
             if (!res.writableEnded) {
                 res.writeHead(413, { 'Content-Type': 'text/plain' });
-                res.end(`Upload too large (limit ${MAX_UPLOAD_BYTES} bytes)`);
+                res.end(`Upload too large (limit ${limit} bytes)`);
             }
             req.destroy();
             safeUnlink(inputPath);
@@ -198,6 +206,115 @@ function serveStatic(req, res) {
     });
 }
 
+/* An integer header inside [lo, hi], or the default. Headers are untrusted
+ * and these end up in argv. */
+function intHeader(req, name, def, lo, hi) {
+    const raw = req.headers[name];
+    if (!/^\d{1,5}$/.test(raw || '')) return def;
+    const v = Number(raw);
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/*
+ * The source's frame rate, so the player runs at the speed it was shot.
+ * ffprobe prints it as a fraction — 24000/1001 for film on video. Not every
+ * ffmpeg install ships ffprobe, so failing that, ffmpeg's own description
+ * of the input ("25 fps") is read instead, and 24 is the last resort.
+ */
+function probeFps(input, done) {
+    const accept = (v) => (v >= 1 && v <= 255 ? Math.round(v) : null);
+    execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
+                       '-show_entries', 'stream=r_frame_rate', '-of', 'csv=p=0', input],
+             { timeout: 30000 }, (err, stdout) => {
+        const m = /^(\d+)(?:\/(\d+))?/.exec((stdout || '').trim());
+        const fps = !err && m ? accept(Number(m[1]) / Number(m[2] || 1)) : null;
+        if (fps) return done(fps);
+        // Without an output, ffmpeg describes the input and exits nonzero.
+        execFile(FFMPEG, ['-hide_banner', '-i', input], { timeout: 30000 }, (_e, _o, stderr) => {
+            const f = /(\d+(?:\.\d+)?) fps/.exec(stderr || '');
+            done((f && accept(Number(f[1]))) || 24);
+        });
+    });
+}
+
+/*
+ * Video in, sequence out: ffmpeg cuts the upload into frames, nvdrv_encode
+ * codes them, and the container goes back to the page.
+ *
+ * Frames are taken as the source has them. Asking ffmpeg for a frame rate
+ * makes it duplicate or drop frames to hit it, and a duplicated frame is a
+ * perfect prediction — it would make the codec look better than it is.
+ * Duration and width are capped because encoding is the slow direction and
+ * the frames sit on disk as PNG while it runs.
+ */
+function handleVideo(req, res) {
+    const seconds = intHeader(req, 'x-seconds', 5, 1, 30);
+    const maxWidth = intHeader(req, 'x-max-width', 1280, 64, 3840);
+
+    receiveUpload(req, res, (inputPath, fileId) => {
+        const outPath = path.join(outDir, `temp_${fileId}.nvdrv`);
+        const framesDir = fs.mkdtempSync(path.join(outDir, `frames_${fileId}_`));
+        const cleanup = () => setTimeout(() => {
+            safeUnlink(inputPath);
+            safeUnlink(outPath);
+            fs.rm(framesDir, { recursive: true, force: true }, () => {});
+        }, 5000);
+        const fail = (code, text) => {
+            console.error(`Video: ${text}`);
+            if (!res.writableEnded) {
+                res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end(text);
+            }
+            cleanup();
+        };
+
+        const encoder = findExecutable(__dirname, 'nvdrv_encode');
+        if (!encoder) return fail(500, `nvdrv_encode não encontrado em ${__dirname}. Rode \`make\`.`);
+
+        probeFps(inputPath, (fps) => {
+            const args = ['-hide_banner', '-loglevel', 'error', '-i', inputPath,
+                          '-map', '0:v:0', '-t', String(seconds), '-frames:v', '900',
+                          '-vf', `scale='min(${maxWidth},iw)':-2`,
+                          '-f', 'image2', path.join(framesDir, 'f%04d.png')];
+            console.log(`Video: extracting up to ${seconds}s at <=${maxWidth}px, ${fps} fps...`);
+            execFile(FFMPEG, args, { timeout: 300000 }, (err, _out, stderr) => {
+                if (err && err.code === 'ENOENT') {
+                    return fail(501, 'ffmpeg não encontrado no PATH do servidor. Instale o ffmpeg ' +
+                                     'ou aponte NVDR_FFMPEG para o executável.');
+                }
+                if (err) return fail(422, `ffmpeg não conseguiu ler o vídeo: ${(stderr || err.message).trim()}`);
+
+                const frames = fs.readdirSync(framesDir).filter(n => n.endsWith('.png')).length;
+                if (!frames) return fail(422, 'ffmpeg não extraiu nenhum quadro.');
+                console.log(`Video: ${frames} frames, encoding...`);
+
+                execFile(encoder, [framesDir, outPath, '--fps', String(fps)],
+                         { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, (err2, stdout, stderr2) => {
+                    if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
+                    fs.readFile(outPath, (err3, data) => {
+                        if (err3) return fail(500, 'nvdrv_encode não produziu saída');
+                        // The per-frame report runs a line per frame; keep
+                        // its head and its summary so the header stays small.
+                        let lines = (stdout || '').trim().split('\n');
+                        if (lines.length > 60)
+                            lines = [...lines.slice(0, 42), `  … ${lines.length - 50} quadros …`, ...lines.slice(-8)];
+                        res.writeHead(200, {
+                            'Content-Type': 'application/octet-stream',
+                            'Content-Length': data.length,
+                            'X-Encoder-Report': Buffer.from(lines.join('\n'), 'utf8').toString('base64'),
+                            'X-Frames': String(frames),
+                            'X-Fps': String(fps)
+                        });
+                        res.end(data);
+                        console.log(`Video: sent ${data.length} bytes for ${frames} frames.`);
+                        cleanup();
+                    });
+                });
+            });
+        });
+    }, { exts: VIDEO_EXTS, limit: MAX_VIDEO_BYTES });
+}
+
 const server = http.createServer((req, res) => {
     if (req.method === 'GET') {
         serveStatic(req, res);
@@ -207,6 +324,11 @@ const server = http.createServer((req, res) => {
     if (req.method !== 'POST') {
         res.writeHead(404);
         res.end('Not found');
+        return;
+    }
+
+    if (req.url === '/video') {
+        handleVideo(req, res);
         return;
     }
 

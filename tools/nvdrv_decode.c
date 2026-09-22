@@ -52,7 +52,9 @@ int main(int argc, char** argv) {
             "usage: %s <in.nvdrv> [options]\n"
             "  --out DIR       write every frame as DIR/f%%03d.png\n"
             "  --compare DIR   PSNR of each frame against the source frames\n"
-            "  --smooth W      seam blend on the written frames (default %.2f)\n",
+            "  --smooth W      seam blend on the written frames (default %.2f)\n"
+            "  --ppm           write PPM instead of PNG; with --smooth 0 this is the\n"
+            "                  decoder state itself, which is what a check compares\n",
             argv[0], NVDR_SMOOTH_DEFAULT);
         return 2;
     }
@@ -60,10 +62,12 @@ int main(int argc, char** argv) {
     const char* outdir = NULL;
     const char* cmpdir = NULL;
     float smooth = NVDR_SMOOTH_DEFAULT;
+    const char* ext = "png";
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--out") && i+1 < argc) outdir = argv[++i];
         else if (!strcmp(argv[i], "--compare") && i+1 < argc) cmpdir = argv[++i];
         else if (!strcmp(argv[i], "--smooth") && i+1 < argc) smooth = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--ppm")) ext = "ppm";
     }
 
     NvdrvDecoder* dec;
@@ -110,7 +114,7 @@ int main(int argc, char** argv) {
         }
         if (outdir) {
             char path[512];
-            snprintf(path, sizeof(path), "%s/f%03d.png", outdir, i);
+            snprintf(path, sizeof(path), "%s/f%03d.%s", outdir, i, ext);
             NvdrImage shown = f;
             unsigned char* copy = (unsigned char*)malloc((size_t)f.width*f.height*3);
             memcpy(copy, f.pixels, (size_t)f.width*f.height*3);
