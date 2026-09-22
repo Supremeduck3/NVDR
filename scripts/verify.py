@@ -155,6 +155,13 @@ def check_sequence(tmp, psnr_slack):
     problems = []
     if not stable:
         problems.append("sequence encoder is not deterministic")
+    # The browser player has to hold the same state as the C decoder after
+    # every frame, or it drifts from the file while each frame looks fine.
+    cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_seq.mjs"), str(out)],
+                        capture_output=True, text=True)
+    if cc.returncode != 0:
+        bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
+        problems.append("C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
     # Drift: the last frames must not be worse than the first. Predicting
     # from the wrong reference shows up here and nowhere else.
     drift = min(per_frame[1:]) - per_frame[0]

@@ -588,6 +588,67 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+## Playing it
+
+`public/nvdrv.js` is the sequence decoder in the browser, and the page has
+a video tab that plays a `.nvdrv` at the source's frame rate. A video
+dropped on the page goes to `POST /video`, where the server's ffmpeg cuts
+it into frames, `nvdrv_encode` codes them, and the container comes back.
+
+The JS decoder has to hold the same state as the C one after every frame,
+not just draw something similar: a predicted frame is a residual on top of
+that state, so one pixel apart at frame 1 is a different reference at
+frame 2 and the difference compounds. `scripts/crosscheck_seq.mjs` compares
+the two frame by frame, whole and cut at seven points, and the gate runs
+it. Across 35 containers — every synthetic sequence, global and block
+motion, three block sizes, short GOPs, ramps off, scene cuts — 280 checks,
+no divergence. Moving the residual bias from 128 to 127 in the JS alone
+fails the gate at frame 1.
+
+### Against a real codec
+
+Tested end to end with a real ffmpeg on a real VP8 file: a 960x540 clip
+Playwright recorded from an animated page — a pan and a slow zoom over a
+photograph, with a region moving against it — at 25 fps. Unlike the
+synthetic sequences, it has the frame-to-frame noise a lossy codec leaves
+behind. Checked first for the trap that would flatter the result: no
+frame of the 144 is a duplicate, the smallest difference between
+consecutive frames is 2.5 levels.
+
+It is the first comparison against a video codec, and it loses:
+
+    tolerancia            bytes    kbit/s     PSNR vs the VP8 frames
+    0.090,0.040,0.018   2255789     3133      33.77 dB
+    0.120,0.060,0.030    671234      932      30.47 dB
+    VP8 itself           678729      943      (the reference)
+
+At VP8's own bitrate, NVDRV reproduces VP8's frames at 30.5 dB. A
+predicted frame costs 15 KB against an intra frame's 38 KB — 40%, where on
+the synthetic sequences it was 25% and falling.
+
+The obvious suspect was sub-pixel motion — the pan moves 1.12 px a frame
+and the vectors are whole pixels — and it is not the cause. The best
+quarter-pixel shift lowers the mean frame-to-frame error from 3.56 levels
+to 3.24, 9%. What is left after the best possible alignment is about 3.4
+levels everywhere: the previous codec's noise, which changes every frame.
+A camera's sensor does the same. A quadtree of flat fills is the worst
+possible representation of noise — following it means subdividing to the
+pixel — and at the tolerances tuned for stills, that is what it does.
+
+Past 0.12 the curve stops behaving: looser tolerances lose quality and
+gain bytes (681 KB at 0.16, 685 KB at 0.22), which points at feedback in
+the prediction loop — error left uncoded accumulating until it crosses the
+tolerance — and is not yet understood. The default stays where it is
+until it is.
+
+### Real time
+
+In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
+to display against a 40 ms budget at 25 fps: not real time, and the
+display is the larger half. The seam blend runs in JS over every pixel,
+after a copy from RGB to RGBA, on the main thread. The decoder in C runs
+at about 28 ms per megapixel, which is 38 fps at 720p and 17 at 1080p.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
@@ -768,7 +829,7 @@ Not here yet: B-frames.
 
     src/        the codec: nvdr.c and entropy.c, plus nvdrv.c for sequences
     tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
-    public/     the browser decoder (nvdr.js) and its viewer
+    public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-check, analysis
     samples/    the images every number in this file was measured on
     vendor/     stb_image.h, the only third-party code

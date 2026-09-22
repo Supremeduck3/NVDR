@@ -90,7 +90,34 @@ amostras e sai com código 1, com `circulos` acusando -4,60 dB.
 node server.js
 ```
 
-Abre `http://localhost:3000`, arrasta uma imagem e pronto:
+Abre `http://localhost:3000`. A página tem duas abas, **Imagem** e **Vídeo**.
+
+### Vídeo
+
+Arrasta um MP4, WebM, MOV, MKV ou AVI. O servidor usa o **ffmpeg da sua
+máquina** para extrair os quadros, codifica com `nvdrv_encode`, e o player
+toca no navegador. Um `.nvdrv` já codificado também pode ser arrastado —
+esse toca direto, sem passar pelo servidor.
+
+- Precisa de `ffmpeg` no PATH. Se estiver em outro lugar:
+  `NVDR_FFMPEG=/caminho/ffmpeg node server.js`. Sem ele, a página avisa.
+- O fps é lido do próprio arquivo (com `ffprobe` se houver, senão pela
+  descrição que o `ffmpeg` dá da entrada), e os quadros são extraídos
+  **sem reamostrar** — reamostrar duplica quadros, e quadro duplicado é
+  predição perfeita, o que faria o codec parecer melhor do que é.
+- **Duração** (3 a 20 s) e **largura máxima** limitam o trabalho: codificar
+  é a direção lenta, e os quadros ficam em PNG no disco enquanto isso.
+  Com os padrões (5 s, 1280 px), um clipe de 960×540 levou 14 s ida e volta.
+
+O player mostra, por quadro, quanto custou **decodificar** e **exibir**
+contra o orçamento do fps do vídeo, e quantas vezes travou. A faixa embaixo
+é o arquivo inteiro: cada barra é um quadro, larga pelos bytes que custou,
+alta se for intra. Clicar ou arrastar corta o arquivo ali — um prefixo do
+arquivo é um prefixo do filme, e o quadro onde o corte cai ainda aparece.
+
+### Imagem
+
+Arrasta uma imagem e pronto:
 
 - as três camadas lado a lado, com bytes acumulados e número de retângulos
 - um slider que corta o arquivo para simular download interrompido
@@ -322,6 +349,18 @@ que os bytes dele pagaram.
 ---
 
 ## Conferindo que C e JS decodificam igual
+
+Para vídeo o equivalente é `scripts/crosscheck_seq.mjs`: compara o
+**estado** dos dois decoders depois de cada quadro, não a imagem na tela.
+Um quadro predito é um resíduo em cima desse estado, então um pixel de
+diferença no quadro 1 vira outra referência no quadro 2 e o erro se
+acumula — o player sairia do arquivo com cada quadro parecendo normal.
+
+```bash
+node scripts/crosscheck_seq.mjs /tmp/saida.nvdrv
+```
+
+O gate (`make check`) roda os dois.
 
 O decoder em C e o do navegador têm que produzir **os mesmos bytes** — se
 divergirem, a página mostra algo que o formato não gravou. O script
