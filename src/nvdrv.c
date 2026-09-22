@@ -21,6 +21,9 @@ static int clamp255v(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 NvdrvConfig nvdrv_default_config(void) {
     NvdrvConfig c;
     c.frame = nvdr_default_config();
+    /* Every frame's texture in one layer: nobody watches a video frame
+     * arrive, and the split costs bytes. */
+    c.frame.band = 0;
     /* Two seconds at 24fps. Short enough to join a stream quickly, long
      * enough that the intra frames — four times the size of a predicted
      * one — do not dominate the bitrate. */

@@ -140,9 +140,9 @@ Arrasta uma imagem e pronto:
 ```
 samples/montanha_pessoas.jpg  768x512  q 24/24  blocks 4..32
   layer       stored  cumulative     PSNR
-  COR            4879        4911    20.95 dB
-  TEXTURA       47898       52809    33.28 dB
-  leaves 4/8/16/32: 1264/2156/778/35, 3847 with texture
+  COR            4726        4758    20.84 dB
+  TEX-BAIXA     13318       18076    25.57 dB
+  TEX-ALTA      33934       52012    33.41 dB
 ```
 
 Desde o formato v10, a imagem é uma **quadtree de blocos quadrados** de 4 a
@@ -155,7 +155,9 @@ Como ler:
 
 - **COR** — a primeira camada: a árvore e a cor de cada bloco. Sozinha já
   é uma imagem inteira de blocos chapados.
-- **TEXTURA** — a segunda camada: a textura de cada bloco.
+- **TEX-BAIXA** — a segunda camada: as frequências baixas da textura de
+  **todos** os blocos. Com ela a imagem inteira já tem a textura grossa.
+- **TEX-ALTA** — a terceira: o detalhe fino.
 - **stored** — o tamanho real da camada no arquivo, que é também o que
   trafegaria na rede.
 - **cumulative** — soma até aqui, mais o header: quantos bytes um decoder
@@ -174,10 +176,11 @@ Como ler:
 
 Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
 
-Só a camada de cor:
+Só a camada de cor, ou cor + textura baixa:
 
 ```bash
-./nvdr_decode /tmp/m.nvdr /tmp/cor.png --layer 0
+./nvdr_decode /tmp/m.nvdr /tmp/cor.png   --layer 0
+./nvdr_decode /tmp/m.nvdr /tmp/baixa.png --layer 1
 ```
 
 Para medir a qualidade junto:
@@ -190,8 +193,9 @@ Para medir a qualidade junto:
 
 Cortar o arquivo em qualquer ponto depois do começo da camada de cor ainda
 produz imagem. Cada camada é enviada em blocos de 32×32, de cima para
-baixo: um bloco de cor que não chegou fica **cinza**, e um bloco de
-textura que não chegou fica com a cor chapada.
+baixo, e a textura vem em duas: primeiro a **grossa da imagem inteira**,
+depois o detalhe. Um bloco de cor que não chegou fica **cinza**, e um
+bloco de textura que não chegou mostra o que a camada anterior deu a ele.
 
 ```bash
 SZ=$(stat -c%s /tmp/m.nvdr)
@@ -202,17 +206,8 @@ for pct in 3 10 30 50 75 100; do
 done
 ```
 
-```
-  3% -> ... cor 168/384 tiles  textura 0/384 tiles  psnr 13.30 dB
- 10% -> ... cor 384/384 tiles  textura 5/384 tiles  psnr 20.96 dB
- 30% -> ... cor 384/384 tiles  textura 145/384 tiles  psnr 22.22 dB
- 50% -> ... cor 384/384 tiles  textura 214/384 tiles  psnr 24.04 dB
- 75% -> ... cor 384/384 tiles  textura 300/384 tiles  psnr 27.15 dB
-100% -> ... cor 384/384 tiles  textura 384/384 tiles  psnr 33.28 dB
-```
-
-A qualidade nunca cai com mais bytes, mas a textura chegando de cima para
-baixo faz o meio da curva subir devagar (ver "Coisas que confundem").
+No montanha_pessoas: 30% do arquivo dá 24,6 dB, 50% dá 26,5 dB, 75% dá
+28,8 dB e 100% dá 33,4 dB. A qualidade nunca cai com mais bytes.
 
 O único corte que não produz imagem é antes dos primeiros bytes da camada
 de cor. Nesse caso o decoder diz isso e sai com erro, que é o contrato,
@@ -239,6 +234,10 @@ não uma falha.
   bloco. Quase não muda nada entre 0,06 e 0,3; default 0,12.
 - **`--max-block N` / `--min-block N`** — o maior e o menor bloco (4 a 32).
   32 ganhou de 16 por até 0,5 dB.
+- **`--band N`** — onde a textura se divide entre as camadas baixa e alta
+  (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
+  em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
+- **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
 
 ---
 
@@ -337,21 +336,14 @@ Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
 
 ## Coisas que confundem
 
-**Os arquivos antigos (`.nvdr` v9) não abrem mais.** O formato mudou de
+**Arquivos antigos (`.nvdr` v9 e v10, `.nvdrv` antes da versão 6) não abrem mais.** O formato mudou de
 retângulos chapados para quadtree + DCT; recodifique a imagem. O codec
 antigo está em `reference/nvdr_v9`, só para reproduzir medições antigas.
 
-**No meio de um download, a imagem melhora de cima para baixo.** A textura
-chega em blocos de 32×32 em ordem de leitura, então com metade do arquivo a
-metade de cima está nítida e a de baixo só com a cor. No montanha_pessoas,
-50% do arquivo dá 24,0 dB, contra 25,8 dB no formato antigo, que espalhava
-o refinamento pela tela inteira. Em compensação, o arquivo inteiro dá
-33,3 dB, contra 26,3. Mandar primeiro as frequências baixas da imagem
-inteira resolve isso e está na lista.
-
 **Com qualidade baixa aparecem blocos.** Com `--q` alto, os blocos grandes
-de 32×32 ficam chapados e as emendas aparecem. É o artefato típico de DCT;
-o remédio é um filtro de deblocking, que ainda não existe aqui.
+de 32×32 ficam chapados e as emendas aparecem. É o artefato típico de DCT.
+O filtro de deblocking suaviza as emendas que têm textura de um dos lados;
+entre dois blocos chapados a emenda é a própria imagem e fica.
 
 **PSNR não enxerga tudo.** Ele mede erro absoluto, então é cego para onde
 o erro está. Quando avaliar uma mudança, olhe a imagem, não só o número.

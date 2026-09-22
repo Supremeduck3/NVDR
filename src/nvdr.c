@@ -158,6 +158,7 @@ NvdrConfig nvdr_default_config(void) {
      * skipped blocks carry their reference's error forward and it falls
      * 0.1 dB below. */
     c.skip_k = 0.25f;
+    c.band = 8;
     return c;
 }
 
@@ -178,6 +179,7 @@ static const int cos_table[33] = {
 static int tmat[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* [k * n + x] */
 static int scan_pos[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_ctx[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+static uint8_t scan_diag[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* u + v */
 static double bitcost[2][1 << NVDR_PROB_BITS];
 
 static int cos_entry(int j) {
@@ -208,6 +210,7 @@ static void tables_init(void) {
                 if (u < 0 || u >= n) continue;
                 scan_pos[s][at] = v * n + u;
                 scan_ctx[s][at] = (uint8_t)(d < 8 ? d : 8 + ((d - 8) / 4 < 6 ? (d - 8) / 4 : 6));
+                scan_diag[s][at] = (uint8_t)d;
                 at++;
             }
     }
@@ -389,36 +392,43 @@ static void put_mag(Sink* s, TextureModels* m, int c, int g, int a) {
     put_escape(s, (unsigned)(r - MAG_UNARY));
 }
 
-/* A block's AC levels in scan order, positions 1..count-1. */
-static void put_texture(Sink* s, TextureModels* m, int sc, int c, const int* lv, int count) {
+/*
+ * A block's AC levels over scan positions [start, end): a coded-block
+ * flag, then per position a significance flag and, after a significant
+ * one, a last flag, conditioned on the diagonal; magnitudes adaptive.
+ * The last position of the range needs neither flag: reaching it means it
+ * is the one left.
+ */
+static void put_texture(Sink* s, TextureModels* m, int sc, int c, const int* lv,
+                        int start, int end) {
     int last = 0;
-    for (int i = 1; i < count; i++) if (lv[i]) last = i;
+    for (int i = start; i < end; i++) if (lv[i]) last = i;
     put_bit(s, &m->cbf[sc][c], last > 0);
     if (!last) return;
     int g = 0;
-    for (int i = 1; i <= last; i++) {
+    for (int i = start; i <= last; i++) {
         int a = lv[i] < 0 ? -lv[i] : lv[i];
         int pc = scan_ctx[sc][i];
-        if (i < count - 1) put_bit(s, &m->sig[sc][c][pc], a != 0);
+        if (i < end - 1) put_bit(s, &m->sig[sc][c][pc], a != 0);
         if (!a) continue;
-        if (i < count - 1) put_bit(s, &m->last[sc][c][pc], i == last);
+        if (i < end - 1) put_bit(s, &m->last[sc][c][pc], i == last);
         put_mag(s, m, c, g < 3 ? g : 3, a);
         put_direct(s, lv[i] < 0, 1);
         if (a > 1) g++;
     }
 }
 
-/* Returns 0 when the block has no texture. */
-static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv, int count,
-                       int* corrupt) {
-    memset(lv, 0, sizeof(int) * count);
+/* Fills lv[start, end); returns 0 when the range carries nothing. */
+static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
+                       int start, int end, int* corrupt) {
+    memset(lv + start, 0, sizeof(int) * (size_t)(end - start));
     if (!nvdr_dec_bit(d, &m->cbf[sc][c])) return 0;
     int g = 0;
-    for (int i = 1; i < count; i++) {
+    for (int i = start; i < end; i++) {
         int pc = scan_ctx[sc][i];
-        int sig = i < count - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][pc]) : 1;
+        int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][pc]) : 1;
         if (!sig) continue;
-        int last = i < count - 1 ? nvdr_dec_bit(d, &m->last[sc][c][pc]) : 1;
+        int last = i < end - 1 ? nvdr_dec_bit(d, &m->last[sc][c][pc]) : 1;
         int a;
         if (!nvdr_dec_bit(d, &m->gt1[c][g < 3 ? g : 3])) a = 1;
         else {
@@ -438,6 +448,28 @@ static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
     return 1;
 }
 
+/*
+ * FREQUENCY BANDS
+ * ---------------
+ * Texture travels in two layers: the low frequencies of every leaf, then
+ * the rest. A cut file then shows the whole picture with its coarse
+ * texture, not its top half sharp and its bottom half flat. The split is
+ * by diagonal (u + v) relative to the leaf: a position is low when
+ * u + v <= max(1, n * band / 32). band 0 puts everything in the first
+ * texture layer, which is what a sequence's frames use: nobody watches a
+ * video frame arrive, and the split costs bytes.
+ *
+ * Returns the first scan position of the high band.
+ */
+static int band_split(int sc, int band) {
+    int n = NVDR_MIN_BLOCK << sc, count = n * n;
+    if (band <= 0) return count;
+    int dmax = n * band / 32;
+    if (dmax < 1) dmax = 1;
+    for (int i = 1; i < count; i++) if (scan_diag[sc][i] > dmax) return i;
+    return count;
+}
+
 /* ============================================================== planes */
 
 /*
@@ -451,6 +483,10 @@ typedef struct {
     int fixed_pred;              /* NVDR_FLAG_RESIDUAL: every colour predicted as 128 */
     uint8_t* flat[3];
     uint8_t* full[3];
+    /* The texture added so far, unclamped (to 16 bits): `full` is
+     * clamp(flat + acc). The bands are added here and clamped only when
+     * shown, so a high band can pull back what the low band overshot. */
+    int16_t* acc[3];
 } Canvas;
 
 static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block) {
@@ -461,13 +497,14 @@ static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block) {
     for (int c = 0; c < 3; c++) {
         cv->flat[c] = (uint8_t*)malloc((size_t)cv->pw * cv->ph);
         cv->full[c] = (uint8_t*)malloc((size_t)cv->pw * cv->ph);
-        if (!cv->flat[c] || !cv->full[c]) return -1;
+        cv->acc[c] = (int16_t*)calloc((size_t)cv->pw * cv->ph, sizeof(int16_t));
+        if (!cv->flat[c] || !cv->full[c] || !cv->acc[c]) return -1;
     }
     return 0;
 }
 
 static void canvas_free(Canvas* cv) {
-    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); }
+    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); free(cv->acc[c]); }
 }
 
 /*
@@ -497,6 +534,13 @@ static void fill(uint8_t* p, int stride, int x, int y, int w, int h, int v) {
     for (int j = y; j < y + h; j++) memset(p + (size_t)j * stride + x, v, (size_t)w);
 }
 
+/* A region set to one flat colour and no texture. */
+static void paint_flat(Canvas* cv, int c, int x, int y, int w, int h, int v) {
+    fill(cv->flat[c], cv->pw, x, y, w, h, v);
+    fill(cv->full[c], cv->pw, x, y, w, h, v);
+    for (int j = y; j < y + h; j++) memset(cv->acc[c] + (size_t)j * cv->pw + x, 0, sizeof(int16_t) * (size_t)w);
+}
+
 /*
  * A tile of layer 0 that never arrived is painted neutral grey. Painting
  * it with the colour its neighbours predict looks smoother and is not
@@ -508,18 +552,19 @@ static void tile_fallback(Canvas* cv, int tx, int ty) {
     int w = tx + cv->tile < cv->pw ? cv->tile : cv->pw - tx;
     int h = ty + cv->tile < cv->ph ? cv->tile : cv->ph - ty;
     for (int c = 0; c < 3; c++) {
-        fill(cv->flat[c], cv->pw, tx, ty, w, h, 128);
-        fill(cv->full[c], cv->pw, tx, ty, w, h, 128);
+        paint_flat(cv, c, tx, ty, w, h, 128);
     }
 }
 
-/* Adds a leaf's texture from its levels. `lv` is in scan order. */
-static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv, int step) {
+/* Adds the texture in scan positions [start, end) to the leaf's
+ * accumulated texture, and shows flat + texture clamped. */
+static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
+                          int start, int end, int step) {
     int s = size_class(n), count = n * n;
     int coef[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     memset(coef, 0, sizeof(int) * count);
     int mu = 0, mv = 0, sh = log2_int(n);
-    for (int i = 1; i < count; i++) {
+    for (int i = start; i < end; i++) {
         if (!lv[i]) continue;
         int p = scan_pos[s][i], u = p & (n - 1), v = p >> sh;
         coef[p] = clamp_coef((long)lv[i] * step);
@@ -530,7 +575,10 @@ static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) {
             size_t at = (size_t)(y + j) * cv->pw + x + i;
-            cv->full[c][at] = (uint8_t)clamp_u8(cv->flat[c][at] + res[j * n + i]);
+            int a = cv->acc[c][at] + res[j * n + i];
+            a = a < -32768 ? -32768 : (a > 32767 ? 32767 : a);
+            cv->acc[c][at] = (int16_t)a;
+            cv->full[c][at] = (uint8_t)clamp_u8(cv->flat[c][at] + a);
         }
 }
 
@@ -560,12 +608,15 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     h->flags = data[5];
     h->stored_bytes[0] = get_u32(data + 16);
     h->stored_bytes[1] = get_u32(data + 20);
+    h->stored_bytes[2] = get_u32(data + 24);
+    h->band = data[28];
     if (!h->width || !h->height || (size_t)h->width * h->height > NVDR_MAX_PIXELS) return -1;
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
     if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK)) return -1;   /* a flag this decoder does not know */
-    if (h->stored_bytes[0] > 0x7fffffffu || h->stored_bytes[1] > 0x7fffffffu) return -1;
+    for (int k = 0; k < NVDR_LAYERS; k++) if (h->stored_bytes[k] > 0x7fffffffu) return -1;
+    if (h->band > 32) return -1;
     return 0;
 }
 
@@ -578,7 +629,9 @@ typedef struct {
     double         deadzone, lambda;
     double         skip_lambda;  /* 0: every leaf coded; see code_leaf() */
     ColourModels   cm;
-    TextureModels  tm;
+    TextureModels  tm;           /* the low band */
+    TextureModels  tm2;          /* the high band */
+    int            band_at[NSIZES];   /* first high-band scan position per size */
     int*           split;       /* one decision per node, per size */
     size_t         grid_base[NSIZES];
     int            grid_w[NSIZES];
@@ -629,7 +682,7 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
             dl[c] = quantise(dc / step, 0.0);
         }
         int colour = clamp_u8(pred + div_round(clamp_coef((long)dl[c] * step), n));
-        fill(cv->flat[c], cv->pw, x, y, n, n, colour);
+        paint_flat(cv, c, x, y, n, n, colour);
 
         memset(lv[c], 0, sizeof(int) * count);
         int nonzero = 0;
@@ -644,8 +697,12 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
                 nonzero |= lv[c][i];
             }
         }
-        if (nonzero) { apply_texture(cv, c, x, y, n, lv[c], step); any = 1; }
-        else fill(cv->full[c], cv->pw, x, y, n, n, colour);
+        if (nonzero) {
+            int at = e->band_at[sc];
+            apply_texture(cv, c, x, y, n, lv[c], 1, at, step);
+            if (at < count) apply_texture(cv, c, x, y, n, lv[c], at, count, step);
+            any = 1;
+        }
 
         for (int j = 0; j < n && y + j < cv->h; j++)
             for (int i = 0; i < n && x + i < cv->w; i++) {
@@ -658,12 +715,14 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
     return err;
 }
 
+/* s1 is the two texture layers' sinks, low band then high. */
 static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
                       const int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK]) {
-    int sc = size_class(n);
+    int sc = size_class(n), count = n * n, at = e->band_at[sc];
     for (int c = 0; c < 3; c++) {
         put_dc(s0, &e->cm, sc, c, dl[c]);
-        put_texture(s1, &e->tm, sc, c, lv[c], n * n);
+        put_texture(&s1[0], &e->tm, sc, c, lv[c], 1, at);
+        if (at < count) put_texture(&s1[1], &e->tm2, sc, c, lv[c], at, count);
     }
 }
 
@@ -682,14 +741,14 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* te
     static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int skip = 0;
     if (e->skip_lambda > 0.0) {
-        Sink c0 = { NULL, 0 }, c1 = { NULL, 0 };
+        Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
         double d_skip = leaf_levels(e, x, y, n, 1, dl, lv, NULL);
-        leaf_emit(e, &c0, &c1, n, dl, lv);
-        double j_skip = d_skip + e->skip_lambda * (c0.bits + c1.bits);
-        Sink k0 = { NULL, 0 }, k1 = { NULL, 0 };
+        leaf_emit(e, &c0, c1, n, dl, lv);
+        double j_skip = d_skip + e->skip_lambda * (c0.bits + c1[0].bits + c1[1].bits);
+        Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
         double d_code = leaf_levels(e, x, y, n, 0, dl, lv, NULL);
-        leaf_emit(e, &k0, &k1, n, dl, lv);
-        double j_code = d_code + e->skip_lambda * (k0.bits + k1.bits);
+        leaf_emit(e, &k0, k1, n, dl, lv);
+        double j_code = d_code + e->skip_lambda * (k0.bits + k1[0].bits + k1[1].bits);
         skip = j_skip <= j_code;
     }
     double err = leaf_levels(e, x, y, n, skip, dl, lv, textured);
@@ -697,19 +756,24 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* te
     return err;
 }
 
+/* A block's flat, full and accumulated texture: 12 bytes a pixel. */
 static void save_block(const Canvas* cv, int x, int y, int n, uint8_t* buf) {
     for (int c = 0; c < 3; c++)
         for (int j = 0; j < n; j++) {
-            memcpy(buf, cv->flat[c] + (size_t)(y + j) * cv->pw + x, (size_t)n); buf += n;
-            memcpy(buf, cv->full[c] + (size_t)(y + j) * cv->pw + x, (size_t)n); buf += n;
+            size_t at = (size_t)(y + j) * cv->pw + x;
+            memcpy(buf, cv->flat[c] + at, (size_t)n); buf += n;
+            memcpy(buf, cv->full[c] + at, (size_t)n); buf += n;
+            memcpy(buf, cv->acc[c] + at, sizeof(int16_t) * (size_t)n); buf += 2 * n;
         }
 }
 
 static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
     for (int c = 0; c < 3; c++)
         for (int j = 0; j < n; j++) {
-            memcpy(cv->flat[c] + (size_t)(y + j) * cv->pw + x, buf, (size_t)n); buf += n;
-            memcpy(cv->full[c] + (size_t)(y + j) * cv->pw + x, buf, (size_t)n); buf += n;
+            size_t at = (size_t)(y + j) * cv->pw + x;
+            memcpy(cv->flat[c] + at, buf, (size_t)n); buf += n;
+            memcpy(cv->full[c] + at, buf, (size_t)n); buf += n;
+            memcpy(cv->acc[c] + at, buf, sizeof(int16_t) * (size_t)n); buf += 2 * n;
         }
 }
 
@@ -729,12 +793,12 @@ static double search(Enc* e, int x, int y, int n) {
     uint8_t* kept = NULL;
 
     if (whole) {
-        Sink s0 = { NULL, 0 }, s1 = { NULL, 0 };
+        Sink s0 = { NULL, 0 }, s1[2] = { { NULL, 0 }, { NULL, 0 } };
         if (can_split) put_bit(&s0, &e->cm.split[size_class(n)], 0);
-        double d = code_leaf(e, &s0, &s1, x, y, n, NULL);
-        whole_cost = d + e->lambda * (s0.bits + s1.bits);
+        double d = code_leaf(e, &s0, s1, x, y, n, NULL);
+        whole_cost = d + e->lambda * (s0.bits + s1[0].bits + s1[1].bits);
         if (!can_split) { e->split[id] = 0; return whole_cost; }
-        kept = (uint8_t*)malloc((size_t)6 * n * n);
+        kept = (uint8_t*)malloc((size_t)12 * n * n);
         if (kept) save_block(cv, x, y, n, kept);
     }
 
@@ -792,9 +856,11 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     Enc e;
     memset(&e, 0, sizeof(e));
     int rc = -1;
-    NvdrEncoder enc0, enc1;
+    NvdrEncoder enc0, enc1, enc2;
     memset(&enc0, 0, sizeof(enc0));
     memset(&enc1, 0, sizeof(enc1));
+    memset(&enc2, 0, sizeof(enc2));
+    int band = cfg.band < 0 ? 0 : (cfg.band > 32 ? 32 : cfg.band);
     NvdrHeader h;
     memset(&h, 0, sizeof(h));
 
@@ -820,6 +886,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     e.deadzone = cfg.deadzone;
     e.lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     e.skip_lambda = cfg.residual ? cfg.skip_k * e.lambda : 0.0;
+    for (int s = 0; s < NSIZES; s++) e.band_at[s] = band_split(s, band);
 
     size_t nodes = 0;
     for (int s = 0; s < NSIZES; s++) {
@@ -833,19 +900,25 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 
     models_fill((uint16_t*)&e.cm, sizeof(e.cm) / sizeof(uint16_t));
     models_fill((uint16_t*)&e.tm, sizeof(e.tm) / sizeof(uint16_t));
-    if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0) goto done;
-    Sink s0 = { &enc0, 0 }, s1 = { &enc1, 0 };
+    models_fill((uint16_t*)&e.tm2, sizeof(e.tm2) / sizeof(uint16_t));
+    if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0 ||
+        nvdr_enc_init(&enc2, 1 << 16) != 0) goto done;
+    Sink s0 = { &enc0, 0 }, s1[2] = { { &enc1, 0 }, { &enc2, 0 } };
 
     /* Each tile is searched against the models as they stand, then coded
      * for real, which is what adapts them for the next. */
     for (int ty = 0; ty < cv->ph; ty += cv->tile)
         for (int tx = 0; tx < cv->pw; tx += cv->tile) {
             search(&e, tx, ty, cv->tile);
-            emit(&e, &s0, &s1, tx, ty, cv->tile, &h);
+            emit(&e, &s0, s1, tx, ty, cv->tile, &h);
         }
-    if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0) goto done;
+    if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
+        nvdr_enc_finish(&enc2) != 0) goto done;
+    /* With no high band the stream holds no symbols, only the coder's
+     * flush: leave it out, and the layer is empty. */
+    size_t n2 = band ? enc2.count : 0;
 
-    size_t total = NVDR_HEADER_SIZE + enc0.count + enc1.count;
+    size_t total = NVDR_HEADER_SIZE + enc0.count + enc1.count + n2;
     uint8_t* buf = (uint8_t*)malloc(total);
     if (!buf) goto done;
     memset(buf, 0, NVDR_HEADER_SIZE);
@@ -860,8 +933,11 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     put_u16(buf + 14, (uint32_t)e.step[1]);
     put_u32(buf + 16, (uint32_t)enc0.count);
     put_u32(buf + 20, (uint32_t)enc1.count);
+    put_u32(buf + 24, (uint32_t)n2);
+    buf[28] = (uint8_t)band;
     memcpy(buf + NVDR_HEADER_SIZE, enc0.bytes, enc0.count);
     memcpy(buf + NVDR_HEADER_SIZE + enc0.count, enc1.bytes, enc1.count);
+    if (n2) memcpy(buf + NVDR_HEADER_SIZE + enc0.count + enc1.count, enc2.bytes, n2);
 
     h.width = (uint16_t)img->width; h.height = (uint16_t)img->height;
     h.max_block = (uint8_t)cfg.max_block; h.min_block = (uint8_t)cfg.min_block;
@@ -869,6 +945,8 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     h.flags = (uint8_t)buf[5];
     h.stored_bytes[0] = (uint32_t)enc0.count;
     h.stored_bytes[1] = (uint32_t)enc1.count;
+    h.stored_bytes[2] = (uint32_t)n2;
+    h.band = (uint8_t)band;
     if (hdr_out) *hdr_out = h;
     *out_buf = buf;
     *out_len = total;
@@ -877,6 +955,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 done:
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
+    nvdr_enc_free(&enc2);
     for (int c = 0; c < 3; c++) free(e.src[c]);
     free(e.split);
     canvas_free(&e.cv);
@@ -945,8 +1024,7 @@ static int read_node(Layer0* L, int x, int y, int n) {
         int pred = predict(cv, c, x, y, n);
         int dl = get_dc(L->d, L->cm, sc, c, &L->corrupt);
         int colour = clamp_u8(pred + div_round(clamp_coef((long)dl * L->step[c]), n));
-        fill(cv->flat[c], cv->pw, x, y, n, n, colour);
-        fill(cv->full[c], cv->pw, x, y, n, n, colour);
+        paint_flat(cv, c, x, y, n, n, colour);
     }
     return push_leaf(L, x, y, n);
 }
@@ -1061,6 +1139,11 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     size_t off1 = NVDR_HEADER_SIZE + (size_t)h.stored_bytes[0];
     size_t avail1 = size > off1 ? size - off1 : 0;
     if (avail1 > h.stored_bytes[1]) avail1 = h.stored_bytes[1];
+    size_t off2 = off1 + (size_t)h.stored_bytes[1];
+    size_t avail2 = size > off2 ? size - off2 : 0;
+    if (avail2 > h.stored_bytes[2]) avail2 = h.stored_bytes[2];
+    int band_at[NSIZES];
+    for (int s = 0; s < NSIZES; s++) band_at[s] = band_split(s, h.band);
 
     Canvas cv;
     int rc = -1;
@@ -1095,43 +1178,66 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     }
     tile_start[tiles] = L.count;
 
-    /* Layer 1: texture for the tiles layer 0 delivered, as far as its own
-     * bytes reach. A tile cut short keeps its flat colours. */
-    int complete1 = 0;
-    if ((max_layer < 0 || max_layer >= 1) && avail1 >= 5 && complete0 > 0) {
+    /* Layers 1 and 2: the low and the high band of every leaf's texture,
+     * each as far as its own bytes reach and no further than the layer
+     * before it. A tile cut short is restored to what it showed before
+     * its band arrived. */
+    int complete[NVDR_LAYERS] = { complete0, 0, 0 };
+    uint8_t* saved = NULL;
+    textured = (uint8_t*)calloc(L.count ? L.count : 1, 1);
+    saved = (uint8_t*)malloc((size_t)cv.tile * cv.tile * 9);   /* full and acc, 3 channels */
+    if (!textured || !saved) { free(saved); goto done; }
+    for (int layer = 1; layer < NVDR_LAYERS; layer++) {
+        const uint8_t* stream = data + (layer == 1 ? off1 : off2);
+        size_t avail = layer == 1 ? avail1 : avail2;
+        if ((max_layer >= 0 && max_layer < layer) || avail < 5 || complete[layer - 1] == 0) break;
+        if (layer == 2 && h.band == 0) break;
         TextureModels tm;
         models_fill((uint16_t*)&tm, sizeof(tm) / sizeof(uint16_t));
-        NvdrDecoder d1;
-        nvdr_dec_init(&d1, data + off1, avail1);
+        NvdrDecoder d;
+        nvdr_dec_init(&d, stream, avail);
         int corrupt = 0;
         int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-        textured = (uint8_t*)calloc(L.count ? L.count : 1, 1);
-        if (!textured) goto done;
-        for (int t = 0; t < complete0; t++) {
-            for (size_t i = tile_start[t]; i < tile_start[t + 1] && !d1.overrun && !corrupt; i++) {
+        for (int t = 0; t < complete[layer - 1]; t++) {
+            int tx = (t % tiles_x) * cv.tile, ty = (t / tiles_x) * cv.tile;
+            int tw = tx + cv.tile < cv.pw ? cv.tile : cv.pw - tx;
+            int th = ty + cv.tile < cv.ph ? cv.tile : cv.ph - ty;
+            for (int c = 0; c < 3; c++)
+                for (int j = 0; j < th; j++) {
+                    size_t at = (size_t)(ty + j) * cv.pw + tx;
+                    memcpy(saved + ((size_t)c * cv.tile + j) * cv.tile * 3, cv.full[c] + at, (size_t)tw);
+                    memcpy(saved + ((size_t)c * cv.tile + j) * cv.tile * 3 + cv.tile,
+                           cv.acc[c] + at, sizeof(int16_t) * (size_t)tw);
+                }
+            uint8_t was[1024];   /* a tile holds at most (32 / 4)^2 leaves */
+            size_t first = tile_start[t], nl = tile_start[t + 1] - first;
+            for (size_t i = 0; i < nl && i < sizeof(was); i++) was[i] = textured[first + i];
+            for (size_t i = first; i < tile_start[t + 1] && !d.overrun && !corrupt; i++) {
                 const Leaf* f = &L.leaves[i];
-                int sc = size_class(f->n);
-                for (int c = 0; c < 3 && !d1.overrun && !corrupt; c++)
-                    if (get_texture(&d1, &tm, sc, c, lv, f->n * f->n, &corrupt) && !d1.overrun && !corrupt) {
-                        apply_texture(&cv, c, f->x, f->y, f->n, lv, step[c]);
+                int sc = size_class(f->n), count = f->n * f->n;
+                int start = layer == 1 ? 1 : band_at[sc], end = layer == 1 ? band_at[sc] : count;
+                if (start >= end) continue;
+                for (int c = 0; c < 3 && !d.overrun && !corrupt; c++)
+                    if (get_texture(&d, &tm, sc, c, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
+                        apply_texture(&cv, c, f->x, f->y, f->n, lv, start, end, step[c]);
                         textured[i] = 1;
                     }
             }
-            if (d1.overrun || corrupt) {
-                /* Undo whatever of this tile was painted from bad bytes. */
-                for (size_t i = tile_start[t]; i < tile_start[t + 1]; i++) {
-                    const Leaf* f = &L.leaves[i];
-                    textured[i] = 0;
-                    for (int c = 0; c < 3; c++)
-                        for (int j = 0; j < f->n; j++)
-                            memcpy(cv.full[c] + (size_t)(f->y + j) * cv.pw + f->x,
-                                   cv.flat[c] + (size_t)(f->y + j) * cv.pw + f->x, f->n);
-                }
+            if (d.overrun || corrupt) {
+                for (int c = 0; c < 3; c++)
+                    for (int j = 0; j < th; j++) {
+                        size_t at = (size_t)(ty + j) * cv.pw + tx;
+                        memcpy(cv.full[c] + at, saved + ((size_t)c * cv.tile + j) * cv.tile * 3, (size_t)tw);
+                        memcpy(cv.acc[c] + at, saved + ((size_t)c * cv.tile + j) * cv.tile * 3 + cv.tile,
+                               sizeof(int16_t) * (size_t)tw);
+                    }
+                for (size_t i = 0; i < nl && i < sizeof(was); i++) textured[first + i] = was[i];
                 break;
             }
-            complete1++;
+            complete[layer]++;
         }
     }
+    free(saved);
 
     out->pixels = (unsigned char*)malloc((size_t)h.width * h.height * 3);
     if (!out->pixels) goto done;
@@ -1150,9 +1256,10 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
         }
     if (info) {
         info->tiles = tiles;
-        info->tiles_complete[0] = complete0;
-        info->tiles_complete[1] = complete1;
-        info->layers_present = (complete0 == tiles && avail1 >= 5) ? 2 : 1;
+        for (int k = 0; k < NVDR_LAYERS; k++) info->tiles_complete[k] = complete[k];
+        info->layers_present = 1;
+        if (complete0 == tiles && avail1 >= 5) info->layers_present = 2;
+        if (h.band && complete[1] == tiles && avail2 >= 5) info->layers_present = 3;
     }
     rc = 0;
 

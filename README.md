@@ -208,6 +208,40 @@ drift is how a reference that walks away from the source shows up. The
 default run holds the encoder as it ships to the baseline, 25% smaller
 than the loop run.
 
+### Frequency bands (format v11)
+
+Texture used to travel as one layer, tile by tile from the top. Half of
+montanha_pessoas therefore showed its top half sharp and its bottom half
+flat: 24.1 dB, where v9, which spread its refinement over the whole
+picture, gave 25.8. Texture now travels in two layers, the way
+progressive JPEG's spectral selection does. The low frequencies of every
+leaf come first, the rest after. A position in an n x n leaf is low when
+u + v <= max(1, n * band / 32). `band` is in the header, 8 by default,
+and 0 keeps all texture in one layer.
+
+Swept over the six samples:
+
+    band    bytes     PSNR, whole file   PSNR, first half of the file
+      0    172044        34.40 dB           22.64 dB
+      4    170849        34.32 dB           24.18 dB
+      8    170330        34.28 dB           25.06 dB
+     16    170525        34.27 dB           24.39 dB
+
+montanha_pessoas cut at 30%, 50% and 75% goes from 22.2, 24.1 and
+27.2 dB to 24.6, 26.5 and 28.8. The files come out about 1% smaller,
+because the high band gets adaptive models of its own. The tiny
+synthetic probes grow by the extra layer's fixed cost: `blocos` by 14
+bytes.
+
+Each band's inverse transform is rounded on its own. Clamping between
+them lost 0.4 to 0.8 dB wherever the low band overshot 0 or 255 and the
+high band could no longer pull it back. So the texture accumulates in a
+16-bit plane and is clamped only when shown: `full = clamp(flat + low +
+high)`.
+
+Sequences keep `band` 0. Nobody watches a video frame arrive, and the
+split costs bytes.
+
 ### Deblocking
 
 Each leaf is quantised on its own, so where two leaves meet there is a
@@ -1287,7 +1321,7 @@ Not here yet: B-frames.
 
     make
     ./nvdr_encode image.jpg out.nvdr [--q 24]
-    ./nvdr_decode out.nvdr out.png --layer 0 --compare image.jpg
+    ./nvdr_decode out.nvdr out.png --layer 1 --compare image.jpg
     ./nvdrv_encode frames/ out.nvdrv
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     make check          # the regression gate
@@ -1296,17 +1330,20 @@ Not here yet: B-frames.
 `nvdr_encode` prints each layer's stored size and the PSNR of the file
 read back at that layer, and how many leaves of each size the tree chose.
 
-`public/index.html`, served by `server.js`, shows the two layers side by
+`public/index.html`, served by `server.js`, shows the three layers side by
 side, a slider that truncates the container, and plays sequences.
 
-## Format (v10)
+## Format (v11)
 
-    [header 32B]  "NVDR", 10, 0, width u16, height u16, max block u8,
+    [header 32B]  "NVDR", 11, flags, width u16, height u16, max block u8,
                   min block u8, luma step u16, chroma step u16,
-                  layer 0 bytes u32, layer 1 bytes u32, 8 reserved
+                  layer 0/1/2 bytes u32 x3, band u8, 3 reserved
     [layer 0]     per 32x32 tile in raster order: split flags, and per
                   leaf three colour corrections
-    [layer 1]     per tile, per leaf in the same order: three textures
+    [layer 1]     per tile, per leaf in the same order: three low-band textures
+    [layer 2]     the same for the high band; empty when band is 0
+
+Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does

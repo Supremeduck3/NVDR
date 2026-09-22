@@ -25,15 +25,19 @@
  * when its four children, coded for real against the adaptive models,
  * cost less in error + lambda * bits than the node coded whole.
  *
- * TWO LAYERS, AND THE TRUNCATION GUARANTEE
- * ----------------------------------------
+ * THREE LAYERS, AND THE TRUNCATION GUARANTEE
+ * ------------------------------------------
  * Layer 0 is the tree and every leaf's colour: a complete picture of flat
- * rectangles on its own. Layer 1 is the texture. Each is one arithmetic
- * stream, coded 32x32 tile by tile in raster order, and a stream cut
- * short decodes every tile that arrived whole. A tile of layer 0 that did
- * not arrive is painted neutral grey; a tile of layer 1 that
- * did not arrive keeps its flat colours. So any prefix of the file past
- * the header decodes, and every further byte adds to it.
+ * rectangles on its own. Layer 1 is every leaf's low-frequency texture,
+ * layer 2 the rest (format v11; the split is `band`). Each is one
+ * arithmetic stream, coded 32x32 tile by tile in raster order, and a
+ * stream cut short decodes every tile that arrived whole. A tile of layer
+ * 0 that did not arrive is painted neutral grey; a tile of a texture layer
+ * that did not arrive shows what the layer before gave it. So any prefix
+ * of the file past the header decodes, and every further byte adds to it,
+ * and since the coarse texture of the whole picture comes before any of
+ * its detail, a half-delivered file is sharp everywhere rather than at the
+ * top.
  *
  * That guarantee costs one thing. A leaf's colour is predicted from the
  * flat colours around it, never from their texture, so that layer 0
@@ -73,7 +77,7 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b);
 
 /* --------------------------------------------------------------- config */
 
-#define NVDR_LAYERS      2
+#define NVDR_LAYERS      3
 #define NVDR_MIN_BLOCK   4
 #define NVDR_MAX_BLOCK   32
 
@@ -106,6 +110,10 @@ typedef struct {
      * of lambda: its bits are weighed at skip_k * lambda against the error
      * it would remove. 0 codes every leaf. */
     float skip_k;
+    /* Where texture splits between its two layers: low frequencies are
+     * u + v <= max(1, n * band / 32) in an n x n leaf. 0 keeps all texture
+     * in one layer (see band_split() in nvdr.c). */
+    int   band;
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
@@ -117,7 +125,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     10
+#define NVDR_VERSION     11
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -127,6 +135,7 @@ typedef struct {
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
+    uint8_t  band;
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */

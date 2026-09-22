@@ -15,7 +15,8 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s <in.nvdr> <out.png|out.ppm> [--layer N] [--compare source]\n"
-            "  --layer N      0 renders colour only, 1 adds texture (default);\n"
+            "  --layer N      0 renders colour only, 1 adds the low texture band,\n"
+            "                 2 the high one too (default);\n"
             "                 the file may carry less, and then less is what you get\n"
             "  --compare IMG  also report PSNR against IMG\n",
             argv[0]);
@@ -48,7 +49,8 @@ int main(int argc, char** argv) {
 
     printf("%s  %dx%d  cor %d/%d tiles", in_path, hdr.width, hdr.height,
            info.tiles_complete[0], info.tiles);
-    if (layer >= 1) printf("  textura %d/%d tiles", info.tiles_complete[1], info.tiles);
+    if (layer >= 1) printf("  textura %d/%d", info.tiles_complete[1], info.tiles);
+    if (layer >= 2 && hdr.band) printf("  alta %d/%d", info.tiles_complete[2], info.tiles);
     if (compare_path) {
         NvdrImage source;
         if (nvdr_image_load(&source, compare_path) == 0) {
