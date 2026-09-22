@@ -58,6 +58,7 @@ static void usage(const char* a0) {
         "  --gop N          force an intra frame every N (default 48; 0 = only the first)\n"
         "  --search N       global motion search half-width in px (default 12; 0 disables)\n"
         "  --intra-thresh F mean absolute error above which a frame goes intra (default 24)\n"
+        "  --block N        per-block motion with NxN blocks (0 = one global vector)\n"
         "  --fps N          recorded in the header (default 24)\n"
         "  --tolerance A,B,C  per-frame tolerance, coarse to fine\n"
         "  --gradient F     per-frame ramp multiplier (0 disables)\n"
@@ -74,6 +75,7 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gop") && i+1 < argc) cfg.gop = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--search") && i+1 < argc) cfg.search = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--block") && i+1 < argc) cfg.block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--intra-thresh") && i+1 < argc) cfg.intra_threshold = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i+1 < argc) cfg.fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gradient") && i+1 < argc) cfg.frame.gradient = (float)atof(argv[++i]);
@@ -105,8 +107,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("%d frames  %dx%d  gop %d  search %d\n", n, first.width, first.height,
-           cfg.gop, cfg.search);
+    printf("%d frames  %dx%d  gop %d  search %d  block %d\n", n, first.width, first.height,
+           cfg.gop, cfg.search, cfg.block);
     printf("  frame  tipo      bytes    mv     acumulado\n");
 
     size_t total = NVDRV_HEADER_SIZE, intra_total = 0;

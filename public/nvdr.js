@@ -33,6 +33,7 @@ const HEADER_SIZE = 72;
 const COMPRESS_NONE = 0;
 const COMPRESS_DEFLATE = 1;
 const COMPRESS_ARITH = 2;
+const MAX_PIXELS = 1 << 27;   // NVDR_MAX_PIXELS
 const ORDER_AREA = 1;
 const SPACE_YCC = 1;
 
@@ -196,6 +197,10 @@ class ArithDecoder {
 function replayArith(dec, models, rects, x, y, w, h) {
     if (dec.overrun) return false;
     if (!dec.bit(models.split, areaContext(w, h))) return rects.push(x, y, w, h);
+    // The encoder never splits below two pixels, so a split bit here is
+    // damage. Following it would descend through zero-area rectangles for
+    // as long as the bits said so. Same rule as nvdr.c.
+    if (w < 2 || h < 2) return false;
 
     const hw = w >> 1, hh = h >> 1;
     const rw = w - hw, rh = h - hh;
@@ -253,6 +258,7 @@ class RectSet {
 function replay(reader, rects, x, y, w, h) {
     if (reader.overrun) return false;
     if (!reader.next()) return rects.push(x, y, w, h);
+    if (w < 2 || h < 2) return false;   // see replayArith
 
     const hw = w >> 1, hh = h >> 1;
     const rw = w - hw, rh = h - hh;
@@ -293,6 +299,18 @@ export function readHeader(buffer) {
         const cs = view.getUint8(64 + k);
         header.chromaStep.push(cs || view.getUint8(11 + k));
     }
+    // The header is data from outside like everything after it, and each
+    // of these sizes an allocation or indexes a table. An honest encoder
+    // never writes them out of range. Same limits as nvdr.c.
+    const canvas = header.width * header.height;
+    if (header.width === 0 || header.height === 0 || canvas > MAX_PIXELS ||
+        header.anchorBits < 1 || header.anchorBits > 8 ||
+        (header.compression !== COMPRESS_ARITH &&
+         header.compression !== COMPRESS_DEFLATE &&
+         header.compression !== COMPRESS_NONE))
+        return null;
+    for (let k = 0; k < LEVELS; k++)
+        if (header.leafCount[k] > canvas) return null;
     return header;
 }
 
@@ -431,6 +449,8 @@ export async function decode(buffer) {
     const arith = header.compression === COMPRESS_ARITH;
     let offset = 0;
     const paletteCount = anchorStream[offset++] + 1;   // stored biased by one
+    if (1 + paletteCount * 3 > anchorStream.length)
+        return { header, levels, levelsPresent: 0 };
     const palette = anchorStream.subarray(offset, offset + paletteCount * 3);
     offset += paletteCount * 3;
 
@@ -449,6 +469,10 @@ export async function decode(buffer) {
             tokens[i] = dec.tree(models.token, header.anchorBits);
         if (dec.overrun) return { header, levels, levelsPresent: 0 };
     } else {
+        const splitBytes = (header.splitBits[0] + 7) >> 3;
+        const tokenBytes = Math.ceil(header.leafCount[0] * header.anchorBits / 8);
+        if (offset + splitBytes + tokenBytes > anchorStream.length)
+            return { header, levels, levelsPresent: 0 };
         const reader = new BitReader(anchorStream, offset, header.splitBits[0]);
         if (!replay(reader, anchorRects, 0, 0, header.width, header.height)
             || reader.overrun
@@ -508,6 +532,12 @@ export async function decode(buffer) {
         const axis = ramped ? new Uint8Array(capacity) : null;
         const slope = ramped ? new Int8Array(capacity * 3) : null;
 
+        // The planar layout's two lengths both come from the header and
+        // both have to fit in what inflated. Same rule as nvdr.c.
+        if (!arith && ((header.splitBits[k] + 7) >> 3) + header.leafCount[k] * 3
+                      > stream.length)
+            break;
+
         const models = arith ? newModels() : null;
         const dec = arith ? new ArithDecoder(stream, 0, stream.length) : null;
         const reader = arith ? null : new BitReader(stream, 0, header.splitBits[k]);
@@ -525,7 +555,8 @@ export async function decode(buffer) {
         // parent was showing there, so a unit cut in half still
         // contributes everything that arrived.
         const d = {
-            prevIndex: 0, splitCtx: 0, prev0: 0, stopped: false, delivered: 0
+            prevIndex: 0, splitCtx: 0, prev0: 0, stopped: false, delivered: 0,
+            corrupt: false
         };
         const parent = new Uint8Array(3);
 
@@ -536,13 +567,10 @@ export async function decode(buffer) {
         function replayUnit(x, y, w, h, depth) {
             let split = 0;
             if (!d.stopped) {
-                if (rects.count + 1 >= capacity) {
-                    d.stopped = true;
-                } else {
-                    split = dec.bit(models.split, areaContext(w, h));
-                    if (dec.overrun) { d.stopped = true; split = 0; }
-                    else if (depth === 0) d.splitCtx = split;
-                }
+                split = dec.bit(models.split, areaContext(w, h));
+                if (dec.overrun) { d.stopped = true; split = 0; }
+                else if (depth === 0) d.splitCtx = split;
+                if (split && (w < 2 || h < 2)) { d.corrupt = true; return false; }
             }
 
             if (split) {
@@ -554,7 +582,7 @@ export async function decode(buffer) {
                 return true;
             }
 
-            if (!rects.push(x, y, w, h)) return false;
+            if (!rects.push(x, y, w, h)) { d.corrupt = true; return false; }
             const j = rects.count - 1;
             parentColour(x + (w >> 1), y + (h >> 1));
 
@@ -619,8 +647,11 @@ export async function decode(buffer) {
                 // Past the end of what arrived: this unit keeps the
                 // rectangle and colour it had at the level before, ramp
                 // included, so it renders exactly as that level did.
-                rects.push(prev.rects.x[i], prev.rects.y[i],
-                           prev.rects.w[i], prev.rects.h[i]);
+                if (!rects.push(prev.rects.x[i], prev.rects.y[i],
+                                prev.rects.w[i], prev.rects.h[i])) {
+                    d.corrupt = true;
+                    break;
+                }
                 const j = rects.count - 1;
                 for (let c = 0; c < 3; c++) {
                     rgb[j * 3 + c] = prev.rgb[i * 3 + c];
@@ -642,7 +673,8 @@ export async function decode(buffer) {
                 // Deflate is all or nothing, so it keeps the old planar
                 // layout: every split bit, then every residual.
                 const ok = replay(reader, rects, prev.rects.x[i], prev.rects.y[i],
-                                  prev.rects.w[i], prev.rects.h[i]) && !reader.overrun;
+                                  prev.rects.w[i], prev.rects.h[i]) && !reader.overrun
+                           && rects.count <= header.leafCount[k];
                 if (!ok) { rects.count = before; stopped = true; u--; continue; }
                 for (let j = before; j < rects.count; j++) {
                     chainSample(prev, i, rects.x[j] + (rects.w[j] >> 1),
@@ -654,7 +686,10 @@ export async function decode(buffer) {
                 }
             } else {
                 if (!replayUnit(prev.rects.x[i], prev.rects.y[i],
-                                prev.rects.w[i], prev.rects.h[i], 0)) break;
+                                prev.rects.w[i], prev.rects.h[i], 0)) {
+                    d.corrupt = true;
+                    break;
+                }
                 if (d.delivered === 0) {
                     // Not one rectangle of this unit arrived. Roll it back
                     // and let the absent path above cover it.
@@ -673,7 +708,9 @@ export async function decode(buffer) {
             processed++;
         }
 
-        if (processed === 0) break;
+        // A level that said something impossible is not shown at all; the
+        // last good level always covers the canvas. Same rule as nvdr.c.
+        if (processed === 0 || d.corrupt) break;
 
         levels.push({ rects, rgb, chain, axis, slope,
                       slopeStep: header.gradientStep, space: header.space });

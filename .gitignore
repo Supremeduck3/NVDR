@@ -34,3 +34,5 @@ ANTIGRAVITY.md
 
 # Frame sequences are large and belong to whoever recorded them.
 samples/video/*/
+fuzz_nvdr
+fuzz_last_input.bin

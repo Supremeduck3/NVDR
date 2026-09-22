@@ -48,7 +48,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      1
+#define NVDRV_VERSION      2
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 12
 
@@ -75,6 +75,14 @@ typedef struct {
      * than coded badly.
      */
     float intra_threshold;
+    /*
+     * Block size for per-block motion, in pixels. 0 keeps one global
+     * vector per frame. A block's vector is searched around the global one
+     * and around zero, and sent as a delta against the global one, so a
+     * shot with nothing moving against the camera costs almost nothing
+     * extra for having it on.
+     */
+    int   block;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 

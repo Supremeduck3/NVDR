@@ -36,7 +36,16 @@ nvdrv_decode: tools/nvdrv_decode.c $(SEQ) $(SEQ_H)
 check: $(TOOLS)
 	python3 scripts/verify.py
 
-clean:
-	rm -f $(TOOLS)
+# Mutates real containers and decodes them under AddressSanitizer and
+# UndefinedBehaviorSanitizer. Any out-of-bounds access stops it with the
+# offending input left in fuzz_last_input.bin.
+fuzz_nvdr: scripts/fuzz.c $(SEQ) $(SEQ_H)
+	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+	    -Isrc -Ivendor $(OPENMP) -o $@ scripts/fuzz.c $(SEQ) $(LDLIBS)
 
-.PHONY: all check clean
+fuzz: fuzz_nvdr
+
+clean:
+	rm -f $(TOOLS) fuzz_nvdr
+
+.PHONY: all check clean fuzz

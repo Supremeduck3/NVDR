@@ -1,6 +1,17 @@
 # Frame sequences
 
-The quickest way in is the importer, which takes a zip, a folder or a URL,
+Getting a clip into a sandbox is the awkward part, because its outbound
+access is usually restricted: in the one this was written in, GitHub
+answers and every other host refuses the connection, so a link to a file
+service is not a route. Pushing the zip to a branch is:
+
+    git checkout -b frames
+    git add -f clipe.zip && git commit -m "frames" && git push -u origin frames
+
+GitHub rejects a single file over 100 MB, so a large clip goes in as
+several zips or as fewer frames. Delete the branch once the frames are in.
+
+The importer takes a zip, a folder or a URL,
 finds the images however deep they are nested, renames them in reading
 order, and refuses the set if the frames are not all the same size:
 

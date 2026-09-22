@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr,
             "usage: %s <image> <outdir> <mode> [frames] [--noise N]\n"
-            "  mode: static | pan | zoom | object\n", argv[0]);
+            "  mode: static | pan | zoom | object | mixed\n", argv[0]);
         return 2;
     }
     const char* in = argv[1];
@@ -51,15 +51,18 @@ int main(int argc, char** argv) {
     for (int n = 0; n < frames; n++) {
         int ox = (src.width - W) / 2, oy = (src.height - H) / 2;
         double scale = 1.0;
-        if (!strcmp(mode, "pan"))  ox += n * 3;
+        if (!strcmp(mode, "pan") || !strcmp(mode, "mixed")) ox += n * 3;
         if (!strcmp(mode, "zoom")) scale = 1.0 - n * 0.01;
 
         unsigned seed = 12345u + (unsigned)n * 7919u;
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
                 int sx = ox + (int)(x * scale), sy = oy + (int)(y * scale);
-                /* One region slides across an otherwise still frame. */
-                if (!strcmp(mode, "object")) {
+                /* One region slides across an otherwise still frame. In
+                 * `mixed` the camera pans at the same time, so the region
+                 * and the background move in different directions and no
+                 * single vector can describe the frame. */
+                if (!strcmp(mode, "object") || !strcmp(mode, "mixed")) {
                     int bx = W / 6 + n * 5, by = H / 2;
                     if (x >= bx && x < bx + W / 5 && y >= by && y < by + H / 5) {
                         sx = ox + (x - bx) + W / 3;

@@ -588,6 +588,52 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+## Damaged input
+
+Every test until this point fed the decoders valid files, or valid files
+cut short. A file that crosses a network can also arrive damaged, and one
+from an untrusted source can be damaged on purpose, so `make fuzz` builds
+a harness that mutates real containers — bit flips, overwritten bytes,
+header fields set to extremes, runs copied over other runs, truncation —
+and decodes each result under AddressSanitizer and
+UndefinedBehaviorSanitizer. Seeds cover every path the decoder has: arith
+and deflate, with and without ramps, YCbCr and RGB, and a block-motion
+sequence.
+
+It found heap-buffer overflows in the still decoder on its first run, in
+code that predates the sequence format. The per-rectangle arrays of a level
+were sized from the leaf count in the header, while the rectangle list
+itself grew on demand. A damaged split stream that subdivided past what the
+header promised wrote colours straight past the end of those arrays, both
+while replaying a unit and while filling in the units that never arrived.
+
+Reading the decoder for the same pattern turned up five more of its
+family that the fuzzer had not reached yet:
+
+  - a split bit on a rectangle under two pixels wide is accepted, and the
+    walk then descends through zero-area rectangles for as long as the
+    bits say so
+  - `anchor_bits` indexes a 256-entry model table and was never checked
+  - the palette is copied by a count the stream supplies, without checking
+    the stream holds that many bytes
+  - the deflate layout's split and token lengths come from the header and
+    were trusted against the inflated buffer
+  - `ramp_offset` multiplies a slope step from the header by an axis length
+    in `int`, which overflows on a damaged file — undefined behaviour, and
+    a value the JS decoder would compute differently
+
+All fixed on both sides, C and JS. A level that says something impossible
+is dropped whole and the last good level is shown, since nothing after the
+damage can be trusted to cover the canvas. The header is validated before
+anything is allocated from it, with a hard ceiling of 134 Mpx. None of it
+touches a valid file: every sample decodes to the same pixels, the
+regression gate is unchanged on the stills, and C and JS still agree byte
+for byte on every level and every cut.
+
+The original crashing inputs are the proof. Fifteen of them — two still
+containers and thirteen frame containers pulled out of sequences — overflow
+the heap in the decoder before this change and decode cleanly after it.
+
 ## Softening the seams
 
 A rectangle meets its neighbour at a hard step, and that step is the most
@@ -688,7 +734,35 @@ restore a ladder, and costs 59% more bytes for 0.15 dB, so it stays as it
 is. The anchor palette was the suspect before this was measured, and it
 is not: 9 bytes is not where the waste would be.
 
-Not here yet: per-block motion and B-frames.
+### Per-block motion
+
+One vector per frame describes a camera pan and nothing else. When
+something in the shot moves differently from the camera, the global vector
+is right for one of them and wrong for the other. Each 8x8 block now
+carries its own vector, searched in two windows — around the global
+vector, where most blocks are, and around zero, because what moves against
+a pan is very often something holding still relative to the camera. The
+field goes in the frame as deltas against the global vector, in two
+deflated planes, so a shot with nothing moving against the camera pays a
+few dozen bytes for it.
+
+Measured with the field's cost inside the bytes:
+
+    sequence      global              block 8
+    pan        245517 B  28.66 dB   243331 B  28.76 dB     -0.9%
+    object     311216 B  27.07 dB   289666 B  27.24 dB     -6.9%
+    mixed      308443 B  28.16 dB   268886 B  28.53 dB    -12.8%
+    pan+noise  337152 B  28.58 dB   333416 B  28.67 dB     -1.1%
+
+Smaller and better on every sequence at once, for 18% more encode time.
+Blocks of 16 and 32 were expected to win on vector cost and lost at every
+row; a mostly-agreeing field deflates to almost nothing, so the finer grid
+is nearly free. `mixed` — camera panning while a region moves the other
+way — is the case one vector cannot describe, and it is only 4% of the
+area there. Real footage, where far more of the frame moves independently,
+is where this should matter most and is exactly what has not been measured.
+
+Not here yet: B-frames.
 
 ## Layout
 
