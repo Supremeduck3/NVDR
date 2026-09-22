@@ -37,3 +37,9 @@ Texture layer, still images:
 - `texture` — the rectangles cut at some level (`none`, `anchor`, `r1`,
   `r1c`, `full`), rendered flat, and what is left coded with an 8x8 DCT
   through the adaptive arithmetic coder. Real bytes, PSNR in RGB.
+    gcc -std=c11 -O2 -I../../src -I../../vendor -o qtdct qtdct.c ../../src/nvdr.c ../../src/entropy.c -lm -lz
+
+- `qtdct` — the quadtree as the DCT's partition: power-of-two leaves of 4 to
+  32 px, each predicted as the mean of the decoded pixels above and to its
+  left, the remainder coded with a DCT of the leaf's size, and splits
+  chosen by rate and distortion against the live models.

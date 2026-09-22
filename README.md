@@ -773,6 +773,47 @@ coefficients of its own texture. A flat fill is then just a leaf with
 no AC coefficients. `comparacao_macarrao.png` shows the images side by
 side.
 
+### The quadtree as the transform's partition
+
+`scripts/analysis/qtdct` gives the quadtree a new job. Its leaves are
+squares of 4 to 32 pixels on a power-of-two grid. Each leaf's colour is
+predicted from the decoded pixels just above and to its left, so it
+costs nothing to send, and what the prediction misses is coded with a
+DCT of the leaf's own size. A leaf with no AC coefficients is exactly a
+flat rectangle; the old codec is the special case where texture is never
+sent. Each node splits only if its four children, coded against the
+adaptive models as they stand, beat it on distortion + lambda * bits.
+
+PSNR at today's container size, same deadzone (0.1) for both DCTs:
+
+    image                  NVDR today       DCT 8x8 fixed   quadtree DCT            NVDR's PSNR in
+    OIP-3451121336         39852 B 21.83   31.13            31.32 (+0.19)            23% of the bytes
+    macarrão               10826 B 30.00   41.97            45.69 (+3.72)            13%
+    montanha_pessoas       51765 B 26.30   32.42            33.20 (+0.79)            25%
+    f0000 (video bench)    57113 B 29.60   39.11            41.24 (+2.13)            15%
+
+(deadzone 0.33, all seven samples: +0.2 to +3.7 dB over the fixed grid,
+NVDR's quality in 14-26% of the bytes.)
+
+The quadtree beats the fixed grid on every sample, most where the image
+has large smooth areas and least on dense texture. Two controls:
+
+- without the prediction from the neighbours (`--pred none`) the gain
+  over the fixed grid drops by 0.3 to 2 dB, and goes negative on the
+  most textured sample. Predicting the leaf's colour is what makes big
+  leaves cheap.
+- with the AC coefficients switched off (`--dc-only`), which is flat
+  rectangles again at a 4 px minimum, PSNR stops at 27.5 dB on macarrão
+  however many bytes it is given.
+
+lambda barely matters (0.06 to 0.3 times Q^2 moves nothing past 0.05 dB).
+A 32 px maximum beats 16 by up to 0.5 dB. Chroma at the luma step
+(`--chroma-q 1`) beats 1.5 slightly. `quadtree_dct.png` shows both images
+at equal size. At about a sixth of the bytes, the quadtree DCT matches
+today's PSNR. The artefacts it shows there are blocking in the largest
+leaves, which a deblocking filter is for, not the staircase of flat
+tiles.
+
 ### Real time
 
 In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
