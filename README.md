@@ -103,9 +103,7 @@ with a transform coding the residual, the misalignment it leaves is fine
 texture across the whole frame, the most expensive thing there is to
 code. Against the source frame, refining 16x16 vectors to half and then
 quarter pixels took the residual from 4343 bytes to 1515 and PSNR from
-40.0 to 43.2 dB. H.264's 6-tap interpolation would add 5 to 7% on top of
-bilinear; bilinear is what is built, because it is exact in integers and
-cheap in JS.
+40.0 to 43.2 dB.
 
 Block vectors are now in quarter pixels, bilinear between whole pixels,
 in integers the same way in C and JS: weights (4 - a) and a per axis,
@@ -136,6 +134,43 @@ smaller at -0.42 dB, and at equal bytes it is 0.66 dB better. It is
 encoded with equal quantisers now, so its drift check measures the
 prediction loop and not the 1.2 ratio. The JS decoder takes 43 ms per
 960x540 frame in Node, against a 40 ms budget at 25 fps.
+
+### A sharper interpolation filter (sequence format 6)
+
+Quarter pixels were first built with bilinear interpolation. Measured
+between two source frames, H.264's 6-tap filter promised only 5 to 7%
+less residual. Built into the loop it was worth far more, because
+bilinear interpolation is a blur, and in a closed loop the blur
+compounds. Each predicted frame is interpolated from a reference that
+was itself interpolated from the one before. On the clean clip:
+
+    interpolation        q     kbit/s    PSNR
+    bilinear            24       690   36.22 dB
+    bilinear            20       841   37.16 dB
+    6-tap               24       532   36.03 dB
+    6-tap               20       622   36.80 dB
+    VP8                            605   37.19 dB
+
+At equal rate the 6-tap filter is about 1 dB ahead of bilinear. It is
+H.264's luma filter exactly, in integers, over the reference with its
+edges held:
+
+- half pixels across (B) and down (H): (1, -5, 20, 20, -5, 1) / 32,
+  clipped;
+- the centre (J): the same filter down a column of the unrounded
+  horizontal sums, (sum + 512) >> 10;
+- quarter pixels: the rounded mean of the two nearest whole or half
+  samples.
+
+The C side builds the three half-pixel planes once per reference, over
+the frame plus a margin as wide as the field's largest vector.
+
+The browser cannot afford whole planes per frame. `nvdrv.js` computes
+per block only the samples that block's phase reads, over its own
+region, gathered once into a contiguous buffer. The numbers are the
+same, and the cross-check holds on every sequence. A 960x540 frame of
+the panning clip, where every block has a fractional vector, decodes in
+31 ms in Node, against 21 ms with bilinear and a 40 ms budget.
 
 ### Leaving still regions alone
 
