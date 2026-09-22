@@ -650,8 +650,9 @@ and they put the gap in one place:
     VP8 300k             55333 B          1099 B
     NVDRV default        56993 B         16029 B
 
-The intra frames are close. The predicted frames, which are 124 of 125,
-are fifteen times larger. `scripts/analysis/loopcost` explains why: at
+The intra frames are the same size. They are not the same quality (see
+"The intra frame is the gap", below). The predicted frames, which are
+124 of 125, are fifteen times larger. `scripts/analysis/loopcost` explains why: at
 the default tolerance, a predicted frame coded against the *source*
 previous frame costs 91 bytes, and coded against the *reconstructed*
 previous frame, as the closed loop must, about 20 KB. The genuine change
@@ -659,7 +660,9 @@ between frames is 3.6 levels. The reference's own coding error is 5.9.
 Between 97% and 100% of every predicted frame is the codec re-coding
 texture the intra frame left out. Flat rectangles cannot converge on
 texture, so the error never goes away, and every frame pays for it again.
-That is the rate floor.
+That is the rate floor. "Re-coding" is not the same as "wasted", though:
+the same section below shows those bytes are refining an intra frame
+that starts 7 dB behind VP8's.
 
 Loosening only the predicted frames (`--pred-tolerance`, intra left at
 the default) stops that re-coding. Every loose setting gives the same
@@ -678,10 +681,97 @@ a tolerance, not by rate against distortion, so predicted frames
 re-code errors they cannot remove. The motion field ignores that
 neighbouring vectors agree. And there is no rate control. What to fix
 follows from that: predict each vector from its neighbours (done in v3,
-under "Coding the field"), skip blocks that need nothing, decide
-the residual per block by rate and distortion, and add a zoom/affine
-global model. `--pred-tolerance`
+under "Coding the field"), decide the residual per block by rate and
+distortion (tried, and it measured something more basic, under "The
+intra frame is the gap"), and add a zoom/affine global model. `--pred-tolerance`
 stays off by default, because on its own it trades 3 dB for the rate.
+
+### The intra frame is the gap
+
+The next planned fix was to decide each block's residual in a predicted
+frame by rate against distortion, and drop what does not pay. The
+prototype coded the frame, decoded it, and measured what the residual
+bought in each 16x16 block. It set the losing blocks to the neutral 128
+and coded the frame again. It did not survive measurement, for two
+reasons that are worth more than the fix would have been.
+
+The residual pays for itself. Over the first predicted frames of the
+clean clip it removes 140 units of squared error per bit on average,
+and 55% of blocks gain. Per-frame PSNR shows what it is doing: the intra
+frame comes out at 31.2 dB, and the predicted frames lift the clip to
+33.4 dB within a few frames and hold it there. Dropping the residual
+holds the clip at the intra frame's quality instead, 30.7 dB.
+
+Dropping part of it drops all of it. The tolerance is a mean deviation
+over a region, and the texture error in the residual, about 6 levels,
+sits just above it, about 4.6. With half the blocks set to 128, every
+region that straddles both falls under the tolerance and stops
+splitting, the blocks that were meant to keep their residual included.
+Every lambda from 0.01 to 300 gives the same collapsed frame: 300 bytes
+of residual, 30.7 dB.
+
+The comparison that matters is the intra frame against VP8's key frame,
+measured on frame 0 of the same clip:
+
+                                  bytes    PSNR
+    NVDR, default tolerance       57113   29.6 dB (flat render; 31.2 in the sequence)
+    NVDR, 0.03/0.012/0.004        86975   30.1 dB
+    NVDR, same, --min-tile 1     239924   34.1 dB
+    VP8 300k key frame            55333   38.3 dB
+    JPEG, Chromium, quality 0.5   48117   37.2 dB
+
+The JPEG number is flattered, since the source is itself a JPEG on the
+same 8x8 grid. The VP8 one is not. Tightening the tolerance buys almost
+nothing, because 2x2 flat rectangles cannot represent texture finer than
+2 pixels. Allowing 1x1 buys 4 dB for four times the bytes. A transform
+coder at the same size is 7 to 8 dB ahead. That is a property of
+piecewise-constant approximation, not of any tuning. Every predicted
+frame inherits it: its residual is the same texture error, coded by the
+same rectangles.
+
+### Where the finest level's bytes go
+
+R2 costs 2.1 to 3.8 times R1's bytes. On every sample it is about 70%
+of the file, for +1.3 to +4.3 dB. The rectangle count grows much less,
+1.1 to 2.2 times, so most of the cost is not the new tiles. Counting
+bits by category in the coder:
+
+- every rectangle R1 hands down that does not split still pays a colour
+  correction at R2's finer step, and 91-97% of them need one. That is
+  40-80% of R2's bytes. The corrections are not waste: dropping them
+  costs 1.1 to 2.2 dB. Making R1's step finer only moves the same cost
+  into R1, and 16,4 stays the smallest file on every sample.
+- the new tiles R2 subdivides into are what barely pay: 4-7 KB for
+  +0.16 to +0.5 dB on most samples. That is the quadtree trying to hold
+  texture with flat fills.
+
+### A texture layer, measured
+
+`scripts/analysis/texture` renders the rectangles at some cut and codes
+what is left with an 8x8 DCT through the same arithmetic coder. PSNR at
+the byte size of today's container, interpolated along each curve:
+
+    image                  NVDR today       DCT alone        anchor + DCT     R1 + DCT
+    OIP-1304511485         18126 B 24.92   33.28 (+8.36)    29.91 (+4.99)    29.21 (+4.29)
+    OIP-3451121336         39852 B 21.83   30.06 (+8.23)    28.22 (+6.39)    26.18 (+4.35)
+    OIP-3786546191         38501 B 24.15   32.15 (+8.00)    30.26 (+6.11)    28.66 (+4.51)
+    OIP-4140498144         29253 B 25.20   34.70 (+9.50)    32.43 (+7.23)    30.86 (+5.66)
+    macarrão               10826 B 30.00   41.02 (+11.0)    38.35 (+8.35)    35.74 (+5.74)
+    montanha_pessoas       51765 B 26.30   31.93 (+5.63)    30.93 (+4.63)    29.68 (+3.38)
+    f0000 (video bench)    57113 B 29.60   38.56 (+8.96)    34.92 (+5.32)    32.98 (+3.38)
+
+The DCT alone, which is essentially JPEG with a better entropy coder,
+lands where Chromium's JPEG does on f0000, so the prototype is
+calibrated. The result is uncomfortable. Every rectangle added under
+the DCT makes it worse. The hard edges of a flat-filled base end up in
+the residual, and a fixed 8x8 transform pays dearly for edges that cross
+its blocks. Laid on a grid, the rectangles are a cost to the transform,
+not a help. Where the quadtree can still earn its place is as the
+partition the transform runs on: large blocks where the image is smooth,
+small ones where it is busy, each leaf carrying its colour plus the
+coefficients of its own texture. A flat fill is then just a leaf with
+no AC coefficients. `comparacao_macarrao.png` shows the images side by
+side.
 
 ### Real time
 

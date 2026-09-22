@@ -29,3 +29,11 @@ Video measurements, same rules:
   forward so accumulated drift shows up if there is any.
 
 None of these is part of the build.
+
+Texture layer, still images:
+
+    gcc -std=c11 -O2 -I../../src -I../../vendor -o texture texture.c ../../src/nvdr.c ../../src/entropy.c -lm -lz
+
+- `texture` — the rectangles cut at some level (`none`, `anchor`, `r1`,
+  `r1c`, `full`), rendered flat, and what is left coded with an 8x8 DCT
+  through the adaptive arithmetic coder. Real bytes, PSNR in RGB.
