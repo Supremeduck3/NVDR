@@ -1,12 +1,9 @@
 /*
- * nvdr_encode — build a PRS container and report what each level costs
+ * nvdr_encode — build a v10 container and report what each layer costs
  * and buys.
  *
- * The report is the point. The spec makes testable claims about the
- * residual stack (§1.3): that the anchor carries the bulk of the
- * information and that the residuals correcting it are far lower entropy.
- * Every run prints the numbers that confirm or refute them on real data,
- * rather than leaving them assumed.
+ * The report is read back from the file the way a consumer would see it,
+ * not taken from the encoder's own state: layer 0 alone, then both.
  */
 #include "nvdr.h"
 
@@ -17,105 +14,33 @@
 static void usage(const char* argv0) {
     fprintf(stderr,
         "usage: %s <image> <out.nvdr> [options]\n"
-        "  --anchor-bits N    anchor palette is 2^N entries (default 4)\n"
-        "  --tolerance A,B,C  per-level tolerance, coarse to fine\n"
-        "                     (default 0.090,0.040,0.018)\n"
-        "  --step B,C         residual quantisation step for levels 1 and 2\n"
-        "                     (default 16,4)\n"
-        "  --min-tile N       smallest tile edge (default 2)\n"
-        "  --max-depth N      deepest subdivision (default 12)\n"
-        "  --codec NAME       arith (default) or deflate, for comparison\n"
-        "  --chroma N         how much coarser chroma is than luma (default 2;\n"
-        "                     0 drops the transform and codes RGB)\n"
-        "  --order NAME       area (default) sends the largest rectangles\n"
-        "                     first so a cut stream covers the whole canvas;\n"
-        "                     dfs keeps tree order\n"
-        "  --weber F          how much harder to push in dark regions\n"
-        "                     (default 64; a huge value restores the old\n"
-        "                      absolute-difference metric)\n"
-        "  --texture F        how much to penalise regions that do not get\n"
-        "                     better when split (default 1.0; 0 disables)\n"
-        "  --gradient F       how readily a rectangle carries a one-axis colour\n"
-        "                     ramp instead of a flat fill: the Lagrange\n"
-        "                     multiplier on its bits (0 disables)\n"
-        "  --gradient-step N  quantisation step of the ramp slopes (default 2)\n",
+        "  --q N            quantiser step, the quality knob (default 24;\n"
+        "                   smaller is better and larger)\n"
+        "  --chroma-q F     chroma step relative to luma (default 1.0)\n"
+        "  --deadzone F     0..0.5, how readily small coefficients round to\n"
+        "                   zero (default 0.1)\n"
+        "  --lambda F       rate-distortion slope, times q^2 (default 0.12)\n"
+        "  --max-block N    largest leaf, 4..32 (default 32)\n"
+        "  --min-block N    smallest leaf, 4..max (default 4)\n",
         argv0);
 }
 
-static int parse_floats(const char* text, float* out, int expected) {
-    char buffer[128];
-    snprintf(buffer, sizeof(buffer), "%s", text);
-    int n = 0;
-    for (char* tok = strtok(buffer, ","); tok && n < expected; tok = strtok(NULL, ","))
-        out[n++] = (float)atof(tok);
-    return n == expected ? 0 : -1;
-}
+static const char* layer_name(int k) { return k == 0 ? "COR" : "TEXTURA"; }
 
 int main(int argc, char** argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
-
     const char* in_path  = argv[1];
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
 
     for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--anchor-bits") && i + 1 < argc) {
-            cfg.anchor_bits = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--tolerance") && i + 1 < argc) {
-            if (parse_floats(argv[++i], cfg.tolerance, NVDR_LEVELS) != 0) {
-                fprintf(stderr, "--tolerance needs %d comma-separated values\n", NVDR_LEVELS);
-                return 2;
-            }
-        } else if (!strcmp(argv[i], "--step") && i + 1 < argc) {
-            float steps[NVDR_LEVELS - 1];
-            if (parse_floats(argv[++i], steps, NVDR_LEVELS - 1) != 0) {
-                fprintf(stderr, "--step needs %d comma-separated values\n", NVDR_LEVELS - 1);
-                return 2;
-            }
-            for (int k = 1; k < NVDR_LEVELS; k++) cfg.step[k] = (int)steps[k - 1];
-        } else if (!strcmp(argv[i], "--min-tile") && i + 1 < argc) {
-            cfg.min_tile = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--max-depth") && i + 1 < argc) {
-            cfg.max_depth = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--weber") && i + 1 < argc) {
-            cfg.weber = (float)atof(argv[++i]);
-        } else if (!strcmp(argv[i], "--texture") && i + 1 < argc) {
-            cfg.texture = (float)atof(argv[++i]);
-        } else if (!strcmp(argv[i], "--gradient") && i + 1 < argc) {
-            cfg.gradient = (float)atof(argv[++i]);
-        } else if (!strcmp(argv[i], "--gradient-step") && i + 1 < argc) {
-            cfg.gradient_step = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
-            cfg.chroma = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--order") && i + 1 < argc) {
-            const char* name = argv[++i];
-            if (!strcmp(name, "area")) cfg.order = NVDR_ORDER_AREA;
-            else if (!strcmp(name, "dfs")) cfg.order = NVDR_ORDER_DFS;
-            else { fprintf(stderr, "--order takes area or dfs\n"); return 2; }
-        } else if (!strcmp(argv[i], "--codec") && i + 1 < argc) {
-            const char* name = argv[++i];
-            if (!strcmp(name, "arith")) cfg.codec = NVDR_COMPRESS_ARITH;
-            else if (!strcmp(name, "deflate")) cfg.codec = NVDR_COMPRESS_DEFLATE;
-            else { fprintf(stderr, "--codec takes arith or deflate\n"); return 2; }
-        } else {
-            usage(argv[0]);
-            return 2;
-        }
-    }
-
-    if (cfg.anchor_bits < 1 || cfg.anchor_bits > 8) {
-        fprintf(stderr, "anchor-bits must be between 1 and 8\n");
-        return 2;
-    }
-    for (int k = 1; k < NVDR_LEVELS; k++) {
-        if (cfg.step[k] < 1 || cfg.step[k] > 64) {
-            fprintf(stderr, "residual steps must be between 1 and 64\n");
-            return 2;
-        }
-        if (cfg.tolerance[k] > cfg.tolerance[k - 1]) {
-            fprintf(stderr, "tolerances must decrease from coarse to fine\n");
-            return 2;
-        }
+        if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--chroma-q") && i + 1 < argc) cfg.chroma_q = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--deadzone") && i + 1 < argc) cfg.deadzone = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--lambda") && i + 1 < argc) cfg.lambda_k = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--max-block") && i + 1 < argc) cfg.max_block = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-block") && i + 1 < argc) cfg.min_block = atoi(argv[++i]);
+        else { fprintf(stderr, "unknown option '%s'\n", argv[i]); usage(argv[0]); return 2; }
     }
 
     NvdrImage source;
@@ -136,40 +61,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Read the container back and measure each level the way a consumer
-     * would see it, rather than trusting the encoder's own state. */
-    NvdrPyramid pyr;
-    NvdrHeader read_hdr;
-    if (nvdr_decode_file(out_path, &pyr, &read_hdr) != 0) {
-        fprintf(stderr, "wrote a container that does not read back\n");
-        nvdr_image_free(&source);
-        return 1;
-    }
-
-    NvdrImage canvas;
-    canvas.width = source.width;
-    canvas.height = source.height;
-    canvas.pixels = (unsigned char*)calloc((size_t)source.width * source.height * 3, 1);
-    if (!canvas.pixels) {
-        nvdr_pyramid_free(&pyr);
-        nvdr_image_free(&source);
-        return 1;
-    }
-
-    printf("%s  %dx%d\n", in_path, source.width, source.height);
-    printf("  level      rects        raw     stored  cumulative     PSNR\n");
+    printf("%s  %dx%d  q %d/%d  blocks %d..%d\n", in_path, source.width, source.height,
+           hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block);
+    printf("  layer       stored  cumulative     PSNR\n");
     size_t cumulative = NVDR_HEADER_SIZE;
-    static const char* names[NVDR_LEVELS] = { "ANCHOR", "R1", "R2" };
-    for (int k = 0; k < pyr.levels_present; k++) {
-        nvdr_render_level(&pyr.level[k], &canvas);
+    for (int k = 0; k < NVDR_LAYERS; k++) {
+        NvdrImage shown;
+        if (nvdr_decode_file(out_path, k, &shown, NULL, NULL) != 0) {
+            fprintf(stderr, "wrote a container that does not read back\n");
+            nvdr_image_free(&source);
+            return 1;
+        }
         cumulative += hdr.stored_bytes[k];
-        printf("  %-8s %8u %10u %10u  %10zu   %6.2f dB\n",
-               names[k], pyr.level[k].count, hdr.raw_bytes[k],
-               hdr.stored_bytes[k], cumulative, nvdr_psnr(&source, &canvas));
+        printf("  %-8s %10u  %10zu   %6.2f dB\n", layer_name(k), hdr.stored_bytes[k],
+               cumulative, nvdr_psnr(&source, &shown));
+        nvdr_image_free(&shown);
     }
+    printf("  leaves 4/8/16/32: %u/%u/%u/%u, %u with texture\n",
+           hdr.leaves[0], hdr.leaves[1], hdr.leaves[2], hdr.leaves[3], hdr.textured);
 
-    free(canvas.pixels);
-    nvdr_pyramid_free(&pyr);
     nvdr_image_free(&source);
     return 0;
 }

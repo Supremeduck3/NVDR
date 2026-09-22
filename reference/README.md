@@ -58,3 +58,13 @@ where the same staircase problem shows up: on a picture of flat circles,
 21% of the leaves sit on 0.76% of the area because an axis-aligned grid
 cannot follow a curve. Porting it means replacing its input (quadtree
 leaves grouped by palette entry) and its output (SVG `<path>`).
+
+## nvdr_v9
+
+The still-image codec before format v10: a stack of flat rectangles, each
+level a finer quadtree with a colour correction per rectangle. v10
+replaced it because a transform on the same quadtree came out 6 to 11 dB
+ahead at the same size (README, "The quadtree as the transform's
+partition"). It stays because most of the measurements in
+`scripts/analysis` were taken on it and build against it. Nothing in the
+build or the browser reads its containers any more.

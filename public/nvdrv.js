@@ -12,10 +12,10 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
-import { decode, paintLevel, showRGB, SMOOTH_DEFAULT, ArithDecoder, PROB_INIT } from './nvdr.js';
+import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 3;
+const VERSION = 4;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 12;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -138,19 +138,15 @@ function blockPredict(src, dst, width, height, block, vx, vy) {
 }
 
 /*
- * Decode one frame's container and paint it flat into `out`, cleared
- * first. Returns false where reconstruct() in nvdrv.c returns -1: the
- * container did not decode, or is not the size of the sequence.
+ * Decode one frame's container at full quality into `out`. Returns false
+ * where reconstruct() in nvdrv.c returns -1: the container did not decode,
+ * or is not the size of the sequence.
  */
-async function reconstruct(bytes, out, width, height) {
-    // decode() wants an ArrayBuffer of its own.
-    const copy = bytes.slice().buffer;
-    const result = await decode(copy);
-    if (!result || result.levelsPresent === 0) return false;
+function reconstruct(bytes, out, width, height) {
+    const result = decode(bytes);
+    if (!result) return false;
     if (result.header.width !== width || result.header.height !== height) return false;
-    out.fill(0);
-    for (let k = 0; k < result.levelsPresent; k++)
-        paintLevel(result.levels[k], width, height, out, 3);
+    out.set(result.rgb);
     return true;
 }
 
@@ -167,7 +163,7 @@ async function reconstruct(bytes, out, width, height) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v3 file');
+        if (!this.info) throw new Error('not an NVDRV v4 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -223,11 +219,16 @@ export class SequenceDecoder {
 
         const body = bytes.subarray(this.pos, this.pos + len);
         if (kind === INTRA) {
-            if (!await reconstruct(body, this.state, width, height))
+            // A frame cut before its colour layer ends the stream.
+            if (!reconstruct(body, this.state, width, height)) {
+                if (partial) return null;
                 throw new Error('frame does not decode');
+            }
         } else {
-            if (!await reconstruct(body, this.error, width, height))
+            if (!reconstruct(body, this.error, width, height)) {
+                if (partial) return null;
                 throw new Error('frame does not decode');
+            }
             const err = this.error, st = this.state;
             for (let i = 0; i < st.length; i++)
                 st[i] = clamp255(err[i] - 128 + ref[i]);
@@ -239,4 +240,4 @@ export class SequenceDecoder {
     }
 }
 
-export { showRGB, SMOOTH_DEFAULT };
+export { showRGB };

@@ -56,15 +56,14 @@ static void usage(const char* a0) {
     fprintf(stderr,
         "usage: %s <frames-dir> <out.nvdrv> [options]\n"
         "  --gop N          force an intra frame every N (default 48; 0 = only the first)\n"
-        "  --search N       global motion search half-width in px (default 12; 0 disables)\n"
+        "  --search N       global motion search half-width in px (default 24; 0 disables)\n"
         "  --intra-thresh F mean absolute error above which a frame goes intra (default 24)\n"
         "  --block N        per-block motion with NxN blocks (0 = one global vector)\n"
         "  --fps N          recorded in the header (default 24)\n"
-        "  --tolerance A,B,C  per-frame tolerance, coarse to fine\n"
-        "  --pred-tolerance A,B,C  tolerance for predicted frames only\n"
+        "  --q N            quantiser step for every frame (default 24)\n"
+        "  --pred-q N       quantiser step for predicted frames only\n"
         "  --mv-lambda N    weight of one motion-field bit against block error\n"
         "                   (default 8; 0 keeps each block's best-matching vector)\n"
-        "  --gradient F     per-frame ramp multiplier (0 disables)\n"
         "  --limit N        stop after N frames\n", a0);
 }
 
@@ -81,23 +80,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--block") && i+1 < argc) cfg.block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--intra-thresh") && i+1 < argc) cfg.intra_threshold = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i+1 < argc) cfg.fps = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--gradient") && i+1 < argc) cfg.frame.gradient = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--q") && i+1 < argc) cfg.frame.q = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pred-q") && i+1 < argc) cfg.pred_q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mv-lambda") && i+1 < argc) cfg.mv_lambda = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--pred-tolerance") && i+1 < argc) {
-            char buf[128]; snprintf(buf, sizeof(buf), "%s", argv[++i]);
-            int k = 0;
-            for (char* t = strtok(buf, ","); t && k < NVDR_LEVELS; t = strtok(NULL, ","))
-                cfg.pred_tolerance[k++] = (float)atof(t);
-            if (k != NVDR_LEVELS) { fprintf(stderr, "--pred-tolerance needs %d values\n", NVDR_LEVELS); return 2; }
-        }
-        else if (!strcmp(argv[i], "--tolerance") && i+1 < argc) {
-            char buf[128]; snprintf(buf, sizeof(buf), "%s", argv[++i]);
-            int k = 0;
-            for (char* t = strtok(buf, ","); t && k < NVDR_LEVELS; t = strtok(NULL, ","))
-                cfg.frame.tolerance[k++] = (float)atof(t);
-            if (k != NVDR_LEVELS) { fprintf(stderr, "--tolerance needs %d values\n", NVDR_LEVELS); return 2; }
-        } else { usage(argv[0]); return 2; }
     }
 
     int n = 0;

@@ -1,62 +1,60 @@
 /*
- * NVDR — Progressive Residual Stack, still-image implementation
+ * NVDR — still images, format v10: the quadtree as the partition of a
+ * transform.
  *
- * This is the PRS of NVDR spec v0.14.1 §1.2 built for real, on the one
- * domain that can be built and measured without a GPU: static images.
+ * WHAT CHANGED FROM v9, AND WHY
+ * -----------------------------
+ * Up to v9 an image was a stack of flat rectangles, each level a finer
+ * quadtree with a colour correction per rectangle. Measured against a
+ * DCT at the same size it was 6 to 11 dB behind on every sample, and the
+ * reason was structural: a flat rectangle cannot hold texture finer than
+ * the smallest tile, so the finest level spent most of the file
+ * subdividing into grain (see README, "A texture layer, measured"). v9
+ * lives on in reference/nvdr_v9 so the numbers measured with it stay
+ * reproducible.
  *
- * The spec's decomposition is:
+ * In v10 the quadtree keeps its job of deciding where detail is, and each
+ * of its leaves carries two things:
  *
- *     ANCHOR = quantize_coarse(L)
- *     R1     = quantize_mid (L - dequant(ANCHOR))
- *     R2     = quantize_fine(L - dequant(ANCHOR) - dequant(R1))
+ *   - a colour, predicted from the neighbouring leaves and corrected by a
+ *     small delta. A leaf with nothing else is exactly a v9 rectangle.
+ *   - optionally, texture: the DCT of what the flat colour misses, at the
+ *     leaf's own size (4, 8, 16 or 32 pixels square).
  *
- * with the guarantee that ANCHOR alone always decodes, that each further
- * layer is a pure delta on top of what came before, and that the three
- * together reconstruct L to within a rounding step.
+ * The encoder chooses the tree by rate and distortion: a node splits only
+ * when its four children, coded for real against the adaptive models,
+ * cost less in error + lambda * bits than the node coded whole.
  *
- * WHAT L IS, AND WHY IT MOVED
- * ---------------------------
- * The first cut of this file made L the colour of each leaf of a fixed
- * quadtree: the anchor picked colours from a 16-entry palette and the two
- * residuals corrected them. That is a faithful reading of the spec, and it
- * measured badly — the residuals drove PSNR from 23.3 dB to 26.3 dB and
- * then stopped dead, because 26.3 dB was not a colour limit at all. It was
- * the geometry: one flat colour per leaf, and the leaf set never changed.
- * The stack was refining the dimension that was already nearly solved.
+ * TWO LAYERS, AND THE TRUNCATION GUARANTEE
+ * ----------------------------------------
+ * Layer 0 is the tree and every leaf's colour: a complete picture of flat
+ * rectangles on its own. Layer 1 is the texture. Each is one arithmetic
+ * stream, coded 32x32 tile by tile in raster order, and a stream cut
+ * short decodes every tile that arrived whole. A tile of layer 0 that did
+ * not arrive is painted neutral grey; a tile of layer 1 that
+ * did not arrive keeps its flat colours. So any prefix of the file past
+ * the header decodes, and every further byte adds to it.
  *
- * That is an artefact of the domain, not of the spec. In the spec L is a
- * diffusion latent — a fixed 64x64x4 grid — so the support is constant and
- * quantisation precision really is the only axis left. An image has no such
- * fixed support. Its dominant error is where the tiles are.
+ * That guarantee costs one thing. A leaf's colour is predicted from the
+ * flat colours around it, never from their texture, so that layer 0
+ * decodes without layer 1. Predicting from the full reconstruction would
+ * be slightly better and would make layer 0 depend on layer 1.
  *
- * So here a level is a *tolerance*, and refining means both subdividing and
- * recolouring. Level 0 prunes the tree wherever a region is uniform enough
- * for a coarse tolerance; each further level lowers the tolerance, so some
- * leaves split into their subtrees. Every leaf at level k — whether it is
- * newly split or the same rectangle as before — carries one signed delta
- * against the colour level k-1 displayed at that spot. Geometric refinement
- * and colour refinement become the same operation, and the residual is a
- * parent-to-child delta, which is where the low entropy the spec counts on
- * actually lives.
- *
- * The guarantee is unchanged and is the point: every prefix of the
- * container past the anchor decodes. Truncate the file anywhere and it
- * still renders, at the quality the surviving bytes pay for.
- *
- * Each level is entropy-coded on its own rather than the container being
- * compressed as a whole. That is not a packaging detail — a prefix of one
- * deflate stream does not decode, so compressing everything together would
- * buy smaller files by destroying the property the format exists for. Per
- * level, both hold: the bytes on disk are the bytes on the wire, and any
- * prefix still ends on a level boundary that decodes.
+ * EXACTNESS
+ * ---------
+ * The C decoder and the browser's must produce the same pixels, and a
+ * video's predicted frames are added to what the decoder holds, so a
+ * one-bit difference compounds. Everything the decoder computes is
+ * integer: the inverse transform is HEVC's integer approximation of the
+ * DCT with fixed shifts, the colour conversion is fixed point, and the
+ * prediction is an integer mean. The forward transform only runs in the
+ * encoder and is free to use floating point.
  */
 #ifndef NVDR_H
 #define NVDR_H
 
 #include <stdint.h>
 #include <stddef.h>
-
-#define NVDR_LEVELS 3
 
 /* ---------------------------------------------------------------- image */
 
@@ -68,257 +66,79 @@ typedef struct {
 int  nvdr_image_load(NvdrImage* img, const char* path);
 int  nvdr_image_write_ppm(const NvdrImage* img, const char* path);
 int  nvdr_image_write_png(const NvdrImage* img, const char* path);
-
-/* Picks the writer from the extension: .png gets a PNG, anything else PPM. */
+/* PNG when the path ends in .png, PPM otherwise. */
 int  nvdr_image_write(const NvdrImage* img, const char* path);
 void nvdr_image_free(NvdrImage* img);
-
 double nvdr_psnr(const NvdrImage* a, const NvdrImage* b);
 
-/* ----------------------------------------------------------------- tree */
+/* --------------------------------------------------------------- config */
 
-/*
- * The full quadtree, built once at the finest tolerance. Every node keeps
- * the mean colour of its region and how far the region strays from it, so
- * a level can be cut out of the tree by thresholding that deviation
- * without ever touching pixels again.
- */
-typedef struct {
-    uint16_t x, y, w, h;
-    int32_t  first_child;    /* -1 when this node was never split */
-    float    deviation;      /* mean perceptual distance from the mean colour */
-    float    penalty;        /* how much harder this region is to justify splitting */
-    uint8_t  r, g, b;
-} NvdrNode;
+#define NVDR_LAYERS      2
+#define NVDR_MIN_BLOCK   4
+#define NVDR_MAX_BLOCK   32
 
 typedef struct {
-    NvdrNode* nodes;
-    uint32_t  count;
-    uint32_t  capacity;
-} NvdrTree;
-
-typedef struct {
-    int   min_tile;
-    int   max_depth;
-    /*
-     * How much the tolerance tightens in dark regions.
-     *
-     * Deviation used to be measured against a constant 255, which makes
-     * the metric one of absolute difference. The eye does not work that
-     * way: an error of 7 on a pixel of value 16 is obvious, the same error
-     * on a pixel of value 240 is invisible. Measured on
-     * samples/montanha_pessoas.jpg, the darkest eighth of the image was
-     * carrying 41% relative error against 1.3% in the brightest — dark
-     * regions were being collapsed into single rectangles while the metric
-     * reported them as uniform.
-     *
-     * The denominator is now `255 * (luma + weber) / (128 + weber)`, which
-     * leaves mid-grey exactly where it was and tightens or loosens either
-     * side of it. Smaller values push harder; a very large value reproduces
-     * the old absolute metric.
-     */
-    float weber;
-    /*
-     * How coarsely fine grain is allowed to be resolved.
-     *
-     * Deviation says a region is not uniform; it does not say whether
-     * subdividing would help. Distant grass varies as much inside a 4x4
-     * window as across the whole patch, so splitting reproduces noise. A
-     * face varies across the region and barely within a window, so
-     * splitting resolves it. The ratio between the two is the grain of a
-     * region, and it raises that region's minimum tile by
-     * `1 + texture * grain`.
-     *
-     * This is a rate control, not a free improvement: it caps how fine
-     * anything can get, so it cannot reach the high-quality end at all.
-     * Below roughly half the default rate it beats plain tolerance by 3-4
-     * dB; above that it is strictly worse. Zero, the default, disables it.
-     */
-    float texture;
-    /*
-     * The order refinement units are emitted in, which is also the order a
-     * truncated stream delivers them. 0 keeps the depth-first order the
-     * tree produces; 1 sends the largest rectangles first, so a prefix
-     * covers the whole canvas coarsely instead of one corner finely.
-     * Both sides derive it from the previous level, so nothing is sent.
-     */
-    int   order;
-    /*
-     * How much coarser the two chroma channels are quantised than luma.
-     *
-     * Residuals used to be RGB deltas with one step for all three, which
-     * spends the same precision on colour as on brightness even though the
-     * eye has far less resolution for the first. It also wastes bits on
-     * redundancy: R, G and B move together, which is exactly why
-     * conditioning each residual on the previous plane was worth 3.4% —
-     * that gain was the coder recovering correlation the representation
-     * should not have had.
-     *
-     * 1 keeps chroma as fine as luma. 0 drops the transform entirely and
-     * codes RGB, for comparison.
-     */
-    int   chroma;
-    /*
-     * How readily a rectangle is allowed to carry a one-axis colour ramp
-     * instead of a flat fill.
-     *
-     * A ramp costs a flag, an axis bit and one slope per channel, and buys
-     * whatever squared error the ramp removes. The encoder compares the
-     * two per rectangle and takes the better deal, so this is a Lagrange
-     * multiplier rather than a switch: higher spends more bits on ramps,
-     * 0 disables them and every rectangle stays flat.
-     *
-     * Measured against the alternatives: a full 2D plane fits better but
-     * needs two slopes per channel and loses to the one-axis ramp per
-     * byte, and gating the tree on ramp fit rather than mean fit makes the
-     * surviving rectangles precisely the ones with expensive slopes.
-     */
-    float gradient;
-    int   gradient_step;
-    float tolerance[NVDR_LEVELS];   /* strictly decreasing: coarse to fine */
-    int   anchor_bits;              /* anchor palette is 1 << anchor_bits */
-    int   step[NVDR_LEVELS];        /* residual quantisation step per level */
-    int   codec;                    /* NVDR_COMPRESS_DEFLATE or _ARITH */
+    /* Quantiser step for luma, in orthonormal DCT units. It is the one
+     * quality knob: halving it costs roughly twice the bytes and buys
+     * about 5 dB. */
+    int   q;
+    /* Chroma's step relative to luma's. */
+    float chroma_q;
+    /* How far below one half a coefficient must fall to round to zero.
+     * 0 rounds to nearest; larger values trade small coefficients for
+     * bytes. */
+    float deadzone;
+    /* lambda = lambda_k * q^2, the slope the split decision weighs bits
+     * against squared error at. */
+    float lambda_k;
+    int   max_block;   /* 4..32, a power of two: the tile size */
+    int   min_block;   /* 4..max_block */
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
 
-int  nvdr_tree_build(NvdrTree* tree, const NvdrImage* img, const NvdrConfig* cfg);
-void nvdr_tree_free(NvdrTree* tree);
-
-/* ------------------------------------------------------------- pyramid */
-
-/*
- * One decoded or encoded level: the rectangles visible at that tolerance
- * and the colour each of them shows.
- */
-typedef struct {
-    uint16_t* x;
-    uint16_t* y;
-    uint16_t* w;
-    uint16_t* h;
-    uint8_t*  rgb;        /* 3 bytes per rectangle, what gets painted */
-    /*
-     * The same reconstruction in the space the residuals run in. The chain
-     * carries this rather than rgb because the round trip through RGB is
-     * lossy by a few units, and re-deriving it at every level would let
-     * that drift accumulate.
-     */
-    uint8_t*  chain;
-    /*
-     * Optional one-axis ramp per rectangle: 0 means flat, 1 ramps along x,
-     * 2 along y. `slope` holds the total change from one edge to the other,
-     * three channels per rectangle, in the chain's colour space.
-     */
-    uint8_t*  axis;
-    int8_t*   slope;
-    uint8_t   slope_step;
-    /* Which space `chain` is in, so the renderer can evaluate a ramp there
-     * and convert per pixel. A flat rectangle never needs it. */
-    uint8_t   space;
-    uint32_t  count;
-} NvdrLevelData;
-
-#define NVDR_ORDER_DFS   0
-#define NVDR_ORDER_AREA  1
-
-/* Colour space the residual chain runs in. */
-#define NVDR_SPACE_RGB   0
-#define NVDR_SPACE_YCC   1
-
-typedef struct {
-    NvdrLevelData level[NVDR_LEVELS];
-    int           levels_present;   /* 1, 2 or 3 */
-    /*
-     * How much of the last level actually arrived. 1.0 when the stream was
-     * complete; less when it was cut, in which case the units that never
-     * came keep the rectangle and colour they had at the level before.
-     */
-    double        last_level_fraction;
-
-    /* Anchor palette, shared by level 0 only. */
-    unsigned char* palette;
-    int            palette_count;
-    int            anchor_bits;
-    int            step[NVDR_LEVELS];
-} NvdrPyramid;
-
-void nvdr_pyramid_free(NvdrPyramid* pyr);
-
 /* ------------------------------------------------------------ container */
 
 /* The largest canvas the decoders will allocate for: 134 Mpx, well past
- * 8K. A damaged header claiming more is refused rather than trusted. */
+ * any real image, well short of what a damaged header could ask for. */
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     9
-#define NVDR_HEADER_SIZE 72
-
-/* Compression applied to each level stream independently. */
-#define NVDR_COMPRESS_NONE    0
-#define NVDR_COMPRESS_DEFLATE 1
-#define NVDR_COMPRESS_ARITH   2   /* adaptive arithmetic coding, see entropy.h */
+#define NVDR_VERSION     10
+#define NVDR_HEADER_SIZE 32
 
 typedef struct {
     uint16_t width, height;
-    uint32_t leaf_count[NVDR_LEVELS];
-    uint32_t split_bits[NVDR_LEVELS];   /* bits, not bytes */
-    uint32_t raw_bytes[NVDR_LEVELS];    /* stream size once inflated */
-    uint32_t stored_bytes[NVDR_LEVELS]; /* stream size on disk and on the wire */
-    uint8_t  anchor_bits;
-    uint8_t  compression;
-    uint8_t  order;
-    uint8_t  space;
-    uint8_t  gradient_step;
-    uint8_t  step[NVDR_LEVELS];
-    uint8_t  chroma_step[NVDR_LEVELS];
+    uint8_t  max_block, min_block;
+    uint16_t q_luma, q_chroma;
+    uint32_t stored_bytes[NVDR_LAYERS];
+    /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
+     * how many of them carry texture. */
+    uint32_t leaves[4];
+    uint32_t textured;
 } NvdrHeader;
 
-/* Encode an image straight to a container. */
+int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                    const NvdrConfig* cfg, NvdrHeader* hdr_out);
 int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                      const NvdrConfig* cfg, NvdrHeader* hdr_out);
 
-/*
- * The same container as a buffer the caller owns and frees.
- *
- * A sequence holds a frame in memory rather than on disk, and the bytes
- * are identical either way, so this is what actually builds the container
- * and the file version is a wrapper over it.
- */
-int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
-                    const NvdrConfig* cfg, NvdrHeader* hdr_out);
+typedef struct {
+    int layers_present;               /* 1 or 2: how far the bytes reached */
+    int tiles;                        /* tiles in the image */
+    int tiles_complete[NVDR_LAYERS];  /* how many of them each layer carried */
+} NvdrDecodeInfo;
 
 /*
- * Read whatever is there. `levels_present` on the returned pyramid says how
- * far the bytes on disk actually reach: a file truncated mid-stream decodes
- * at the last level whose bytes are all present, rather than failing.
+ * Decode as far as the bytes reach, rendering layers up to `max_layer`
+ * (-1 for all of them) into `out`, which the call allocates. Fewer bytes
+ * than the container holds is the truncation case, not an error. Returns
+ * -1 only when there is no picture at all: a header that is missing,
+ * damaged, or asks for more than NVDR_MAX_PIXELS.
  */
-int nvdr_decode_file(const char* path, NvdrPyramid* pyr, NvdrHeader* hdr);
-
-/* The same, from a buffer. Passing fewer bytes than the container holds is
- * the truncation case and decodes as far as they reach. */
-int nvdr_decode_mem(const uint8_t* data, size_t size,
-                    NvdrPyramid* pyr, NvdrHeader* hdr);
-
-/* --------------------------------------------------------------- render */
-
-/* Paint the rectangles of one level onto an RGB canvas. */
-void nvdr_render_level(const NvdrLevelData* level, NvdrImage* out);
-
-/*
- * Soften the seams between rectangles, in place.
- *
- * Every pixel is averaged with its four neighbours at `weight` each. Inside
- * a rectangle the neighbours carry the same colour, so the average returns
- * it unchanged and the pass does nothing; only the one-pixel band along a
- * seam moves. That makes this exactly a boundary blend without needing to
- * know where the boundaries are.
- *
- * Costs no bytes and changes no format: it is a choice the decoder makes.
- * 0 disables it; 0.40 is the measured optimum.
- */
-#define NVDR_SMOOTH_DEFAULT 0.40f
-void nvdr_smooth(NvdrImage* img, float weight);
+int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
+                    NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
+int nvdr_decode_file(const char* path, int max_layer,
+                     NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 
 #endif /* NVDR_H */

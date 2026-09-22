@@ -1,12 +1,12 @@
 /*
  * The C and JS decoders have to agree on every byte, or the viewer shows
- * something the format did not encode. This decodes the same container
- * both ways — at every level, and at truncations that cut a level open —
- * and reports the first pixel where they differ.
+ * something the container does not contain. This decodes the same
+ * container both ways — each layer, and cuts that land inside either
+ * layer — and reports the first pixel where they differ.
  */
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { decode, renderLevel, SMOOTH_DEFAULT } from '../public/nvdr.js';
+import { decode } from '../public/nvdr.js';
 
 const [, , container] = process.argv;
 if (!container) {
@@ -14,22 +14,14 @@ if (!container) {
     process.exit(2);
 }
 
-function fakeCtx(w, h) {
-    let out = null;
-    return {
-        createImageData: () => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
-        putImageData: img => { out = img; },
-        get result() { return out; }
-    };
-}
-
 function readPPM(path) {
     const buf = readFileSync(path);
     // P6\n<w> <h>\n255\n
-    let at = 0, fields = [];
+    let at = 0;
+    const fields = [];
     while (fields.length < 4) {
         while (buf[at] === 0x20 || buf[at] === 0x0a || buf[at] === 0x09) at++;
-        let start = at;
+        const start = at;
         while (at < buf.length && buf[at] !== 0x20 && buf[at] !== 0x0a && buf[at] !== 0x09) at++;
         fields.push(buf.toString('ascii', start, at));
     }
@@ -40,62 +32,44 @@ function readPPM(path) {
 const decoder = new URL('../nvdr_decode', import.meta.url).pathname;
 let failures = 0;
 
-async function check(label, file, level, smooth) {
+function check(label, file, layer) {
     const bytes = readFileSync(file);
-    const args = [file, '/tmp/cc.ppm', '--smooth', String(smooth)];
-    if (level !== null) args.push('--level', String(level));
-
-    // A cut that lands below the anchor stream is the format's contract,
-    // not a failure: neither side may produce a picture, and whether they
-    // agree about that is exactly what needs checking.
     let cDecoded = true;
     try {
-        execFileSync(decoder, args, { stdio: 'ignore' });
+        execFileSync(decoder, [file, '/tmp/cc.ppm', '--layer', String(layer)], { stdio: 'ignore' });
     } catch {
         cDecoded = false;
     }
-
-    const result = await decode(bytes.buffer.slice(bytes.byteOffset,
-                                                   bytes.byteOffset + bytes.length));
-    const jsDecoded = !!result && result.levelsPresent > 0;
+    const result = decode(new Uint8Array(bytes), layer);
+    const jsDecoded = !!result;
     if (!cDecoded || !jsDecoded) {
         if (cDecoded !== jsDecoded) {
             console.log(`${label}: C ${cDecoded ? 'decoded' : 'refused'}, ` +
                         `JS ${jsDecoded ? 'decoded' : 'refused'}`);
             failures++;
         } else {
-            console.log(`${label}: both refuse (cut is below the anchor)`);
+            console.log(`${label}: both refuse (no colour layer yet)`);
         }
         return;
     }
     const ref = readPPM('/tmp/cc.ppm');
-    const k = level === null ? result.levelsPresent - 1
-                             : Math.min(level, result.levelsPresent - 1);
-    const { width, height } = result.header;
-    const ctx = fakeCtx(width, height);
-    renderLevel(result.levels[k], width, height, ctx, smooth);
-    const got = ctx.result.data;
-
-    for (let p = 0; p < width * height; p++)
-        for (let c = 0; c < 3; c++)
-            if (got[p * 4 + c] !== ref.pixels[p * 3 + c]) {
-                console.log(`${label}: differ at pixel ${p} channel ${c}: ` +
-                            `js ${got[p * 4 + c]} vs c ${ref.pixels[p * 3 + c]}`);
-                failures++;
-                return;
-            }
-    console.log(`${label}: identical (${width}x${height}, level ${k})`);
+    const got = result.rgb;
+    for (let i = 0; i < got.length; i++)
+        if (got[i] !== ref.pixels[i]) {
+            console.log(`${label}: differ at pixel ${Math.floor(i / 3)} channel ${i % 3}: ` +
+                        `js ${got[i]} vs c ${ref.pixels[i]}`);
+            failures++;
+            return;
+        }
+    console.log(`${label}: identical (${result.header.width}x${result.header.height}, ` +
+                `tiles ${result.tilesComplete.join('/')} of ${result.tiles})`);
 }
 
 const size = readFileSync(container).length;
-for (const smooth of [0, SMOOTH_DEFAULT]) {
-    for (const level of [0, 1, 2, null])
-        await check(`whole smooth=${smooth} level=${level}`, container, level, smooth);
-    for (const pct of [8, 17, 34, 52, 71, 88, 96]) {
-        const cut = `/tmp/cc_${pct}.nvdr`;
-        execFileSync('bash', ['-c',
-            `head -c ${Math.floor(size * pct / 100)} ${container} > ${cut}`]);
-        await check(`cut ${pct}% smooth=${smooth}`, cut, null, smooth);
-    }
+for (const layer of [0, 1]) check(`whole layer=${layer}`, container, layer);
+for (const pct of [3, 8, 17, 34, 52, 71, 88, 96]) {
+    const cut = `/tmp/cc_${pct}.nvdr`;
+    execFileSync('bash', ['-c', `head -c ${Math.floor(size * pct / 100)} ${container} > ${cut}`]);
+    check(`cut ${pct}%`, cut, 1);
 }
 process.exit(failures ? 1 : 0);

@@ -53,10 +53,11 @@ Ele checa cinco coisas em cada imagem de `samples/`:
    meio das outras.
 3. **Tamanho** — bytes contra a mesma baseline, para uma mudança que
    compra qualidade com bytes aparecer como o que é.
-4. **Truncagem** — corta em 9 pontos; todo corte acima do anchor tem que
-   decodificar, e a qualidade não pode cair conforme os bytes aumentam.
-5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, em
-   todos os níveis e em arquivo cortado.
+4. **Truncagem** — corta em 9 pontos; todo corte que já tem o começo da
+   camada de cor tem que decodificar, e a qualidade não pode cair conforme
+   os bytes aumentam.
+5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, nas
+   duas camadas e em arquivo cortado.
 
 E mais uma, sobre uma sequência de 12 quadros que ele também gera na hora:
 **deriva**. O encoder tem que predizer da própria reconstrução, nunca do
@@ -119,7 +120,7 @@ arquivo é um prefixo do filme, e o quadro onde o corte cai ainda aparece.
 
 Arrasta uma imagem e pronto:
 
-- as três camadas lado a lado, com bytes acumulados e número de retângulos
+- as duas camadas lado a lado (só cor, e cor + textura), com bytes acumulados
 - um slider que corta o arquivo para simular download interrompido
 - o relatório do encoder embaixo
 
@@ -137,27 +138,33 @@ Arrasta uma imagem e pronto:
 ```
 
 ```
-samples/montanha_pessoas.jpg  768x512
-  level      rects        raw     stored  cumulative     PSNR
-  ANCHOR       9364       6292       4470        4542    19.55 dB
-  R1          37663     269528      12538       17080    24.30 dB
-  R2          53707     383331      34685       51765    26.30 dB
+samples/montanha_pessoas.jpg  768x512  q 24/24  blocks 4..32
+  layer       stored  cumulative     PSNR
+  COR            4879        4911    20.95 dB
+  TEXTURA       47898       52809    33.28 dB
+  leaves 4/8/16/32: 1264/2156/778/35, 3847 with texture
 ```
 
-Como ler cada coluna:
+Desde o formato v10, a imagem é uma **quadtree de blocos quadrados** de 4 a
+32 px, e cada bloco carrega duas coisas: uma **cor** (prevista pelos
+vizinhos, mais uma pequena correção) e, se compensar, a **textura** do
+bloco, como coeficientes de DCT do tamanho do bloco. Um bloco só com cor é
+exatamente um retângulo chapado do formato antigo.
 
-- **rects** — quantos retângulos esse nível desenha. Cresce a cada nível
-  porque o refinamento subdivide.
-- **raw** — o tamanho do stream antes da codificação de entropia.
-- **stored** — o tamanho real no arquivo. É também o que trafegaria na
-  rede: o container não é comprimido de novo por cima.
-- **cumulative** — soma de `stored` até aqui, mais o header. É quantos
-  bytes um decoder precisa ter recebido para exibir esse nível.
-- **PSNR** — qualidade contra a imagem original, medida **decodificando o
-  arquivo de volta**, não a partir do estado interno do encoder.
+Como ler:
 
-Compare `cumulative` do último nível com o tamanho da imagem de origem —
-é a taxa de compressão real.
+- **COR** — a primeira camada: a árvore e a cor de cada bloco. Sozinha já
+  é uma imagem inteira de blocos chapados.
+- **TEXTURA** — a segunda camada: a textura de cada bloco.
+- **stored** — o tamanho real da camada no arquivo, que é também o que
+  trafegaria na rede.
+- **cumulative** — soma até aqui, mais o header: quantos bytes um decoder
+  precisa ter recebido para exibir essa camada inteira.
+- **PSNR** — medido **decodificando o arquivo de volta**, não a partir do
+  estado interno do encoder.
+- **leaves** — quantos blocos de cada tamanho a árvore escolheu, e quantos
+  levam textura. Blocos grandes onde a imagem é lisa, pequenos onde tem
+  detalhe.
 
 ### Decodificar
 
@@ -167,19 +174,10 @@ Compare `cumulative` do último nível com o tamanho da imagem de origem —
 
 Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
 
-Para ver um nível específico:
+Só a camada de cor:
 
 ```bash
-./nvdr_decode /tmp/m.nvdr /tmp/anchor.png --level 0
-./nvdr_decode /tmp/m.nvdr /tmp/meio.png   --level 1
-```
-
-O decoder suaviza as emendas entre retângulos por padrão. `--smooth 0`
-desliga e mostra os retângulos duros — útil para ver o que o formato
-realmente gravou:
-
-```bash
-./nvdr_decode /tmp/m.nvdr /tmp/duro.png --smooth 0
+./nvdr_decode /tmp/m.nvdr /tmp/cor.png --layer 0
 ```
 
 Para medir a qualidade junto:
@@ -190,125 +188,57 @@ Para medir a qualidade junto:
 
 ### Testar a garantia de truncagem
 
-Esta é a propriedade central do formato: cortar o arquivo em qualquer
-ponto depois do anchor ainda produz imagem.
-
-```bash
-head -c 4600 /tmp/m.nvdr > /tmp/cortado.nvdr
-./nvdr_decode /tmp/cortado.nvdr /tmp/cortado.png
-```
-
-```
-/tmp/cortado.nvdr  768x512  9364 rects  rendered at ANCHOR  (file carries only ANCHOR)
-```
-
-O anchor inteiro cabe em ~4,5 KB. Com 12000 bytes já entra parte do R1:
-
-```
-/tmp/cortado.nvdr  768x512  28705 rects  rendered at ANCHOR+R1  (file carries only ANCHOR+R1)
-```
-
-A qualidade sobe continuamente com os bytes, sem degraus — um nível
-parcial é aproveitado até onde chegou:
-
-```
- 10% -> 19.73 dB      50% -> 25.80 dB
- 20% -> 23.30 dB      75% -> 26.42 dB
- 30% -> 24.71 dB     100% -> 27.00 dB
-```
-
-Varrendo vários cortes de uma vez:
+Cortar o arquivo em qualquer ponto depois do começo da camada de cor ainda
+produz imagem. Cada camada é enviada em blocos de 32×32, de cima para
+baixo: um bloco de cor que não chegou fica **cinza**, e um bloco de
+textura que não chegou fica com a cor chapada.
 
 ```bash
 SZ=$(stat -c%s /tmp/m.nvdr)
-for pct in 100 60 40 39 3; do
+for pct in 3 10 30 50 75 100; do
   head -c $((SZ*pct/100)) /tmp/m.nvdr > /tmp/t.nvdr
   printf "%3d%% -> " $pct
   ./nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
 done
 ```
 
-O único corte que não produz imagem é abaixo do stream do anchor — nesse
-caso o decoder diz isso e sai com erro, que é o contrato, não uma falha.
+```
+  3% -> ... cor 168/384 tiles  textura 0/384 tiles  psnr 13.30 dB
+ 10% -> ... cor 384/384 tiles  textura 5/384 tiles  psnr 20.96 dB
+ 30% -> ... cor 384/384 tiles  textura 145/384 tiles  psnr 22.22 dB
+ 50% -> ... cor 384/384 tiles  textura 214/384 tiles  psnr 24.04 dB
+ 75% -> ... cor 384/384 tiles  textura 300/384 tiles  psnr 27.15 dB
+100% -> ... cor 384/384 tiles  textura 384/384 tiles  psnr 33.28 dB
+```
+
+A qualidade nunca cai com mais bytes, mas a textura chegando de cima para
+baixo faz o meio da curva subir devagar (ver "Coisas que confundem").
+
+O único corte que não produz imagem é antes dos primeiros bytes da camada
+de cor. Nesse caso o decoder diz isso e sai com erro, que é o contrato,
+não uma falha.
 
 ---
 
 ## Parâmetros que valem mexer
 
 ```bash
-./nvdr_encode entrada.jpg saida.nvdr \
-    --tolerance 0.090,0.040,0.018 \
-    --step 16,4 \
-    --anchor-bits 4 \
-    --codec arith
+./nvdr_encode entrada.jpg saida.nvdr --q 24
 ```
 
-- **`--tolerance A,B,C`** — quão uniforme uma região precisa ser para
-  parar de subdividir, por nível, do grosso para o fino. Valores maiores
-  no primeiro número deixam o anchor menor e mais grosseiro. Têm que ser
-  decrescentes. Default `0.090,0.040,0.018`.
-
-  **Esse parâmetro não significa a mesma coisa em imagens diferentes**, e
-  isso confunde muito na hora de testar. Em foto com grão ou ruído (céu
-  estrelado, folhagem) a árvore nunca satura — entre 0,060 e 0,040 um céu
-  estrelado vai de 4.507 para 103.891 retângulos e continua crescendo até
-  0,010. Ali a tolerância é um dial de taxa suave e qualquer valor dá um
-  resultado razoável. Em imagem simples (formas chapadas, desenho, texto) a
-  árvore satura: `blocos` dá 16 retângulos em toda a faixa, de 0,200 a
-  0,010. Ali não é dial, é penhasco — abaixo da saturação não compra nada,
-  e acima destrói as bordas, que é onde a imagem está (1% dos pixels
-  carregam metade do erro quadrático). Afrouxar custou 5,5 dB para economizar
-  7% dos bytes numa dessas.
-
-  Ou seja: não calibre tolerância só em foto.
-- **`--step B,C`** — o passo de quantização do resíduo nos níveis 1 e 2.
-  Menor = mais fiel e mais pesado.
-- **`--anchor-bits N`** — a paleta do anchor tem `2^N` cores. O default 4
-  é o "int4" do spec. `6` costuma dar um anchor melhor a custo total
-  quase neutro e vale testar; `8` custa mais bytes e quase não melhora em
-  cima de 6.
-- **`--weber F`** — quanto mais a tolerância aperta nas sombras. O default
-  64 equaliza a alocação de detalhe entre regiões escuras e claras; um
-  valor enorme (`1e9`) volta à métrica de diferença absoluta antiga.
-- **`--texture F`** — gasta menos resolução em textura fina (grama
-  distante, folhagem) e mais em estrutura (rostos, bordas). É **controle
-  de taxa**: desligado por padrão, porque também limita a qualidade
-  máxima. Abaixo de ~metade da taxa padrão vale +3 a +4 dB contra
-  simplesmente afrouxar a tolerância; acima disso é pior. Comece em `1`.
-- **`--chroma N`** — quanto mais grosso o croma é quantizado que a luma.
-  Default 2. Corta 28-44% dos bytes contra RGB por -0,13 a -0,32 dB, e a
-  maior parte disso vem da transformada em si, não da subamostragem.
-  Acima de 2 começa a aparecer desvio de cor. `0` volta para RGB.
-- **`--order area|dfs`** — `area` (default) manda os retângulos maiores
-  primeiro, então um stream cortado cobre a tela inteira grosseiramente em
-  vez de um canto em detalhe. Custa 0,18% em bytes e vale até +1,67 dB no
-  primeiro décimo. `dfs` mantém a ordem da árvore.
-- **`--gradient F`** — quanto um retângulo pode carregar uma **rampa de
-  cor** num eixo em vez de ser chapado. É decisão por retângulo: o encoder
-  compara custo (um flag, um bit de eixo, três inclinações) contra o erro
-  que a rampa tira, e `F` é o preço do bit. Por isso **nunca perde para o
-  chapado** — quando não compensa, o retângulo fica chapado. Default 600;
-  `0` desliga. No default ganha em todas as imagens medidas: +0,23 a
-  +2,43 dB por 2 a 33% mais bytes, inclusive nas sintéticas. Valores
-  menores (ex. `280`) gastam mais e rendem mais. A rampa rende em proporção
-  à **área** do retângulo, então com tolerância apertada os retângulos são
-  pequenos e cada rampa explica menos — foi por isso que o 280 original,
-  calibrado junto com tolerância frouxa, não sobreviveu à volta dela.
-- **`--gradient-step N`** — o passo de quantização das inclinações. Default
-  16, que é grosso de propósito: a inclinação é codificada quase em unário,
-  então um passo fino encarece justamente as rampas grandes, que são as que
-  valem a pena.
-- **`--codec arith|deflate`** — `arith` é o default. `deflate` existe só
-  para comparação e **não carrega rampas**, então para comparar os dois
-  codecs de verdade use `--gradient 0` nos dois. Com rampas desligadas em
-  ambos, `arith` corta 18 a 29% dos bytes.
-
-Comparando os dois codecs na mesma imagem:
-
-```bash
-./nvdr_encode entrada.jpg /tmp/a.nvdr --codec arith   | tail -1
-./nvdr_encode entrada.jpg /tmp/d.nvdr --codec deflate | tail -1
-```
+- **`--q N`** — o passo de quantização, **o** botão de qualidade. Menor é
+  melhor e maior. O default 24 foi escolhido para as amostras saírem do
+  tamanho que o formato antigo dava, ou menores, com cerca de +9 dB. No
+  montanha_pessoas: `--q 12` dá 88 KB a 39,1 dB, `--q 24` dá 53 KB a
+  33,3 dB, `--q 48` dá 23 KB a 28,6 dB.
+- **`--chroma-q F`** — o passo do croma relativo ao da luma (default 1,0,
+  que mediu melhor que 1,5 e 2,5).
+- **`--deadzone F`** — de 0 a 0,5: quanto um coeficiente pequeno tende a
+  virar zero. Default 0,1, o melhor medido.
+- **`--lambda F`** — o peso dos bits contra o erro na decisão de dividir um
+  bloco. Quase não muda nada entre 0,06 e 0,3; default 0,12.
+- **`--max-block N` / `--min-block N`** — o maior e o menor bloco (4 a 32).
+  32 ganhou de 16 por até 0,5 dB.
 
 ---
 
@@ -338,6 +268,10 @@ Parâmetros:
 - **`--intra-thresh F`** — erro médio absoluto acima do qual o quadro vai
   intra mesmo fora do GOP (default 24). É assim que corte de cena é
   detectado, não declarado.
+- **`--q N`** — o passo de quantização de todos os quadros (default 24), e
+  **`--pred-q N`** só dos quadros preditos.
+- **`--block N`** — movimento por bloco de NxN (default 8; `0` usa um
+  vetor só para o quadro todo).
 
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.
@@ -363,18 +297,20 @@ node scripts/crosscheck_seq.mjs /tmp/saida.nvdrv
 O gate (`make check`) roda os dois.
 
 O decoder em C e o do navegador têm que produzir **os mesmos bytes** — se
-divergirem, a página mostra algo que o formato não gravou. O script
-compara os dois em todos os níveis e em vários cortes, com e sem
-suavização:
+divergirem, a página mostra algo que o formato não gravou. Por isso tudo
+que o decoder calcula é inteiro: a DCT inversa é a aproximação inteira do
+HEVC, a conversão de cor é em ponto fixo. O script compara os dois nas duas
+camadas e em vários cortes:
 
 ```bash
 node scripts/crosscheck.mjs /tmp/m.nvdr
 ```
 
 ```
-whole smooth=0 level=0: identical (768x512, level 0)
+whole layer=0: identical (768x512, tiles 384/0 of 384)
+whole layer=1: identical (768x512, tiles 384/384 of 384)
+cut 3%: identical (768x512, tiles 182/0 of 384)
 ...
-cut 96% smooth=0.4: identical (768x512, level 2)
 ```
 
 Sai com código 1 e aponta o primeiro pixel divergente se algo quebrar.
@@ -385,39 +321,21 @@ Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
 
 ## Coisas que confundem
 
-**O `.nvdr` às vezes é maior que o JPEG de origem.** É esperado em
-imagens pequenas e detalhadas. O formato não ganha de JPEG em
-rate-distortion para foto — o que ele entrega é que os primeiros
-poucos KB já são uma imagem inteira. Se o objetivo for arquivo menor
-com qualidade igual, JPEG ainda vence.
+**Os arquivos antigos (`.nvdr` v9) não abrem mais.** O formato mudou de
+retângulos chapados para quadtree + DCT; recodifique a imagem. O codec
+antigo está em `reference/nvdr_v9`, só para reproduzir medições antigas.
 
-**Um retângulo não é necessariamente uma cor chapada.** Desde a v8 ele
-pode carregar uma rampa num eixo, e o encoder escolhe por retângulo. Isso
-tirou o teto do formato: com tudo chapado o montanha_pessoas empacava em
-~26 dB por mais bytes que você jogasse nele.
+**No meio de um download, a imagem melhora de cima para baixo.** A textura
+chega em blocos de 32×32 em ordem de leitura, então com metade do arquivo a
+metade de cima está nítida e a de baixo só com a cor. No montanha_pessoas,
+50% do arquivo dá 24,0 dB, contra 25,8 dB no formato antigo, que espalhava
+o refinamento pela tela inteira. Em compensação, o arquivo inteiro dá
+33,3 dB, contra 26,3. Mandar primeiro as frequências baixas da imagem
+inteira resolve isso e está na lista.
 
-**Um corte no meio de uma unidade não perde mais o que já chegou.** Desde
-a v9 a cor de cada retângulo vai intercalada com a geometria dele, então
-uma unidade cortada pela metade entrega tudo que chegou e o resto cai para
-a cor do nível anterior. Não muda o tamanho do arquivo em nada. O ganho é
-pequeno e concentrado em cortes bem no começo (+0,88 dB no macarrão a 12%),
-zero no resto.
-
-**Céu estrelado / imagem com grão parece o melhor caso e é o pior.** Ela
-comprime bem e pontua bem porque a árvore nunca satura — dá para pedir
-qualquer taxa e ela entrega. Mas o anchor sai com **1 retângulo** e o R1
-com 13, então o arquivo não tem estado intermediário nenhum: truncar dá
-21,59 dB em 1% do arquivo e 21,75 dB em 25%, parado ao longo de um quarto
-dos bytes. Uma foto normal sobe 18,40 → 19,85 → 22,45 → 25,46 dB na mesma
-faixa. Bons números de taxa/qualidade ali escondem que a escada
-progressiva, que é o ponto do formato, não existe naquela imagem.
-
-**PSNR baixo (18-26 dB) não é bug.** É o custo de representar a imagem
-com retângulos de cor chapada. JPEG a q75 fica em 32-38 dB. O número
-está lá justamente para não esconder isso.
+**Com qualidade baixa aparecem blocos.** Com `--q` alto, os blocos grandes
+de 32×32 ficam chapados e as emendas aparecem. É o artefato típico de DCT;
+o remédio é um filtro de deblocking, que ainda não existe aqui.
 
 **PSNR não enxerga tudo.** Ele mede erro absoluto, então é cego para onde
-o erro está. Uma mudança que tira detalhe do céu e dá para as sombras
-melhora a imagem e não move o PSNR — foi exatamente o caso do `--weber`.
-Quando avaliar uma mudança de alocação, olhe a imagem, não só o número.
-
+o erro está. Quando avaliar uma mudança, olhe a imagem, não só o número.
