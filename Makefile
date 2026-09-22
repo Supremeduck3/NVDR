@@ -1,11 +1,12 @@
-# NVDR — Progressive Residual Stack, still-image implementation.
+# NVDR — still images (format v10) and sequences.
 #
 # Deliberately dependency-free: C11, libm, zlib and stb_image. Nothing
 # here needs a GPU, and nothing here should start needing one.
 
 CC      = gcc
-# OpenMP parallelises the ramp fit, which is per-rectangle and shares
-# nothing. Without it the pragmas are ignored and the build still works.
+# OpenMP parallelises the sequence encoder's block motion search, which is
+# per-block and shares nothing. Without it the pragmas are ignored and the
+# build still works.
 OPENMP  = $(shell $(CC) -fopenmp -E - < /dev/null > /dev/null 2>&1 && echo -fopenmp)
 CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
 LDLIBS  = -lm -lz

@@ -59,20 +59,16 @@ static void mutate(uint8_t* d, size_t* len, size_t header) {
 }
 
 static int decode_still(const uint8_t* d, size_t n) {
-    NvdrPyramid pyr;
-    NvdrHeader hdr;
-    if (nvdr_decode_mem(d, n, &pyr, &hdr) != 0) return 0;
-    /* Render every level that came back, because a level that decodes
-     * with rectangles off the canvas only shows up when it is painted. */
-    NvdrImage canvas;
-    canvas.width = hdr.width; canvas.height = hdr.height;
-    canvas.pixels = (unsigned char*)calloc((size_t)canvas.width * canvas.height * 3 + 1, 1);
-    if (canvas.pixels) {
-        for (int k = 0; k < pyr.levels_present; k++) nvdr_render_level(&pyr.level[k], &canvas);
-        free(canvas.pixels);
+    /* Both layer caps, because layer 0 alone stops before the texture
+     * decoder and the full decode goes through it. */
+    int ok = 0;
+    for (int layer = 0; layer < NVDR_LAYERS; layer++) {
+        NvdrImage img;
+        if (nvdr_decode_mem(d, n, layer, &img, NULL, NULL) != 0) continue;
+        nvdr_image_free(&img);
+        ok = 1;
     }
-    nvdr_pyramid_free(&pyr);
-    return 1;
+    return ok;
 }
 
 static int decode_sequence(const char* path) {
@@ -112,17 +108,18 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--seq") && i + 1 < argc) { seq = argv[++i]; continue; }
         if (!strcmp(argv[i], "--seed") && i + 1 < argc) { rng_state ^= (uint64_t)atoll(argv[++i]) * 0x100000001B3ull; continue; }
         if (nseeds >= 64) continue;
-        /* An image becomes seed containers by encoding it every way the
-         * decoder has a separate path for: the default, the deflate
-         * layout, no ramps, and RGB instead of YCbCr. A path no seed
-         * reaches is a path the fuzzer never attacks. */
+        /* An image becomes seed containers by encoding it every way that
+         * changes what the decoder walks: the default, a fine quantiser
+         * (large coefficients, escapes), a coarse one (mostly flat
+         * leaves), and a tree held to 8..16 px. A path no seed reaches is
+         * a path the fuzzer never attacks. */
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
         for (int variant = 0; variant < 4 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
-            if (variant == 1) c.codec = NVDR_COMPRESS_DEFLATE;
-            if (variant == 2) c.gradient = 0.0f;
-            if (variant == 3) c.chroma = 0;
+            if (variant == 1) c.q = 1;
+            if (variant == 2) c.q = 200;
+            if (variant == 3) { c.min_block = 8; c.max_block = 16; }
             if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) == 0) nseeds++;
         }
         nvdr_image_free(&img);

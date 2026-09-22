@@ -48,7 +48,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      3
+#define NVDRV_VERSION      4
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 12
 
@@ -83,17 +83,9 @@ typedef struct {
      * extra for having it on.
      */
     int   block;
-    /*
-     * Tolerances for predicted frames, when different from the intra
-     * ones; zero keeps `frame.tolerance`. A predicted frame's residual is
-     * dominated by the previous reconstruction's own error — texture that
-     * flat rectangles could not represent — and re-approximating it with
-     * flat rectangles leaves texture of the same size, so it never
-     * converges and every frame pays for it again. A looser tolerance here
-     * lets predicted frames carry the intra frame's detail forward through
-     * the motion instead of re-coding it.
-     */
-    float pred_tolerance[NVDR_LEVELS];
+    /* Quantiser step for predicted frames, when different from the intra
+     * frames' `frame.q`; zero keeps it. */
+    int   pred_q;
     /* What one bit of motion field is worth in sum of absolute differences
      * over a block, when the encoder chooses between a block's own vector
      * and the one its neighbours predict. 0 keeps the search's choice. */

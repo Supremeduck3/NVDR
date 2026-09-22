@@ -3,6 +3,13 @@
 Throwaway measurements, kept because the numbers they produced are cited in
 `../../README.md` and should be reproducible rather than trusted.
 
+Most of them measured the v9 rectangle codec, which now lives in
+`../../reference/nvdr_v9`, and build against it: in the lines below,
+`-I../../src ... ../../src/nvdr.c` becomes
+`-I../../reference/nvdr_v9 -I../../src ... ../../reference/nvdr_v9/nvdr.c`.
+`frames` and `qtdct` only need image I/O and the entropy coder and build
+against either.
+
     gcc -std=c11 -O2 -I../../src -I../../vendor -o edges   edges.c   ../../src/nvdr.c ../../src/entropy.c -lm -lz
     gcc -std=c11 -O2 -I../../src -I../../vendor -o oblique oblique.c ../../src/nvdr.c ../../src/entropy.c -lm -lz
 
@@ -37,3 +44,10 @@ Texture layer, still images:
 - `texture` — the rectangles cut at some level (`none`, `anchor`, `r1`,
   `r1c`, `full`), rendered flat, and what is left coded with an 8x8 DCT
   through the adaptive arithmetic coder. Real bytes, PSNR in RGB.
+
+    gcc -std=c11 -O2 -I../../src -I../../vendor -o qtdct qtdct.c ../../src/nvdr.c ../../src/entropy.c -lm -lz
+
+- `qtdct` — the quadtree as the DCT's partition: power-of-two leaves of 4 to
+  32 px, each predicted as the mean of the decoded pixels above and to its
+  left, the remainder coded with a DCT of the leaf's size, and splits
+  chosen by rate and distortion against the live models.

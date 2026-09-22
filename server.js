@@ -333,8 +333,7 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.url === '/nvdr') {
-        const anchorBits = req.headers['x-anchor-bits'];
-        const tolerance = req.headers['x-tolerance'];
+        const quality = req.headers['x-q'];
 
         receiveUpload(req, res, (inputPath, fileId) => {
             const outNvdr = path.join(outDir, `temp_${fileId}.nvdr`);
@@ -354,8 +353,7 @@ const server = http.createServer((req, res) => {
             const args = [inputPath, outNvdr];
             // Only forward options that match the encoder's own grammar —
             // a header is untrusted input, and these reach argv directly.
-            if (/^[1-8]$/.test(anchorBits || '')) args.push('--anchor-bits', anchorBits);
-            if (/^[\d.]+,[\d.]+,[\d.]+$/.test(tolerance || '')) args.push('--tolerance', tolerance);
+            if (/^[1-9]\d{0,3}$/.test(quality || '')) args.push('--q', quality);
 
             console.log(`PRS encode for ${inputPath}...`);
             runConverter(res, {

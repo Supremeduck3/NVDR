@@ -37,7 +37,7 @@ NvdrvConfig nvdrv_default_config(void) {
      * expected to win on vector cost and did not, when the field was
      * measured deflated against the global vector (v2). */
     c.block = 8;
-    for (int k = 0; k < NVDR_LEVELS; k++) c.pred_tolerance[k] = 0.0f;
+    c.pred_q = 0;
     c.mv_lambda = 8;
     c.fps = 24;
     return c;
@@ -437,23 +437,20 @@ static int alloc_image(NvdrImage* img, int w, int h) {
     return img->pixels ? 0 : -1;
 }
 
-/* Decode a container and render it flat, which is what the next frame
- * predicts from. Smoothing is a display choice and must not enter the
- * loop, or the two sides would have to agree about it too. */
+/* Decode a frame's container at full quality, which is what the next
+ * frame predicts from. */
 static int reconstruct(const uint8_t* blob, size_t len, NvdrImage* out) {
-    NvdrPyramid pyr;
+    NvdrImage img;
     NvdrHeader hdr;
-    if (nvdr_decode_mem(blob, len, &pyr, &hdr) != 0) return -1;
-    /* A frame's container has to be the size of the sequence it sits in.
-     * Rendering clips, so a mismatch is not unsafe, but it is not a frame
-     * of this sequence either. */
+    if (nvdr_decode_mem(blob, len, -1, &img, &hdr, NULL) != 0) return -1;
+    /* A frame's container has to be the size of the sequence it sits in,
+     * or it is not a frame of this sequence. */
     if (hdr.width != out->width || hdr.height != out->height) {
-        nvdr_pyramid_free(&pyr);
+        nvdr_image_free(&img);
         return -1;
     }
-    memset(out->pixels, 0, (size_t)out->width * out->height * 3);
-    for (int k = 0; k < pyr.levels_present; k++) nvdr_render_level(&pyr.level[k], out);
-    nvdr_pyramid_free(&pyr);
+    memcpy(out->pixels, img.pixels, (size_t)out->width * out->height * 3);
+    nvdr_image_free(&img);
     return 0;
 }
 
@@ -585,8 +582,7 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
     }
 
     NvdrConfig fcfg = e->cfg.frame;
-    if (kind == NVDRV_PRED && e->cfg.pred_tolerance[NVDR_LEVELS - 1] > 0.0f)
-        for (int k = 0; k < NVDR_LEVELS; k++) fcfg.tolerance[k] = e->cfg.pred_tolerance[k];
+    if (kind == NVDRV_PRED && e->cfg.pred_q > 0) fcfg.q = e->cfg.pred_q;
 
     uint8_t* blob = NULL;
     size_t len = 0;
@@ -750,13 +746,15 @@ int nvdrv_decode_next(NvdrvDecoder* d, NvdrImage* out,
     if (len == 0) return 0;
 
     if (kind == NVDRV_INTRA) {
-        if (reconstruct(d->data + d->pos, len, &d->state) != 0) return -1;
+        /* A frame cut before its colour layer has no picture yet: the
+         * stream ends there, it is not damaged. */
+        if (reconstruct(d->data + d->pos, len, &d->state) != 0) return partial ? 0 : -1;
     } else {
         NvdrImage err;
         err.width = d->width; err.height = d->height;
         err.pixels = (unsigned char*)malloc(npx);
         if (!err.pixels) return -1;
-        if (reconstruct(d->data + d->pos, len, &err) != 0) { free(err.pixels); return -1; }
+        if (reconstruct(d->data + d->pos, len, &err) != 0) { free(err.pixels); return partial ? 0 : -1; }
         for (size_t i = 0; i < npx; i++)
             err.pixels[i] = (unsigned char)clamp255v(
                 (int)err.pixels[i] - 128 + (int)ref->pixels[i]);

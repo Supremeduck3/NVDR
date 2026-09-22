@@ -10,6 +10,90 @@ trained model. What *is* here is the part the spec is actually about — the
 residual decomposition and the guarantee it provides — implemented on the
 one domain that can be built and measured today.
 
+## Format v10: the quadtree as the partition of a transform
+
+Everything from "The decomposition" down to "The anchor palette" below
+describes v9: flat rectangles in three levels. v9 was measured 6 to 11 dB
+behind a DCT at the same size on every sample, because a flat rectangle
+cannot hold texture (see "A texture layer, measured" and "The quadtree as
+the transform's partition"). v10 keeps the quadtree and changes what a
+leaf carries. The v9 codec is kept in `reference/nvdr_v9` so the numbers
+measured on it stay reproducible. The decoders no longer read v9 files.
+
+A v10 image is a quadtree of square leaves, 4 to 32 pixels, on 32x32
+tiles. Every leaf carries:
+
+- **a colour**, predicted as the rounded mean of the flat colours just
+  above and to its left, plus a quantised correction. A leaf with nothing
+  else is a v9 rectangle.
+- **texture, if it pays**: the DCT of what the flat colour misses, at the
+  leaf's own size, quantised with one step `q` and coded with the same
+  adaptive arithmetic coder as everything else (a coded-block flag;
+  significance and last flags by diagonal position; adaptive magnitudes).
+
+The encoder picks the tree by rate and distortion. Each node is coded
+whole and as four children against the live models, and the cheaper
+in squared error + 0.12 q^2 * bits wins.
+
+**Two layers, one guarantee.** Layer 0 is the tree and the colours, a
+whole picture of flat blocks on its own. Layer 1 is the texture. Each is
+one arithmetic stream coded tile by tile, and a cut stream decodes every
+tile that arrived whole. A colour tile that did not arrive is grey. A
+texture tile that did not arrive keeps its flat colours. Grey rather than
+a predicted colour: on the `degrade` probe the predicted colour carried
+the top rows down the image and a longer prefix scored worse, 12.5 dB to
+9.1. Colour is predicted from flat colours only, never from texture, so
+layer 0 never needs layer 1. Predicting from the full picture would save
+0.3 to 2% of the bytes.
+
+**Exact in C and in JS.** Everything the decoder computes is an integer:
+HEVC's integer DCT (every matrix entry one of 33 values, shifts of 6 and
+6 + log2 n, a 16-bit clip between the passes), 16-bit fixed-point
+YCbCr to RGB, integer means. `scripts/crosscheck.mjs` finds the two
+decoders identical at both layers and at cuts landing anywhere in either,
+for q from 1 to 4000 and block limits down to 8..16.
+
+At the default `q` 24, against v9 at its defaults (v9 PSNR as its
+decoder showed it, seams blended):
+
+    image                 v9                 v10
+    OIP-1304511485     18126 B 25.51 dB    17345 B 34.95 dB
+    OIP-3451121336     39852 B 21.85 dB    39947 B 31.47 dB
+    OIP-3786546191     38501 B 24.38 dB    34025 B 32.16 dB
+    OIP-4140498144     29253 B 25.71 dB    21696 B 33.62 dB
+    macarrão           10826 B 30.71 dB     6222 B 39.55 dB
+    montanha_pessoas   51765 B 27.00 dB    52809 B 33.28 dB
+    degrade (probe)      598 B 33.83 dB      486 B 46.15 dB
+    blocos (probe)       160 B 34.84 dB      315 B 56.34 dB
+    circulos (probe)    2230 B 29.15 dB     3462 B 39.98 dB
+
+The same size or smaller, and 6 to 10 dB better on every photograph.
+Blocks and circles come out larger at the default only because the
+default takes them to 40-56 dB. At equal quality v10 is smaller there
+too: `blocos` 159 B at 38.4 dB (`--q 255`), `circulos` 1175 B at 29.7 dB
+(`--q 96`). The codec lands 0.3 dB and about 3% short of the float
+prototype in `scripts/analysis/qtdct`, the price of predicting from flat
+colours and of the integer transform.
+
+Two things got worse, and both are on the list:
+
+- **the middle of the truncation curve.** Texture arrives tile by tile
+  from the top, so half of montanha_pessoas shows its top half sharp and
+  its bottom half flat, 24.0 dB against v9's 25.8. v9 spread its
+  refinement over the whole picture. Sending the low frequencies of the
+  whole image first would fix it.
+- **decode speed in the browser.** A 960x540 video frame takes 63 ms to
+  decode in JS, against 21 ms before. The display, which no longer blends
+  seams, went from 26 ms to 3. The inverse DCT runs as plain matrix
+  products; a butterfly and skipping all-zero rows are the obvious fixes.
+
+Sequences use it as is. Every frame, intra or predicted, is a v10
+container, so the sequence format moved to version 4. On the clean
+benchmark clip, 2400 kbit/s at 34.35 dB, against 3402 kbit/s at 33.36 dB
+before. VP8 does 309 kbit/s at 33.5 dB on the same clip, so the gap to a
+real codec is now in the predicted frames (11.6 KB each), not in the
+intra frames: those are 29 KB each, where VP8's key frame is 55 KB.
+
 ## The decomposition
 
     ANCHOR = quantize_coarse(L)
@@ -773,6 +857,47 @@ coefficients of its own texture. A flat fill is then just a leaf with
 no AC coefficients. `comparacao_macarrao.png` shows the images side by
 side.
 
+### The quadtree as the transform's partition
+
+`scripts/analysis/qtdct` gives the quadtree a new job. Its leaves are
+squares of 4 to 32 pixels on a power-of-two grid. Each leaf's colour is
+predicted from the decoded pixels just above and to its left, so it
+costs nothing to send, and what the prediction misses is coded with a
+DCT of the leaf's own size. A leaf with no AC coefficients is exactly a
+flat rectangle; the old codec is the special case where texture is never
+sent. Each node splits only if its four children, coded against the
+adaptive models as they stand, beat it on distortion + lambda * bits.
+
+PSNR at today's container size, same deadzone (0.1) for both DCTs:
+
+    image                  NVDR today       DCT 8x8 fixed   quadtree DCT            NVDR's PSNR in
+    OIP-3451121336         39852 B 21.83   31.13            31.32 (+0.19)            23% of the bytes
+    macarrão               10826 B 30.00   41.97            45.69 (+3.72)            13%
+    montanha_pessoas       51765 B 26.30   32.42            33.20 (+0.79)            25%
+    f0000 (video bench)    57113 B 29.60   39.11            41.24 (+2.13)            15%
+
+(deadzone 0.33, all seven samples: +0.2 to +3.7 dB over the fixed grid,
+NVDR's quality in 14-26% of the bytes.)
+
+The quadtree beats the fixed grid on every sample, most where the image
+has large smooth areas and least on dense texture. Two controls:
+
+- without the prediction from the neighbours (`--pred none`) the gain
+  over the fixed grid drops by 0.3 to 2 dB, and goes negative on the
+  most textured sample. Predicting the leaf's colour is what makes big
+  leaves cheap.
+- with the AC coefficients switched off (`--dc-only`), which is flat
+  rectangles again at a 4 px minimum, PSNR stops at 27.5 dB on macarrão
+  however many bytes it is given.
+
+lambda barely matters (0.06 to 0.3 times Q^2 moves nothing past 0.05 dB).
+A 32 px maximum beats 16 by up to 0.5 dB. Chroma at the luma step
+(`--chroma-q 1`) beats 1.5 slightly. `quadtree_dct.png` shows both images
+at equal size. At about a sixth of the bytes, the quadtree DCT matches
+today's PSNR. The artefacts it shows there are blocking in the largest
+leaves, which a deblocking filter is for, not the staircase of flat
+tiles.
+
 ### Real time
 
 In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
@@ -1008,87 +1133,43 @@ Not here yet: B-frames.
 
 ## Layout
 
-    src/        the codec: nvdr.c and entropy.c, plus nvdrv.c for sequences
+    src/        the codec: nvdr.c (v10) and entropy.c, plus nvdrv.c for sequences
     tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
-    scripts/    the regression gate, the C-vs-JS cross-check, analysis
+    scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
     samples/    the images every number in this file was measured on
     vendor/     stb_image.h, the only third-party code
-    reference/  two modules kept out of a removed pipeline; not built
+    reference/  the v9 rectangle codec and two modules from a removed
+                pipeline; not built
 
 `GUIA.md` is the testing guide, in Portuguese, and is the shorter way in.
 
 ## Build and run
 
     make
-    ./nvdr_encode image.jpg out.nvdr
-    ./nvdr_decode out.nvdr out.ppm --level 1 --compare image.jpg
+    ./nvdr_encode image.jpg out.nvdr [--q 24]
+    ./nvdr_decode out.nvdr out.png --layer 0 --compare image.jpg
     ./nvdrv_encode frames/ out.nvdrv
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     make check          # the regression gate
+    make fuzz           # the decoders under ASan and UBSan
 
-`nvdr_encode` prints the raw and stored size and the PSNR of each layer,
-because the point of this implementation is to test the spec's claims
-rather than assume them.
+`nvdr_encode` prints each layer's stored size and the PSNR of the file
+read back at that layer, and how many leaves of each size the tree chose.
 
-A browser decoder lives in `public/nvdr.js`, with a viewer at
-`public/index.html` served by the repo's `server.js` — it shows the three
-levels side by side and has a slider that truncates the container so the
-guarantee can be watched rather than described.
+`public/index.html`, served by `server.js`, shows the two layers side by
+side, a slider that truncates the container, and plays sequences.
 
-## Measured
+## Format (v10)
 
-What the entropy coder is worth, at `--gradient 0` so both codecs carry
-the same thing:
+    [header 32B]  "NVDR", 10, 0, width u16, height u16, max block u8,
+                  min block u8, luma step u16, chroma step u16,
+                  layer 0 bytes u32, layer 1 bytes u32, 8 reserved
+    [layer 0]     per 32x32 tile in raster order: split flags, and per
+                  leaf three colour corrections
+    [layer 1]     per tile, per leaf in the same order: three textures
 
-    image                   source   deflate     arith
-    OIP-1304511485.jpg       23.7K     12.9K     10.6K   -17.8%
-    OIP-3451121336.jpg       56.7K     44.5K     32.8K   -26.2%
-    OIP-3786546191.jpg       48.4K     45.5K     33.2K   -27.1%
-    OIP-4140498144.jpg       36.2K     31.0K     22.6K   -27.1%
-    macarrao.jpg             12.7K      7.6K      6.0K   -20.9%
-    montanha_pessoas.jpg    133.4K     52.0K     36.8K   -29.3%
-
-At the defaults, against the same encoder with ramps off:
-
-    image                     flat            ramps on
-    OIP-1304511485.jpg   13640 B  22.49   18126 B  24.92 dB
-    OIP-3451121336.jpg   38310 B  21.60   39852 B  21.83 dB
-    OIP-3786546191.jpg   37209 B  23.80   38501 B  24.15 dB
-    OIP-4140498144.jpg   27748 B  24.43   29253 B  25.20 dB
-    macarrao.jpg         10215 B  28.86   10826 B  30.00 dB
-    montanha_pessoas.jpg 50030 B  25.90   51765 B  26.30 dB
-    blocos (synthetic)     156 B  52.64     160 B  52.64 dB
-    circulos (synthetic)  3084 B  29.22    3851 B  30.19 dB
-    linhas (synthetic)    4725 B  17.70   24334 B  36.75 dB
-
-Cumulative bytes and PSNR per level, montanha_pessoas.jpg:
-
-    ANCHOR    4.5K  19.55 dB
-    +R1      17.1K  24.30 dB
-    +R2      51.8K  26.30 dB
-
-Read this honestly: **JPEG wins on rate-distortion for photographs.** At
-133 KB the source JPEG of montanha_pessoas sits far above 26.3 dB. What
-this format buys is not a smaller file at equal quality — it is that the
-first 4.5 KB are already a whole picture, and every byte after that
-improves it without the decoder ever needing to wait or restart.
-
-## Format
-
-    [header 72B]
-    [level 0 : palette, then split flags and anchor tokens, coded]
-    [level 1 : units, each split flags + its rectangles' residuals, coded]
-    [level 2 : units, each split flags + its rectangles' residuals, coded]
-
-A rectangle's residual is three signed deltas, followed by a ramp flag and,
-when it is set, an axis bit and three slopes.
-
-The palette rides ahead of level 0's coded stream: 48 bytes of genuinely
-incompressible colour are not worth modelling. `--codec deflate` selects
-the previous entropy layer, which the decoders still read.
-
-Geometry travels as one bit per visited quadtree node — 1 splits, 0 stops —
-and the decoder replays the subdivision rule from the canvas rectangle. No
-coordinate is ever transmitted. Level k's bitstream is read per level-(k-1)
-rectangle, so each level only describes where it disagrees with the last.
+The canvas is padded to a multiple of the smallest block. A node that
+runs past it has no split flag and always splits; one wholly past it does
+not exist. The v9 format this replaced is described in the git history of
+this file and implemented in `reference/nvdr_v9`.
