@@ -182,6 +182,28 @@ def check_sequence(tmp, psnr_slack):
     return results, problems
 
 
+def check_album(tmp, images):
+    """The photographs as one album: C and JS agree on every image, whole
+    and cut, and the shared context never makes an image bigger overall."""
+    tool = find_binary("nvdr_album")
+    photos = [str(p) for p in images if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+    out = tmp / "album.nvda"
+    r = subprocess.run([str(tool), "pack", str(out)] + photos, capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        return None, [r.stderr.strip() or "album pack failed"]
+    problems = []
+    m = re.search(r"total\s+(\d+)\s+(\d+)", r.stdout)
+    warm, cold = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    if warm > cold:
+        problems.append(f"fluid context made the album bigger: {warm} > {cold}")
+    cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_album.mjs"), str(out)],
+                        capture_output=True, text=True)
+    if cc.returncode != 0:
+        bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
+        problems.append("C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
+    return {"bytes": out.stat().st_size, "warm": warm, "cold": cold}, problems
+
+
 def encode(encoder, image, out):
     r = subprocess.run([str(encoder), str(image), str(out)],
                        capture_output=True, text=True)
@@ -323,6 +345,24 @@ def main():
             print(f"{name:<26} {size:>9} {psnr:>7.2f}dB {delta:>16} "
                   f"{'stable' if stable else 'VARIES':>7}  "
                   f"{'ok' if not notes else '; '.join(notes)[:34]}")
+
+        album, album_problems = check_album(tmp, images)
+        failures += [f"album: {p}" for p in album_problems]
+        if album:
+            recorded["<album>"] = {"bytes": album["bytes"], "psnr": 0.0}
+            delta = ""
+            if "<album>" in baseline:
+                was = baseline["<album>"]
+                d_size = (album["bytes"] - was["bytes"]) / was["bytes"]
+                delta = f"{d_size:+.1%}"
+                if d_size > args.size_slack:
+                    failures.append(f"<album>: {was['bytes']} -> {album['bytes']} bytes ({d_size:+.1%})")
+            elif baseline:
+                delta = "new"
+            gain = (album["warm"] - album["cold"]) / album["cold"] if album["cold"] else 0
+            print(f"{'<album> fotos':<26} {album['bytes']:>9} {'':>8} {delta:>16} {'stable':>7}  "
+                  f"{'ok' if not album_problems else '; '.join(album_problems)[:34]} "
+                  f"(fluido {gain:+.2%})")
 
         seqs, seq_problems = check_sequence(tmp, args.psnr_slack)
         failures += [f"sequence: {p}" for p in seq_problems]

@@ -1,4 +1,8 @@
 {
+  "<album>": {
+    "bytes": 169241,
+    "psnr": 0.0
+  },
   "<sequence default>": {
     "bytes": 6232,
     "psnr": 30.05

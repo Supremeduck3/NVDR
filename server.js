@@ -247,6 +247,83 @@ function probeFps(input, done) {
  * Duration and width are capped because encoding is the slow direction and
  * the frames sit on disk as PNG while it runs.
  */
+/*
+ * Several still images at once, packed into one .nvda album so each is
+ * coded with what the codec learned on the ones before (src/nvda.h).
+ *
+ * The body frames the files itself, so no multipart parser is needed:
+ *   u32 count, then per file: u16 name length, UTF-8 name, u32 size, bytes
+ * all little-endian. Names reach the file system only as a sanitised
+ * basename with a whitelisted extension, inside a directory of our own.
+ */
+const MAX_ALBUM_BYTES = 256 * 1024 * 1024;
+const MAX_ALBUM_IMAGES = 200;
+
+function safeImageName(raw, index, taken) {
+    const base = String(raw).split(/[\\/]/).pop().replace(/[\u0000-\u001f:*?"<>|]/g, '_');
+    const dot = base.lastIndexOf('.');
+    const ext = sanitizeExtension(dot >= 0 ? base.slice(dot) : '');
+    if (!ext) return null;
+    let stem = base.slice(0, dot).replace(/^\.+/, '').slice(0, 100) || 'imagem';
+    let name = stem + ext;
+    if (taken.has(name.toLowerCase())) name = `${stem}_${index}${ext}`;
+    taken.add(name.toLowerCase());
+    return name;
+}
+
+function handleAlbum(req, res) {
+    const chunks = [];
+    let received = 0, aborted = false;
+    const fail = (code, text) => {
+        aborted = true;
+        if (!res.writableEnded) { res.writeHead(code, { 'Content-Type': 'text/plain' }); res.end(text); }
+    };
+    req.on('data', (chunk) => {
+        if (aborted) return;
+        received += chunk.length;
+        if (received > MAX_ALBUM_BYTES) { fail(413, `Upload too large (limit ${MAX_ALBUM_BYTES} bytes)`); return; }
+        chunks.push(chunk);
+    });
+    req.on('aborted', () => { aborted = true; });
+    req.on('end', () => {
+        if (aborted) return;
+        const body = Buffer.concat(chunks);
+        if (body.length < 4) { fail(400, 'Empty album'); return; }
+        const count = body.readUInt32LE(0);
+        if (!count || count > MAX_ALBUM_IMAGES) { fail(400, `Between 1 and ${MAX_ALBUM_IMAGES} images`); return; }
+
+        const exePath = findExecutable(__dirname, 'nvdr_album');
+        if (!exePath) { fail(500, `nvdr_album not found in ${__dirname}. Build it with \`make\`.`); return; }
+
+        const dir = fs.mkdtempSync(path.join(outDir, 'album_'));
+        const cleanup = () => setTimeout(() => fs.rm(dir, { recursive: true, force: true }, () => {}), 5000);
+        const files = [], taken = new Set();
+        let at = 4;
+        for (let i = 0; i < count; i++) {
+            if (at + 2 > body.length) { cleanup(); fail(400, 'Truncated album upload'); return; }
+            const nl = body.readUInt16LE(at); at += 2;
+            if (nl > 1024 || at + nl + 4 > body.length) { cleanup(); fail(400, 'Truncated album upload'); return; }
+            const name = safeImageName(body.toString('utf8', at, at + nl), i, taken); at += nl;
+            const size = body.readUInt32LE(at); at += 4;
+            if (at + size > body.length) { cleanup(); fail(400, 'Truncated album upload'); return; }
+            if (!name) { cleanup(); fail(400, 'Unsupported image type in album'); return; }
+            const file = path.join(dir, name);
+            fs.writeFileSync(file, body.subarray(at, at + size));
+            files.push(file);
+            at += size;
+        }
+        const out = path.join(dir, 'album.nvda');
+        const args = ['pack', out, ...files];
+        const q = req.headers['x-q'];
+        if (/^[1-9]\d{0,3}$/.test(q || '')) args.push('--q', q);
+        console.log(`Album of ${count} images...`);
+        runConverter(res, { exePath, args, resultPath: out, artifacts: [], label: 'Album' });
+        // The directory goes once the answer is out, not on a timer that a
+        // long encode could outrun.
+        res.on('close', cleanup);
+    });
+}
+
 function handleVideo(req, res) {
     const seconds = intHeader(req, 'x-seconds', 5, 1, 30);
     const maxWidth = intHeader(req, 'x-max-width', 1280, 64, 3840);
@@ -324,6 +401,11 @@ const server = http.createServer((req, res) => {
     if (req.method !== 'POST') {
         res.writeHead(404);
         res.end('Not found');
+        return;
+    }
+
+    if (req.url === '/album') {
+        handleAlbum(req, res);
         return;
     }
 

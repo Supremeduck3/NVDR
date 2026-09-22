@@ -241,6 +241,30 @@ não uma falha.
 
 ---
 
+## Álbum: várias imagens num arquivo só
+
+```bash
+./nvdr_album pack /tmp/album.nvda samples/*.jpg
+./nvdr_album unpack /tmp/album.nvda /tmp/saida --compare samples
+```
+
+As imagens vão em ordem num `.nvda`, e cada uma é codificada a partir do
+que o codec aprendeu nas anteriores (o **codebook fluido**: as
+probabilidades do codificador aritmético, em vez de começar do zero). O
+`pack` mostra, por imagem, quanto ela custou e quanto custaria sozinha.
+
+Na página, solte **várias imagens de uma vez** na aba Imagem: elas viram
+um álbum, mostrado em grade com o tamanho de cada uma. Um `.nvda` pronto
+abre direto.
+
+**Expectativa honesta:** nas amostras o ganho é de **0,7%** (até 1,5%
+numa imagem). O codec reaprende essas estatísticas em poucas dezenas de
+símbolos, então começar do zero custa pouco. O ganho grande entre imagens
+viria do **conteúdo**: fotos parecidas (rajada, mesmo cenário) podendo ser
+previstas uma da outra, como quadros de vídeo.
+
+---
+
 ## Vídeo
 
 ```bash

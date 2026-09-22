@@ -166,4 +166,23 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
 int nvdr_decode_file(const char* path, int max_layer,
                      NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 
+/*
+ * The fluid context: the adaptive models one container leaves behind,
+ * carried into the next so it does not start from even odds (see
+ * nvdr.c). An empty or reset context behaves exactly like none. Encoder
+ * and decoder must feed their contexts the same containers in the same
+ * order, each decoded whole.
+ */
+typedef struct NvdrContext NvdrContext;
+NvdrContext* nvdr_context_new(void);
+void nvdr_context_free(NvdrContext* ctx);
+void nvdr_context_reset(NvdrContext* ctx);
+void nvdr_context_copy(NvdrContext* dst, const NvdrContext* src);
+int  nvdr_context_equal(const NvdrContext* a, const NvdrContext* b);
+
+int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                        const NvdrConfig* cfg, NvdrHeader* hdr_out, NvdrContext* ctx);
+int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
+                        NvdrHeader* hdr, NvdrDecodeInfo* info, NvdrContext* ctx);
+
 #endif /* NVDR_H */

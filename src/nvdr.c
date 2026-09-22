@@ -318,6 +318,34 @@ static void models_fill(uint16_t* p, size_t count) {
 }
 
 /*
+ * THE FLUID CONTEXT
+ * -----------------
+ * Every container starts its adaptive models at even odds and pays, in
+ * its first symbols, to learn what the last one already knew: that big
+ * leaves rarely carry texture, how often a colour needs no correction.
+ * A context carries the models as one container left them into the next,
+ * so a sequence's predicted frames keep learning instead of starting
+ * over. The decoder has to hold the same context, so it is only for
+ * containers decoded in order and in full: a sequence's frames.
+ */
+struct NvdrContext {
+    int           valid;
+    ColourModels  cm;
+    TextureModels tm, tm2;
+};
+
+NvdrContext* nvdr_context_new(void) { return (NvdrContext*)calloc(1, sizeof(NvdrContext)); }
+void nvdr_context_free(NvdrContext* ctx) { free(ctx); }
+void nvdr_context_reset(NvdrContext* ctx) { if (ctx) ctx->valid = 0; }
+void nvdr_context_copy(NvdrContext* dst, const NvdrContext* src) { *dst = *src; }
+int nvdr_context_equal(const NvdrContext* a, const NvdrContext* b) {
+    if (a->valid != b->valid) return 0;
+    if (!a->valid) return 1;
+    return !memcmp(&a->cm, &b->cm, sizeof(a->cm)) && !memcmp(&a->tm, &b->tm, sizeof(a->tm)) &&
+           !memcmp(&a->tm2, &b->tm2, sizeof(a->tm2));
+}
+
+/*
  * One front end for coding and for costing. With `enc` set a symbol is
  * written and its model adapts; without, its cost in bits against the
  * model as it stands is added up and nothing changes. The encoder's
@@ -843,6 +871,11 @@ static void emit(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, NvdrHeader* h)
 
 int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                     const NvdrConfig* cfg_in, NvdrHeader* hdr_out) {
+    return nvdr_encode_mem_ctx(out_buf, out_len, img, cfg_in, hdr_out, NULL);
+}
+
+int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
     *out_buf = NULL; *out_len = 0;
     tables_init();
     NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
@@ -898,9 +931,13 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     e.split = (int*)calloc(nodes, sizeof(int));
     if (!e.split) goto done;
 
-    models_fill((uint16_t*)&e.cm, sizeof(e.cm) / sizeof(uint16_t));
-    models_fill((uint16_t*)&e.tm, sizeof(e.tm) / sizeof(uint16_t));
-    models_fill((uint16_t*)&e.tm2, sizeof(e.tm2) / sizeof(uint16_t));
+    if (ctx && ctx->valid) {
+        e.cm = ctx->cm; e.tm = ctx->tm; e.tm2 = ctx->tm2;
+    } else {
+        models_fill((uint16_t*)&e.cm, sizeof(e.cm) / sizeof(uint16_t));
+        models_fill((uint16_t*)&e.tm, sizeof(e.tm) / sizeof(uint16_t));
+        models_fill((uint16_t*)&e.tm2, sizeof(e.tm2) / sizeof(uint16_t));
+    }
     if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0 ||
         nvdr_enc_init(&enc2, 1 << 16) != 0) goto done;
     Sink s0 = { &enc0, 0 }, s1[2] = { { &enc1, 0 }, { &enc2, 0 } };
@@ -950,6 +987,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (hdr_out) *hdr_out = h;
     *out_buf = buf;
     *out_len = total;
+    if (ctx) { ctx->cm = e.cm; ctx->tm = e.tm; ctx->tm2 = e.tm2; ctx->valid = 1; }
     rc = 0;
 
 done:
@@ -1125,6 +1163,11 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
 
 int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
                     NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
+    return nvdr_decode_mem_ctx(data, size, max_layer, out, hdr_out, info, NULL);
+}
+
+int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
+                        NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
@@ -1161,7 +1204,13 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
 
     /* Layer 0: every tile that arrives whole; the rest predicted. */
     ColourModels cm;
-    models_fill((uint16_t*)&cm, sizeof(cm) / sizeof(uint16_t));
+    TextureModels tms[2];
+    if (ctx && ctx->valid) {
+        cm = ctx->cm; tms[0] = ctx->tm; tms[1] = ctx->tm2;
+    } else {
+        models_fill((uint16_t*)&cm, sizeof(cm) / sizeof(uint16_t));
+        for (int k = 0; k < 2; k++) models_fill((uint16_t*)&tms[k], sizeof(TextureModels) / sizeof(uint16_t));
+    }
     NvdrDecoder d0;
     nvdr_dec_init(&d0, data + NVDR_HEADER_SIZE, avail0);
     L.cv = &cv; L.d = &d0; L.cm = &cm; L.step = step;
@@ -1192,8 +1241,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
         size_t avail = layer == 1 ? avail1 : avail2;
         if ((max_layer >= 0 && max_layer < layer) || avail < 5 || complete[layer - 1] == 0) break;
         if (layer == 2 && h.band == 0) break;
-        TextureModels tm;
-        models_fill((uint16_t*)&tm, sizeof(tm) / sizeof(uint16_t));
+        TextureModels* tm = &tms[layer - 1];
         NvdrDecoder d;
         nvdr_dec_init(&d, stream, avail);
         int corrupt = 0;
@@ -1218,7 +1266,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
                 int start = layer == 1 ? 1 : band_at[sc], end = layer == 1 ? band_at[sc] : count;
                 if (start >= end) continue;
                 for (int c = 0; c < 3 && !d.overrun && !corrupt; c++)
-                    if (get_texture(&d, &tm, sc, c, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
+                    if (get_texture(&d, tm, sc, c, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
                         apply_texture(&cv, c, f->x, f->y, f->n, lv, start, end, step[c]);
                         textured[i] = 1;
                     }
@@ -1260,6 +1308,15 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
         info->layers_present = 1;
         if (complete0 == tiles && avail1 >= 5) info->layers_present = 2;
         if (h.band && complete[1] == tiles && avail2 >= 5) info->layers_present = 3;
+    }
+    if (ctx) {
+        /* Only a container decoded whole leaves the models where the
+         * encoder left them; anything less and the next one cannot be
+         * decoded from this context. */
+        int whole = complete[0] == tiles && complete[1] == tiles &&
+                    (h.band == 0 || complete[2] == tiles) && (max_layer < 0 || max_layer >= NVDR_LAYERS - 1);
+        if (whole) { ctx->cm = cm; ctx->tm = tms[0]; ctx->tm2 = tms[1]; ctx->valid = 1; }
+        else ctx->valid = 0;
     }
     rc = 0;
 

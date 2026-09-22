@@ -15,7 +15,7 @@ CODEC   = src/nvdr.c src/entropy.c
 HEADERS = src/nvdr.h src/entropy.h
 SEQ     = $(CODEC) src/nvdrv.c
 SEQ_H   = $(HEADERS) src/nvdrv.h
-TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode
+TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album
 
 all: $(TOOLS)
 
@@ -24,6 +24,9 @@ nvdr_encode: tools/nvdr_encode.c $(CODEC) $(HEADERS)
 
 nvdr_decode: tools/nvdr_decode.c $(CODEC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ tools/nvdr_decode.c $(CODEC) $(LDLIBS)
+
+nvdr_album: tools/nvdr_album.c src/nvda.c src/nvda.h $(CODEC) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_album.c src/nvda.c $(CODEC) $(LDLIBS)
 
 nvdrv_encode: tools/nvdrv_encode.c $(SEQ) $(SEQ_H)
 	$(CC) $(CFLAGS) -o $@ tools/nvdrv_encode.c $(SEQ) $(LDLIBS)
@@ -40,9 +43,9 @@ check: $(TOOLS)
 # Mutates real containers and decodes them under AddressSanitizer and
 # UndefinedBehaviorSanitizer. Any out-of-bounds access stops it with the
 # offending input left in fuzz_last_input.bin.
-fuzz_nvdr: scripts/fuzz.c $(SEQ) $(SEQ_H)
+fuzz_nvdr: scripts/fuzz.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
 	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
-	    -Isrc -Ivendor $(OPENMP) -o $@ scripts/fuzz.c $(SEQ) $(LDLIBS)
+	    -Isrc -Ivendor $(OPENMP) -o $@ scripts/fuzz.c src/nvda.c $(SEQ) $(LDLIBS)
 
 fuzz: fuzz_nvdr
 

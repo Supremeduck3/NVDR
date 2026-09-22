@@ -308,7 +308,14 @@ export function layerThresholds(header) {
  *     rgb,        // the image at maxLayer, RGB, width * height * 3
  *     flatRgb }   // layer 0 alone, only when wantFlat
  */
-export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
+/**
+ * A fluid context: the adaptive models one container leaves behind,
+ * carried into the next. Mirrors NvdrContext; an empty one behaves like
+ * none. Pass the same object to decode() for containers read in order.
+ */
+export function newContext() { return { valid: false, cm: null, tm: null, tm2: null }; }
+
+export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
     if (!h) return null;
@@ -372,7 +379,9 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
     }
 
     // Layer 0.
-    const cm = colourModels();
+    const warm = ctx && ctx.valid;
+    const cm = warm ? ctx.cm : colourModels();
+    const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
     const d0 = new ArithDecoder(bytes, HEADER_SIZE, avail0);
     const s0 = { corrupt: false };
     const lx = [], ly = [], ln = [];
@@ -430,7 +439,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
         const avail = layer === 1 ? avail1 : avail2, off = layer === 1 ? off1 : off2;
         if ((maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
         if (layer === 2 && h.band === 0) break;
-        const tm = textureModels();
+        const tm = tms[layer - 1];
         const d = new ArithDecoder(bytes, off, avail);
         const st = { corrupt: false };
         for (let t = 0; t < complete[layer - 1]; t++) {
@@ -555,6 +564,15 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
 
     // The filter works in place, and a second view of the same planes has
     // to start from the unfiltered ones, so filter a copy when asked for both.
+    if (ctx) {
+        // Only a container decoded whole leaves the models where the
+        // encoder left them (mirrors nvdr_decode_mem_ctx).
+        const whole = complete[0] === tiles && complete[1] === tiles &&
+            (h.band === 0 || complete[2] === tiles) && (maxLayer < 0 || maxLayer >= LAYERS - 1);
+        if (whole) { ctx.cm = cm; ctx.tm = tms[0]; ctx.tm2 = tms[1]; ctx.valid = true; }
+        else ctx.valid = false;
+    }
+
     const shown = (planes, tex) => {
         if (!(h.flags & FLAG_DEBLOCK)) return toRgb(planes);
         const copy = wantFlat ? planes.map(p => p.slice()) : planes;
