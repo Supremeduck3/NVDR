@@ -22,7 +22,11 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const STATIC_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
-    '.css': 'text/css; charset=utf-8'
+    '.css': 'text/css; charset=utf-8',
+    // Encoded media, so a page can use them the way it uses a JPEG.
+    '.nvdr': 'application/octet-stream',
+    '.nvda': 'application/octet-stream',
+    '.nvdrv': 'application/octet-stream'
 };
 
 // Ensure output dir exists
@@ -201,7 +205,28 @@ function serveStatic(req, res) {
             res.end('Not found');
             return;
         }
-        res.writeHead(200, { 'Content-Type': type });
+        // Byte ranges, so a page showing one photo of an album fetches that
+        // photo and its references rather than the album (see nvda.js). A
+        // single range is all it asks for; anything else gets the file.
+        const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
+        if (m) {
+            const start = Number(m[1]);
+            const end = m[2] === '' ? data.length - 1 : Math.min(Number(m[2]), data.length - 1);
+            if (start >= data.length || end < start) {
+                res.writeHead(416, { 'Content-Range': `bytes */${data.length}` });
+                res.end();
+                return;
+            }
+            res.writeHead(206, {
+                'Content-Type': type,
+                'Content-Range': `bytes ${start}-${end}/${data.length}`,
+                'Content-Length': end - start + 1,
+                'Accept-Ranges': 'bytes'
+            });
+            res.end(data.subarray(start, end + 1));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': type, 'Accept-Ranges': 'bytes' });
         res.end(data);
     });
 }

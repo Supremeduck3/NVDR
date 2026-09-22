@@ -39,15 +39,22 @@ function pngPixels(buf) {
 }
 
 let failures = 0;
-function check(label, file) {
-    const c = cDecode(file).map(pngPixels);
+function jsDecodeAll(file) {
     const bytes = readFileSync(file);
-    const js = [];
+    const out = [];
     try {
         const r = new AlbumReader(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
-        let e;
-        while ((e = r.next())) js.push(e.rgb);
+        for (let i = 0; i < r.count; i++) {
+            const e = r.decode(i);
+            if (!e) break;
+            out.push(e.rgb);
+            if (e.partial) break;
+        }
     } catch (err) { /* both sides stop on damage */ }
+    return out;
+}
+
+function compare(label, c, js) {
     if (c.length !== js.length) {
         console.log(`${label}: C ${c.length} images, JS ${js.length}`); failures++; return;
     }
@@ -60,8 +67,24 @@ function check(label, file) {
     console.log(`${label}: identical, ${c.length} images`);
 }
 
+function check(label, file) { compare(label, cDecode(file).map(pngPixels), jsDecodeAll(file)); }
+
 const size = readFileSync(album).length;
 check('whole', album);
+// Random access: the last photo alone, from a fresh reader on each side.
+{
+    const bytes = readFileSync(album);
+    const r = new AlbumReader(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
+    if (!r.fluid && r.count) {
+        const last = r.count - 1;
+        const dir = mkdtempSync(join(tmpdir(), 'nvda-'));
+        execFileSync(tool, ['unpack', album, dir, '--only', String(last + 1)], { stdio: 'pipe' });
+        const c = readdirSync(dir).map(n => pngPixels(readFileSync(join(dir, n))));
+        rmSync(dir, { recursive: true });
+        compare(`photo ${last + 1} alone (chain ${r.chain(last).map(k => k + 1).join('>')})`, c,
+                [new AlbumReader(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length)).decode(last).rgb]);
+    }
+}
 for (const pct of [5, 21, 38, 55, 72, 90]) {
     const cut = join(tmpdir(), `nvda_cut_${pct}.nvda`);
     writeFileSync(cut, readFileSync(album).subarray(0, Math.floor(size * pct / 100)));

@@ -251,6 +251,231 @@ não uma falha.
 As imagens vão em ordem num `.nvda`. Cada uma é codificada de um de dois
 jeitos, e o encoder escolhe:
 
+- **prevista de uma foto anterior**: de **qualquer uma** das últimas 8
+  (`--window N`, até 32), desde que do mesmo tamanho. O encoder procura as
+  mais parecidas por miniatura e tenta as duas melhores. Usa o mesmo
+  mecanismo dos quadros de vídeo: movimento em quarto de pixel, skip e só
+  o que mudou. Serve para rajada, mesmo cenário, capturas de tela, e
+  também para um ensaio que vai e volta entre dois assuntos.
+- **sozinha**, quando nenhuma anterior ajuda.
+
+A comparação é feita **com a mesma qualidade**: a versão prevista é
+refinada até ficar tão boa quanto a sozinha, e só ganha se continuar
+menor. O `pack` mostra, por imagem, o tipo escolhido (`prevista #k` diz de
+qual foto), quanto ela custou e quanto custaria sozinha.
+
+Para tirar **uma foto só** do álbum (decodifica só ela e as de que depende):
+
+```bash
+./nvdr_album unpack /tmp/album.nvda /tmp/saida --only 3
+```
+
+Na página, solte **várias imagens de uma vez** na aba Imagem: elas viram
+um álbum, mostrado em grade com o tamanho de cada uma. Um `.nvda` pronto
+abre direto.
+
+**Quanto economiza:**
+
+| álbum | economia |
+|---|---|
+| fotos sem relação | 0% (nunca fica maior) |
+| fotos do mesmo cenário, 0,4 s entre elas | ~39% |
+| rajada, 0,12 s entre elas | ~58% |
+| dois cenários intercalados | ~66% (com `--window 1` seria 0%) |
+
+`--fluid` liga o **codebook fluido** (as probabilidades do codificador
+aritmético passam de uma foto para a próxima): mais ~0,7%, mas aí cada foto
+depende de todas as anteriores e o álbum só pode ser lido em ordem. Por
+isso vem desligado.
+
+### Usando num site
+
+O arquivo continua com as propriedades quando vai para um site. Coloque
+o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`) junto do site e use o
+elemento no lugar do `<img>`:
+
+```html
+<script type="module" src="nvdr-img.js"></script>
+<nvdr-img src="foto.nvdr" alt="Montanha"></nvdr-img>
+<nvdr-img src="galeria.nvda#3" alt="Terceira foto do álbum"></nvdr-img>
+<nvdr-img src="galeria.nvda#praia.jpg"></nvdr-img>
+```
+
+- **Uma imagem `.nvdr`** aparece enquanto baixa e melhora a cada byte.
+- **Uma foto de álbum** baixa só o índice, ela e as fotos de que ela
+  depende (requisições HTTP com `Range`), não o álbum inteiro. Várias fotos
+  do mesmo álbum na página compartilham o que já baixaram: uma grade com o
+  álbum todo baixa o tamanho do álbum, uma vez.
+- Qualquer servidor estático serve (nginx, Apache, CDN, S3: todos aceitam
+  `Range`). Se o servidor não aceitar, o álbum vem inteiro e funciona igual.
+
+Para ver funcionando:
+
+```bash
+make demo          # gera public/demo/montanha.nvdr e public/demo/galeria.nvda
+node server.js     # abra http://localhost:3000/galeria.html
+```
+
+---
+
+## Vídeo
+
+Arrasta um MP4, WebM, MOV, MKV ou AVI. O servidor usa o **ffmpeg da sua
+máquina** para extrair os quadros, codifica com `nvdrv_encode`, e o player
+toca no navegador. Um `.nvdrv` já codificado também pode ser arrastado —
+esse toca direto, sem passar pelo servidor.
+
+- Precisa de `ffmpeg` no PATH. Se estiver em outro lugar:
+  `NVDR_FFMPEG=/caminho/ffmpeg node server.js`. Sem ele, a página avisa.
+- O fps é lido do próprio arquivo (com `ffprobe` se houver, senão pela
+  descrição que o `ffmpeg` dá da entrada), e os quadros são extraídos
+  **sem reamostrar** — reamostrar duplica quadros, e quadro duplicado é
+  predição perfeita, o que faria o codec parecer melhor do que é.
+- **Duração** (3 a 20 s) e **largura máxima** limitam o trabalho: codificar
+  é a direção lenta, e os quadros ficam em PNG no disco enquanto isso.
+  Com os padrões (5 s, 1280 px), um clipe de 960×540 levou 14 s ida e volta.
+
+O player mostra, por quadro, quanto custou **decodificar** e **exibir**
+contra o orçamento do fps do vídeo, e quantas vezes travou. A faixa embaixo
+é o arquivo inteiro: cada barra é um quadro, larga pelos bytes que custou,
+alta se for intra. Clicar ou arrastar corta o arquivo ali — um prefixo do
+arquivo é um prefixo do filme, e o quadro onde o corte cai ainda aparece.
+
+### Imagem
+
+Arrasta uma imagem e pronto:
+
+- as duas camadas lado a lado (só cor, e cor + textura), com bytes acumulados
+- um slider que corta o arquivo para simular download interrompido
+- o relatório do encoder embaixo
+
+É o caminho mais curto para *olhar* o resultado. O CLI abaixo é para
+*medir*.
+
+---
+
+## CLI
+
+### Codificar
+
+```bash
+./nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr
+```
+
+```
+samples/montanha_pessoas.jpg  768x512  q 24/24  blocks 4..32
+  layer       stored  cumulative     PSNR
+  COR            4726        4758    20.84 dB
+  TEX-BAIXA     13318       18076    25.57 dB
+  TEX-ALTA      33934       52012    33.41 dB
+```
+
+Desde o formato v10, a imagem é uma **quadtree de blocos quadrados** de 4 a
+32 px, e cada bloco carrega duas coisas: uma **cor** (prevista pelos
+vizinhos, mais uma pequena correção) e, se compensar, a **textura** do
+bloco, como coeficientes de DCT do tamanho do bloco. Um bloco só com cor é
+exatamente um retângulo chapado do formato antigo.
+
+Como ler:
+
+- **COR** — a primeira camada: a árvore e a cor de cada bloco. Sozinha já
+  é uma imagem inteira de blocos chapados.
+- **TEX-BAIXA** — a segunda camada: as frequências baixas da textura de
+  **todos** os blocos. Com ela a imagem inteira já tem a textura grossa.
+- **TEX-ALTA** — a terceira: o detalhe fino.
+- **stored** — o tamanho real da camada no arquivo, que é também o que
+  trafegaria na rede.
+- **cumulative** — soma até aqui, mais o header: quantos bytes um decoder
+  precisa ter recebido para exibir essa camada inteira.
+- **PSNR** — medido **decodificando o arquivo de volta**, não a partir do
+  estado interno do encoder.
+- **leaves** — quantos blocos de cada tamanho a árvore escolheu, e quantos
+  levam textura. Blocos grandes onde a imagem é lisa, pequenos onde tem
+  detalhe.
+
+### Decodificar
+
+```bash
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png
+```
+
+Termine o nome em `.png` e sai PNG; qualquer outra extensão sai PPM.
+
+Só a camada de cor, ou cor + textura baixa:
+
+```bash
+./nvdr_decode /tmp/m.nvdr /tmp/cor.png   --layer 0
+./nvdr_decode /tmp/m.nvdr /tmp/baixa.png --layer 1
+```
+
+Para medir a qualidade junto:
+
+```bash
+./nvdr_decode /tmp/m.nvdr /tmp/saida.png --compare samples/montanha_pessoas.jpg
+```
+
+### Testar a garantia de truncagem
+
+Cortar o arquivo em qualquer ponto depois do começo da camada de cor ainda
+produz imagem. Cada camada é enviada em blocos de 32×32, de cima para
+baixo, e a textura vem em duas: primeiro a **grossa da imagem inteira**,
+depois o detalhe. Um bloco de cor que não chegou fica **cinza**, e um
+bloco de textura que não chegou mostra o que a camada anterior deu a ele.
+
+```bash
+SZ=$(stat -c%s /tmp/m.nvdr)
+for pct in 3 10 30 50 75 100; do
+  head -c $((SZ*pct/100)) /tmp/m.nvdr > /tmp/t.nvdr
+  printf "%3d%% -> " $pct
+  ./nvdr_decode /tmp/t.nvdr /tmp/t.png --compare samples/montanha_pessoas.jpg
+done
+```
+
+No montanha_pessoas: 30% do arquivo dá 24,6 dB, 50% dá 26,5 dB, 75% dá
+28,8 dB e 100% dá 33,4 dB. A qualidade nunca cai com mais bytes.
+
+O único corte que não produz imagem é antes dos primeiros bytes da camada
+de cor. Nesse caso o decoder diz isso e sai com erro, que é o contrato,
+não uma falha.
+
+---
+
+## Parâmetros que valem mexer
+
+```bash
+./nvdr_encode entrada.jpg saida.nvdr --q 24
+```
+
+- **`--q N`** — o passo de quantização, **o** botão de qualidade. Menor é
+  melhor e maior. O default 24 foi escolhido para as amostras saírem do
+  tamanho que o formato antigo dava, ou menores, com cerca de +9 dB. No
+  montanha_pessoas: `--q 12` dá 88 KB a 39,1 dB, `--q 24` dá 53 KB a
+  33,3 dB, `--q 48` dá 23 KB a 28,6 dB.
+- **`--chroma-q F`** — o passo do croma relativo ao da luma (default 1,0,
+  que mediu melhor que 1,5 e 2,5).
+- **`--deadzone F`** — de 0 a 0,5: quanto um coeficiente pequeno tende a
+  virar zero. Default 0,1, o melhor medido.
+- **`--lambda F`** — o peso dos bits contra o erro na decisão de dividir um
+  bloco. Quase não muda nada entre 0,06 e 0,3; default 0,12.
+- **`--max-block N` / `--min-block N`** — o maior e o menor bloco (4 a 32).
+  32 ganhou de 16 por até 0,5 dB.
+- **`--band N`** — onde a textura se divide entre as camadas baixa e alta
+  (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
+  em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
+- **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
+
+---
+
+## Álbum: várias imagens num arquivo só
+
+```bash
+./nvdr_album pack /tmp/album.nvda samples/*.jpg
+./nvdr_album unpack /tmp/album.nvda /tmp/saida --compare samples
+```
+
+As imagens vão em ordem num `.nvda`. Cada uma é codificada de um de dois
+jeitos, e o encoder escolhe:
+
 - **prevista da anterior**, quando é do mesmo tamanho e parecida (rajada,
   mesmo cenário, capturas de tela). Usa o mesmo mecanismo dos quadros de
   vídeo: movimento em quarto de pixel, skip e só o que mudou.

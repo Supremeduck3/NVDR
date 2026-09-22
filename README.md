@@ -231,47 +231,87 @@ warm:
 
 The gain is small because the models adapt within a few dozen symbols,
 so learning from even odds costs an image of thousands of symbols little.
-Sequences do not use it. In albums it is on, because it costs nothing.
-The large win between images is in their content, not in their
-statistics: a photo that repeats most of the one before it could be
-predicted from it the way a video frame is.
+Sequences do not use it. The large win between images is in their
+content, not in their statistics: a photo that repeats most of an
+earlier one could be predicted from it the way a video frame is.
 
-`.nvda` is the album: many images in one file, in order (`src/nvda.h`).
+`.nvda` is the album: many images in one file (`src/nvda.h`, format 3).
 Each image is coded one of two ways:
 
-- **on its own**, as a v11 container, carrying the context the last
-  coded image left;
-- **predicted from the image before it**, when that one is the same size.
-  This uses the machinery of a sequence's predicted frames, exposed as
-  `nvdrv_predict_encode` / `nvdrv_predict_decode`: block motion in
-  quarter pixels with the 6-tap filter, the residual as a container with
-  colours predicted as 128 and blocks that need nothing left alone.
+- **on its own**, as a v11 container;
+- **predicted from an earlier image** of the same size, up to `window`
+  places back (8 by default, at most 32). This uses the machinery of a
+  sequence's predicted frames, exposed as `nvdrv_predict_encode` /
+  `nvdrv_predict_decode`: block motion in quarter pixels with the 6-tap
+  filter, the residual as a container with colours predicted as 128 and
+  blocks that need nothing left alone.
 
-This is the reuse that pays. The encoder tries both ways at equal
-quality. It codes the prediction with a finer step, up to 2.4 times
-finer, until its squared error is within 0.1 dB of the image coded
-alone, and keeps the prediction only if it is still smaller. At the same
+The encoder ranks the earlier photos in the window by how much their
+eighth-size grey thumbnails differ (with a shift of up to 2 thumbnail
+pixels, for a pan), and codes a prediction from the best two. It
+compares at equal quality: the prediction is coded with a finer step,
+up to 2.4 times finer, until its squared error is within 0.1 dB of the
+image coded alone, and is kept only if it is still smaller. At the same
 step the prediction always won on bytes and lost about 1 dB, which is
 not a comparison. On photos of the clean clip:
 
-    album                                  alone      album
-    six photos 0.4 s apart (pan + zoom)   168367 B   103338 B   -38.6%
-    six photos 0.12 s apart (a burst)     169584 B    71702 B   -57.7%
-    the six unrelated samples             170229 B   169084 B    -0.7%
+    album                                     alone      album
+    six photos 0.4 s apart (pan + zoom)      168367 B   103338 B   -38.6%
+    six photos 0.12 s apart (a burst)        169584 B    71702 B   -57.7%
+    two scenes interleaved, window 8                              -65.7%
+    the same, window 1 (only the one before)                       0%
+    the six unrelated samples                                       0%
 
-Every photo of both bursts matched or beat its standalone PSNR. Unrelated
-photos are never predicted, so an album is never worse than its images
-coded alone.
+Referring to any earlier photo is what makes the interleaved album work:
+a shoot that goes back and forth between two subjects never has the
+similar photo right before. Unrelated photos are never predicted, so an
+album is never bigger than its images coded alone.
+
+#### One photo at a time, on a web page
+
+An album on a site is not read front to back. A page shows one photo,
+or a grid, and each photo has to come out as cheaply as a JPEG would.
+So the file starts with an index, 16 bytes per image: where its payload
+is, how long it is, its size, and which earlier image it was predicted
+from. A reader that wants photo 10 reads the header and the index,
+follows the references (10 from 8, 8 from 6, ...) down to a photo coded
+alone, and fetches those payloads and nothing else, with HTTP range
+requests. `nvda_decode` does the same in C with the bytes it has, holding
+at most `window` decoded images.
+
+The fluid context works against that: it makes every photo depend on
+all the ones before it. It is worth 0.7% and is off unless `pack` is
+given `--fluid`; a fluid album still decodes, only in order.
+
+`public/nvdr-img.js` is the piece a site uses, an element in place of
+`<img>`:
+
+    <script type="module" src="nvdr-img.js"></script>
+    <nvdr-img src="foto.nvdr" alt="..."></nvdr-img>
+    <nvdr-img src="galeria.nvda#3" alt="..."></nvdr-img>
+
+A single `.nvdr` is painted while it downloads, since every prefix of
+the file is a picture: flat colour, then coarse texture over the whole
+image, then detail. An album photo is fetched by ranges as above.
+Elements showing photos of the same album share what they fetched, so a
+grid of the whole demo album downloads 67.1 KB, the album's size, where
+eight independent fetches of each chain came to 198 KB. A server that
+ignores ranges sends the whole file, which still works. `server.js`
+answers ranges; any static host (nginx, a CDN, S3) does too.
+`public/galeria.html` is a page built that way, and `make demo` makes
+its files.
 
 `nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
-image, whether it was predicted, its bytes, and what it would cost alone.
-On the page, dropping several images at once sends them to `/album` and
+image, whether it was predicted and from which, its bytes, and what it
+would cost alone; `unpack --only N` decodes one photo by its chain. On
+the page, dropping several images at once sends them to `/album` and
 shows the result; a `.nvda` file opens directly. The JS side
 (`public/nvda.js`) mirrors both kinds, and `scripts/crosscheck_album.mjs`
-holds it to the C pixels on every image, whole and cut. The regression
-gate packs the photographs, where the context must not make them bigger,
-and the 12-frame sequence as a burst, where every image after the first
-must be predicted. The fuzzer mutates an album that holds both kinds.
+holds it to the C pixels on every image, whole, cut, and one photo read
+alone. The regression gate packs the photographs, where an album must
+not be bigger, and the 12-frame sequence as a burst, where every image
+after the first must be predicted. The fuzzer mutates an album's header
+and index as well as its payloads, and reads its last photo alone.
 
 ### Frequency bands (format v11)
 
@@ -1281,6 +1321,7 @@ improvement, and costs 8.90 dB by frame 12.
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
     ./nvdr_album unpack album.nvda out/ --compare .
+    ./nvdr_album unpack album.nvda out/ --only 3
 
 A predicted frame's levels look broken and are not. Its anchor comes out
 as one rectangle costing 9 bytes and its R1 as one more, with all 31585

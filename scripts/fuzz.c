@@ -87,17 +87,24 @@ static int decode_sequence(const char* path) {
 }
 
 /* An album decoded end to end, the fluid context carried through it. */
+/* An album decoded in order, then its last image alone from a fresh
+ * reader, which walks its chain of references. */
 static int decode_album(const uint8_t* d, size_t n) {
     NvdaReader r;
     if (nvda_open(&r, d, n) != 0) return 0;
-    int k = 0, rc, partial;
-    char name[256];
+    int k = 0, partial;
     NvdrImage img;
-    while (k < 16 && (rc = nvda_next(&r, name, sizeof name, &img, NULL, &partial)) == 1) {
+    for (int i = 0; i < (int)r.count && i < 16; i++) {
+        if (nvda_decode(&r, i, &img, &partial) != 1) break;
         nvdr_image_free(&img);
         k++;
     }
     nvda_close(&r);
+    if (nvda_open(&r, d, n) == 0) {
+        if (r.count && nvda_decode(&r, (int)(r.count < 16 ? r.count : 16) - 1, &img, &partial) == 1)
+            nvdr_image_free(&img);
+        nvda_close(&r);
+    }
     return k;
 }
 
@@ -159,7 +166,8 @@ int main(int argc, char** argv) {
         names[nalbum] = album_paths[nalbum - 1];
         NvdrConfig c = cfg;
         c.q = 60;   /* small seeds mutate into more distinct inputs */
-        if (ok && nvda_write("fuzz_album_seed.nvda", nalbum + 1, names, imgs, &c, 1, 1, NULL, NULL, NULL) == 0)
+        NvdaOptions o = nvda_default_options();
+        if (ok && nvda_write("fuzz_album_seed.nvda", nalbum + 1, names, imgs, &c, &o, NULL) == 0)
             album = read_all("fuzz_album_seed.nvda", &album_len);
         remove("fuzz_album_seed.nvda");
         for (int k = 0; k < nalbum; k++) nvdr_image_free(&imgs[k]);
@@ -178,7 +186,7 @@ int main(int argc, char** argv) {
             uint8_t* buf = (uint8_t*)malloc(album_len);
             memcpy(buf, album, album_len);
             size_t len = album_len;
-            mutate(buf, &len, NVDA_HEADER_SIZE + 64);
+            mutate(buf, &len, NVDA_HEADER_SIZE + 4 * NVDA_ENTRY_SIZE);
             FILE* f = fopen("fuzz_last_input.bin", "wb");
             if (f) { fwrite(buf, 1, len, f); fclose(f); }
             album_runs++;

@@ -12,6 +12,7 @@ nvdr_album
 
 # Temporary outputs from the server
 output/
+public/demo/
 temp_*
 
 # Editors and caches

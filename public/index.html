@@ -128,7 +128,7 @@
     <div class="panel">
       <h3 style="margin:0 0 4px;font-size:.95rem">Álbum</h3>
       <p class="note" style="margin:0 0 14px">
-        As imagens vão num arquivo só, em ordem. Uma foto parecida com a anterior (rajada,
+        As imagens vão num arquivo só. Uma foto parecida com alguma das 8 anteriores (rajada,
         mesmo cenário) é prevista dela e custa só o que mudou; as outras são codificadas
         sozinhas, com o que o codec aprendeu nas anteriores (o codebook fluido). "Sozinha" é
         quanto cada uma custaria codificada à parte, com a mesma qualidade.
@@ -325,27 +325,31 @@ function showAlbum(buffer, report, original) {
     // "sozinha" per image, from the encoder's report when there is one.
     const alone = {};
     for (const line of report.split('\n')) {
-        const m = line.match(/^\s+(.+?)\s+(?:sozinha|prevista)\s+(\d+)\s+(\d+)\s+[-+][\d.]+%/);
-        if (m && m[1] !== 'total') alone[m[1].trim()] = +m[3];
+        const m = line.match(/^\s+(.+?)\s+(?:sozinha|prevista #\d+)\s+(\d+)\s+(\d+)\s+[-+][\d.]+%/);
+        if (m) alone[m[1].trim()] = +m[3];
     }
     albumGrid.innerHTML = '';
     const t0 = performance.now();
-    let total = 0, totalAlone = 0, n = 0, entry;
+    let total = 0, totalAlone = 0, n = 0;
     try {
-        while ((entry = reader.next())) {
-            const { width, height, rgb } = entry;
+        for (let i = 0; i < reader.count; i++) {
+            const img = reader.decode(i);
+            if (!img) break;
+            const x = reader.index[i], name = reader.name(i);
+            const bytes = Math.min(x.length, buffer.byteLength - x.offset);
             const wrap = document.createElement('div');
             wrap.className = 'level';
-            const solo = alone[entry.name];
-            wrap.innerHTML = `<h3>${entry.index + 1}. ${entry.name.replace(/[<>&]/g, '')}</h3>
-                <div class="meta">${entry.kind === 1 ? 'prevista da anterior · ' : ''}${formatBytes(entry.bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
-                `(${(100 * (entry.bytes - solo) / solo).toFixed(1)}%)` : ''}${entry.partial ? ' · parcial' : ''}</div>`;
+            const solo = alone[name];
+            wrap.innerHTML = `<h3>${i + 1}. ${name.replace(/[<>&]/g, '')}</h3>
+                <div class="meta">${x.kind === 1 ? `prevista da ${i - x.ref + 1} · ` : ''}${formatBytes(bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
+                `(${(100 * (bytes - solo) / solo).toFixed(1)}%)` : ''}${img.partial ? ' · parcial' : ''}</div>`;
             const canvas = document.createElement('canvas');
-            canvas.width = width; canvas.height = height;
+            canvas.width = img.width; canvas.height = img.height;
             wrap.appendChild(canvas);
             albumGrid.appendChild(wrap);
-            showRGB(rgb, width, height, canvas.getContext('2d'));
-            total += entry.bytes; if (solo) totalAlone += solo; n++;
+            showRGB(img.rgb, img.width, img.height, canvas.getContext('2d'));
+            total += bytes; if (solo) totalAlone += solo; n++;
+            if (img.partial) break;
         }
     } catch (e) { setStatus(`Álbum danificado depois de ${n} imagens.`, true); }
     const ms = performance.now() - t0;
