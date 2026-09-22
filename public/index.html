@@ -117,11 +117,26 @@
   <div class="panel">
     <div id="drop">
       <p><strong>Solte uma imagem aqui</strong> ou clique para escolher</p>
-      <p style="font-size:.85rem;margin-top:6px">JPG, PNG, BMP, WEBP, GIF ou TGA</p>
+      <p style="font-size:.85rem;margin-top:6px">JPG, PNG, BMP, WEBP, GIF ou TGA. Várias de uma vez viram
+        um álbum <code>.nvda</code>; um <code>.nvda</code> pronto abre direto.</p>
     </div>
-    <input type="file" id="file" accept="image/*" class="hidden">
+    <input type="file" id="file" accept="image/*,.nvda" multiple class="hidden">
     <div id="status"></div>
   </div>
+
+  <section id="album" class="hidden">
+    <div class="panel">
+      <h3 style="margin:0 0 4px;font-size:.95rem">Álbum</h3>
+      <p class="note" style="margin:0 0 14px">
+        As imagens vão num arquivo só, em ordem. Uma foto parecida com a anterior (rajada,
+        mesmo cenário) é prevista dela e custa só o que mudou; as outras são codificadas
+        sozinhas, com o que o codec aprendeu nas anteriores (o codebook fluido). "Sozinha" é
+        quanto cada uma custaria codificada à parte, com a mesma qualidade.
+      </p>
+      <div id="albumSummary" class="note" style="margin:0 0 14px"></div>
+      <div class="levels" id="albumGrid"></div>
+    </div>
+  </section>
 
   <section id="results" class="hidden">
     <div class="panel">
@@ -222,6 +237,7 @@
 <script type="module">
 import { decode, showRGB, layerThresholds, LAYER_NAMES }
     from './nvdr.js';
+import { AlbumReader } from './nvda.js';
 
 const drop = document.getElementById('drop');
 const fileInput = document.getElementById('file');
@@ -251,11 +267,96 @@ drop.addEventListener('dragleave', () => drop.classList.remove('hot'));
 drop.addEventListener('drop', (e) => {
     e.preventDefault();
     drop.classList.remove('hot');
-    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    handleFiles([...e.dataTransfer.files]);
 });
-fileInput.addEventListener('change', () => {
-    if (fileInput.files[0]) handleFile(fileInput.files[0]);
-});
+fileInput.addEventListener('change', () => handleFiles([...fileInput.files]));
+
+function handleFiles(files) {
+    if (!files.length) return;
+    if (files.length === 1 && files[0].name.toLowerCase().endsWith('.nvda')) { openAlbumFile(files[0]); return; }
+    if (files.length > 1) { makeAlbum(files); return; }
+    albumEl.classList.add('hidden');
+    handleFile(files[0]);
+}
+
+const albumEl = document.getElementById('album');
+const albumGrid = document.getElementById('albumGrid');
+const albumSummary = document.getElementById('albumSummary');
+
+/* The body /album expects: u32 count, then per file u16 name length, the
+ * UTF-8 name, u32 size and the bytes. */
+async function makeAlbum(files) {
+    files = files.filter(f => /\.(jpe?g|png|bmp|webp|gif|tga)$/i.test(f.name));
+    if (files.length < 2) { setStatus('Um álbum precisa de pelo menos duas imagens.', true); return; }
+    results.classList.add('hidden');
+    albumEl.classList.add('hidden');
+    setStatus(`Codificando ${files.length} imagens num álbum…`);
+    const enc = new TextEncoder();
+    const parts = [new Uint32Array([files.length]).buffer];
+    let original = 0;
+    for (const f of files) {
+        const name = enc.encode(f.name).slice(0, 1024);
+        const head = new DataView(new ArrayBuffer(2 + name.length + 4));
+        head.setUint16(0, name.length, true);
+        new Uint8Array(head.buffer).set(name, 2);
+        head.setUint32(2 + name.length, f.size, true);
+        parts.push(head.buffer, await f.arrayBuffer());
+        original += f.size;
+    }
+    let response;
+    try {
+        response = await fetch('/album', { method: 'POST', body: new Blob(parts) });
+    } catch (err) { setStatus(`Falha de rede: ${err.message}`, true); return; }
+    if (!response.ok) { setStatus(`Encoder falhou: ${await response.text()}`, true); return; }
+    const buffer = await response.arrayBuffer();
+    const report = response.headers.get('X-Encoder-Report');
+    showAlbum(buffer, report ? new TextDecoder().decode(Uint8Array.from(atob(report), c => c.charCodeAt(0))) : '', original);
+}
+
+async function openAlbumFile(file) {
+    results.classList.add('hidden');
+    showAlbum(await file.arrayBuffer(), '', 0);
+}
+
+function showAlbum(buffer, report, original) {
+    let reader;
+    try { reader = new AlbumReader(buffer); }
+    catch (e) { setStatus('Não é um álbum NVDA.', true); return; }
+    // "sozinha" per image, from the encoder's report when there is one.
+    const alone = {};
+    for (const line of report.split('\n')) {
+        const m = line.match(/^\s+(.+?)\s+(?:sozinha|prevista)\s+(\d+)\s+(\d+)\s+[-+][\d.]+%/);
+        if (m && m[1] !== 'total') alone[m[1].trim()] = +m[3];
+    }
+    albumGrid.innerHTML = '';
+    const t0 = performance.now();
+    let total = 0, totalAlone = 0, n = 0, entry;
+    try {
+        while ((entry = reader.next())) {
+            const { width, height, rgb } = entry;
+            const wrap = document.createElement('div');
+            wrap.className = 'level';
+            const solo = alone[entry.name];
+            wrap.innerHTML = `<h3>${entry.index + 1}. ${entry.name.replace(/[<>&]/g, '')}</h3>
+                <div class="meta">${entry.kind === 1 ? 'prevista da anterior · ' : ''}${formatBytes(entry.bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
+                `(${(100 * (entry.bytes - solo) / solo).toFixed(1)}%)` : ''}${entry.partial ? ' · parcial' : ''}</div>`;
+            const canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            wrap.appendChild(canvas);
+            albumGrid.appendChild(wrap);
+            showRGB(rgb, width, height, canvas.getContext('2d'));
+            total += entry.bytes; if (solo) totalAlone += solo; n++;
+        }
+    } catch (e) { setStatus(`Álbum danificado depois de ${n} imagens.`, true); }
+    const ms = performance.now() - t0;
+    albumSummary.textContent = `${n} de ${reader.count} imagens, ${formatBytes(buffer.byteLength)} no total` +
+        (original ? `, ${(100 * buffer.byteLength / original).toFixed(0)}% dos originais` : '') +
+        (totalAlone ? `. Codificadas sozinhas seriam ${formatBytes(totalAlone)}: o álbum ` +
+            `economizou ${(100 * (totalAlone - total) / totalAlone).toFixed(2)}%` : '') +
+        `. Decodificado em ${ms.toFixed(0)} ms.`;
+    albumEl.classList.remove('hidden');
+    setStatus(`Álbum com ${n} imagens.`);
+}
 
 async function handleFile(file) {
     const dot = file.name.lastIndexOf('.');

@@ -182,6 +182,39 @@ def check_sequence(tmp, psnr_slack):
     return results, problems
 
 
+def check_album(tmp, images):
+    """Two albums. The photographs, which share nothing but statistics: the
+    fluid context must never make them bigger. And the gate's frame
+    sequence packed as stills, a burst: its images must come out predicted
+    from each other, and at equal quality smaller than coded alone. C and
+    JS must agree on every image of both, whole and cut."""
+    tool = find_binary("nvdr_album")
+    burst_dir = tmp / "burst"
+    burst_dir.mkdir(exist_ok=True)
+    burst = make_sequence(burst_dir)
+    photos = [str(p) for p in images if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+    results, problems = {}, []
+    for name, files in (("fotos", photos), ("rajada", [str(p) for p in burst])):
+        out = tmp / f"album_{name}.nvda"
+        r = subprocess.run([str(tool), "pack", str(out)] + files, capture_output=True, text=True)
+        if r.returncode != 0 or not out.exists():
+            return None, [r.stderr.strip() or f"{name} album pack failed"]
+        m = re.search(r"total\s+(\d+)\s+(\d+)", r.stdout)
+        warm, cold = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        predicted = len(re.findall(r"\sprevista\s", r.stdout))
+        if warm > cold:
+            problems.append(f"{name}: album bigger than its images alone ({warm} > {cold})")
+        if name == "rajada" and predicted < len(files) - 1:
+            problems.append(f"rajada: only {predicted} of {len(files) - 1} images predicted")
+        cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_album.mjs"), str(out)],
+                            capture_output=True, text=True)
+        if cc.returncode != 0:
+            bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
+            problems.append(f"{name} C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
+        results[name] = {"bytes": out.stat().st_size, "warm": warm, "cold": cold}
+    return results, problems
+
+
 def encode(encoder, image, out):
     r = subprocess.run([str(encoder), str(image), str(out)],
                        capture_output=True, text=True)
@@ -323,6 +356,25 @@ def main():
             print(f"{name:<26} {size:>9} {psnr:>7.2f}dB {delta:>16} "
                   f"{'stable' if stable else 'VARIES':>7}  "
                   f"{'ok' if not notes else '; '.join(notes)[:34]}")
+
+        albums, album_problems = check_album(tmp, images)
+        failures += [f"album: {p}" for p in album_problems]
+        for name, album in (albums or {}).items():
+            key = f"<album {name}>"
+            recorded[key] = {"bytes": album["bytes"], "psnr": 0.0}
+            delta = ""
+            if key in baseline:
+                was = baseline[key]
+                d_size = (album["bytes"] - was["bytes"]) / was["bytes"]
+                delta = f"{d_size:+.1%}"
+                if d_size > args.size_slack:
+                    failures.append(f"{key}: {was['bytes']} -> {album['bytes']} bytes ({d_size:+.1%})")
+            elif baseline:
+                delta = "new"
+            gain = (album["warm"] - album["cold"]) / album["cold"] if album["cold"] else 0
+            print(f"{key:<26} {album['bytes']:>9} {'':>8} {delta:>16} {'stable':>7}  "
+                  f"{'ok' if not album_problems else '; '.join(album_problems)[:34]} "
+                  f"(contra sozinhas {gain:+.1%})")
 
         seqs, seq_problems = check_sequence(tmp, args.psnr_slack)
         failures += [f"sequence: {p}" for p in seq_problems]

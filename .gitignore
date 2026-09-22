@@ -3,6 +3,7 @@ nvdr_encode
 nvdrv_encode
 nvdrv_decode
 nvdr_decode
+nvdr_album
 *.exe
 *.o
 *.out

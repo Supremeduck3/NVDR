@@ -208,6 +208,71 @@ drift is how a reference that walks away from the source shows up. The
 default run holds the encoder as it ships to the baseline, 25% smaller
 than the loop run.
 
+### Albums and the fluid context
+
+The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
+across files. It was never measured cold against warm, and v10 has no
+palette for it to feed. What an image codec actually learns from one
+image and could reuse in the next is its adaptive models: how often a
+leaf of each size carries texture, how its coefficients fall. Every
+container starts those at even odds.
+
+`NvdrContext` carries them. `nvdr_encode_mem_ctx` and
+`nvdr_decode_mem_ctx` start from the models the last container left and
+leave theirs behind. A context is only valid after a container decoded
+whole, and an empty one behaves exactly like none. Measured cold against
+warm:
+
+    six samples in a row               -0.67%   (-1.5% on the best image)
+    same at q 48                       -0.82%
+    eight frames of the clean clip     -0.52%
+    predicted frames of a sequence     ~0: +4% bytes and +0.2 dB, which
+                                       sit on the same rate-quality curve
+
+The gain is small because the models adapt within a few dozen symbols,
+so learning from even odds costs an image of thousands of symbols little.
+Sequences do not use it. In albums it is on, because it costs nothing.
+The large win between images is in their content, not in their
+statistics: a photo that repeats most of the one before it could be
+predicted from it the way a video frame is.
+
+`.nvda` is the album: many images in one file, in order (`src/nvda.h`).
+Each image is coded one of two ways:
+
+- **on its own**, as a v11 container, carrying the context the last
+  coded image left;
+- **predicted from the image before it**, when that one is the same size.
+  This uses the machinery of a sequence's predicted frames, exposed as
+  `nvdrv_predict_encode` / `nvdrv_predict_decode`: block motion in
+  quarter pixels with the 6-tap filter, the residual as a container with
+  colours predicted as 128 and blocks that need nothing left alone.
+
+This is the reuse that pays. The encoder tries both ways at equal
+quality. It codes the prediction with a finer step, up to 2.4 times
+finer, until its squared error is within 0.1 dB of the image coded
+alone, and keeps the prediction only if it is still smaller. At the same
+step the prediction always won on bytes and lost about 1 dB, which is
+not a comparison. On photos of the clean clip:
+
+    album                                  alone      album
+    six photos 0.4 s apart (pan + zoom)   168367 B   103338 B   -38.6%
+    six photos 0.12 s apart (a burst)     169584 B    71702 B   -57.7%
+    the six unrelated samples             170229 B   169084 B    -0.7%
+
+Every photo of both bursts matched or beat its standalone PSNR. Unrelated
+photos are never predicted, so an album is never worse than its images
+coded alone.
+
+`nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
+image, whether it was predicted, its bytes, and what it would cost alone.
+On the page, dropping several images at once sends them to `/album` and
+shows the result; a `.nvda` file opens directly. The JS side
+(`public/nvda.js`) mirrors both kinds, and `scripts/crosscheck_album.mjs`
+holds it to the C pixels on every image, whole and cut. The regression
+gate packs the photographs, where the context must not make them bigger,
+and the 12-frame sequence as a burst, where every image after the first
+must be predicted. The fuzzer mutates an album that holds both kinds.
+
 ### Frequency bands (format v11)
 
 Texture used to travel as one layer, tile by tile from the top. Half of
@@ -1214,6 +1279,8 @@ improvement, and costs 8.90 dB by frame 12.
 
     ./nvdrv_encode frames/ out.nvdrv
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+    ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
+    ./nvdr_album unpack album.nvda out/ --compare .
 
 A predicted frame's levels look broken and are not. Its anchor comes out
 as one rectangle costing 9 bytes and its R1 as one more, with all 31585
@@ -1307,7 +1374,7 @@ Not here yet: B-frames.
 ## Layout
 
     src/        the codec: nvdr.c (v10) and entropy.c, plus nvdrv.c for sequences
-    tools/      four CLIs: nvdr_encode/decode and nvdrv_encode/decode
+    tools/      five CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
     samples/    the images every number in this file was measured on
@@ -1324,6 +1391,8 @@ Not here yet: B-frames.
     ./nvdr_decode out.nvdr out.png --layer 1 --compare image.jpg
     ./nvdrv_encode frames/ out.nvdrv
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+    ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
+    ./nvdr_album unpack album.nvda out/ --compare .
     make check          # the regression gate
     make fuzz           # the decoders under ASan and UBSan
 

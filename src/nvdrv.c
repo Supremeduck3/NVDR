@@ -963,3 +963,112 @@ void nvdrv_decode_close(NvdrvDecoder* d) {
     free(d->scratch.pixels);
     free(d);
 }
+
+/* ------------------------------------------------- one image from another */
+
+/*
+ * A predicted image outside any sequence: an album's photo coded against
+ * the one before it. The same tools as a predicted frame — block motion in
+ * quarter pixels, the residual as a v11 container with its colours
+ * predicted as 128 and blocks that need nothing left alone — packed as
+ *
+ *   [block u8][global dx i16][global dy i16][field length u32][field][container]
+ */
+static int auto_block(int w, int h, int block) {
+    if (block > 0 && block <= 128) return block;
+    return (long)w * h >= 200000 ? 16 : 8;
+}
+
+int nvdrv_predict_encode(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg_in,
+                         uint8_t** out, size_t* out_len, NvdrImage* recon) {
+    *out = NULL; *out_len = 0; recon->pixels = NULL;
+    if (ref->width != cur->width || ref->height != cur->height) return -1;
+    NvdrvConfig cfg = cfg_in ? *cfg_in : nvdrv_default_config();
+    int w = cur->width, h = cur->height, block = auto_block(w, h, cfg.block);
+    size_t npx = (size_t)w * h * 3;
+    int nbx = (w + block - 1) / block, nby = (h + block - 1) / block;
+    int rc = -1;
+    int8_t* vx = (int8_t*)malloc((size_t)nbx * nby);
+    int8_t* vy = (int8_t*)malloc((size_t)nbx * nby);
+    NvdrImage pred = { NULL, w, h }, err = { NULL, w, h };
+    uint8_t *field = NULL, *blob = NULL;
+    size_t field_len = 0, len = 0;
+    Subpel sp;
+    memset(&sp, 0, sizeof(sp));
+    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&err, w, h)) goto done;
+
+    int dx = 0, dy = 0;
+    find_shift(cur, ref, cfg.search, &dx, &dy);
+    block_search(cur, ref, block, dx, dy, vx, vy);
+    if (subpel_build(&sp, ref) != 0) goto done;
+    block_refine(cur, &sp, block, vx, vy);
+    if (cfg.mv_lambda > 0) field_rd(cur, &sp, block, dx * 4, dy * 4, cfg.mv_lambda, vx, vy);
+    block_predict(&sp, &pred, block, vx, vy);
+    for (size_t i = 0; i < npx; i++)
+        err.pixels[i] = (unsigned char)clamp255v((int)cur->pixels[i] - (int)pred.pixels[i] + 128);
+    field = pack_field(vx, vy, nbx, nby, dx * 4, dy * 4, &field_len);
+    if (!field) goto done;
+
+    NvdrConfig fcfg = cfg.frame;
+    fcfg.residual = 1;
+    fcfg.deblock = 0;
+    fcfg.band = 0;
+    if (cfg.pred_q > 0) fcfg.q = cfg.pred_q;
+    if (nvdr_encode_mem(&blob, &len, &err, &fcfg, NULL) != 0) goto done;
+
+    size_t total = 9 + field_len + len;
+    uint8_t* p = (uint8_t*)malloc(total);
+    if (!p) goto done;
+    p[0] = (uint8_t)block;
+    put_u16v(p + 1, (uint16_t)(int16_t)dx);
+    put_u16v(p + 3, (uint16_t)(int16_t)dy);
+    put_u32v(p + 5, (uint32_t)field_len);
+    memcpy(p + 9, field, field_len);
+    memcpy(p + 9 + field_len, blob, len);
+
+    /* What the decoder will show, from the bytes just written. */
+    if (nvdrv_predict_decode(ref, p, total, recon, NULL) != 0) { free(p); goto done; }
+    *out = p; *out_len = total;
+    rc = 0;
+
+done:
+    subpel_free(&sp);
+    free(vx); free(vy); free(pred.pixels); free(err.pixels); free(field); free(blob);
+    return rc;
+}
+
+int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
+                         NvdrImage* out, int* partial_out) {
+    out->pixels = NULL;
+    if (partial_out) *partial_out = 0;
+    if (len < 9) return -1;
+    int w = ref->width, h = ref->height;
+    int block = data[0];
+    if (block < 4 || block > 128) return -1;
+    int dx = (int16_t)get_u16v(data + 1), dy = (int16_t)get_u16v(data + 3);
+    size_t field_len = get_u32v(data + 5);
+    /* Without the whole field there is no reference to add a residual to. */
+    if (field_len > len - 9) return -1;
+    int nbx = (w + block - 1) / block, nby = (h + block - 1) / block;
+    size_t npx = (size_t)w * h * 3;
+    int rc = -1;
+    int8_t* vx = (int8_t*)malloc((size_t)nbx * nby);
+    int8_t* vy = (int8_t*)malloc((size_t)nbx * nby);
+    NvdrImage pred = { NULL, w, h }, err = { NULL, w, h };
+    Subpel sp;
+    memset(&sp, 0, sizeof(sp));
+    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&err, w, h)) goto done;
+    if (unpack_field(data + 9, field_len, nbx, nby, dx * 4, dy * 4, vx, vy) != 0) goto done;
+    if (subpel_build(&sp, ref) != 0) goto done;
+    block_predict(&sp, &pred, block, vx, vy);
+    if (reconstruct(data + 9 + field_len, len - 9 - field_len, &err) != 0) goto done;
+    for (size_t i = 0; i < npx; i++)
+        pred.pixels[i] = (unsigned char)clamp255v((int)err.pixels[i] - 128 + (int)pred.pixels[i]);
+    *out = pred;
+    pred.pixels = NULL;
+    rc = 0;
+done:
+    subpel_free(&sp);
+    free(vx); free(vy); free(pred.pixels); free(err.pixels);
+    return rc;
+}

@@ -136,4 +136,17 @@ int  nvdrv_decode_next(NvdrvDecoder* dec, NvdrImage* out,
                        int* kind_out, int* partial_out);
 void nvdrv_decode_close(NvdrvDecoder* dec);
 
+/* ------------------------------------------------- one image from another */
+
+/*
+ * One image predicted from another of the same size, outside a sequence:
+ * what an album uses for a photo that repeats the one before it. `recon`
+ * (allocated) is what the decoder will show. `cfg->pred_q` > 0 sets the
+ * residual's step, otherwise `cfg->frame.q`.
+ */
+int nvdrv_predict_encode(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg,
+                         uint8_t** out, size_t* out_len, NvdrImage* recon);
+int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
+                         NvdrImage* out, int* partial);
+
 #endif /* NVDRV_H */

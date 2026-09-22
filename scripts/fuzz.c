@@ -21,6 +21,7 @@
  */
 #include "nvdr.h"
 #include "nvdrv.h"
+#include "nvda.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +86,21 @@ static int decode_sequence(const char* path) {
     return frames;
 }
 
+/* An album decoded end to end, the fluid context carried through it. */
+static int decode_album(const uint8_t* d, size_t n) {
+    NvdaReader r;
+    if (nvda_open(&r, d, n) != 0) return 0;
+    int k = 0, rc, partial;
+    char name[256];
+    NvdrImage img;
+    while (k < 16 && (rc = nvda_next(&r, name, sizeof name, &img, NULL, &partial)) == 1) {
+        nvdr_image_free(&img);
+        k++;
+    }
+    nvda_close(&r);
+    return k;
+}
+
 static uint8_t* read_all(const char* path, size_t* n) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
@@ -102,6 +118,8 @@ int main(int argc, char** argv) {
     uint8_t* seeds[64];
     size_t seed_len[64];
     NvdrConfig cfg = nvdr_default_config();
+    const char* album_paths[3];
+    int nalbum = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--iters") && i + 1 < argc) { iters = atol(argv[++i]); continue; }
@@ -115,6 +133,7 @@ int main(int argc, char** argv) {
          * a path the fuzzer never attacks. */
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
+        if (nalbum < 3) album_paths[nalbum++] = argv[i];
         for (int variant = 0; variant < 4 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 1) c.q = 1;
@@ -126,6 +145,26 @@ int main(int argc, char** argv) {
         nvdr_image_free(&img);
     }
 
+    /* The first images as an album, the fluid context and prediction on,
+     * with the last of them repeated so the seed holds a predicted entry
+     * as well as coded ones. The repeat shares the pixels it copies. */
+    uint8_t* album = NULL;
+    size_t album_len = 0;
+    if (nalbum >= 2) {
+        NvdrImage imgs[4];
+        const char* names[4];
+        int ok = 1;
+        for (int k = 0; k < nalbum; k++) { ok &= nvdr_image_load(&imgs[k], album_paths[k]) == 0; names[k] = album_paths[k]; }
+        imgs[nalbum] = imgs[nalbum - 1];
+        names[nalbum] = album_paths[nalbum - 1];
+        NvdrConfig c = cfg;
+        c.q = 60;   /* small seeds mutate into more distinct inputs */
+        if (ok && nvda_write("fuzz_album_seed.nvda", nalbum + 1, names, imgs, &c, 1, 1, NULL, NULL, NULL) == 0)
+            album = read_all("fuzz_album_seed.nvda", &album_len);
+        remove("fuzz_album_seed.nvda");
+        for (int k = 0; k < nalbum; k++) nvdr_image_free(&imgs[k]);
+    }
+
     size_t seq_len = 0;
     uint8_t* seq_data = seq ? read_all(seq, &seq_len) : NULL;
     if (!nseeds && !seq_data) {
@@ -133,8 +172,20 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    long decoded = 0, rejected = 0, seq_runs = 0;
+    long decoded = 0, rejected = 0, seq_runs = 0, album_runs = 0;
     for (long it = 0; it < iters; it++) {
+        if (album && rnd() % 4 == 0) {
+            uint8_t* buf = (uint8_t*)malloc(album_len);
+            memcpy(buf, album, album_len);
+            size_t len = album_len;
+            mutate(buf, &len, NVDA_HEADER_SIZE + 64);
+            FILE* f = fopen("fuzz_last_input.bin", "wb");
+            if (f) { fwrite(buf, 1, len, f); fclose(f); }
+            album_runs++;
+            if (decode_album(buf, len) > 0) decoded++; else rejected++;
+            free(buf);
+            continue;
+        }
         int do_seq = seq_data && (!nseeds || (rnd() % 3 == 0));
         const uint8_t* src = do_seq ? seq_data : seeds[rnd() % nseeds];
         size_t n = do_seq ? seq_len : seed_len[src == seeds[0] ? 0 : 0];
@@ -157,13 +208,14 @@ int main(int argc, char** argv) {
         free(buf);
 
         if ((it + 1) % 1000 == 0)
-            fprintf(stderr, "  %ld iteracoes, %ld decodificados, %ld recusados, %ld sequencias\n",
-                    it + 1, decoded, rejected, seq_runs);
+            fprintf(stderr, "  %ld iteracoes, %ld decodificados, %ld recusados, %ld sequencias, %ld albuns\n",
+                    it + 1, decoded, rejected, seq_runs, album_runs);
     }
     remove("fuzz_last_input.bin");
     printf("%ld iteracoes sem falha de memoria (%ld decodificados, %ld recusados)\n",
            iters, decoded, rejected);
     for (int i = 0; i < nseeds; i++) free(seeds[i]);
     free(seq_data);
+    free(album);
     return 0;
 }
