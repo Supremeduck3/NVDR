@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 5;
+const VERSION = 6;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 12;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -122,50 +122,139 @@ function shiftInto(src, dst, width, height, dx, dy) {
 
 /*
  * The reference assembled block by block, each block from its own
- * quarter-pixel vector, bilinear between whole pixels, edges held.
- * Mirrors qsample() and block_predict() exactly: weights (4 - a) and a on
- * each axis, rounded with + 8 >> 4.
+ * quarter-pixel vector. Mirrors qsample() and block_predict() in nvdrv.c
+ * exactly: H.264's 6-tap half pixels (B across, H down, J the centre from
+ * the unrounded horizontal sums) and quarter pixels as the rounded mean of
+ * the two nearest samples, all over the reference with its edges held.
+ *
+ * The C side builds the half-pixel planes once per frame. Here each block
+ * computes only the samples its vector's phase needs, over its own
+ * region, which comes to the same numbers for a fraction of the work: a
+ * whole-pixel vector is a copy, and most phases need one plane of three.
  */
+// Which samples each phase ((fy & 3) << 2 | (fx & 3)) reads.
+const USE_F = [1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+const USE_B = [0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1];
+const USE_H = [0, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1];
+const USE_J = [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0];
+const MAXB = 128 + 1;
+const PF = new Uint8Array(MAXB * MAXB * 3), PB = new Uint8Array(MAXB * MAXB * 3);
+const PH = new Uint8Array(MAXB * MAXB * 3), PJ = new Uint8Array(MAXB * MAXB * 3);
+const B1 = new Int32Array((MAXB + 5) * MAXB * 3);
+const XS = new Int32Array(MAXB + 8), YS = new Int32Array(MAXB + 8);
+const SG = new Int32Array((MAXB + 6) * (MAXB + 6) * 3);
+
+const clip8 = v => (v < 0 ? 0 : v > 255 ? 255 : v);
+
 function blockPredict(src, dst, width, height, block, vx, vy) {
-    // Block by block: a whole-pixel vector is a copy, and a block whose
-    // source rectangle lies inside the frame needs no edge clamping. Every
-    // pixel still comes out exactly as qsample() makes it.
     const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
     const stride = width * 3;
     for (let by = 0; by < nby; by++) {
-        const y0 = by * block, y1 = Math.min(y0 + block, height);
+        const y0 = by * block, bh = Math.min(block, height - y0);
         for (let bx = 0; bx < nbx; bx++) {
-            const x0 = bx * block, x1 = Math.min(x0 + block, width);
+            const x0 = bx * block, bw = Math.min(block, width - x0);
             const b = by * nbx + bx, fx = vx[b], fy = vy[b];
-            const ox = fx >> 2, oy = fy >> 2, ax = fx & 3, ay = fy & 3;
-            const inside = x0 + ox >= 0 && x1 + ox < width && y0 + oy >= 0 && y1 + oy < height;
-            if (inside && !ax && !ay) {
-                for (let y = y0; y < y1; y++) {
-                    const s0 = (y + oy) * stride + (x0 + ox) * 3;
-                    dst.set(src.subarray(s0, s0 + (x1 - x0) * 3), y * stride + x0 * 3);
+            const X0 = x0 + (fx >> 2), Y0 = y0 + (fy >> 2);
+            const phase = ((fy & 3) << 2) | (fx & 3);
+            // Clamped source columns X0-2 .. X0+bw+3 and rows Y0-2 .. Y0+bh+3.
+            for (let i = 0; i < bw + 6; i++) {
+                const X = X0 - 2 + i;
+                XS[i] = (X < 0 ? 0 : X >= width ? width - 1 : X) * 3;
+            }
+            for (let j = 0; j < bh + 6; j++) {
+                const Y = Y0 - 2 + j;
+                YS[j] = (Y < 0 ? 0 : Y >= height ? height - 1 : Y) * stride;
+            }
+            const ls = bw + 1;                    // local stride, in samples
+            if (phase === 0) {
+                for (let j = 0; j < bh; j++) {
+                    const row = YS[j + 2];
+                    let o = (y0 + j) * stride + x0 * 3;
+                    for (let i = 0; i < bw; i++, o += 3) {
+                        const s0 = row + XS[i + 2];
+                        dst[o] = src[s0]; dst[o + 1] = src[s0 + 1]; dst[o + 2] = src[s0 + 2];
+                    }
                 }
                 continue;
             }
-            const w00 = (4 - ax) * (4 - ay), w01 = ax * (4 - ay), w10 = (4 - ax) * ay, w11 = ax * ay;
-            for (let y = y0; y < y1; y++) {
-                let iy = y + oy, iy1 = iy + 1;
-                if (!inside) {
-                    iy = iy < 0 ? 0 : iy >= height ? height - 1 : iy;
-                    iy1 = iy1 < 0 ? 0 : iy1 >= height ? height - 1 : iy1;
+            // The source region the filters reach, gathered once, edges
+            // held: rows Y0-2 .. Y0+bh+3, columns X0-2 .. X0+bw+3.
+            const gs = (bw + 6) * 3;
+            for (let j = 0; j < bh + 6; j++) {
+                const row = YS[j];
+                let g = j * gs;
+                for (let i = 0; i < bw + 6; i++, g += 3) {
+                    const s0 = row + XS[i];
+                    SG[g] = src[s0]; SG[g + 1] = src[s0 + 1]; SG[g + 2] = src[s0 + 2];
                 }
-                const r0 = iy * stride, r1 = iy1 * stride;
-                let o = y * stride + x0 * 3;
-                for (let x = x0; x < x1; x++, o += 3) {
-                    let ix = x + ox, ix1 = ix + 1;
-                    if (!inside) {
-                        ix = ix < 0 ? 0 : ix >= width ? width - 1 : ix;
-                        ix1 = ix1 < 0 ? 0 : ix1 >= width ? width - 1 : ix1;
+            }
+            const n3 = (bw + 1) * 3, ls3 = ls * 3;
+            if (USE_F[phase])
+                for (let j = 0; j <= bh; j++) {
+                    const g = (j + 2) * gs + 6, l = j * ls3;
+                    for (let k = 0; k < n3; k++) PF[l + k] = SG[g + k];
+                }
+            if (USE_J[phase] || USE_B[phase]) {
+                // Unrounded horizontal sums; all bh+6 rows only for J.
+                const j0 = USE_J[phase] ? 0 : 2, j1 = USE_J[phase] ? bh + 6 : bh + 3;
+                for (let j = j0; j < j1; j++) {
+                    const g = j * gs, l = j * ls3;
+                    for (let k = 0; k < n3; k++) {
+                        const q = g + k;
+                        B1[l + k] = SG[q] - 5 * SG[q + 3] + 20 * SG[q + 6] + 20 * SG[q + 9] -
+                                    5 * SG[q + 12] + SG[q + 15];
                     }
-                    const a0 = r0 + ix * 3, a1 = r0 + ix1 * 3, b0 = r1 + ix * 3, b1 = r1 + ix1 * 3;
-                    dst[o] = (w00 * src[a0] + w01 * src[a1] + w10 * src[b0] + w11 * src[b1] + 8) >> 4;
-                    dst[o + 1] = (w00 * src[a0 + 1] + w01 * src[a1 + 1] + w10 * src[b0 + 1] + w11 * src[b1 + 1] + 8) >> 4;
-                    dst[o + 2] = (w00 * src[a0 + 2] + w01 * src[a1 + 2] + w10 * src[b0 + 2] + w11 * src[b1 + 2] + 8) >> 4;
                 }
+                if (USE_B[phase])
+                    for (let j = 0; j <= bh; j++) {
+                        const l = j * ls3, m = (j + 2) * ls3;
+                        for (let k = 0; k < n3; k++) PB[l + k] = clip8((B1[m + k] + 16) >> 5);
+                    }
+                if (USE_J[phase])
+                    for (let j = 0; j <= bh; j++) {
+                        const l = j * ls3, m = (j + 2) * ls3;
+                        for (let k = 0; k < n3; k++) {
+                            const q = m + k;
+                            PJ[l + k] = clip8((B1[q - 2 * ls3] - 5 * B1[q - ls3] + 20 * B1[q] +
+                                20 * B1[q + ls3] - 5 * B1[q + 2 * ls3] + B1[q + 3 * ls3] + 512) >> 10);
+                        }
+                    }
+            }
+            if (USE_H[phase])
+                for (let j = 0; j <= bh; j++) {
+                    const g = j * gs + 6, l = j * ls3;
+                    for (let k = 0; k < n3; k++) {
+                        const q = g + k;
+                        PH[l + k] = clip8((SG[q] - 5 * SG[q + gs] + 20 * SG[q + 2 * gs] +
+                            20 * SG[q + 3 * gs] - 5 * SG[q + 4 * gs] + SG[q + 5 * gs] + 16) >> 5);
+                    }
+                }
+            // Each phase is one sample or the mean of two: pick the planes
+            // and offsets once per block, not per pixel.
+            const R = 3, D = ls * 3;
+            let A, oa, Bp = null, ob = 0;
+            switch (phase) {
+            case 1:  A = PF; oa = 0; Bp = PB; ob = 0; break;
+            case 2:  A = PB; oa = 0; break;
+            case 3:  A = PB; oa = 0; Bp = PF; ob = R; break;
+            case 4:  A = PF; oa = 0; Bp = PH; ob = 0; break;
+            case 5:  A = PB; oa = 0; Bp = PH; ob = 0; break;
+            case 6:  A = PB; oa = 0; Bp = PJ; ob = 0; break;
+            case 7:  A = PB; oa = 0; Bp = PH; ob = R; break;
+            case 8:  A = PH; oa = 0; break;
+            case 9:  A = PH; oa = 0; Bp = PJ; ob = 0; break;
+            case 10: A = PJ; oa = 0; break;
+            case 11: A = PJ; oa = 0; Bp = PH; ob = R; break;
+            case 12: A = PH; oa = 0; Bp = PF; ob = D; break;
+            case 13: A = PH; oa = 0; Bp = PB; ob = D; break;
+            case 14: A = PJ; oa = 0; Bp = PB; ob = D; break;
+            default: A = PH; oa = R; Bp = PB; ob = D;
+            }
+            for (let j = 0; j < bh; j++) {
+                const o = (y0 + j) * stride + x0 * 3, l = j * ls * 3;
+                const n = bw * 3;
+                if (Bp) for (let k = 0; k < n; k++) dst[o + k] = (A[l + k + oa] + Bp[l + k + ob] + 1) >> 1;
+                else for (let k = 0; k < n; k++) dst[o + k] = A[l + k + oa];
             }
         }
     }
@@ -197,7 +286,7 @@ function reconstruct(bytes, out, width, height) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v5 file');
+        if (!this.info) throw new Error('not an NVDRV v6 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;

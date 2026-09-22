@@ -284,8 +284,10 @@ Parâmetros:
   anterior se arrastar; acima de ~0,5 perde para simplesmente aumentar o
   `--q`.
 
-No clipe de referência de 960×540, o padrão dá **822 kbit/s a 36,9 dB**.
-O VP8 faz 605 kbit/s a 37,2 dB, então estamos a ~1,5× a taxa dele.
+No clipe de referência de 960×540, `--q 20` dá **622 kbit/s a 36,8 dB**.
+O VP8 faz 605 kbit/s a 37,2 dB. A interpolação de quarto de pixel usa o
+filtro de 6 taps do H.264, que no laço fechado vale ~1 dB sobre a
+bilinear.
 
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.
