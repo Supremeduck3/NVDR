@@ -626,20 +626,61 @@ At VP8's own bitrate, NVDRV reproduces VP8's frames at 30.5 dB. A
 predicted frame costs 15 KB against an intra frame's 38 KB — 40%, where on
 the synthetic sequences it was 25% and falling.
 
-The obvious suspect was sub-pixel motion — the pan moves 1.12 px a frame
-and the vectors are whole pixels — and it is not the cause. The best
+Two early explanations are wrong, and the measurements that ruled them out
+are worth keeping. Sub-pixel motion is not the cause: the best
 quarter-pixel shift lowers the mean frame-to-frame error from 3.56 levels
-to 3.24, 9%. What is left after the best possible alignment is about 3.4
-levels everywhere: the previous codec's noise, which changes every frame.
-A camera's sensor does the same. A quadtree of flat fills is the worst
-possible representation of noise — following it means subdividing to the
-pixel — and at the tolerances tuned for stills, that is what it does.
+to 3.24, 9%. Noise is not the cause either. A clean clip, rendered
+deterministically from the same page (`window.render(t)`, 125 frames,
+JPEG q100, no codec in between), loses worse. Both codecs are measured
+against that source with `scripts/analysis/psnr_dirs`:
 
-Past 0.12 the curve stops behaving: looser tolerances lose quality and
-gain bytes (681 KB at 0.16, 685 KB at 0.22), which points at feedback in
-the prediction loop — error left uncoded accumulating until it crosses the
-tolerance — and is not yet understood. The default stays where it is
-until it is.
+    VP8 target   kbit/s   PSNR        NVDRV tolerance      kbit/s   PSNR
+    150k            174   30.57 dB    0.200,0.100,0.050       925   28.72 dB
+    300k            309   33.52 dB    0.120,0.060,0.030       947   29.85 dB
+    600k            605   37.19 dB    0.090,0.040,0.018      3402   33.36 dB
+    1200k          1202   39.41 dB    0.050,0.020,0.008      6174   34.45 dB
+
+At equal quality NVDRV spends about 11 times the bits, and it has a floor:
+no tolerance takes it under about 925 kbit/s.
+
+`scripts/analysis/webm_frames.py` reads VP8's frame sizes out of the WebM,
+and they put the gap in one place:
+
+                       intra frame    predicted frame
+    VP8 300k             55333 B          1099 B
+    NVDRV default        56993 B         16029 B
+
+The intra frames are close. The predicted frames, which are 124 of 125,
+are fifteen times larger. `scripts/analysis/loopcost` explains why: at
+the default tolerance, a predicted frame coded against the *source*
+previous frame costs 91 bytes, and coded against the *reconstructed*
+previous frame, as the closed loop must, about 20 KB. The genuine change
+between frames is 3.6 levels. The reference's own coding error is 5.9.
+Between 97% and 100% of every predicted frame is the codec re-coding
+texture the intra frame left out. Flat rectangles cannot converge on
+texture, so the error never goes away, and every frame pays for it again.
+That is the rate floor.
+
+Loosening only the predicted frames (`--pred-tolerance`, intra left at
+the default) stops that re-coding. Every loose setting gives the same
+file, 999 kbit/s at 30.29 dB. A predicted frame is then 91 bytes of
+residual and 3607 bytes of motion field. The field is now the cost, and
+it is coded naively, as deltas from the global vector:
+
+    block    kbit/s   PSNR
+    8           999   30.29 dB
+    16          473   28.20 dB
+    32          345   26.00 dB
+    global      405   20.19 dB
+
+So the gap has three parts, in order of size. The residual is decided by
+a tolerance, not by rate against distortion, so predicted frames
+re-code errors they cannot remove. The motion field ignores that
+neighbouring vectors agree. And there is no rate control. What to fix
+follows from that: predict each vector from its neighbours and skip
+blocks that need nothing, decide the residual per block by rate and
+distortion, and add a zoom/affine global model. `--pred-tolerance`
+stays off by default, because on its own it trades 3 dB for the rate.
 
 ### Real time
 

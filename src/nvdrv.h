@@ -83,6 +83,17 @@ typedef struct {
      * extra for having it on.
      */
     int   block;
+    /*
+     * Tolerances for predicted frames, when different from the intra
+     * ones; zero keeps `frame.tolerance`. A predicted frame's residual is
+     * dominated by the previous reconstruction's own error — texture that
+     * flat rectangles could not represent — and re-approximating it with
+     * flat rectangles leaves texture of the same size, so it never
+     * converges and every frame pays for it again. A looser tolerance here
+     * lets predicted frames carry the intra frame's detail forward through
+     * the motion instead of re-coding it.
+     */
+    float pred_tolerance[NVDR_LEVELS];
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 

@@ -37,6 +37,7 @@ NvdrvConfig nvdrv_default_config(void) {
      * expected to win on vector cost and did not: once deflated, a field
      * that mostly agrees with the global vector costs almost nothing. */
     c.block = 8;
+    for (int k = 0; k < NVDR_LEVELS; k++) c.pred_tolerance[k] = 0.0f;
     c.fps = 24;
     return c;
 }
@@ -420,10 +421,14 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
         if (!field) return -1;
     }
 
+    NvdrConfig fcfg = e->cfg.frame;
+    if (kind == NVDRV_PRED && e->cfg.pred_tolerance[NVDR_LEVELS - 1] > 0.0f)
+        for (int k = 0; k < NVDR_LEVELS; k++) fcfg.tolerance[k] = e->cfg.pred_tolerance[k];
+
     uint8_t* blob = NULL;
     size_t len = 0;
     NvdrHeader fh;
-    if (nvdr_encode_mem(&blob, &len, to_code, &e->cfg.frame, &fh) != 0) { free(field); return -1; }
+    if (nvdr_encode_mem(&blob, &len, to_code, &fcfg, &fh) != 0) { free(field); return -1; }
 
     if (write_frame(e, kind, dx, dy, block, field, field_len, blob, len) != 0) {
         free(blob); free(field); return -1;
