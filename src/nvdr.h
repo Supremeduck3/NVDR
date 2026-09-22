@@ -99,6 +99,9 @@ typedef struct {
      * and on the clean clip predicting from them cost 13% more colour
      * bytes and 5% more texture bytes. Carried in the header's flags. */
     int   residual;
+    /* Filter the seams between leaves after decoding (see deblock() in
+     * nvdr.c). Carried in the header's flags. */
+    int   deblock;
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
@@ -113,6 +116,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_VERSION     10
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
+#define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
 
 typedef struct {
     uint16_t width, height;

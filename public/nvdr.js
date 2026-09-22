@@ -26,6 +26,8 @@ export const LAYER_NAMES = ['COR', 'COR+TEXTURA'];
 
 const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
 const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
+const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
+const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
 
 /* --- entropy layer, mirroring src/entropy.c -------------------------- */
@@ -272,7 +274,7 @@ export function readHeader(buffer) {
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~FLAG_RESIDUAL) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK)) return null;
     if (h.storedBytes[0] > 0x7fffffff || h.storedBytes[1] > 0x7fffffff) return null;
     return h;
 }
@@ -394,10 +396,12 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
 
     // Layer 1.
     let complete1 = 0;
+    let texturedLeaf = null;
     if ((maxLayer < 0 || maxLayer >= 1) && avail1 >= 5 && complete0 > 0) {
         const tm = textureModels();
         const d1 = new ArithDecoder(bytes, off1, avail1);
         const s1 = { corrupt: false };
+        texturedLeaf = new Uint8Array(lx.length);
         const lv = new Int32Array(MAX_BLOCK * MAX_BLOCK);
         const coef = new Int32Array(MAX_BLOCK * MAX_BLOCK);
         const res = new Int32Array(MAX_BLOCK * MAX_BLOCK);
@@ -417,6 +421,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
                             if (v > mv) mv = v;
                         }
                         inverseDct(sc, coef, res, mu, mv);
+                        texturedLeaf[i] = 1;
                         const f = flat[c], o = full[c];
                         for (let j = 0; j < n; j++)
                             for (let ii = 0; ii < n; ii++) {
@@ -429,6 +434,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
             if (d1.overrun || s1.corrupt) {
                 for (let i = tileStart[t]; i < tileStart[t + 1]; i++) {
                     const x = lx[i], y = ly[i], n = ln[i];
+                    texturedLeaf[i] = 0;
                     for (let c = 0; c < 3; c++)
                         for (let j = 0; j < n; j++) {
                             const at = (y + j) * pw + x;
@@ -438,6 +444,58 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
                 break;
             }
             complete1++;
+        }
+    }
+
+    /* Mirrors deblock() and deblock_plane(); `tex` is null for colours only. */
+    function deblock(planes, tex) {
+        const gw = pw >> 2, gh = ph >> 2;
+        const vedge = new Uint8Array(gw * gh), hedge = new Uint8Array(gw * gh);
+        const textured = new Uint8Array(gw * gh);   // the cell's leaf shows texture
+        const mark = (x, y, n, t) => {
+            for (let j = y; j < y + n && j < gh; j++)
+                for (let k = x; k < x + n && k < gw; k++) textured[j * gw + k] = t;
+            if (x > 0) for (let j = y; j < y + n && j < gh; j++) vedge[j * gw + x] = 1;
+            if (y > 0) for (let k = x; k < x + n && k < gw; k++) hedge[y * gw + k] = 1;
+        };
+        const kept = tileStart[complete0];
+        for (let i = 0; i < kept; i++) mark(lx[i] >> 2, ly[i] >> 2, ln[i] >> 2, tex ? tex[i] : 0);
+        for (let t = complete0; t < tiles; t++)
+            mark(((t % tilesX) * tile) >> 2, (Math.floor(t / tilesX) * tile) >> 2, tile >> 2, 0);
+        for (let c = 0; c < 3; c++) {
+            const p = planes[c];
+            const alpha = (step[c] * DB_ALPHA + 8) >> 4, beta = (step[c] * DB_BETA + 8) >> 4;
+            const tc = (step[c] * DB_TC + 8) >> 4;
+            for (let gy = 0; gy < gh; gy++)
+                for (let gx = 1; gx < gw; gx++) {
+                    if (!vedge[gy * gw + gx]) continue;
+                    if (!textured[gy * gw + gx] && !textured[gy * gw + gx - 1]) continue;
+                    for (let y = gy * 4; y < gy * 4 + 4; y++) {
+                        const r = y * pw + gx * 4;
+                        const p1 = p[r - 2], p0 = p[r - 1], q0 = p[r], q1 = p[r + 1];
+                        if (Math.abs(p0 - q0) >= alpha || Math.abs(p1 - p0) >= beta ||
+                            Math.abs(q1 - q0) >= beta) continue;
+                        let d = ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3;
+                        d = d < -tc ? -tc : d > tc ? tc : d;
+                        p[r - 1] = clampU8(p0 + d);
+                        p[r] = clampU8(q0 - d);
+                    }
+                }
+            for (let gy = 1; gy < gh; gy++)
+                for (let gx = 0; gx < gw; gx++) {
+                    if (!hedge[gy * gw + gx]) continue;
+                    if (!textured[gy * gw + gx] && !textured[(gy - 1) * gw + gx]) continue;
+                    for (let x = gx * 4; x < gx * 4 + 4; x++) {
+                        const r = gy * 4 * pw + x;
+                        const p1 = p[r - 2 * pw], p0 = p[r - pw], q0 = p[r], q1 = p[r + pw];
+                        if (Math.abs(p0 - q0) >= alpha || Math.abs(p1 - p0) >= beta ||
+                            Math.abs(q1 - q0) >= beta) continue;
+                        let d = ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3;
+                        d = d < -tc ? -tc : d > tc ? tc : d;
+                        p[r - pw] = clampU8(p0 + d);
+                        p[r] = clampU8(q0 - d);
+                    }
+                }
         }
     }
 
@@ -455,13 +513,22 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
         return out;
     };
 
+    // The filter works in place, and a second view of the same planes has
+    // to start from the unfiltered ones, so filter a copy when asked for both.
+    const shown = (planes, tex) => {
+        if (!(h.flags & FLAG_DEBLOCK)) return toRgb(planes);
+        const copy = wantFlat ? planes.map(p => p.slice()) : planes;
+        deblock(copy, tex);
+        return toRgb(copy);
+    };
+
     return {
         header: h,
         layersPresent: complete0 === tiles && avail1 >= 5 ? 2 : 1,
         tiles,
         tilesComplete: [complete0, complete1],
-        rgb: toRgb(maxLayer === 0 ? flat : full),
-        flatRgb: wantFlat ? toRgb(flat) : null
+        rgb: maxLayer === 0 ? shown(flat, null) : shown(full, texturedLeaf),
+        flatRgb: wantFlat ? shown(flat, null) : null
     };
 }
 

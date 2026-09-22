@@ -149,6 +149,7 @@ NvdrConfig nvdr_default_config(void) {
     c.max_block = NVDR_MAX_BLOCK;
     c.min_block = NVDR_MIN_BLOCK;
     c.residual = 0;
+    c.deblock = 1;
     return c;
 }
 
@@ -555,7 +556,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
-    if (h->flags & ~NVDR_FLAG_RESIDUAL) return -1;   /* a flag this decoder does not know */
+    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK)) return -1;   /* a flag this decoder does not know */
     if (h->stored_bytes[0] > 0x7fffffffu || h->stored_bytes[1] > 0x7fffffffu) return -1;
     return 0;
 }
@@ -793,7 +794,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = NVDR_VERSION;
-    buf[5] = cfg.residual ? NVDR_FLAG_RESIDUAL : 0;
+    buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0));
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -893,6 +894,100 @@ static int read_node(Layer0* L, int x, int y, int n) {
     return push_leaf(L, x, y, n);
 }
 
+/*
+ * DEBLOCKING
+ * ----------
+ * Quantising each leaf on its own leaves a small step where two leaves
+ * meet, and the eye finds a grid of small steps long before PSNR does.
+ * Every leaf edge is filtered the way H.264's normal filter does it: with
+ * p1 p0 | q0 q1 across the edge, a step smaller than alpha between flat
+ * enough sides is taken for quantisation and pulled together by
+ * ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3, clipped to +-tc. A larger step is
+ * taken for a real edge and left alone. The thresholds scale with the
+ * quantiser, since that is what sets how big a quantisation step can be.
+ *
+ * It runs after decoding, on whichever layer is shown, and for a sequence
+ * that output is what the next frame predicts from, so it improves the
+ * reference too. Vertical edges first, then horizontal, in integers; edges
+ * are 4 px apart at least, so no pixel is read by one edge and written by
+ * another within a pass. The header flag turns it on.
+ */
+/* alpha, beta and tc are step * 20/16, 6/16 and 3/16. Swept on the six
+ * samples at q 24 and 48: +0.24 and +0.28 dB on average, where a filter
+ * twice as strong starts to cost PSNR. */
+#define DB_ALPHA 20
+#define DB_BETA   6
+#define DB_TC     3
+static int db_param(int step, int k16) { return (step * k16 + 8) >> 4; }
+
+/*
+ * Which edges are filtered. Only those with texture on at least one side:
+ * between two flat leaves the step is their two colours, and a colour's
+ * quantisation error in pixels is step / n, a fraction of a level for any
+ * leaf larger than 4. That step is the picture, not the codec. Filtering
+ * it anyway cost the `blocos` probe 6.7 dB, and skipping it costs the
+ * photographs nothing measurable (34.40 dB against 34.41). Scaling the
+ * thresholds by leaf size instead was tried and lost 0.08 dB on the
+ * photographs.
+ */
+static int edge_filtered(int ca, int cb) { return ((ca | cb) & 0x80) != 0; }
+
+static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
+                          const uint8_t* vedge, const uint8_t* hedge, int step) {
+    int gw = pw / 4, gh = ph / 4;
+    for (int pass = 0; pass < 2; pass++)
+        for (int gy = pass; gy < gh; gy++)
+            for (int gx = 1 - pass; gx < gw; gx++) {
+                const uint8_t* edge = pass ? hedge : vedge;
+                if (!edge[gy * gw + gx]) continue;
+                int other = pass ? (gy - 1) * gw + gx : gy * gw + gx - 1;
+                if (!edge_filtered(cell[gy * gw + gx], cell[other])) continue;
+                int alpha = db_param(step, DB_ALPHA), beta = db_param(step, DB_BETA);
+                int tc = db_param(step, DB_TC);
+                int along = pass ? 1 : pw, across = pass ? pw : 1;
+                uint8_t* r = p + (size_t)gy * 4 * pw + gx * 4;
+                for (int k = 0; k < 4; k++, r += along) {
+                    int p1 = r[-2 * across], p0 = r[-across], q0 = r[0], q1 = r[across];
+                    if (abs(p0 - q0) >= alpha || abs(p1 - p0) >= beta || abs(q1 - q0) >= beta) continue;
+                    int d = ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3;
+                    d = d < -tc ? -tc : (d > tc ? tc : d);
+                    r[-across] = (uint8_t)clamp_u8(p0 + d);
+                    r[0] = (uint8_t)clamp_u8(q0 - d);
+                }
+            }
+}
+
+/* Edges on a 4-px grid: every leaf's left and top side, and every tile
+ * that never arrived as one block. `cell` holds, per 4x4 cell, log2 of its
+ * leaf's size in cells and 0x80 when the leaf shows texture; `textured` is
+ * NULL when only colours are shown. */
+static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const uint8_t* textured,
+                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step) {
+    int gw = cv->pw / 4, gh = cv->ph / 4;
+    uint8_t* vedge = (uint8_t*)calloc((size_t)gw * gh, 1);
+    uint8_t* hedge = (uint8_t*)calloc((size_t)gw * gh, 1);
+    uint8_t* cell = (uint8_t*)calloc((size_t)gw * gh, 1);
+    if (!vedge || !hedge || !cell) { free(vedge); free(hedge); free(cell); return -1; }
+    for (size_t i = 0; i < count; i++) {
+        int x = leaves[i].x / 4, y = leaves[i].y / 4, n = leaves[i].n / 4;
+        int info = log2_int(n) | (textured && textured[i] ? 0x80 : 0);
+        for (int j = y; j < y + n && j < gh; j++)
+            for (int k = x; k < x + n && k < gw; k++) cell[(size_t)j * gw + k] = (uint8_t)info;
+        if (x > 0) for (int j = y; j < y + n && j < gh; j++) vedge[(size_t)j * gw + x] = 1;
+        if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
+    }
+    for (int t = first_missing_tile; t < tiles; t++) {
+        int x = (t % tiles_x) * cv->tile / 4, y = (t / tiles_x) * cv->tile / 4, n = cv->tile / 4;
+        for (int j = y; j < y + n && j < gh; j++)
+            for (int k = x; k < x + n && k < gw; k++) cell[(size_t)j * gw + k] = (uint8_t)log2_int(n);
+        if (x > 0) for (int j = y; j < y + n && j < gh; j++) vedge[(size_t)j * gw + x] = 1;
+        if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
+    }
+    for (int c = 0; c < 3; c++) deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[c]);
+    free(vedge); free(hedge); free(cell);
+    return 0;
+}
+
 int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
                     NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
     out->pixels = NULL; out->width = out->height = 0;
@@ -915,6 +1010,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     Layer0 L;
     memset(&L, 0, sizeof(L));
     size_t* tile_start = NULL;
+    uint8_t* textured = NULL;
     if (canvas_init(&cv, h.width, h.height, h.max_block, h.min_block) != 0) goto done;
     cv.fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
     int tiles_x = (cv.pw + cv.tile - 1) / cv.tile, tiles_y = (cv.ph + cv.tile - 1) / cv.tile;
@@ -952,18 +1048,23 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
         nvdr_dec_init(&d1, data + off1, avail1);
         int corrupt = 0;
         int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+        textured = (uint8_t*)calloc(L.count ? L.count : 1, 1);
+        if (!textured) goto done;
         for (int t = 0; t < complete0; t++) {
             for (size_t i = tile_start[t]; i < tile_start[t + 1] && !d1.overrun && !corrupt; i++) {
                 const Leaf* f = &L.leaves[i];
                 int sc = size_class(f->n);
                 for (int c = 0; c < 3 && !d1.overrun && !corrupt; c++)
-                    if (get_texture(&d1, &tm, sc, c, lv, f->n * f->n, &corrupt) && !d1.overrun && !corrupt)
+                    if (get_texture(&d1, &tm, sc, c, lv, f->n * f->n, &corrupt) && !d1.overrun && !corrupt) {
                         apply_texture(&cv, c, f->x, f->y, f->n, lv, step[c]);
+                        textured[i] = 1;
+                    }
             }
             if (d1.overrun || corrupt) {
                 /* Undo whatever of this tile was painted from bad bytes. */
                 for (size_t i = tile_start[t]; i < tile_start[t + 1]; i++) {
                     const Leaf* f = &L.leaves[i];
+                    textured[i] = 0;
                     for (int c = 0; c < 3; c++)
                         for (int j = 0; j < f->n; j++)
                             memcpy(cv.full[c] + (size_t)(f->y + j) * cv.pw + f->x,
@@ -979,6 +1080,11 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     if (!out->pixels) goto done;
     out->width = h.width; out->height = h.height;
     uint8_t** planes = (max_layer == 0) ? cv.flat : cv.full;
+    if ((h.flags & NVDR_FLAG_DEBLOCK) &&
+        deblock(&cv, planes, L.leaves, max_layer == 0 ? NULL : textured, tile_start[complete0],
+                complete0, tiles_x, tiles, step) != 0) {
+        free(out->pixels); out->pixels = NULL; goto done;
+    }
     for (int y = 0; y < h.height; y++)
         for (int x = 0; x < h.width; x++) {
             size_t at = (size_t)y * cv.pw + x;
@@ -996,6 +1102,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
 done:
     free(L.leaves);
     free(tile_start);
+    free(textured);
     canvas_free(&cv);
     return rc;
 }

@@ -137,6 +137,31 @@ encoded with equal quantisers now, so its drift check measures the
 prediction loop and not the 1.2 ratio. The JS decoder takes 43 ms per
 960x540 frame in Node, against a 40 ms budget at 25 fps.
 
+### Deblocking
+
+Each leaf is quantised on its own, so where two leaves meet there is a
+small step, and the eye finds a grid of small steps long before PSNR
+does. With header flag `NVDR_FLAG_DEBLOCK` (on by default,
+`--no-deblock` to leave it off), the decoder filters every leaf edge the
+way H.264's normal filter does. A step smaller than alpha, with flat
+enough pixels either side, is taken for quantisation and pulled together
+by at most tc. Anything larger is a real edge and is left alone. alpha,
+beta and tc are 20/16, 6/16 and 3/16 of the step. Swept on the six
+samples, that gives +0.24 dB at q 24 and +0.28 at q 48; twice as strong
+starts to cost.
+
+Only edges with texture on at least one side are filtered. Between two
+flat leaves the step is their two colours, and a colour's quantisation
+error in pixels is step / n, a fraction of a level for any leaf larger
+than 4. Filtering those edges anyway cost the `blocos` probe 6.7 dB, and
+skipping them costs the photographs nothing.
+
+In a sequence the filter runs on intra frames, whose decoded picture is
+the next frame's reference. It does not run on predicted frames'
+containers: those hold a residual, not a picture.
+
+At the defaults, per sample: +0.14 to +0.47 dB at the same bytes.
+
 ## The decomposition
 
     ANCHOR = quantize_coarse(L)

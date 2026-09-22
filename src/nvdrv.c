@@ -662,6 +662,9 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
     NvdrConfig fcfg = e->cfg.frame;
     if (kind == NVDRV_PRED) {
         fcfg.residual = 1;
+        /* The filter smooths seams in a picture; a residual is not one,
+         * and its seams are not what the viewer sees. */
+        fcfg.deblock = 0;
         /* Coarser than the intra frames by 1.2 unless told otherwise: on the
          * clean clip that was 0.1 dB better at equal rate across q 16-40. */
         fcfg.q = e->cfg.pred_q > 0 ? e->cfg.pred_q : (e->cfg.frame.q * 6 + 2) / 5;
