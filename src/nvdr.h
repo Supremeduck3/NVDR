@@ -102,6 +102,10 @@ typedef struct {
     /* Filter the seams between leaves after decoding (see deblock() in
      * nvdr.c). Carried in the header's flags. */
     int   deblock;
+    /* In a residual, how readily a leaf is left uncorrected, as a multiple
+     * of lambda: its bits are weighed at skip_k * lambda against the error
+     * it would remove. 0 codes every leaf. */
+    float skip_k;
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);

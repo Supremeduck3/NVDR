@@ -63,6 +63,8 @@ static void usage(const char* a0) {
         "  --fps N          recorded in the header (default 24)\n"
         "  --q N            quantiser step for every frame (default 24)\n"
         "  --pred-q N       quantiser step for predicted frames (default 1.2 x q)\n"
+        "  --skip-k F       how readily a predicted frame leaves a block as it was\n"
+        "                   (default 0.25; 0 corrects every block)\n"
         "  --mv-lambda N    weight of one motion-field bit against block error\n"
         "                   (default 16; 0 keeps each block's best-matching vector)\n"
         "  --limit N        stop after N frames\n", a0);
@@ -83,6 +85,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fps") && i+1 < argc) cfg.fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--q") && i+1 < argc) cfg.frame.q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pred-q") && i+1 < argc) cfg.pred_q = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--skip-k") && i+1 < argc) cfg.frame.skip_k = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--mv-lambda") && i+1 < argc) cfg.mv_lambda = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
     }

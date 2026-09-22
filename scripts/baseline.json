@@ -1,4 +1,8 @@
 {
+  "<sequence default>": {
+    "bytes": 6172,
+    "psnr": 30.06
+  },
   "<sequence>": {
     "bytes": 8231,
     "psnr": 30.32
