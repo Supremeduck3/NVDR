@@ -275,6 +275,14 @@ Parâmetros:
   para o quadro todo).
 - **`--mv-lambda N`** — quanto um bit de vetor pesa contra o erro do bloco
   (default 16).
+- **`--skip-k F`** — quão facilmente um quadro predito deixa um bloco
+  **exatamente como estava** no quadro anterior, em vez de recodificar a
+  pequena diferença (default 0,25; `0` corrige todos). É o que tira a
+  cintilação do fundo parado: sem isso, 5,5% dos pixels de um fundo
+  parado mudavam a cada quadro, e com o padrão são 1,3%, com 19% menos
+  bytes. Valores maiores economizam mais, mas deixam o erro do quadro
+  anterior se arrastar; acima de ~0,5 perde para simplesmente aumentar o
+  `--q`.
 
 No clipe de referência de 960×540, o padrão dá **822 kbit/s a 36,9 dB**.
 O VP8 faz 605 kbit/s a 37,2 dB, então estamos a ~1,5× a taxa dele.

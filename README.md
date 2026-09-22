@@ -137,6 +137,42 @@ encoded with equal quantisers now, so its drift check measures the
 prediction loop and not the 1.2 ratio. The JS decoder takes 43 ms per
 960x540 frame in Node, against a 40 ms budget at 25 fps.
 
+### Leaving still regions alone
+
+A predicted frame used to correct every block: whatever small error the
+reference carried, it was re-coded, and a little differently each
+frame. On a background that does not move, that is visible as shimmer.
+`scripts/analysis/flicker` measures it. Of the pixels whose source is the
+same in two consecutive frames, it counts how many changed in the
+decode. On a 40-frame clip with a still background and a moving subject,
+5.5% of them changed every frame; with sensor noise added to the source,
+8.7%.
+
+Now, in a residual, the encoder also costs each leaf left uncorrected:
+no colour correction and no texture, so the decoder shows exactly what
+the previous frame held there. It picks that whenever it costs less in
+error + skip_k * lambda * bits. The decoder needed no change, because an
+uncorrected leaf was already a legal one.
+
+    still background, moving subject     shimmer   bytes
+    every leaf corrected                   5.47%   60622
+    skip_k 0.25 (default)                  1.26%   48938   -19%
+    same, sensor noise in the source       8.66% -> 2.05%   -26%
+
+Leaving a block alone carries its reference's error forward, so the
+weight matters on content where everything moves. On the panning clip,
+0.25 sits 0.1 to 0.2 dB above the plain quantiser curve at equal rate.
+1 falls 0.1 dB below it. The error a skipped block carries is bounded by
+the same rule that skips it: once correcting pays, the block is
+corrected. Per-frame PSNR falls about 0.2 dB over the first 25 frames of
+a GOP and then holds flat.
+
+The regression gate now encodes its sequence twice. The loop run uses
+equal quantisers and no skipping, and holds drift to 0.25 dB, because
+drift is how a reference that walks away from the source shows up. The
+default run holds the encoder as it ships to the baseline, 25% smaller
+than the loop run.
+
 ### Deblocking
 
 Each leaf is quantised on its own, so where two leaves meet there is a

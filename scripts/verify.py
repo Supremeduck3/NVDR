@@ -121,62 +121,65 @@ def make_sequence(directory, frames=12, size=128):
 
 
 def check_sequence(tmp, psnr_slack):
-    """Encode the sequence, decode it, and report bytes, quality and drift."""
+    """Encode the sequence twice and report bytes, quality and drift.
+
+    The loop run holds everything that trades quality over time still:
+    equal quantisers for intra and predicted frames, and no skipped blocks.
+    What it is after is a reference that walks away from the source, and
+    by design the defaults settle a little below the intra frame. The
+    default run is the encoder as it ships, held to the baseline on bytes
+    and quality."""
     enc = find_binary("nvdrv_encode")
     dec = find_binary("nvdrv_decode")
     srcdir = tmp / "seq"
     srcdir.mkdir(exist_ok=True)
     make_sequence(srcdir)
 
-    # Predicted frames use the intra frames' quantiser here. By default the
-    # encoder makes them 1.2x coarser, and they then settle a little below
-    # the intra frame by design; the drift check is after the other thing,
-    # a reference that walks away from the source, and equal quantisers
-    # keep the two apart.
-    args = ["--gop", "0", "--q", "24", "--pred-q", "24"]
-    out = tmp / "seq.nvdrv"
-    r = subprocess.run([str(enc), str(srcdir), str(out)] + args,
+    results, problems = {}, []
+    for name, args in (("loop", ["--gop", "0", "--q", "24", "--pred-q", "24", "--skip-k", "0"]),
+                       ("default", ["--gop", "0"])):
+        out = tmp / f"seq_{name}.nvdrv"
+        r = subprocess.run([str(enc), str(srcdir), str(out)] + args,
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not out.exists():
+            return None, [r.stderr.strip() or f"{name} sequence encode failed"]
+
+        # Determinism, same rule as the stills.
+        out_b = tmp / f"seq_{name}_b.nvdrv"
+        subprocess.run([str(enc), str(srcdir), str(out_b)] + args,
                        capture_output=True, text=True)
-    if r.returncode != 0 or not out.exists():
-        return None, [r.stderr.strip() or "sequence encode failed"]
+        if not (out_b.exists() and
+                hashlib.sha256(out.read_bytes()).hexdigest()
+                == hashlib.sha256(out_b.read_bytes()).hexdigest()):
+            problems.append(f"{name} sequence encoder is not deterministic")
 
-    # Determinism, same rule as the stills.
-    out_b = tmp / "seq_b.nvdrv"
-    subprocess.run([str(enc), str(srcdir), str(out_b)] + args,
-                   capture_output=True, text=True)
-    stable = (out_b.exists() and
-              hashlib.sha256(out.read_bytes()).hexdigest()
-              == hashlib.sha256(out_b.read_bytes()).hexdigest())
+        r = subprocess.run([str(dec), str(out), "--compare", str(srcdir)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return None, [r.stderr.strip() or f"{name} sequence decode failed"]
+        per_frame = [float(m) for m in
+                     re.findall(r"(?:INTRA|pred)\s+([0-9.]+) dB", r.stdout)]
+        if len(per_frame) < 12:
+            return None, [f"{name}: only {len(per_frame)} of 12 frames decoded"]
 
-    r = subprocess.run([str(dec), str(out), "--compare", str(srcdir)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        return None, [r.stderr.strip() or "sequence decode failed"]
+        # The browser player has to hold the same state as the C decoder
+        # after every frame, or it drifts from the file while each frame
+        # looks fine.
+        cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_seq.mjs"), str(out)],
+                            capture_output=True, text=True)
+        if cc.returncode != 0:
+            bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
+            problems.append(f"{name} C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
 
-    per_frame = [float(m) for m in
-                 re.findall(r"(?:INTRA|pred)\s+([0-9.]+) dB", r.stdout)]
-    if len(per_frame) < 12:
-        return None, [f"only {len(per_frame)} of 12 frames decoded"]
-
-    problems = []
-    if not stable:
-        problems.append("sequence encoder is not deterministic")
-    # The browser player has to hold the same state as the C decoder after
-    # every frame, or it drifts from the file while each frame looks fine.
-    cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_seq.mjs"), str(out)],
-                        capture_output=True, text=True)
-    if cc.returncode != 0:
-        bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
-        problems.append("C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
-    # Drift: the last frames must not be worse than the first. Predicting
-    # from the wrong reference shows up here and nowhere else.
-    drift = min(per_frame[1:]) - per_frame[0]
-    if drift < -psnr_slack:
-        problems.append(f"drifts {drift:+.2f} dB by the end")
-
-    return {"bytes": out.stat().st_size,
-            "psnr": round(sum(per_frame) / len(per_frame), 2),
-            "drift": round(drift, 2)}, problems
+        drift = min(per_frame[1:]) - per_frame[0]
+        # Drift: the last frames must not be worse than the first. Predicting
+        # from the wrong reference shows up here and nowhere else.
+        if name == "loop" and drift < -psnr_slack:
+            problems.append(f"drifts {drift:+.2f} dB by the end")
+        results[name] = {"bytes": out.stat().st_size,
+                         "psnr": round(sum(per_frame) / len(per_frame), 2),
+                         "drift": round(drift, 2)}
+    return results, problems
 
 
 def encode(encoder, image, out):
@@ -321,25 +324,27 @@ def main():
                   f"{'stable' if stable else 'VARIES':>7}  "
                   f"{'ok' if not notes else '; '.join(notes)[:34]}")
 
-        seq, seq_problems = check_sequence(tmp, args.psnr_slack)
+        seqs, seq_problems = check_sequence(tmp, args.psnr_slack)
         failures += [f"sequence: {p}" for p in seq_problems]
-        if seq:
-            recorded["<sequence>"] = {k: seq[k] for k in ("bytes", "psnr")}
+        for name, seq in (seqs or {}).items():
+            key = "<sequence>" if name == "loop" else "<sequence default>"
+            recorded[key] = {k: seq[k] for k in ("bytes", "psnr")}
             delta = ""
-            if "<sequence>" in baseline:
-                was = baseline["<sequence>"]
+            if key in baseline:
+                was = baseline[key]
                 d_psnr = seq["psnr"] - was["psnr"]
                 d_size = (seq["bytes"] - was["bytes"]) / was["bytes"]
                 delta = f"{d_psnr:+.2f}dB {d_size:+.1%}"
                 if d_psnr < -args.psnr_slack:
                     failures.append(
-                        f"sequence: PSNR {was['psnr']:.2f} -> {seq['psnr']:.2f} dB")
+                        f"{key}: PSNR {was['psnr']:.2f} -> {seq['psnr']:.2f} dB")
                 if d_size > args.size_slack:
                     failures.append(
-                        f"sequence: {was['bytes']} -> {seq['bytes']} bytes ({d_size:+.1%})")
+                        f"{key}: {was['bytes']} -> {seq['bytes']} bytes ({d_size:+.1%})")
             elif baseline:
                 delta = "new"
-            print(f"{'<sequence> 12 frames':<26} {seq['bytes']:>9} {seq['psnr']:>7.2f}dB "
+            label = f"<sequence {name}> 12 fr"
+            print(f"{label:<26} {seq['bytes']:>9} {seq['psnr']:>7.2f}dB "
                   f"{delta:>16} {'stable':>7}  "
                   f"{'ok' if not seq_problems else '; '.join(seq_problems)[:34]} "
                   f"(deriva {seq['drift']:+.2f} dB)")
