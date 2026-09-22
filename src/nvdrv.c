@@ -30,15 +30,19 @@ NvdrvConfig nvdrv_default_config(void) {
      * per block. */
     c.search = 12;
     c.intra_threshold = 24.0f;
-    /* Per-block motion on, at 8x8. Measured against one global vector on
-     * every synthetic sequence it came out smaller and better at once —
-     * -12.8% and +0.37 dB where the camera and a subject move differently,
-     * -0.9% on a plain pan — for 18% more encode time. Larger blocks were
-     * expected to win on vector cost and did not, when the field was
-     * measured deflated against the global vector (v2). */
-    c.block = 8;
+    /* Per-block motion on, in quarter pixels, with the block size chosen
+     * by resolution (-1). With whole-pixel vectors 8x8 won everywhere,
+     * because the finer grid made up for the coarse precision. With
+     * quarter pixels, 16x16 wins on the 960x540 clean clip: 591 bytes a
+     * frame of field against 2386, for 0.16 dB of the 3 dB quarter pixels
+     * bought. On the 128x128 sequence in the regression gate, where the
+     * moving object is 30 px, 8x8 wins both ways: 7189 bytes against 8626
+     * and 0.3 dB more by the last frame. So 16 from 0.2 Mpx up, 8 below. */
+    c.block = -1;
     c.pred_q = 0;
-    c.mv_lambda = 8;
+    /* In SAD per bit of field. With quarter-pixel deltas a vector costs
+     * more bits than it did, so the weight that balances them rose from 8. */
+    c.mv_lambda = 16;
     c.fps = 24;
     return c;
 }
@@ -188,8 +192,84 @@ static void block_search(const NvdrImage* cur, const NvdrImage* ref, int block,
     }
 }
 
-/* The reference assembled block by block, each block from its own vector,
- * edges held rather than wrapped. Encoder and decoder both build it here. */
+/*
+ * QUARTER-PIXEL MOTION
+ * --------------------
+ * Block vectors are in quarter pixels. A whole-pixel vector cannot follow
+ * a pan of 1.12 px a frame or a slow zoom, and with a transform coding the
+ * residual, the misalignment it leaves is texture over the whole frame,
+ * which is the most expensive thing to code. Measured on two frames of the
+ * clean clip against the source (scripts/analysis/subpel), quarter pixels
+ * cut the residual's bytes by 65% and raised PSNR by 3 dB.
+ *
+ * Between whole pixels the reference is interpolated bilinearly, in
+ * integers, the same way in nvdrv.js: weights (4 - a) and a on each axis,
+ * a sum of 16 rounded with + 8 >> 4, edges held. The global vector stays
+ * in whole pixels; the field is predicted from it multiplied by four.
+ */
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* One channel of the reference at (x + fx/4, y + fy/4). */
+static inline int qsample(const NvdrImage* ref, int x, int y, int fx, int fy, int c) {
+    int ix = x + (fx >> 2), iy = y + (fy >> 2);
+    int ax = fx & 3, ay = fy & 3;
+    int x0 = clampi(ix, 0, ref->width - 1), x1 = clampi(ix + 1, 0, ref->width - 1);
+    int y0 = clampi(iy, 0, ref->height - 1), y1 = clampi(iy + 1, 0, ref->height - 1);
+    const unsigned char* r0 = ref->pixels + (size_t)y0 * ref->width * 3;
+    const unsigned char* r1 = ref->pixels + (size_t)y1 * ref->width * 3;
+    return ((4 - ax) * (4 - ay) * r0[x0 * 3 + c] + ax * (4 - ay) * r0[x1 * 3 + c] +
+            (4 - ax) * ay * r1[x0 * 3 + c] + ax * ay * r1[x1 * 3 + c] + 8) >> 4;
+}
+
+static int block_sad_q(const NvdrImage* cur, const NvdrImage* ref,
+                       int x0, int y0, int bw, int bh, int fx, int fy, int limit) {
+    int acc = 0;
+    for (int y = y0; y < y0 + bh; y++) {
+        const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
+        for (int x = x0; x < x0 + bw; x++, a += 3)
+            for (int c = 0; c < 3; c++) {
+                int d = a[c] - qsample(ref, x, y, fx, fy, c);
+                acc += d < 0 ? -d : d;
+            }
+        if (acc >= limit) return acc;
+    }
+    return acc;
+}
+
+/* The whole-pixel vectors from block_search, refined to half and then to
+ * quarter pixels around themselves. Blocks are independent. */
+static void block_refine(const NvdrImage* cur, const NvdrImage* ref, int block,
+                         int8_t* vx, int8_t* vy) {
+    int nbx = (cur->width + block - 1) / block;
+    int nby = (cur->height + block - 1) / block;
+    int nb = nbx * nby;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8)
+#endif
+    for (int b = 0; b < nb; b++) {
+        int x0 = (b % nbx) * block, y0 = (b / nbx) * block;
+        int bw = cur->width - x0 < block ? cur->width - x0 : block;
+        int bh = cur->height - y0 < block ? cur->height - y0 : block;
+        int fx = clampi(vx[b] * 4, -127, 127), fy = clampi(vy[b] * 4, -127, 127);
+        int best = block_sad_q(cur, ref, x0, y0, bw, bh, fx, fy, INT_MAX);
+        for (int step = 2; step >= 1; step--) {
+            int cx = fx, cy = fy;
+            for (int dy = -step; dy <= step; dy += step)
+                for (int dx = -step; dx <= step; dx += step) {
+                    if (!dx && !dy) continue;
+                    int tx = cx + dx, ty = cy + dy;
+                    if (tx < -127 || tx > 127 || ty < -127 || ty > 127) continue;
+                    int c = block_sad_q(cur, ref, x0, y0, bw, bh, tx, ty, best);
+                    if (c < best) { best = c; fx = tx; fy = ty; }
+                }
+        }
+        vx[b] = (int8_t)fx;
+        vy[b] = (int8_t)fy;
+    }
+}
+
+/* The reference assembled block by block, each block from its own
+ * quarter-pixel vector. Encoder and decoder both build it here. */
 static void block_predict(const NvdrImage* src, NvdrImage* dst, int block,
                           const int8_t* vx, const int8_t* vy) {
     int nbx = (dst->width + block - 1) / block;
@@ -202,12 +282,7 @@ static void block_predict(const NvdrImage* src, NvdrImage* dst, int block,
         unsigned char* out = dst->pixels + (size_t)y * dst->width * 3;
         for (int x = 0; x < dst->width; x++, out += 3) {
             int b = x / block;
-            int sx = x + rvx[b], sy = y + rvy[b];
-            if (sx < 0) sx = 0;
-            if (sx >= src->width) sx = src->width - 1;
-            if (sy < 0) sy = 0;
-            if (sy >= src->height) sy = src->height - 1;
-            memcpy(out, src->pixels + ((size_t)sy * src->width + sx) * 3, 3);
+            for (int c = 0; c < 3; c++) out[c] = (unsigned char)qsample(src, x, y, rvx[b], rvy[b], c);
         }
     }
 }
@@ -402,7 +477,8 @@ static void field_rd(const NvdrImage* cur, const NvdrImage* ref, int block,
             if (dup) continue;
             int rate = lambda * mv_bits(cx - px, cy - py);
             if (rate >= best) continue;
-            int cost = block_sad(cur, ref, x0, y0, bw, bh, cx, cy, best - rate) + rate;
+            if (cx < -127 || cx > 127 || cy < -127 || cy > 127) continue;
+            int cost = block_sad_q(cur, ref, x0, y0, bw, bh, cx, cy, best - rate) + rate;
             if (cost < best) { best = cost; bx = cx; by = cy; }
         }
         vx[b] = (int8_t)bx;
@@ -462,7 +538,8 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     e->cfg = cfg ? *cfg : nvdrv_default_config();
     e->width = width; e->height = height;
 
-    if (e->cfg.block < 0 || e->cfg.block > 128) e->cfg.block = 0;
+    if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 16 : 8;
+    if (e->cfg.block > 128) e->cfg.block = 0;
     if (alloc_image(&e->state, width, height) != 0 ||
         alloc_image(&e->scratch, width, height) != 0 ||
         alloc_image(&e->error, width, height) != 0) {
@@ -542,8 +619,9 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
         if (e->cfg.block > 0) {
             block = e->cfg.block;
             block_search(frame, &e->state, block, dx, dy, e->vx, e->vy);
+            block_refine(frame, &e->state, block, e->vx, e->vy);
             if (e->cfg.mv_lambda > 0)
-                field_rd(frame, &e->state, block, dx, dy, e->cfg.mv_lambda, e->vx, e->vy);
+                field_rd(frame, &e->state, block, dx * 4, dy * 4, e->cfg.mv_lambda, e->vx, e->vy);
             block_predict(&e->state, &e->scratch, block, e->vx, e->vy);
             ref = &e->scratch;
         } else if (dx || dy) {
@@ -577,12 +655,20 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
 
     if (block) {
         field = pack_field(e->vx, e->vy, (e->width + block - 1) / block,
-                           (e->height + block - 1) / block, dx, dy, &field_len);
+                           (e->height + block - 1) / block, dx * 4, dy * 4, &field_len);
         if (!field) return -1;
     }
 
     NvdrConfig fcfg = e->cfg.frame;
-    if (kind == NVDRV_PRED && e->cfg.pred_q > 0) fcfg.q = e->cfg.pred_q;
+    if (kind == NVDRV_PRED) {
+        fcfg.residual = 1;
+        /* The filter smooths seams in a picture; a residual is not one,
+         * and its seams are not what the viewer sees. */
+        fcfg.deblock = 0;
+        /* Coarser than the intra frames by 1.2 unless told otherwise: on the
+         * clean clip that was 0.1 dB better at equal rate across q 16-40. */
+        fcfg.q = e->cfg.pred_q > 0 ? e->cfg.pred_q : (e->cfg.frame.q * 6 + 2) / 5;
+    }
 
     uint8_t* blob = NULL;
     size_t len = 0;
@@ -724,7 +810,7 @@ int nvdrv_decode_next(NvdrvDecoder* d, NvdrImage* out,
         int8_t* vy = (int8_t*)malloc((size_t)nb);
         if (!vx || !vy ||
             unpack_field(d->data + d->pos + 4, field_len, (d->width + block - 1) / block,
-                         (d->height + block - 1) / block, dx, dy, vx, vy) != 0) {
+                         (d->height + block - 1) / block, dx * 4, dy * 4, vx, vy) != 0) {
             free(vx); free(vy); return -1;
         }
         block_predict(&d->state, &d->scratch, block, vx, vy);

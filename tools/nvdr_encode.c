@@ -21,7 +21,8 @@ static void usage(const char* argv0) {
         "                   zero (default 0.1)\n"
         "  --lambda F       rate-distortion slope, times q^2 (default 0.12)\n"
         "  --max-block N    largest leaf, 4..32 (default 32)\n"
-        "  --min-block N    smallest leaf, 4..max (default 4)\n",
+        "  --min-block N    smallest leaf, 4..max (default 4)\n"
+        "  --no-deblock     leave the seams between leaves unfiltered\n",
         argv0);
 }
 
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lambda") && i + 1 < argc) cfg.lambda_k = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--max-block") && i + 1 < argc) cfg.max_block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--min-block") && i + 1 < argc) cfg.min_block = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
         else { fprintf(stderr, "unknown option '%s'\n", argv[i]); usage(argv[0]); return 2; }
     }
 

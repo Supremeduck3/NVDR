@@ -268,10 +268,16 @@ Parâmetros:
 - **`--intra-thresh F`** — erro médio absoluto acima do qual o quadro vai
   intra mesmo fora do GOP (default 24). É assim que corte de cena é
   detectado, não declarado.
-- **`--q N`** — o passo de quantização de todos os quadros (default 24), e
-  **`--pred-q N`** só dos quadros preditos.
-- **`--block N`** — movimento por bloco de NxN (default 8; `0` usa um
-  vetor só para o quadro todo).
+- **`--q N`** — o passo de quantização dos quadros intra (default 24), e
+  **`--pred-q N`** o dos quadros preditos (default 1,2× o `--q`).
+- **`--block N`** — movimento por bloco de NxN, com vetores em **quarto de
+  pixel** (default: 16 a partir de 0,2 Mpx, 8 abaixo; `0` usa um vetor só
+  para o quadro todo).
+- **`--mv-lambda N`** — quanto um bit de vetor pesa contra o erro do bloco
+  (default 16).
+
+No clipe de referência de 960×540, o padrão dá **822 kbit/s a 36,9 dB**.
+O VP8 faz 605 kbit/s a 37,2 dB, então estamos a ~1,5× a taxa dele.
 
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.

@@ -128,15 +128,21 @@ def check_sequence(tmp, psnr_slack):
     srcdir.mkdir(exist_ok=True)
     make_sequence(srcdir)
 
+    # Predicted frames use the intra frames' quantiser here. By default the
+    # encoder makes them 1.2x coarser, and they then settle a little below
+    # the intra frame by design; the drift check is after the other thing,
+    # a reference that walks away from the source, and equal quantisers
+    # keep the two apart.
+    args = ["--gop", "0", "--q", "24", "--pred-q", "24"]
     out = tmp / "seq.nvdrv"
-    r = subprocess.run([str(enc), str(srcdir), str(out), "--gop", "0"],
+    r = subprocess.run([str(enc), str(srcdir), str(out)] + args,
                        capture_output=True, text=True)
     if r.returncode != 0 or not out.exists():
         return None, [r.stderr.strip() or "sequence encode failed"]
 
     # Determinism, same rule as the stills.
     out_b = tmp / "seq_b.nvdrv"
-    subprocess.run([str(enc), str(srcdir), str(out_b), "--gop", "0"],
+    subprocess.run([str(enc), str(srcdir), str(out_b)] + args,
                    capture_output=True, text=True)
     stable = (out_b.exists() and
               hashlib.sha256(out.read_bytes()).hexdigest()

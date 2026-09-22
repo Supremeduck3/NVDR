@@ -93,6 +93,15 @@ typedef struct {
     float lambda_k;
     int   max_block;   /* 4..32, a power of two: the tile size */
     int   min_block;   /* 4..max_block */
+    /* The image is a residual centred on 128, as a sequence's predicted
+     * frames are. Every leaf's colour is then predicted as 128 rather than
+     * from its neighbours: a residual's neighbours say nothing about it,
+     * and on the clean clip predicting from them cost 13% more colour
+     * bytes and 5% more texture bytes. Carried in the header's flags. */
+    int   residual;
+    /* Filter the seams between leaves after decoding (see deblock() in
+     * nvdr.c). Carried in the header's flags. */
+    int   deblock;
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
@@ -106,11 +115,14 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAGIC       "NVDR"
 #define NVDR_VERSION     10
 #define NVDR_HEADER_SIZE 32
+#define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
+#define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
 
 typedef struct {
     uint16_t width, height;
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
+    uint8_t  flags;                     /* NVDR_FLAG_* */
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */

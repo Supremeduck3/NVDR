@@ -48,7 +48,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      4
+#define NVDRV_VERSION      5
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 12
 
@@ -83,8 +83,8 @@ typedef struct {
      * extra for having it on.
      */
     int   block;
-    /* Quantiser step for predicted frames, when different from the intra
-     * frames' `frame.q`; zero keeps it. */
+    /* Quantiser step for predicted frames; zero means 1.2 times the intra
+     * frames' `frame.q`. */
     int   pred_q;
     /* What one bit of motion field is worth in sum of absolute differences
      * over a block, when the encoder chooses between a block's own vector
