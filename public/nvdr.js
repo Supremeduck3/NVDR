@@ -147,22 +147,29 @@ function divRound(a, n) {
     return a >= 0 ? (a + (n >> 1)) >> k : -((-a + (n >> 1)) >> k);
 }
 
-/* Mirrors inverse_dct: columns >> 6 with a 16-bit clip, rows >> 6+log2 n. */
+/*
+ * Mirrors inverse_dct: columns >> 6 with a 16-bit clip, rows >> 6+log2 n.
+ * `mu` and `mv` bound the nonzero coefficients (u <= mu, v <= mv). Every
+ * term past them is a zero, so skipping them changes nothing but the
+ * time: most leaves carry only a few low frequencies.
+ */
 const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-function inverseDct(s, input, out) {
+function inverseDct(s, input, out, mu, mv) {
     const n = MIN_BLOCK << s, t = TMAT[s], shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
     for (let y = 0; y < n; y++)
-        for (let u = 0; u < n; u++) {
+        for (let u = 0; u <= mu; u++) {
             let a = 0;
-            for (let v = 0; v < n; v++) a += t[v * n + y] * input[v * n + u];
+            for (let v = 0; v <= mv; v++) a += t[v * n + y] * input[v * n + u];
             TMP[y * n + u] = clampCoef((a + 32) >> 6);
         }
-    for (let y = 0; y < n; y++)
+    for (let y = 0; y < n; y++) {
+        const row = y * n;
         for (let x = 0; x < n; x++) {
             let a = 0;
-            for (let u = 0; u < n; u++) a += t[u * n + x] * TMP[y * n + u];
-            out[y * n + x] = (a + half) >> shift2;
+            for (let u = 0; u <= mu; u++) a += t[u * n + x] * TMP[row + u];
+            out[row + x] = (a + half) >> shift2;
         }
+    }
 }
 
 /* --- models ------------------------------------------------------------ */
@@ -400,9 +407,16 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
                 for (let c = 0; c < 3 && !d1.overrun && !s1.corrupt; c++) {
                     if (getTexture(d1, tm, sc, c, lv, count, s1) && !d1.overrun && !s1.corrupt) {
                         coef.fill(0, 0, count);
-                        const pos = SCAN_POS[sc];
-                        for (let k = 1; k < count; k++) coef[pos[k]] = clampCoef(lv[k] * step[c]);
-                        inverseDct(sc, coef, res);
+                        const pos = SCAN_POS[sc], sh = log2(n);
+                        let mu = 0, mv = 0;
+                        for (let k = 1; k < count; k++) {
+                            if (!lv[k]) continue;
+                            const p = pos[k], u = p & (n - 1), v = p >> sh;
+                            coef[p] = clampCoef(lv[k] * step[c]);
+                            if (u > mu) mu = u;
+                            if (v > mv) mv = v;
+                        }
+                        inverseDct(sc, coef, res, mu, mv);
                         const f = flat[c], o = full[c];
                         for (let j = 0; j < n; j++)
                             for (let ii = 0; ii < n; ii++) {

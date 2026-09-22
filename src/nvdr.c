@@ -238,21 +238,23 @@ static void forward_dct(int s, const double* in, double* out) {
  * bites on damaged input, and it is what keeps every product inside 32
  * bits: 32767 * 90 * 32 is under 2^27.
  */
-static void inverse_dct(int s, const int* in, int* out) {
+static void inverse_dct(int s, const int* in, int* out, int mu, int mv) {
+    /* mu and mv bound the nonzero coefficients; every term past them is a
+     * zero, so the bounds change the time and nothing else. */
     int n = NVDR_MIN_BLOCK << s;
     const int* t = tmat[s];
     int tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int shift2 = 6 + log2_int(n);
     for (int y = 0; y < n; y++)
-        for (int u = 0; u < n; u++) {
+        for (int u = 0; u <= mu; u++) {
             int a = 0;
-            for (int v = 0; v < n; v++) a += t[v * n + y] * in[v * n + u];
+            for (int v = 0; v <= mv; v++) a += t[v * n + y] * in[v * n + u];
             tmp[y * n + u] = clamp_coef((a + 32) >> 6);
         }
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++) {
             int a = 0;
-            for (int u = 0; u < n; u++) a += t[u * n + x] * tmp[y * n + u];
+            for (int u = 0; u <= mu; u++) a += t[u * n + x] * tmp[y * n + u];
             out[y * n + x] = (a + (1 << (shift2 - 1))) >> shift2;
         }
 }
@@ -507,8 +509,15 @@ static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
     int s = size_class(n), count = n * n;
     int coef[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     memset(coef, 0, sizeof(int) * count);
-    for (int i = 1; i < count; i++) coef[scan_pos[s][i]] = clamp_coef((long)lv[i] * step);
-    inverse_dct(s, coef, res);
+    int mu = 0, mv = 0, sh = log2_int(n);
+    for (int i = 1; i < count; i++) {
+        if (!lv[i]) continue;
+        int p = scan_pos[s][i], u = p & (n - 1), v = p >> sh;
+        coef[p] = clamp_coef((long)lv[i] * step);
+        if (u > mu) mu = u;
+        if (v > mv) mv = v;
+    }
+    inverse_dct(s, coef, res, mu, mv);
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) {
             size_t at = (size_t)(y + j) * cv->pw + x + i;

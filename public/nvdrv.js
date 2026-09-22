@@ -127,22 +127,46 @@ function shiftInto(src, dst, width, height, dx, dy) {
  * each axis, rounded with + 8 >> 4.
  */
 function blockPredict(src, dst, width, height, block, vx, vy) {
-    const nbx = Math.ceil(width / block);
-    const clampX = v => (v < 0 ? 0 : v >= width ? width - 1 : v);
-    const clampY = v => (v < 0 ? 0 : v >= height ? height - 1 : v);
-    for (let y = 0; y < height; y++) {
-        const rowBase = Math.floor(y / block) * nbx;
-        let o = y * width * 3;
-        for (let x = 0; x < width; x++, o += 3) {
-            const b = rowBase + Math.floor(x / block);
-            const fx = vx[b], fy = vy[b];
-            const ix = x + (fx >> 2), iy = y + (fy >> 2), ax = fx & 3, ay = fy & 3;
-            const x0 = clampX(ix), x1 = clampX(ix + 1);
-            const r0 = clampY(iy) * width * 3, r1 = clampY(iy + 1) * width * 3;
+    // Block by block: a whole-pixel vector is a copy, and a block whose
+    // source rectangle lies inside the frame needs no edge clamping. Every
+    // pixel still comes out exactly as qsample() makes it.
+    const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
+    const stride = width * 3;
+    for (let by = 0; by < nby; by++) {
+        const y0 = by * block, y1 = Math.min(y0 + block, height);
+        for (let bx = 0; bx < nbx; bx++) {
+            const x0 = bx * block, x1 = Math.min(x0 + block, width);
+            const b = by * nbx + bx, fx = vx[b], fy = vy[b];
+            const ox = fx >> 2, oy = fy >> 2, ax = fx & 3, ay = fy & 3;
+            const inside = x0 + ox >= 0 && x1 + ox < width && y0 + oy >= 0 && y1 + oy < height;
+            if (inside && !ax && !ay) {
+                for (let y = y0; y < y1; y++) {
+                    const s0 = (y + oy) * stride + (x0 + ox) * 3;
+                    dst.set(src.subarray(s0, s0 + (x1 - x0) * 3), y * stride + x0 * 3);
+                }
+                continue;
+            }
             const w00 = (4 - ax) * (4 - ay), w01 = ax * (4 - ay), w10 = (4 - ax) * ay, w11 = ax * ay;
-            for (let c = 0; c < 3; c++)
-                dst[o + c] = (w00 * src[r0 + x0 * 3 + c] + w01 * src[r0 + x1 * 3 + c] +
-                              w10 * src[r1 + x0 * 3 + c] + w11 * src[r1 + x1 * 3 + c] + 8) >> 4;
+            for (let y = y0; y < y1; y++) {
+                let iy = y + oy, iy1 = iy + 1;
+                if (!inside) {
+                    iy = iy < 0 ? 0 : iy >= height ? height - 1 : iy;
+                    iy1 = iy1 < 0 ? 0 : iy1 >= height ? height - 1 : iy1;
+                }
+                const r0 = iy * stride, r1 = iy1 * stride;
+                let o = y * stride + x0 * 3;
+                for (let x = x0; x < x1; x++, o += 3) {
+                    let ix = x + ox, ix1 = ix + 1;
+                    if (!inside) {
+                        ix = ix < 0 ? 0 : ix >= width ? width - 1 : ix;
+                        ix1 = ix1 < 0 ? 0 : ix1 >= width ? width - 1 : ix1;
+                    }
+                    const a0 = r0 + ix * 3, a1 = r0 + ix1 * 3, b0 = r1 + ix * 3, b1 = r1 + ix1 * 3;
+                    dst[o] = (w00 * src[a0] + w01 * src[a1] + w10 * src[b0] + w11 * src[b1] + 8) >> 4;
+                    dst[o + 1] = (w00 * src[a0 + 1] + w01 * src[a1 + 1] + w10 * src[b0 + 1] + w11 * src[b1 + 1] + 8) >> 4;
+                    dst[o + 2] = (w00 * src[a0 + 2] + w01 * src[a1 + 2] + w10 * src[b0 + 2] + w11 * src[b1 + 2] + 8) >> 4;
+                }
+            }
         }
     }
 }
