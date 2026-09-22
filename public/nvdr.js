@@ -7,22 +7,24 @@
  *
  * Format, little-endian:
  *
- *   [header 32B]  "NVDR", version 10, flags, width, height, max/min block,
- *                 luma and chroma steps, the two layers' byte counts
+ *   [header 32B]  "NVDR", version 11, flags, width, height, max/min block,
+ *                 luma and chroma steps, the three layers' byte counts, band
  *   [layer 0]     the quadtree and every leaf's colour, arithmetic coded,
  *                 32x32 tile by tile
- *   [layer 1]     every leaf's texture: DCT coefficients, same order
+ *   [layer 1]     every leaf's low-frequency texture: DCT coefficients
+ *   [layer 2]     every leaf's high-frequency texture
  *
  * A short buffer is a normal outcome, not an error: every tile that
- * arrived whole is decoded, a colour tile that did not is painted grey, a texture tile that did not keeps its flat colours.
+ * arrived whole is decoded, a colour tile that did not is painted grey, a
+ * texture tile that did not shows what the layer before gave it.
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-const VERSION = 10;
+const VERSION = 11;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
-export const LAYERS = 2;
-export const LAYER_NAMES = ['COR', 'COR+TEXTURA'];
+export const LAYERS = 3;
+export const LAYER_NAMES = ['COR', 'COR+TEXTURA BAIXA', 'COR+TEXTURA COMPLETA'];
 
 const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
 const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
@@ -119,14 +121,23 @@ function cosEntry(j) {
     return COS_TABLE[128 - j];
 }
 
-const TMAT = [], SCAN_POS = [], SCAN_CTX = [];
+const TMAT = [], SCAN_POS = [], SCAN_CTX = [], SCAN_DIAG = [];
+
+/* Mirrors band_split(): the first scan position of the high band. */
+function bandSplit(sc, band) {
+    const n = MIN_BLOCK << sc, count = n * n;
+    if (band <= 0) return count;
+    const dmax = Math.max(1, Math.floor(n * band / 32));
+    for (let i = 1; i < count; i++) if (SCAN_DIAG[sc][i] > dmax) return i;
+    return count;
+}
 for (let s = 0; s < NSIZES; s++) {
     const n = MIN_BLOCK << s, unit = MAX_BLOCK / n;
     const t = new Int32Array(n * n);
     for (let k = 0; k < n; k++)
         for (let x = 0; x < n; x++)
             t[k * n + x] = k ? cosEntry((2 * x + 1) * k * unit) : 64;
-    const pos = new Int32Array(n * n), ctx = new Uint8Array(n * n);
+    const pos = new Int32Array(n * n), ctx = new Uint8Array(n * n), diag = new Uint8Array(n * n);
     let at = 0;
     for (let d = 0; d <= 2 * (n - 1); d++)
         for (let v = 0; v < n; v++) {
@@ -134,9 +145,10 @@ for (let s = 0; s < NSIZES; s++) {
             if (u < 0 || u >= n) continue;
             pos[at] = v * n + u;
             ctx[at] = d < 8 ? d : 8 + Math.min((d - 8) >> 2, 6);
+            diag[at] = d;
             at++;
         }
-    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx);
+    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag);
 }
 
 const sizeClass = n => (n === 4 ? 0 : n === 8 ? 1 : n === 16 ? 2 : 3);
@@ -221,15 +233,16 @@ function getDc(d, m, sc, c, state) {
     return neg ? -(r + 1) : r + 1;
 }
 
-function getTexture(d, m, sc, c, lv, count, state) {
-    lv.fill(0, 0, count);
+/* Mirrors get_texture(): fills lv[start, end). */
+function getTexture(d, m, sc, c, lv, start, end, state) {
+    lv.fill(0, start, end);
     if (!d.bit(m.cbf[sc], c)) return false;
     let g = 0;
-    for (let i = 1; i < count; i++) {
+    for (let i = start; i < end; i++) {
         const pc = SCAN_CTX[sc][i];
-        const sig = i < count - 1 ? d.bit(m.sig[sc][c], pc) : 1;
+        const sig = i < end - 1 ? d.bit(m.sig[sc][c], pc) : 1;
         if (!sig) continue;
-        const last = i < count - 1 ? d.bit(m.last[sc][c], pc) : 1;
+        const last = i < end - 1 ? d.bit(m.last[sc][c], pc) : 1;
         let a;
         if (!d.bit(m.gt1[c], g < 3 ? g : 3)) a = 1;
         else {
@@ -269,20 +282,21 @@ export function readHeader(buffer) {
         qLuma: v.getUint16(12, true),
         qChroma: v.getUint16(14, true),
         flags: v.getUint8(5),
-        storedBytes: [v.getUint32(16, true), v.getUint32(20, true)]
+        storedBytes: [v.getUint32(16, true), v.getUint32(20, true), v.getUint32(24, true)],
+        band: v.getUint8(28)
     };
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
     if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK)) return null;
-    if (h.storedBytes[0] > 0x7fffffff || h.storedBytes[1] > 0x7fffffff) return null;
+    if (h.storedBytes.some(b => b > 0x7fffffff) || h.band > 32) return null;
     return h;
 }
 
 /** Bytes needed before each layer is complete. */
 export function layerThresholds(header) {
-    const a = HEADER_SIZE + header.storedBytes[0];
-    return [a, a + header.storedBytes[1]];
+    const a = HEADER_SIZE + header.storedBytes[0], b = a + header.storedBytes[1];
+    return [a, b, b + header.storedBytes[2]];
 }
 
 /* --- decoder ----------------------------------------------------------- */
@@ -304,12 +318,17 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
     if (avail0 < 5) return null;
     const off1 = HEADER_SIZE + h.storedBytes[0];
     const avail1 = Math.min(size > off1 ? size - off1 : 0, h.storedBytes[1]);
+    const off2 = off1 + h.storedBytes[1];
+    const avail2 = Math.min(size > off2 ? size - off2 : 0, h.storedBytes[2]);
+    const bandAt = [0, 1, 2, 3].map(sc => bandSplit(sc, h.band));
 
     const tile = h.maxBlock, minBlock = h.minBlock;
     const pw = Math.ceil(h.width / minBlock) * minBlock;
     const ph = Math.ceil(h.height / minBlock) * minBlock;
     const flat = [0, 1, 2].map(() => new Uint8Array(pw * ph));
     const full = [0, 1, 2].map(() => new Uint8Array(pw * ph));
+    // Texture added so far, unclamped to 16 bits; full = clamp(flat + acc).
+    const acc = [0, 1, 2].map(() => new Int16Array(pw * ph));
     const step = [h.qLuma, h.qChroma, h.qChroma];
     const tilesX = Math.ceil(pw / tile), tilesY = Math.ceil(ph / tile), tiles = tilesX * tilesY;
 
@@ -318,6 +337,13 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
 
     function fill(p, x, y, w, hh, v) {
         for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + w);
+    }
+
+    // Mirrors paint_flat().
+    function paintFlat(c, x, y, w, hh, v) {
+        fill(flat[c], x, y, w, hh, v);
+        fill(full[c], x, y, w, hh, v);
+        fill(acc[c], x, y, w, hh, 0);
     }
 
     const fixedPred = (h.flags & FLAG_RESIDUAL) !== 0;
@@ -342,10 +368,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
         const w = tx + tile < pw ? tile : pw - tx;
         const hh = ty + tile < ph ? tile : ph - ty;
         // Neutral grey, as tile_fallback() explains.
-        for (let c = 0; c < 3; c++) {
-            fill(flat[c], tx, ty, w, hh, 128);
-            fill(full[c], tx, ty, w, hh, 128);
-        }
+        for (let c = 0; c < 3; c++) paintFlat(c, tx, ty, w, hh, 128);
     }
 
     // Layer 0.
@@ -373,8 +396,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
             const pred = predict(c, x, y, n);
             const dl = getDc(d0, cm, sc, c, s0);
             const colour = clampU8(pred + divRound(clampCoef(dl * step[c]), n));
-            fill(flat[c], x, y, n, n, colour);
-            fill(full[c], x, y, n, n, colour);
+            paintFlat(c, x, y, n, n, colour);
         }
         lx.push(x); ly.push(y); ln.push(n);
     }
@@ -394,26 +416,44 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
     }
     tileStart[tiles] = lx.length;
 
-    // Layer 1.
-    let complete1 = 0;
-    let texturedLeaf = null;
-    if ((maxLayer < 0 || maxLayer >= 1) && avail1 >= 5 && complete0 > 0) {
+    // Layers 1 and 2, the low and the high texture band. Mirrors the C
+    // loop: each band as far as its bytes reach and no further than the
+    // layer before it; a tile cut short is restored to what it showed.
+    const complete = [complete0, 0, 0];
+    const texturedLeaf = new Uint8Array(lx.length);
+    const lv = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    const coef = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    const res = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    const saved = [0, 1, 2].map(() => new Uint8Array(tile * tile));
+    const savedAcc = [0, 1, 2].map(() => new Int16Array(tile * tile));
+    for (let layer = 1; layer < LAYERS; layer++) {
+        const avail = layer === 1 ? avail1 : avail2, off = layer === 1 ? off1 : off2;
+        if ((maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
+        if (layer === 2 && h.band === 0) break;
         const tm = textureModels();
-        const d1 = new ArithDecoder(bytes, off1, avail1);
-        const s1 = { corrupt: false };
-        texturedLeaf = new Uint8Array(lx.length);
-        const lv = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-        const coef = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-        const res = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-        for (let t = 0; t < complete0; t++) {
-            for (let i = tileStart[t]; i < tileStart[t + 1] && !d1.overrun && !s1.corrupt; i++) {
+        const d = new ArithDecoder(bytes, off, avail);
+        const st = { corrupt: false };
+        for (let t = 0; t < complete[layer - 1]; t++) {
+            const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
+            const tw = tx + tile < pw ? tile : pw - tx, th = ty + tile < ph ? tile : ph - ty;
+            for (let c = 0; c < 3; c++)
+                for (let j = 0; j < th; j++) {
+                    const at = (ty + j) * pw + tx;
+                    saved[c].set(full[c].subarray(at, at + tw), j * tile);
+                    savedAcc[c].set(acc[c].subarray(at, at + tw), j * tile);
+                }
+            const first = tileStart[t], last = tileStart[t + 1];
+            const was = texturedLeaf.slice(first, last);
+            for (let i = first; i < last && !d.overrun && !st.corrupt; i++) {
                 const x = lx[i], y = ly[i], n = ln[i], sc = sizeClass(n), count = n * n;
-                for (let c = 0; c < 3 && !d1.overrun && !s1.corrupt; c++) {
-                    if (getTexture(d1, tm, sc, c, lv, count, s1) && !d1.overrun && !s1.corrupt) {
+                const start = layer === 1 ? 1 : bandAt[sc], end = layer === 1 ? bandAt[sc] : count;
+                if (start >= end) continue;
+                for (let c = 0; c < 3 && !d.overrun && !st.corrupt; c++) {
+                    if (getTexture(d, tm, sc, c, lv, start, end, st) && !d.overrun && !st.corrupt) {
                         coef.fill(0, 0, count);
                         const pos = SCAN_POS[sc], sh = log2(n);
                         let mu = 0, mv = 0;
-                        for (let k = 1; k < count; k++) {
+                        for (let k = start; k < end; k++) {
                             if (!lv[k]) continue;
                             const p = pos[k], u = p & (n - 1), v = p >> sh;
                             coef[p] = clampCoef(lv[k] * step[c]);
@@ -422,28 +462,28 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
                         }
                         inverseDct(sc, coef, res, mu, mv);
                         texturedLeaf[i] = 1;
-                        const f = flat[c], o = full[c];
+                        const o = full[c], f = flat[c], a = acc[c];
                         for (let j = 0; j < n; j++)
                             for (let ii = 0; ii < n; ii++) {
                                 const at = (y + j) * pw + x + ii;
-                                o[at] = clampU8(f[at] + res[j * n + ii]);
+                                let v = a[at] + res[j * n + ii];
+                                v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+                                a[at] = v;
+                                o[at] = clampU8(f[at] + v);
                             }
                     }
                 }
             }
-            if (d1.overrun || s1.corrupt) {
-                for (let i = tileStart[t]; i < tileStart[t + 1]; i++) {
-                    const x = lx[i], y = ly[i], n = ln[i];
-                    texturedLeaf[i] = 0;
-                    for (let c = 0; c < 3; c++)
-                        for (let j = 0; j < n; j++) {
-                            const at = (y + j) * pw + x;
-                            full[c].set(flat[c].subarray(at, at + n), at);
-                        }
-                }
+            if (d.overrun || st.corrupt) {
+                for (let c = 0; c < 3; c++)
+                    for (let j = 0; j < th; j++) {
+                        full[c].set(saved[c].subarray(j * tile, j * tile + tw), (ty + j) * pw + tx);
+                        acc[c].set(savedAcc[c].subarray(j * tile, j * tile + tw), (ty + j) * pw + tx);
+                    }
+                texturedLeaf.set(was, first);
                 break;
             }
-            complete1++;
+            complete[layer]++;
         }
     }
 
@@ -524,9 +564,10 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
 
     return {
         header: h,
-        layersPresent: complete0 === tiles && avail1 >= 5 ? 2 : 1,
+        layersPresent: h.band && complete[1] === tiles && avail2 >= 5 ? 3
+                     : complete0 === tiles && avail1 >= 5 ? 2 : 1,
         tiles,
-        tilesComplete: [complete0, complete1],
+        tilesComplete: complete,
         rgb: maxLayer === 0 ? shown(flat, null) : shown(full, texturedLeaf),
         flatRgb: wantFlat ? shown(flat, null) : null
     };

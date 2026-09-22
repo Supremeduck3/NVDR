@@ -8,39 +8,39 @@
     "psnr": 30.27
   },
   "OIP-1304511485.jpg": {
-    "bytes": 17345,
-    "psnr": 35.32
+    "bytes": 17276,
+    "psnr": 35.28
   },
   "OIP-3451121336.jpg": {
-    "bytes": 39947,
-    "psnr": 31.63
+    "bytes": 39564,
+    "psnr": 31.61
   },
   "OIP-3786546191.jpg": {
-    "bytes": 34025,
-    "psnr": 32.3
+    "bytes": 33642,
+    "psnr": 32.29
   },
   "OIP-4140498144.jpg": {
-    "bytes": 21696,
+    "bytes": 21482,
     "psnr": 33.86
   },
   "blocos.ppm": {
-    "bytes": 315,
+    "bytes": 329,
     "psnr": 56.34
   },
   "circulos.ppm": {
-    "bytes": 3462,
-    "psnr": 40.45
+    "bytes": 3563,
+    "psnr": 40.46
   },
   "degrade.ppm": {
-    "bytes": 486,
+    "bytes": 500,
     "psnr": 46.51
   },
   "macarr\u00e3o.jpg": {
-    "bytes": 6222,
-    "psnr": 39.87
+    "bytes": 6253,
+    "psnr": 39.84
   },
   "montanha_pessoas.jpg": {
-    "bytes": 52809,
-    "psnr": 33.44
+    "bytes": 52012,
+    "psnr": 33.41
   }
 }

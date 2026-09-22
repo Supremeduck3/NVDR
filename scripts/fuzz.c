@@ -119,7 +119,8 @@ int main(int argc, char** argv) {
             NvdrConfig c = cfg;
             if (variant == 1) c.q = 1;
             if (variant == 2) c.q = 200;
-            if (variant == 3) { c.min_block = 8; c.max_block = 16; }
+            if (variant == 3) { c.min_block = 8; c.max_block = 16; c.band = 0; }
+            if (variant == 2) c.band = 32;
             if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) == 0) nseeds++;
         }
         nvdr_image_free(&img);

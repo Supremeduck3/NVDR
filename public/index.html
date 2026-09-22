@@ -51,7 +51,7 @@
   #status, .status { margin-top: 14px; color: var(--muted); min-height: 1.5em; }
   #status .err, .status .err { color: #f85149; }
 
-  .levels { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
   @media (max-width: 860px) { .levels { grid-template-columns: 1fr; } }
 
   .level h3 { margin: 0 0 2px; font-size: .95rem; font-weight: 600; }
@@ -128,9 +128,9 @@
       <h3 style="margin:0 0 4px;font-size:.95rem">Camadas</h3>
       <p class="note" style="margin:0 0 14px">
         A primeira camada é a árvore e a cor de cada bloco: sozinha, já é uma
-        imagem inteira de blocos chapados. A segunda acrescenta a textura de cada
-        bloco. Os bytes acumulados são exatamente o que o arquivo ocupa e o que
-        trafegaria na rede.
+        imagem inteira de blocos chapados. A segunda acrescenta as frequências
+        baixas da textura de todos os blocos, a terceira o resto. Os bytes
+        acumulados são exatamente o que o arquivo ocupa e o que trafegaria na rede.
       </p>
       <div class="levels" id="levels"></div>
     </div>
@@ -139,9 +139,10 @@
       <h3 style="margin:0 0 6px;font-size:.95rem">Entrega parcial</h3>
       <p class="note" style="margin:0 0 14px">
         Arraste para simular um download interrompido.
-        Cada camada chega em blocos de 32×32, de cima para baixo. Um bloco de cor
-        que não chegou fica cinza; um bloco de textura
-        que não chegou mantém a cor chapada. Qualquer corte depois do cabeçalho
+        Cada camada chega em blocos de 32×32, de cima para baixo, e a textura vem
+        em duas: primeiro a grossa da imagem inteira, depois o detalhe. Um bloco
+        de cor que não chegou fica cinza; um bloco de textura que não chegou mostra
+        o que a camada anterior deu a ele. Qualquer corte depois do cabeçalho
         mostra uma imagem, e cada byte a mais melhora o que está na tela.
       </p>
       <div class="slider-row">
@@ -301,7 +302,8 @@ async function handleFile(file) {
 
 async function showLevels() {
     const t0 = performance.now();
-    const result = decode(container, 1, true);
+    const result = decode(container, 2, true);
+    const low = decode(container, 1);
     const decodeMs = performance.now() - t0;
 
     if (!result) {
@@ -313,7 +315,7 @@ async function showLevels() {
     const thresholds = layerThresholds(header);
     levelsEl.innerHTML = '';
 
-    [result.flatRgb, result.rgb].forEach((rgb, k) => {
+    [result.flatRgb, low.rgb, result.rgb].forEach((rgb, k) => {
         const wrap = document.createElement('div');
         wrap.className = 'level';
         wrap.innerHTML = `
@@ -365,10 +367,11 @@ async function showTruncated() {
     }
 
     showRGB(result.rgb, result.header.width, result.header.height, ctx);
-    const [cor, tex] = result.tilesComplete;
+    const [cor, baixa, alta] = result.tilesComplete;
     truncOut.innerHTML =
         `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +
-        `cor ${cor}/${result.tiles} blocos · textura ${tex}/${result.tiles} blocos`;
+        `cor ${cor}/${result.tiles} · textura ${baixa}/${result.tiles} · ` +
+        `detalhe ${alta}/${result.tiles} blocos`;
 }
 </script>
 

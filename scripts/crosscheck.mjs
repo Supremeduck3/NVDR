@@ -66,10 +66,11 @@ function check(label, file, layer) {
 }
 
 const size = readFileSync(container).length;
-for (const layer of [0, 1]) check(`whole layer=${layer}`, container, layer);
+for (const layer of [0, 1, 2]) check(`whole layer=${layer}`, container, layer);
 for (const pct of [3, 8, 17, 34, 52, 71, 88, 96]) {
     const cut = `/tmp/cc_${pct}.nvdr`;
     execFileSync('bash', ['-c', `head -c ${Math.floor(size * pct / 100)} ${container} > ${cut}`]);
-    check(`cut ${pct}%`, cut, 1);
+    check(`cut ${pct}%`, cut, 2);
+    check(`cut ${pct}% layer=1`, cut, 1);
 }
 process.exit(failures ? 1 : 0);
