@@ -677,9 +677,10 @@ So the gap has three parts, in order of size. The residual is decided by
 a tolerance, not by rate against distortion, so predicted frames
 re-code errors they cannot remove. The motion field ignores that
 neighbouring vectors agree. And there is no rate control. What to fix
-follows from that: predict each vector from its neighbours and skip
-blocks that need nothing, decide the residual per block by rate and
-distortion, and add a zoom/affine global model. `--pred-tolerance`
+follows from that: predict each vector from its neighbours (done in v3,
+under "Coding the field"), skip blocks that need nothing, decide
+the residual per block by rate and distortion, and add a zoom/affine
+global model. `--pred-tolerance`
 stays off by default, because on its own it trades 3 dB for the rate.
 
 ### Real time
@@ -844,9 +845,10 @@ is right for one of them and wrong for the other. Each 8x8 block now
 carries its own vector, searched in two windows — around the global
 vector, where most blocks are, and around zero, because what moves against
 a pan is very often something holding still relative to the camera. The
-field goes in the frame as deltas against the global vector, in two
-deflated planes, so a shot with nothing moving against the camera pays a
-few dozen bytes for it.
+field went in the frame as deltas against the global vector, in two
+deflated planes, so a shot with nothing moving against the camera paid a
+few dozen bytes for it. Version 3 codes it predictively instead; see
+below.
 
 Measured with the field's cost inside the bytes:
 
@@ -863,6 +865,54 @@ is nearly free. `mixed` — camera panning while a region moves the other
 way — is the case one vector cannot describe, and it is only 4% of the
 area there. Real footage, where far more of the frame moves independently,
 is where this should matter most and is exactly what has not been measured.
+
+### Coding the field
+
+On the clean benchmark clip, once predicted frames stopped re-coding the
+intra frame's texture, the motion field was most of what was left: 3607
+of a predicted frame's 3714 bytes. Deflate over deltas against the global
+vector sees runs of equal bytes. It cannot see that the likeliest vector
+is the one next door.
+
+Version 3 predicts each vector from the median of its left, top and
+top-right neighbours, as H.264 does, and codes it with the same adaptive
+arithmetic coder as the stills. A block that matches its prediction costs
+one bit, conditioned on whether its left and top neighbours matched. Any
+other block codes the difference, x then y, as zero flag, sign and
+adaptive unary magnitude.
+
+A better coder for the field does little while the search ignores it,
+because the search picks each vector by prediction error alone. Among
+near-equal matches on texture, the winner flickers from block to block.
+A second pass therefore walks the blocks in coding order, when each
+block's prediction is known. It weighs a handful of candidates (the
+search's pick, the prediction and its four neighbours at one pixel, the
+global vector, the left and top vectors) by block error plus
+`--mv-lambda` times the bits the vector would cost. That pass is
+sequential, because every choice moves the prediction of the blocks
+after it. It is cheap, because it only evaluates candidates.
+
+On the clean clip, against v2:
+
+                               v2                    v3, lambda 8
+    default tolerance     3402 kbit/s 33.36 dB    3143 kbit/s 33.39 dB   -7.6%
+    --pred-tolerance loose 999 kbit/s 30.29 dB     816 kbit/s 30.36 dB  -18.3%
+
+    field per predicted frame, loose:  3607 B  ->  2674 B
+
+The coder alone, with lambda 0, gives 905 kbit/s. The rest comes from the
+rate-aware pass. Larger lambdas keep trading quality for rate (715 kbit/s
+at 16 and 30.17 dB; 593 at 32 and 29.81 dB). 8 is the default because it
+is the largest that costs no quality at the default tolerance. The
+12-frame sequence in the regression gate is 4.1% smaller at -0.02 dB.
+
+That is not the gap to VP8 closed. The field is still about 2.3 bits per
+8x8 block. VP8 spends its whole predicted frame, 637 bytes at 150 kbit/s,
+on 16x16 macroblocks that split only where it pays. The next step for
+the field is the same thing in this codec's own terms: a quadtree over
+the motion that stays whole where the vectors agree. At the default
+tolerance the residual is still 12 KB of the 15 KB frame, and that is
+fix (b).
 
 Not here yet: B-frames.
 

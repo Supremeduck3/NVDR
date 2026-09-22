@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
+#include "entropy.h"
 
 /* ---------------------------------------------------------------- bytes */
 
@@ -34,10 +34,11 @@ NvdrvConfig nvdrv_default_config(void) {
      * every synthetic sequence it came out smaller and better at once —
      * -12.8% and +0.37 dB where the camera and a subject move differently,
      * -0.9% on a plain pan — for 18% more encode time. Larger blocks were
-     * expected to win on vector cost and did not: once deflated, a field
-     * that mostly agrees with the global vector costs almost nothing. */
+     * expected to win on vector cost and did not, when the field was
+     * measured deflated against the global vector (v2). */
     c.block = 8;
     for (int k = 0; k < NVDR_LEVELS; k++) c.pred_tolerance[k] = 0.0f;
+    c.mv_lambda = 8;
     c.fps = 24;
     return c;
 }
@@ -129,7 +130,8 @@ static void shift_into(const NvdrImage* src, NvdrImage* dst, int dx, int dy) {
  * A block only leaves the global vector when doing so buys more than a
  * level per pixel of absolute difference. Below that, the gain is noise
  * the residual would have absorbed anyway, and every block that agrees
- * with the global vector costs almost nothing once the field is deflated.
+ * with its neighbours costs about a bit once the field is coded (see
+ * pack_field).
  */
 #define NVDRV_LOCAL_RANGE 4
 
@@ -211,42 +213,201 @@ static void block_predict(const NvdrImage* src, NvdrImage* dst, int block,
 }
 
 /*
- * The field as two planes of deltas against the global vector, deflated.
- * A pan with nothing moving against it is a field of zeros and costs a few
- * dozen bytes; the planes are split so each is a run of like values.
+ * THE FIELD
+ * ---------
+ * Neighbouring blocks nearly always move together, so each vector is
+ * coded against a prediction from the blocks already coded: the
+ * component-wise median of the left, top and top-right neighbours, the
+ * rule H.264 uses. A neighbour off the frame is replaced by the global
+ * vector. On the top row there is only the left neighbour, which is then
+ * the prediction on its own.
+ *
+ * A block whose vector equals its prediction costs one adaptive bit,
+ * conditioned on whether its left and top neighbours were the same. On
+ * a pan or a smooth zoom that bit is most of the field. Any other block
+ * codes its difference from the prediction, x and then y, each as a zero
+ * flag, a sign and an adaptive unary magnitude that escapes to eight direct
+ * bits. When x is zero, y cannot be, since the block would have been a
+ * match, so y skips its zero flag.
+ *
+ * This replaces two planes of deltas against the global vector, deflated.
+ * Deflate sees runs; it cannot see that the vector above is the likeliest
+ * value, and on the clean benchmark clip the field had become most of a
+ * predicted frame.
  */
-static uint8_t* pack_field(const int8_t* vx, const int8_t* vy, int nb,
-                           int gdx, int gdy, size_t* out_len) {
-    uint8_t* raw = (uint8_t*)malloc((size_t)nb * 2);
-    if (!raw) return NULL;
-    for (int i = 0; i < nb; i++) {
-        raw[i]      = (uint8_t)(int8_t)(vx[i] - gdx);
-        raw[nb + i] = (uint8_t)(int8_t)(vy[i] - gdy);
-    }
-    uLongf bound = compressBound((uLong)nb * 2);
-    uint8_t* packed = (uint8_t*)malloc(bound);
-    if (!packed || compress2(packed, &bound, raw, (uLong)nb * 2, 9) != Z_OK) {
-        free(raw); free(packed); return NULL;
-    }
-    free(raw);
-    *out_len = bound;
-    return packed;
+#define MV_MAG_CTX 6
+
+typedef struct {
+    uint16_t same[3];
+    uint16_t zero[2];
+    uint16_t sign[2];
+    uint16_t mag[2][MV_MAG_CTX];
+} MvModels;
+
+static void mv_models_init(MvModels* m) {
+    uint16_t* p = (uint16_t*)m;
+    for (size_t i = 0; i < sizeof(*m) / sizeof(uint16_t); i++) p[i] = NVDR_PROB_INIT;
 }
 
-static int unpack_field(const uint8_t* packed, size_t len, int nb,
+static int median3(int a, int b, int c) {
+    if (a > b) { int t = a; a = b; b = t; }
+    return c < a ? a : (c > b ? b : c);
+}
+
+static void mv_predict(const int8_t* vx, const int8_t* vy, int nbx, int b,
+                       int gdx, int gdy, int* px, int* py) {
+    int x = b % nbx, y = b / nbx;
+    if (y == 0) {
+        if (x > 0) { *px = vx[b - 1]; *py = vy[b - 1]; }
+        else       { *px = gdx;       *py = gdy; }
+        return;
+    }
+    int t = b - nbx;
+    int lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
+    int rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
+    *px = median3(lx, vx[t], rx);
+    *py = median3(ly, vy[t], ry);
+}
+
+/* The context of the match bit: how many of left and top matched. */
+static int mv_same_ctx(const uint8_t* same, int nbx, int b) {
+    int x = b % nbx, y = b / nbx;
+    return (x > 0 && same[b - 1]) + (y > 0 && same[b - nbx]);
+}
+
+static void mv_enc_component(NvdrEncoder* enc, MvModels* m, int c, int v, int can_be_zero) {
+    if (can_be_zero) {
+        nvdr_enc_bit(enc, &m->zero[c], v != 0);
+        if (!v) return;
+    }
+    nvdr_enc_bit(enc, &m->sign[c], v < 0);
+    int remaining = (v < 0 ? -v : v) - 1;
+    for (int i = 0; i < MV_MAG_CTX; i++) {
+        int more = remaining > i;
+        nvdr_enc_bit(enc, &m->mag[c][i], more);
+        if (!more) return;
+    }
+    nvdr_enc_direct(enc, (uint32_t)(remaining - MV_MAG_CTX), 8);
+}
+
+static int mv_dec_component(NvdrDecoder* dec, MvModels* m, int c, int can_be_zero) {
+    if (can_be_zero && !nvdr_dec_bit(dec, &m->zero[c])) return 0;
+    int negative = nvdr_dec_bit(dec, &m->sign[c]);
+    int remaining = 0, i = 0;
+    for (; i < MV_MAG_CTX; i++) {
+        if (!nvdr_dec_bit(dec, &m->mag[c][i])) break;
+        remaining = i + 1;
+    }
+    if (i == MV_MAG_CTX) remaining = MV_MAG_CTX + (int)nvdr_dec_direct(dec, 8);
+    return negative ? -(remaining + 1) : remaining + 1;
+}
+
+/* Roughly what a difference costs under the binarisation above, for the
+ * search to weigh against the prediction error it saves. */
+static int mv_component_bits(int v, int can_be_zero) {
+    int bits = can_be_zero;
+    if (!v) return bits;
+    int a = v < 0 ? -v : v;
+    return bits + 1 + (a <= MV_MAG_CTX ? a : MV_MAG_CTX + 8);
+}
+
+static int mv_bits(int dx, int dy) {
+    if (!dx && !dy) return 1;
+    return 1 + mv_component_bits(dx, 1) + mv_component_bits(dy, dx != 0);
+}
+
+static uint8_t* pack_field(const int8_t* vx, const int8_t* vy, int nbx, int nby,
+                           int gdx, int gdy, size_t* out_len) {
+    int nb = nbx * nby;
+    uint8_t* same = (uint8_t*)malloc((size_t)nb);
+    if (!same) return NULL;
+    MvModels m;
+    mv_models_init(&m);
+    NvdrEncoder enc;
+    if (nvdr_enc_init(&enc, (size_t)nb / 2 + 64) != 0) { free(same); return NULL; }
+    for (int b = 0; b < nb; b++) {
+        int px, py;
+        mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+        int ex = vx[b] - px, ey = vy[b] - py;
+        same[b] = !ex && !ey;
+        nvdr_enc_bit(&enc, &m.same[mv_same_ctx(same, nbx, b)], !same[b]);
+        if (same[b]) continue;
+        mv_enc_component(&enc, &m, 0, ex, 1);
+        mv_enc_component(&enc, &m, 1, ey, ex != 0);
+    }
+    free(same);
+    if (nvdr_enc_finish(&enc) != 0) { nvdr_enc_free(&enc); return NULL; }
+    *out_len = enc.count;
+    return enc.bytes;      /* ownership passes to the caller */
+}
+
+/* A vector that does not fit the field's int8 is damage, not motion. */
+static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby,
                         int gdx, int gdy, int8_t* vx, int8_t* vy) {
-    uint8_t* raw = (uint8_t*)malloc((size_t)nb * 2);
-    if (!raw) return -1;
-    uLongf got = (uLongf)nb * 2;
-    if (uncompress(raw, &got, packed, (uLong)len) != Z_OK || got != (uLongf)nb * 2) {
-        free(raw); return -1;
+    int nb = nbx * nby;
+    uint8_t* same = (uint8_t*)malloc((size_t)nb);
+    if (!same) return -1;
+    MvModels m;
+    mv_models_init(&m);
+    NvdrDecoder dec;
+    nvdr_dec_init(&dec, packed, len);
+    for (int b = 0; b < nb; b++) {
+        int px, py;
+        mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+        same[b] = !nvdr_dec_bit(&dec, &m.same[mv_same_ctx(same, nbx, b)]);
+        int ex = 0, ey = 0;
+        if (!same[b]) {
+            ex = mv_dec_component(&dec, &m, 0, 1);
+            ey = mv_dec_component(&dec, &m, 1, ex != 0);
+        }
+        int x = px + ex, y = py + ey;
+        if (x < -128 || x > 127 || y < -128 || y > 127) { free(same); return -1; }
+        vx[b] = (int8_t)x;
+        vy[b] = (int8_t)y;
     }
-    for (int i = 0; i < nb; i++) {
-        vx[i] = (int8_t)(gdx + (int8_t)raw[i]);
-        vy[i] = (int8_t)(gdy + (int8_t)raw[nb + i]);
-    }
-    free(raw);
+    free(same);
     return 0;
+}
+
+/*
+ * The search above picks each block's vector by prediction error alone.
+ * This pass revisits the blocks in coding order, when the prediction each
+ * one will be coded against is known, and trades error against the bits
+ * the vector costs: a block keeps its own vector only if that beats the
+ * predicted one, or a neighbour's, by more than the difference is worth.
+ * It has to run in order, since every choice moves the prediction of the
+ * blocks after it; it only evaluates a handful of candidates per block.
+ */
+static void field_rd(const NvdrImage* cur, const NvdrImage* ref, int block,
+                     int gdx, int gdy, int lambda, int8_t* vx, int8_t* vy) {
+    int nbx = (cur->width + block - 1) / block;
+    int nby = (cur->height + block - 1) / block;
+    for (int b = 0; b < nbx * nby; b++) {
+        int x0 = (b % nbx) * block, y0 = (b / nbx) * block;
+        int bw = cur->width - x0 < block ? cur->width - x0 : block;
+        int bh = cur->height - y0 < block ? cur->height - y0 : block;
+        int px, py;
+        mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+        int cand[9][2] = {
+            { px, py }, { vx[b], vy[b] }, { gdx, gdy },
+            { b % nbx ? vx[b - 1] : gdx, b % nbx ? vy[b - 1] : gdy },
+            { b >= nbx ? vx[b - nbx] : gdx, b >= nbx ? vy[b - nbx] : gdy },
+            { px - 1, py }, { px + 1, py }, { px, py - 1 }, { px, py + 1 },
+        };
+        int best = INT_MAX, bx = px, by = py;
+        for (int c = 0; c < 9; c++) {
+            int cx = cand[c][0], cy = cand[c][1];
+            int dup = 0;
+            for (int k = 0; k < c; k++) dup |= cand[k][0] == cx && cand[k][1] == cy;
+            if (dup) continue;
+            int rate = lambda * mv_bits(cx - px, cy - py);
+            if (rate >= best) continue;
+            int cost = block_sad(cur, ref, x0, y0, bw, bh, cx, cy, best - rate) + rate;
+            if (cost < best) { best = cost; bx = cx; by = cy; }
+        }
+        vx[b] = (int8_t)bx;
+        vy[b] = (int8_t)by;
+    }
 }
 
 static int field_blocks(int w, int h, int block) {
@@ -384,6 +545,8 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
         if (e->cfg.block > 0) {
             block = e->cfg.block;
             block_search(frame, &e->state, block, dx, dy, e->vx, e->vy);
+            if (e->cfg.mv_lambda > 0)
+                field_rd(frame, &e->state, block, dx, dy, e->cfg.mv_lambda, e->vx, e->vy);
             block_predict(&e->state, &e->scratch, block, e->vx, e->vy);
             ref = &e->scratch;
         } else if (dx || dy) {
@@ -416,8 +579,8 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
     }
 
     if (block) {
-        field = pack_field(e->vx, e->vy, field_blocks(e->width, e->height, block),
-                           dx, dy, &field_len);
+        field = pack_field(e->vx, e->vy, (e->width + block - 1) / block,
+                           (e->height + block - 1) / block, dx, dy, &field_len);
         if (!field) return -1;
     }
 
@@ -564,7 +727,8 @@ int nvdrv_decode_next(NvdrvDecoder* d, NvdrImage* out,
         int8_t* vx = (int8_t*)malloc((size_t)nb);
         int8_t* vy = (int8_t*)malloc((size_t)nb);
         if (!vx || !vy ||
-            unpack_field(d->data + d->pos + 4, field_len, nb, dx, dy, vx, vy) != 0) {
+            unpack_field(d->data + d->pos + 4, field_len, (d->width + block - 1) / block,
+                         (d->height + block - 1) / block, dx, dy, vx, vy) != 0) {
             free(vx); free(vy); return -1;
         }
         block_predict(&d->state, &d->scratch, block, vx, vy);

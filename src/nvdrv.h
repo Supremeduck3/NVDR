@@ -48,7 +48,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      2
+#define NVDRV_VERSION      3
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 12
 
@@ -94,6 +94,10 @@ typedef struct {
      * the motion instead of re-coding it.
      */
     float pred_tolerance[NVDR_LEVELS];
+    /* What one bit of motion field is worth in sum of absolute differences
+     * over a block, when the encoder chooses between a block's own vector
+     * and the one its neighbours predict. 0 keeps the search's choice. */
+    int   mv_lambda;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 

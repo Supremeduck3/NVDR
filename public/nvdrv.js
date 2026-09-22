@@ -12,10 +12,10 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
-import { decode, paintLevel, showRGB, SMOOTH_DEFAULT } from './nvdr.js';
+import { decode, paintLevel, showRGB, SMOOTH_DEFAULT, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 2;
+const VERSION = 3;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 12;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -24,7 +24,6 @@ export const INTRA = 0;
 export const PRED = 1;
 
 function clamp255(v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
-function int8(v) { return (v << 24) >> 24; }
 
 export function readSequenceHeader(buffer) {
     if (buffer.byteLength < HEADER_SIZE) return null;
@@ -42,10 +41,67 @@ export function readSequenceHeader(buffer) {
     return info;
 }
 
-/* The zlib stream the C side writes with compress2. */
-async function inflate(bytes) {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
-    return new Uint8Array(await new Response(stream).arrayBuffer());
+/*
+ * The motion field, mirroring pack_field/unpack_field in nvdrv.c: each
+ * vector predicted by the median of its left, top and top-right
+ * neighbours, then a match bit or the difference, arithmetic coded.
+ */
+const MV_MAG_CTX = 6;
+
+function median3(a, b, c) {
+    if (a > b) { const t = a; a = b; b = t; }
+    return c < a ? a : (c > b ? b : c);
+}
+
+function mvComponent(dec, m, c, canBeZero) {
+    if (canBeZero && !dec.bit(m.zero, c)) return 0;
+    const negative = dec.bit(m.sign, c);
+    let remaining = 0, i = 0;
+    for (; i < MV_MAG_CTX; i++) {
+        if (!dec.bit(m.mag[c], i)) break;
+        remaining = i + 1;
+    }
+    if (i === MV_MAG_CTX) remaining = MV_MAG_CTX + dec.direct(8);
+    return negative ? -(remaining + 1) : remaining + 1;
+}
+
+/* Returns false where unpack_field returns -1: a vector outside int8. */
+function unpackField(bytes, offset, len, nbx, nby, gdx, gdy, vx, vy) {
+    const m = {
+        same: new Uint16Array(3).fill(PROB_INIT),
+        zero: new Uint16Array(2).fill(PROB_INIT),
+        sign: new Uint16Array(2).fill(PROB_INIT),
+        mag: [new Uint16Array(MV_MAG_CTX).fill(PROB_INIT),
+              new Uint16Array(MV_MAG_CTX).fill(PROB_INIT)]
+    };
+    const nb = nbx * nby;
+    const same = new Uint8Array(nb);
+    const dec = new ArithDecoder(bytes, offset, len);
+    for (let b = 0; b < nb; b++) {
+        const x = b % nbx, y = (b - x) / nbx;
+        let px, py;
+        if (y === 0) {
+            px = x > 0 ? vx[b - 1] : gdx;
+            py = x > 0 ? vy[b - 1] : gdy;
+        } else {
+            const t = b - nbx;
+            const lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
+            const rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
+            px = median3(lx, vx[t], rx);
+            py = median3(ly, vy[t], ry);
+        }
+        const ctx = (x > 0 && same[b - 1] ? 1 : 0) + (y > 0 && same[b - nbx] ? 1 : 0);
+        same[b] = dec.bit(m.same, ctx) ? 0 : 1;
+        let ex = 0, ey = 0;
+        if (!same[b]) {
+            ex = mvComponent(dec, m, 0, true);
+            ey = mvComponent(dec, m, 1, ex !== 0);
+        }
+        const nx = px + ex, ny = py + ey;
+        if (nx < -128 || nx > 127 || ny < -128 || ny > 127) return false;
+        vx[b] = nx; vy[b] = ny;
+    }
+    return true;
 }
 
 /* The reference translated by one vector, edges held. Mirrors shift_into. */
@@ -111,7 +167,7 @@ async function reconstruct(bytes, out, width, height) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v2 file');
+        if (!this.info) throw new Error('not an NVDRV v3 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -145,20 +201,10 @@ export class SequenceDecoder {
             const fieldLen = new DataView(bytes.buffer, bytes.byteOffset + this.pos, 4)
                 .getUint32(0, true);
             if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return null;
-            const nb = Math.ceil(width / block) * Math.ceil(height / block);
-            let raw;
-            try {
-                raw = await inflate(bytes.subarray(this.pos + 4, this.pos + 4 + fieldLen));
-            } catch (e) {
-                throw new Error('motion field does not inflate');
-            }
-            if (raw.length !== nb * 2) throw new Error('motion field has the wrong size');
-            const vx = new Int8Array(nb), vy = new Int8Array(nb);
-            for (let i = 0; i < nb; i++) {
-                // (int8_t)(gdx + (int8_t)raw[i]), wrap included.
-                vx[i] = int8(dx + int8(raw[i]));
-                vy[i] = int8(dy + int8(raw[nb + i]));
-            }
+            const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
+            const vx = new Int8Array(nbx * nby), vy = new Int8Array(nbx * nby);
+            if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx, dy, vx, vy))
+                throw new Error('motion field is damaged');
             blockPredict(this.state, this.scratch, width, height, block, vx, vy);
             ref = this.scratch;
             this.pos += 4 + fieldLen;

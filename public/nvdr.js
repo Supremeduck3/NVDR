@@ -40,7 +40,7 @@ const SPACE_YCC = 1;
 /* --- entropy layer, mirroring nvdr/entropy.c ------------------------- */
 
 const PROB_BITS = 11;
-const PROB_INIT = 1 << (PROB_BITS - 1);
+export const PROB_INIT = 1 << (PROB_BITS - 1);
 const MOVE_BITS = 5;
 const TOP_VALUE = 1 << 24;
 const AREA_CTX = 16;
@@ -98,7 +98,7 @@ function areaContext(w, h) {
  * coder works on unsigned 32-bit words and JavaScript's bitwise operators
  * are signed.
  */
-class ArithDecoder {
+export class ArithDecoder {
     constructor(bytes, offset, size) {
         this.bytes = bytes;
         this.pos = offset;
