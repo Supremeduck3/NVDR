@@ -7,7 +7,7 @@
  *
  * Format, little-endian:
  *
- *   [header 32B]  "NVDR", version 10, width, height, max/min block,
+ *   [header 32B]  "NVDR", version 10, flags, width, height, max/min block,
  *                 luma and chroma steps, the two layers' byte counts
  *   [layer 0]     the quadtree and every leaf's colour, arithmetic coded,
  *                 32x32 tile by tile
@@ -25,6 +25,7 @@ export const LAYERS = 2;
 export const LAYER_NAMES = ['COR', 'COR+TEXTURA'];
 
 const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
+const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
 
 /* --- entropy layer, mirroring src/entropy.c -------------------------- */
@@ -258,11 +259,13 @@ export function readHeader(buffer) {
         minBlock: v.getUint8(11),
         qLuma: v.getUint16(12, true),
         qChroma: v.getUint16(14, true),
+        flags: v.getUint8(5),
         storedBytes: [v.getUint32(16, true), v.getUint32(20, true)]
     };
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
+    if (h.flags & ~FLAG_RESIDUAL) return null;
     if (h.storedBytes[0] > 0x7fffffff || h.storedBytes[1] > 0x7fffffff) return null;
     return h;
 }
@@ -308,7 +311,9 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false) {
         for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + w);
     }
 
+    const fixedPred = (h.flags & FLAG_RESIDUAL) !== 0;
     function predict(c, x, y, n) {
+        if (fixedPred) return 128;
         const p = flat[c];
         let sum = 0, k = 0;
         if (y > 0) {

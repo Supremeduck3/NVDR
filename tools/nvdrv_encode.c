@@ -58,12 +58,13 @@ static void usage(const char* a0) {
         "  --gop N          force an intra frame every N (default 48; 0 = only the first)\n"
         "  --search N       global motion search half-width in px (default 24; 0 disables)\n"
         "  --intra-thresh F mean absolute error above which a frame goes intra (default 24)\n"
-        "  --block N        per-block motion with NxN blocks (0 = one global vector)\n"
+        "  --block N        per-block motion with NxN blocks (default 16 from 0.2 Mpx\n"
+        "                   up, 8 below; 0 = one global vector)\n"
         "  --fps N          recorded in the header (default 24)\n"
         "  --q N            quantiser step for every frame (default 24)\n"
-        "  --pred-q N       quantiser step for predicted frames only\n"
+        "  --pred-q N       quantiser step for predicted frames (default 1.2 x q)\n"
         "  --mv-lambda N    weight of one motion-field bit against block error\n"
-        "                   (default 8; 0 keeps each block's best-matching vector)\n"
+        "                   (default 16; 0 keeps each block's best-matching vector)\n"
         "  --limit N        stop after N frames\n", a0);
 }
 

@@ -148,6 +148,7 @@ NvdrConfig nvdr_default_config(void) {
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
     c.min_block = NVDR_MIN_BLOCK;
+    c.residual = 0;
     return c;
 }
 
@@ -436,6 +437,7 @@ static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
  */
 typedef struct {
     int w, h, pw, ph, tile, min_block;
+    int fixed_pred;              /* NVDR_FLAG_RESIDUAL: every colour predicted as 128 */
     uint8_t* flat[3];
     uint8_t* full[3];
 } Canvas;
@@ -464,6 +466,7 @@ static void canvas_free(Canvas* cv) {
  * `flat`, so layer 0 needs nothing else to decode.
  */
 static int predict(const Canvas* cv, int c, int x, int y, int n) {
+    if (cv->fixed_pred) return 128;
     const uint8_t* p = cv->flat[c];
     int sum = 0, k = 0;
     if (y > 0) {
@@ -536,12 +539,14 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     h->min_block = data[11];
     h->q_luma = (uint16_t)get_u16(data + 12);
     h->q_chroma = (uint16_t)get_u16(data + 14);
+    h->flags = data[5];
     h->stored_bytes[0] = get_u32(data + 16);
     h->stored_bytes[1] = get_u32(data + 20);
     if (!h->width || !h->height || (size_t)h->width * h->height > NVDR_MAX_PIXELS) return -1;
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
+    if (h->flags & ~NVDR_FLAG_RESIDUAL) return -1;   /* a flag this decoder does not know */
     if (h->stored_bytes[0] > 0x7fffffffu || h->stored_bytes[1] > 0x7fffffffu) return -1;
     return 0;
 }
@@ -729,6 +734,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 
     if (canvas_init(&e.cv, img->width, img->height, cfg.max_block, cfg.min_block) != 0) goto done;
     Canvas* cv = &e.cv;
+    cv->fixed_pred = cfg.residual != 0;
     for (int c = 0; c < 3; c++) {
         e.src[c] = (double*)malloc(sizeof(double) * cv->pw * cv->ph);
         if (!e.src[c]) goto done;
@@ -778,6 +784,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = NVDR_VERSION;
+    buf[5] = cfg.residual ? NVDR_FLAG_RESIDUAL : 0;
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -792,6 +799,7 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     h.width = (uint16_t)img->width; h.height = (uint16_t)img->height;
     h.max_block = (uint8_t)cfg.max_block; h.min_block = (uint8_t)cfg.min_block;
     h.q_luma = (uint16_t)e.step[0]; h.q_chroma = (uint16_t)e.step[1];
+    h.flags = (uint8_t)buf[5];
     h.stored_bytes[0] = (uint32_t)enc0.count;
     h.stored_bytes[1] = (uint32_t)enc1.count;
     if (hdr_out) *hdr_out = h;
@@ -899,6 +907,7 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     memset(&L, 0, sizeof(L));
     size_t* tile_start = NULL;
     if (canvas_init(&cv, h.width, h.height, h.max_block, h.min_block) != 0) goto done;
+    cv.fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
     int tiles_x = (cv.pw + cv.tile - 1) / cv.tile, tiles_y = (cv.ph + cv.tile - 1) / cv.tile;
     int tiles = tiles_x * tiles_y;
     tile_start = (size_t*)malloc(sizeof(size_t) * (tiles + 1));

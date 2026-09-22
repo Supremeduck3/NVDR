@@ -88,11 +88,54 @@ Two things got worse, and both are on the list:
   products; a butterfly and skipping all-zero rows are the obvious fixes.
 
 Sequences use it as is. Every frame, intra or predicted, is a v10
-container, so the sequence format moved to version 4. On the clean
-benchmark clip, 2400 kbit/s at 34.35 dB, against 3402 kbit/s at 33.36 dB
-before. VP8 does 309 kbit/s at 33.5 dB on the same clip, so the gap to a
-real codec is now in the predicted frames (11.6 KB each), not in the
-intra frames: those are 29 KB each, where VP8's key frame is 55 KB.
+container. Predicted frames set the header's residual flag, so their
+colours are predicted as 128 rather than from neighbours. A residual's
+neighbours say nothing about it, and predicting from them cost 13% more
+colour bytes and 5% more texture bytes.
+
+### Quarter-pixel motion (sequence format 5)
+
+With whole-pixel vectors a predicted frame on the clean clip was 2.4 KB
+of motion field and 9 KB of residual. VP8's whole predicted frame there
+is 1.1 KB. The residual was the gap, and `scripts/analysis/subpel` found
+why. A whole-pixel vector cannot follow a 1.12 px pan or a slow zoom, and
+with a transform coding the residual, the misalignment it leaves is fine
+texture across the whole frame, the most expensive thing there is to
+code. Against the source frame, refining 16x16 vectors to half and then
+quarter pixels took the residual from 4343 bytes to 1515 and PSNR from
+40.0 to 43.2 dB. H.264's 6-tap interpolation would add 5 to 7% on top of
+bilinear; bilinear is what is built, because it is exact in integers and
+cheap in JS.
+
+Block vectors are now in quarter pixels, bilinear between whole pixels,
+in integers the same way in C and JS: weights (4 - a) and a per axis,
+rounded with + 8 >> 4, edges held. The search stays whole-pixel, then
+refines each block to half and quarter pixels. The rate-aware pass that
+weighs vectors against their bits runs on quarter-pixel SAD.
+
+With quarter pixels the better block size became resolution-dependent.
+On the 960x540 clip 16x16 wins: 591 bytes of field a frame against 2386,
+for 0.16 dB. On the 128x128 gate sequence, whose moving object is 30 px,
+8x8 wins both ways. So 16 from 0.2 Mpx up, 8 below. The vector's bit
+weight rose from 8 to 16, since quarter-pixel deltas cost more bits.
+Predicted frames default to a step 1.2 times the intra frames': across q
+16 to 40 that was 0.1 dB better at equal rate.
+
+The clean clip, 125 frames:
+
+    NVDRV, v4 (whole pixels, q 24)             2400 kbit/s   34.35 dB
+    NVDRV, format 5, q 20                      1013 kbit/s   37.80 dB
+    NVDRV, format 5, q 24 (default)             822 kbit/s   36.86 dB
+    NVDRV, format 5, q 32                       616 kbit/s   35.52 dB
+    VP8                                         605 kbit/s   37.19 dB
+    VP8                                         309 kbit/s   33.52 dB
+
+At VP8's quality NVDRV needs about 1.5 times its rate, down from 11
+times at the start of this work. The gate's 12-frame sequence is 15%
+smaller at -0.42 dB, and at equal bytes it is 0.66 dB better. It is
+encoded with equal quantisers now, so its drift check measures the
+prediction loop and not the 1.2 ratio. The JS decoder takes 43 ms per
+960x540 frame in Node, against a 40 ms budget at 25 fps.
 
 ## The decomposition
 

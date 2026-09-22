@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 4;
+const VERSION = 5;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 12;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -120,19 +120,29 @@ function shiftInto(src, dst, width, height, dx, dy) {
     }
 }
 
-/* The reference assembled block by block. Mirrors block_predict. */
+/*
+ * The reference assembled block by block, each block from its own
+ * quarter-pixel vector, bilinear between whole pixels, edges held.
+ * Mirrors qsample() and block_predict() exactly: weights (4 - a) and a on
+ * each axis, rounded with + 8 >> 4.
+ */
 function blockPredict(src, dst, width, height, block, vx, vy) {
     const nbx = Math.ceil(width / block);
+    const clampX = v => (v < 0 ? 0 : v >= width ? width - 1 : v);
+    const clampY = v => (v < 0 ? 0 : v >= height ? height - 1 : v);
     for (let y = 0; y < height; y++) {
         const rowBase = Math.floor(y / block) * nbx;
         let o = y * width * 3;
         for (let x = 0; x < width; x++, o += 3) {
             const b = rowBase + Math.floor(x / block);
-            let sx = x + vx[b], sy = y + vy[b];
-            if (sx < 0) sx = 0; else if (sx >= width) sx = width - 1;
-            if (sy < 0) sy = 0; else if (sy >= height) sy = height - 1;
-            const s = (sy * width + sx) * 3;
-            dst[o] = src[s]; dst[o + 1] = src[s + 1]; dst[o + 2] = src[s + 2];
+            const fx = vx[b], fy = vy[b];
+            const ix = x + (fx >> 2), iy = y + (fy >> 2), ax = fx & 3, ay = fy & 3;
+            const x0 = clampX(ix), x1 = clampX(ix + 1);
+            const r0 = clampY(iy) * width * 3, r1 = clampY(iy + 1) * width * 3;
+            const w00 = (4 - ax) * (4 - ay), w01 = ax * (4 - ay), w10 = (4 - ax) * ay, w11 = ax * ay;
+            for (let c = 0; c < 3; c++)
+                dst[o + c] = (w00 * src[r0 + x0 * 3 + c] + w01 * src[r0 + x1 * 3 + c] +
+                              w10 * src[r1 + x0 * 3 + c] + w11 * src[r1 + x1 * 3 + c] + 8) >> 4;
         }
     }
 }
@@ -163,7 +173,7 @@ function reconstruct(bytes, out, width, height) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v4 file');
+        if (!this.info) throw new Error('not an NVDRV v5 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -199,7 +209,8 @@ export class SequenceDecoder {
             if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return null;
             const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
             const vx = new Int8Array(nbx * nby), vy = new Int8Array(nbx * nby);
-            if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx, dy, vx, vy))
+            // The field is in quarter pixels, the global vector in whole ones.
+            if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy))
                 throw new Error('motion field is damaged');
             blockPredict(this.state, this.scratch, width, height, block, vx, vy);
             ref = this.scratch;
