@@ -729,6 +729,50 @@ piecewise-constant approximation, not of any tuning. Every predicted
 frame inherits it: its residual is the same texture error, coded by the
 same rectangles.
 
+### Where the finest level's bytes go
+
+R2 costs 2.1 to 3.8 times R1's bytes. On every sample it is about 70%
+of the file, for +1.3 to +4.3 dB. The rectangle count grows much less,
+1.1 to 2.2 times, so most of the cost is not the new tiles. Counting
+bits by category in the coder:
+
+- every rectangle R1 hands down that does not split still pays a colour
+  correction at R2's finer step, and 91-97% of them need one. That is
+  40-80% of R2's bytes. The corrections are not waste: dropping them
+  costs 1.1 to 2.2 dB. Making R1's step finer only moves the same cost
+  into R1, and 16,4 stays the smallest file on every sample.
+- the new tiles R2 subdivides into are what barely pay: 4-7 KB for
+  +0.16 to +0.5 dB on most samples. That is the quadtree trying to hold
+  texture with flat fills.
+
+### A texture layer, measured
+
+`scripts/analysis/texture` renders the rectangles at some cut and codes
+what is left with an 8x8 DCT through the same arithmetic coder. PSNR at
+the byte size of today's container, interpolated along each curve:
+
+    image                  NVDR today       DCT alone        anchor + DCT     R1 + DCT
+    OIP-1304511485         18126 B 24.92   33.28 (+8.36)    29.91 (+4.99)    29.21 (+4.29)
+    OIP-3451121336         39852 B 21.83   30.06 (+8.23)    28.22 (+6.39)    26.18 (+4.35)
+    OIP-3786546191         38501 B 24.15   32.15 (+8.00)    30.26 (+6.11)    28.66 (+4.51)
+    OIP-4140498144         29253 B 25.20   34.70 (+9.50)    32.43 (+7.23)    30.86 (+5.66)
+    macarrão               10826 B 30.00   41.02 (+11.0)    38.35 (+8.35)    35.74 (+5.74)
+    montanha_pessoas       51765 B 26.30   31.93 (+5.63)    30.93 (+4.63)    29.68 (+3.38)
+    f0000 (video bench)    57113 B 29.60   38.56 (+8.96)    34.92 (+5.32)    32.98 (+3.38)
+
+The DCT alone, which is essentially JPEG with a better entropy coder,
+lands where Chromium's JPEG does on f0000, so the prototype is
+calibrated. The result is uncomfortable. Every rectangle added under
+the DCT makes it worse. The hard edges of a flat-filled base end up in
+the residual, and a fixed 8x8 transform pays dearly for edges that cross
+its blocks. Laid on a grid, the rectangles are a cost to the transform,
+not a help. Where the quadtree can still earn its place is as the
+partition the transform runs on: large blocks where the image is smooth,
+small ones where it is busy, each leaf carrying its colour plus the
+coefficients of its own texture. A flat fill is then just a leaf with
+no AC coefficients. `comparacao_macarrao.png` shows the images side by
+side.
+
 ### Real time
 
 In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
