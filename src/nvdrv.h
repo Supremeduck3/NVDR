@@ -58,7 +58,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      7
+#define NVDRV_VERSION      8
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20
 
@@ -142,6 +142,7 @@ typedef struct {
     int    level;          /* 0 for an anchor, 1.. for B frames */
     int    q;              /* the container's quantiser step */
     size_t bytes;          /* frame header included */
+    size_t field_bytes;    /* of which the motion field */
     int    dx, dy;         /* global vector toward the frame before */
 } NvdrvFrameReport;
 typedef void (*NvdrvReportFn)(void* user, const NvdrvFrameReport* r);

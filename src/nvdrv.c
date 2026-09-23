@@ -1,6 +1,7 @@
 #include "nvdrv.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -493,19 +494,29 @@ static int median3(int a, int b, int c) {
     return c < a ? a : (c > b ? b : c);
 }
 
-static void mv_predict(const int16_t* vx, const int16_t* vy, int nbx, int b,
-                       int gdx, int gdy, int* px, int* py) {
+/*
+ * The prediction is made relative to the frame's motion model (see "The
+ * motion model" below): `mx`, `my` hold the model's vector at each block,
+ * and the neighbours contribute how far they stray from the model there.
+ * A block that follows the model under neighbours that do costs one
+ * cheap bit, whether the model is a pan, a zoom or a rotation. With a
+ * model that is one translation this is exactly the median of the
+ * neighbours' vectors, a neighbour off the frame counting as the global
+ * vector, which is what albums use.
+ */
+static void mv_predict(const int16_t* vx, const int16_t* vy, const int16_t* mx, const int16_t* my,
+                       int nbx, int b, int* px, int* py) {
     int x = b % nbx, y = b / nbx;
     if (y == 0) {
-        if (x > 0) { *px = vx[b - 1]; *py = vy[b - 1]; }
-        else       { *px = gdx;       *py = gdy; }
+        if (x > 0) { *px = mx[b] + vx[b - 1] - mx[b - 1]; *py = my[b] + vy[b - 1] - my[b - 1]; }
+        else       { *px = mx[b];                         *py = my[b]; }
         return;
     }
     int t = b - nbx;
-    int lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
-    int rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
-    *px = median3(lx, vx[t], rx);
-    *py = median3(ly, vy[t], ry);
+    int lx = x > 0 ? vx[b - 1] - mx[b - 1] : 0, ly = x > 0 ? vy[b - 1] - my[b - 1] : 0;
+    int rx = x + 1 < nbx ? vx[t + 1] - mx[t + 1] : 0, ry = x + 1 < nbx ? vy[t + 1] - my[t + 1] : 0;
+    *px = mx[b] + median3(lx, vx[t] - mx[t], rx);
+    *py = my[b] + median3(ly, vy[t] - my[t], ry);
 }
 
 /* The context of the match bit: how many of left and top matched. */
@@ -564,9 +575,9 @@ static int mv_bits(int dx, int dy) {
 /* One block's vector against its prediction; `same` holds, per block,
  * whether it matched. */
 static void enc_vector(NvdrEncoder* enc, MvModels* m, uint8_t* same, const int16_t* vx,
-                       const int16_t* vy, int nbx, int b, int gdx, int gdy, int esc) {
+                       const int16_t* vy, const int16_t* mx, const int16_t* my, int nbx, int b, int esc) {
     int px, py;
-    mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+    mv_predict(vx, vy, mx, my, nbx, b, &px, &py);
     int ex = vx[b] - px, ey = vy[b] - py;
     same[b] = !ex && !ey;
     nvdr_enc_bit(enc, &m->same[mv_same_ctx(same, nbx, b)], !same[b]);
@@ -578,9 +589,9 @@ static void enc_vector(NvdrEncoder* enc, MvModels* m, uint8_t* same, const int16
 /* The decoder's side; -1 for a vector outside -lim-1 .. lim quarter
  * pixels (int8 for lim 127), which is damage, not motion. */
 static int dec_vector(NvdrDecoder* dec, MvModels* m, uint8_t* same, int16_t* vx, int16_t* vy,
-                      int nbx, int b, int gdx, int gdy, int esc, int lim) {
+                      const int16_t* mx, const int16_t* my, int nbx, int b, int esc, int lim) {
     int px, py;
-    mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+    mv_predict(vx, vy, mx, my, nbx, b, &px, &py);
     same[b] = !nvdr_dec_bit(dec, &m->same[mv_same_ctx(same, nbx, b)]);
     int ex = 0, ey = 0;
     if (!same[b]) {
@@ -596,16 +607,16 @@ static int dec_vector(NvdrDecoder* dec, MvModels* m, uint8_t* same, int16_t* vx,
 
 /* A block that does not use a list takes that list's prediction as its
  * vector, at no cost, so its neighbours' predictions stay continuous. */
-static void inherit_vector(uint8_t* same, int16_t* vx, int16_t* vy, int nbx, int b,
-                           int gdx, int gdy) {
+static void inherit_vector(uint8_t* same, int16_t* vx, int16_t* vy, const int16_t* mx,
+                           const int16_t* my, int nbx, int b) {
     int px, py;
-    mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+    mv_predict(vx, vy, mx, my, nbx, b, &px, &py);
     vx[b] = (int16_t)px; vy[b] = (int16_t)py;
     same[b] = 1;
 }
 
-static uint8_t* pack_field(const int16_t* vx, const int16_t* vy, int nbx, int nby,
-                           int gdx, int gdy, int esc, size_t* out_len) {
+static uint8_t* pack_field(const int16_t* vx, const int16_t* vy, const int16_t* mx, const int16_t* my,
+                           int nbx, int nby, int esc, size_t* out_len) {
     int nb = nbx * nby;
     uint8_t* same = (uint8_t*)malloc((size_t)nb);
     if (!same) return NULL;
@@ -613,15 +624,15 @@ static uint8_t* pack_field(const int16_t* vx, const int16_t* vy, int nbx, int nb
     mv_models_init(&m);
     NvdrEncoder enc;
     if (nvdr_enc_init(&enc, (size_t)nb / 2 + 64) != 0) { free(same); return NULL; }
-    for (int b = 0; b < nb; b++) enc_vector(&enc, &m, same, vx, vy, nbx, b, gdx, gdy, esc);
+    for (int b = 0; b < nb; b++) enc_vector(&enc, &m, same, vx, vy, mx, my, nbx, b, esc);
     free(same);
     if (nvdr_enc_finish(&enc) != 0) { nvdr_enc_free(&enc); return NULL; }
     *out_len = enc.count;
     return enc.bytes;      /* ownership passes to the caller */
 }
 
-static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby,
-                        int gdx, int gdy, int esc, int lim, int16_t* vx, int16_t* vy) {
+static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby, const int16_t* mx,
+                        const int16_t* my, int esc, int lim, int16_t* vx, int16_t* vy) {
     int nb = nbx * nby;
     uint8_t* same = (uint8_t*)malloc((size_t)nb);
     if (!same) return -1;
@@ -630,7 +641,7 @@ static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby,
     NvdrDecoder dec;
     nvdr_dec_init(&dec, packed, len);
     for (int b = 0; b < nb; b++)
-        if (dec_vector(&dec, &m, same, vx, vy, nbx, b, gdx, gdy, esc, lim) != 0) {
+        if (dec_vector(&dec, &m, same, vx, vy, mx, my, nbx, b, esc, lim) != 0) {
             free(same); return -1;
         }
     free(same);
@@ -647,7 +658,7 @@ static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby,
  * blocks after it; it only evaluates a handful of candidates per block.
  */
 static void field_rd(const NvdrImage* cur, const Subpel* ref, int block, int lim,
-                     int gdx, int gdy, int lambda, int16_t* vx, int16_t* vy) {
+                     const int16_t* mx, const int16_t* my, int lambda, int16_t* vx, int16_t* vy) {
     int nbx = (cur->width + block - 1) / block;
     int nby = (cur->height + block - 1) / block;
     for (int b = 0; b < nbx * nby; b++) {
@@ -655,11 +666,11 @@ static void field_rd(const NvdrImage* cur, const Subpel* ref, int block, int lim
         int bw = cur->width - x0 < block ? cur->width - x0 : block;
         int bh = cur->height - y0 < block ? cur->height - y0 : block;
         int px, py;
-        mv_predict(vx, vy, nbx, b, gdx, gdy, &px, &py);
+        mv_predict(vx, vy, mx, my, nbx, b, &px, &py);
         int cand[9][2] = {
-            { px, py }, { vx[b], vy[b] }, { gdx, gdy },
-            { b % nbx ? vx[b - 1] : gdx, b % nbx ? vy[b - 1] : gdy },
-            { b >= nbx ? vx[b - nbx] : gdx, b >= nbx ? vy[b - nbx] : gdy },
+            { px, py }, { vx[b], vy[b] }, { mx[b], my[b] },
+            { b % nbx ? vx[b - 1] : mx[b], b % nbx ? vy[b - 1] : my[b] },
+            { b >= nbx ? vx[b - nbx] : mx[b], b >= nbx ? vy[b - nbx] : my[b] },
             { px - 1, py }, { px + 1, py }, { px, py - 1 }, { px, py + 1 },
         };
         int best = INT_MAX, bx = px, by = py;
@@ -681,6 +692,154 @@ static void field_rd(const NvdrImage* cur, const Subpel* ref, int block, int lim
 
 static int field_blocks(int w, int h, int block) {
     return ((w + block - 1) / block) * ((h + block - 1) / block);
+}
+
+/* --------------------------------------------------- the motion model */
+
+/*
+ * THE MOTION MODEL
+ * ----------------
+ * A camera that zooms or turns moves every block by a slightly different
+ * vector, varying smoothly across the frame, and a median of neighbours
+ * pays for each step of that gradient: on a slow zoom the field was two
+ * thirds of every predicted frame. So each field in a sequence carries an
+ * affine model of the frame's motion,
+ *
+ *     mx = a0 + (a1 * cx + a2 * cy + 32768) >> 16
+ *     my = b0 + (b1 * cx + b2 * cy + 32768) >> 16
+ *
+ * in quarter pixels at the block's centre (cx, cy), with a0 and b0 in
+ * quarter pixels and the four slopes in 65536ths of a quarter pixel per
+ * pixel, each an int16 ahead of the field (12 bytes a list; a list whose
+ * model is the frame header's global vector, a plain translation, is
+ * flagged in the header instead and costs nothing). Vectors are
+ * then predicted as the model plus how far the neighbours stray from it
+ * (see mv_predict). The encoder fits the model to its searched vectors by
+ * least squares, twice more on the blocks that agree with the last fit,
+ * so a moving object does not drag the camera's motion with it.
+ */
+#define MODEL_BYTES 12
+/* Frame header byte 18: which lists carry an affine model. */
+#define FRAME_MODEL0 1
+#define FRAME_MODEL1 2
+
+typedef struct { int a0, a1, a2, b0, b1, b2; } Model;
+
+static void model_fill(const Model* m, int w, int h, int block, int16_t* mx, int16_t* my) {
+    int nbx = (w + block - 1) / block, nby = (h + block - 1) / block;
+    for (int by = 0; by < nby; by++)
+        for (int bx = 0; bx < nbx; bx++) {
+            int cx = bx * block + block / 2, cy = by * block + block / 2;
+            int b = by * nbx + bx;
+            /* In 64 bits: a slope times a coordinate overflows 32 on a
+             * frame 65535 wide, and a damaged file can say that. */
+            int64_t sx = ((int64_t)m->a1 * cx + (int64_t)m->a2 * cy + 32768) >> 16;
+            int64_t sy = ((int64_t)m->b1 * cx + (int64_t)m->b2 * cy + 32768) >> 16;
+            int64_t vx = m->a0 + sx, vy = m->b0 + sy;
+            mx[b] = (int16_t)(vx < -NVDRV_MV_MAX ? -NVDRV_MV_MAX : vx > NVDRV_MV_MAX ? NVDRV_MV_MAX : vx);
+            my[b] = (int16_t)(vy < -NVDRV_MV_MAX ? -NVDRV_MV_MAX : vy > NVDRV_MV_MAX ? NVDRV_MV_MAX : vy);
+        }
+}
+
+static void model_put(const Model* m, uint8_t* p) {
+    const int v[6] = { m->a0, m->a1, m->a2, m->b0, m->b1, m->b2 };
+    for (int i = 0; i < 6; i++) put_u16v(p + 2 * i, (uint16_t)(int16_t)v[i]);
+}
+
+static void model_get(Model* m, const uint8_t* p) {
+    m->a0 = (int16_t)get_u16v(p);     m->a1 = (int16_t)get_u16v(p + 2);
+    m->a2 = (int16_t)get_u16v(p + 4); m->b0 = (int16_t)get_u16v(p + 6);
+    m->b1 = (int16_t)get_u16v(p + 8); m->b2 = (int16_t)get_u16v(p + 10);
+}
+
+/* Least squares of v = c0 + c1 x + c2 y over the blocks in `use`. */
+static int fit_plane(const int16_t* v, const uint8_t* use, int nbx, int nby, int block, double c[3]) {
+    double A[3][4] = { { 0 } };
+    int n = 0;
+    for (int b = 0; b < nbx * nby; b++) {
+        if (!use[b]) continue;
+        double p[3] = { 1.0, (b % nbx) * block + block / 2, (b / nbx) * block + block / 2 };
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) A[i][j] += p[i] * p[j];
+            A[i][3] += p[i] * v[b];
+        }
+        n++;
+    }
+    if (n < 6) return -1;
+    for (int i = 0; i < 3; i++) {
+        int piv = i;
+        for (int r = i + 1; r < 3; r++) if (fabs(A[r][i]) > fabs(A[piv][i])) piv = r;
+        for (int k = 0; k < 4; k++) { double t = A[i][k]; A[i][k] = A[piv][k]; A[piv][k] = t; }
+        if (fabs(A[i][i]) < 1e-9) return -1;
+        for (int r = 0; r < 3; r++) {
+            if (r == i) continue;
+            double f = A[r][i] / A[i][i];
+            for (int k = i; k < 4; k++) A[r][k] -= f * A[i][k];
+        }
+    }
+    for (int i = 0; i < 3; i++) c[i] = A[i][3] / A[i][i];
+    return 0;
+}
+
+static int round_clamp(double v, int lim) {
+    long r = lrint(v);
+    return (int)(r < -lim ? -lim : (r > lim ? lim : r));
+}
+
+/* The model of a searched field; one translation by (gx, gy) quarter
+ * pixels when the fit fails. */
+static int model_fit(const int16_t* vx, const int16_t* vy, int w, int h, int block,
+                     int gx, int gy, Model* m) {
+    int nbx = (w + block - 1) / block, nby = (h + block - 1) / block, nb = nbx * nby;
+    m->a0 = gx; m->b0 = gy; m->a1 = m->a2 = m->b1 = m->b2 = 0;
+    uint8_t* use = (uint8_t*)malloc((size_t)nb);
+    int* dev = (int*)malloc(sizeof(int) * (size_t)nb);
+    int affine = 0;
+    if (!use || !dev) { free(use); free(dev); return 0; }
+    memset(use, 1, (size_t)nb);
+    double cx[3], cy[3];
+    int ok = 0;
+    for (int pass = 0; pass < 3; pass++) {
+        if (fit_plane(vx, use, nbx, nby, block, cx) != 0 || fit_plane(vy, use, nbx, nby, block, cy) != 0) break;
+        ok = 1;
+        /* Keep the blocks within 2.5 times the median deviation, and never
+         * reject a block within one pixel. */
+        for (int b = 0; b < nb; b++) {
+            double px = (b % nbx) * block + block / 2, py = (b / nbx) * block + block / 2;
+            double ex = vx[b] - (cx[0] + cx[1] * px + cx[2] * py);
+            double ey = vy[b] - (cy[0] + cy[1] * px + cy[2] * py);
+            dev[b] = (int)(fabs(ex) + fabs(ey));
+        }
+        int hist[64] = { 0 }, med = 0, acc = 0;
+        for (int b = 0; b < nb; b++) hist[dev[b] < 63 ? dev[b] : 63]++;
+        while (med < 63 && (acc += hist[med]) < nb / 2) med++;
+        int keep = med * 5 / 2 > 4 ? med * 5 / 2 : 4;
+        for (int b = 0; b < nb; b++) use[b] = dev[b] <= keep;
+    }
+    if (ok) {
+        Model a;
+        a.a1 = round_clamp(cx[1] * 65536.0, 32767); a.a2 = round_clamp(cx[2] * 65536.0, 32767);
+        a.b1 = round_clamp(cy[1] * 65536.0, 32767); a.b2 = round_clamp(cy[2] * 65536.0, 32767);
+        a.a0 = round_clamp(cx[0], 32767); a.b0 = round_clamp(cy[0], 32767);
+        /* A field of noise (flat or periodic texture, where every offset
+         * matches about as well) fits slopes that are not there, and a
+         * wrong model costs every block. So the model has to predict
+         * clearly more blocks to within a quarter pixel than the global
+         * translation does. */
+        int16_t* mx = (int16_t*)malloc(sizeof(int16_t) * (size_t)nb * 2);
+        if (mx) {
+            model_fill(&a, w, h, block, mx, mx + nb);
+            int hit_model = 0, hit_trans = 0;
+            for (int b = 0; b < nb; b++) {
+                hit_model += abs(vx[b] - mx[b]) + abs(vy[b] - mx[nb + b]) <= 1;
+                hit_trans += abs(vx[b] - gx) + abs(vy[b] - gy) <= 1;
+            }
+            if (hit_model > hit_trans + hit_trans / 8 + nb / 64) { *m = a; affine = 1; }
+            free(mx);
+        }
+    }
+    free(use); free(dev);
+    return affine;
 }
 
 /* ------------------------------------------------------- B frames */
@@ -768,7 +927,8 @@ static void bi_models_init(BiModels* m) {
  * the decoder will see them. */
 static uint8_t* pack_field_bi(const uint8_t* mode, int16_t* v0x, int16_t* v0y,
                               int16_t* v1x, int16_t* v1y, int nbx, int nby,
-                              int g0x, int g0y, int g1x, int g1y, size_t* out_len) {
+                              const int16_t* m0x, const int16_t* m0y,
+                              const int16_t* m1x, const int16_t* m1y, size_t* out_len) {
     int nb = nbx * nby;
     uint8_t* same = (uint8_t*)malloc((size_t)nb * 2);
     if (!same) return NULL;
@@ -779,10 +939,10 @@ static uint8_t* pack_field_bi(const uint8_t* mode, int16_t* v0x, int16_t* v0y,
     for (int b = 0; b < nb; b++) {
         nvdr_enc_bit(&enc, &m.not_bi[mode_ctx(mode, nbx, b, 0)], mode[b] != MODE_BI);
         if (mode[b] != MODE_BI) nvdr_enc_bit(&enc, &m.bwd[mode_ctx(mode, nbx, b, 1)], mode[b] == MODE_BWD);
-        if (mode[b] != MODE_BWD) enc_vector(&enc, &m.l0, same, v0x, v0y, nbx, b, g0x, g0y, MV_ESC_SEQ);
-        else inherit_vector(same, v0x, v0y, nbx, b, g0x, g0y);
-        if (mode[b] != MODE_FWD) enc_vector(&enc, &m.l1, same + nb, v1x, v1y, nbx, b, g1x, g1y, MV_ESC_SEQ);
-        else inherit_vector(same + nb, v1x, v1y, nbx, b, g1x, g1y);
+        if (mode[b] != MODE_BWD) enc_vector(&enc, &m.l0, same, v0x, v0y, m0x, m0y, nbx, b, MV_ESC_SEQ);
+        else inherit_vector(same, v0x, v0y, m0x, m0y, nbx, b);
+        if (mode[b] != MODE_FWD) enc_vector(&enc, &m.l1, same + nb, v1x, v1y, m1x, m1y, nbx, b, MV_ESC_SEQ);
+        else inherit_vector(same + nb, v1x, v1y, m1x, m1y, nbx, b);
     }
     free(same);
     if (nvdr_enc_finish(&enc) != 0) { nvdr_enc_free(&enc); return NULL; }
@@ -791,7 +951,8 @@ static uint8_t* pack_field_bi(const uint8_t* mode, int16_t* v0x, int16_t* v0y,
 }
 
 static int unpack_field_bi(const uint8_t* packed, size_t len, int nbx, int nby,
-                           int g0x, int g0y, int g1x, int g1y, uint8_t* mode,
+                           const int16_t* m0x, const int16_t* m0y,
+                           const int16_t* m1x, const int16_t* m1y, uint8_t* mode,
                            int16_t* v0x, int16_t* v0y, int16_t* v1x, int16_t* v1y) {
     int nb = nbx * nby;
     uint8_t* same = (uint8_t*)malloc((size_t)nb * 2);
@@ -806,12 +967,12 @@ static int unpack_field_bi(const uint8_t* packed, size_t len, int nbx, int nby,
         if (nvdr_dec_bit(&dec, &m.not_bi[mode_ctx(mode, nbx, b, 0)]))
             mode[b] = nvdr_dec_bit(&dec, &m.bwd[mode_ctx(mode, nbx, b, 1)]) ? MODE_BWD : MODE_FWD;
         if (mode[b] != MODE_BWD)
-            rc = dec_vector(&dec, &m.l0, same, v0x, v0y, nbx, b, g0x, g0y, MV_ESC_SEQ, NVDRV_MV_MAX);
-        else inherit_vector(same, v0x, v0y, nbx, b, g0x, g0y);
+            rc = dec_vector(&dec, &m.l0, same, v0x, v0y, m0x, m0y, nbx, b, MV_ESC_SEQ, NVDRV_MV_MAX);
+        else inherit_vector(same, v0x, v0y, m0x, m0y, nbx, b);
         if (rc) break;
         if (mode[b] != MODE_FWD)
-            rc = dec_vector(&dec, &m.l1, same + nb, v1x, v1y, nbx, b, g1x, g1y, MV_ESC_SEQ, NVDRV_MV_MAX);
-        else inherit_vector(same + nb, v1x, v1y, nbx, b, g1x, g1y);
+            rc = dec_vector(&dec, &m.l1, same + nb, v1x, v1y, m1x, m1y, nbx, b, MV_ESC_SEQ, NVDRV_MV_MAX);
+        else inherit_vector(same + nb, v1x, v1y, m1x, m1y, nbx, b);
     }
     free(same);
     return rc;
@@ -825,7 +986,8 @@ static int unpack_field_bi(const uint8_t* packed, size_t len, int nbx, int nby,
  * predicted ones (which cost a bit).
  */
 static void bi_decide(const NvdrImage* cur, const Subpel* r0, const Subpel* r1, int block,
-                      int lambda, int g0x, int g0y, int g1x, int g1y,
+                      int lambda, const int16_t* m0x, const int16_t* m0y,
+                      const int16_t* m1x, const int16_t* m1y,
                       const int16_t* s0x, const int16_t* s0y, const int16_t* s1x, const int16_t* s1y,
                       uint8_t* mode, int16_t* v0x, int16_t* v0y, int16_t* v1x, int16_t* v1y) {
     int nbx = (cur->width + block - 1) / block;
@@ -835,8 +997,8 @@ static void bi_decide(const NvdrImage* cur, const Subpel* r0, const Subpel* r1, 
         int bw = cur->width - x0 < block ? cur->width - x0 : block;
         int bh = cur->height - y0 < block ? cur->height - y0 : block;
         int p0x, p0y, p1x, p1y;
-        mv_predict(v0x, v0y, nbx, b, g0x, g0y, &p0x, &p0y);
-        mv_predict(v1x, v1y, nbx, b, g1x, g1y, &p1x, &p1y);
+        mv_predict(v0x, v0y, m0x, m0y, nbx, b, &p0x, &p0y);
+        mv_predict(v1x, v1y, m1x, m1y, nbx, b, &p1x, &p1y);
         /* mode, then list 0's vector, then list 1's */
         int cand[8][5] = {
             { MODE_BI,  s0x[b], s0y[b], s1x[b], s1y[b] },
@@ -918,7 +1080,7 @@ struct NvdrvEncoder {
     NvdrImage   last_src;
     int         anchor;      /* display number of the last anchor, -1 before any */
     NvdrImage   pred, error;
-    int16_t     *s0x, *s0y, *s1x, *s1y, *v0x, *v0y, *v1x, *v1y;
+    int16_t     *s0x, *s0y, *s1x, *s1y, *v0x, *v0y, *v1x, *v1y, *m0x, *m0y, *m1x, *m1y;
     uint8_t*    mode;
     NvdrvReportFn report;
     void*       user;
@@ -981,8 +1143,9 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     }
     if (e->cfg.block > 0) {
         size_t nb = (size_t)field_blocks(width, height, e->cfg.block);
-        int16_t** v[8] = { &e->s0x, &e->s0y, &e->s1x, &e->s1y, &e->v0x, &e->v0y, &e->v1x, &e->v1y };
-        for (int i = 0; i < 8; i++)
+        int16_t** v[12] = { &e->s0x, &e->s0y, &e->s1x, &e->s1y, &e->v0x, &e->v0y, &e->v1x, &e->v1y,
+                            &e->m0x, &e->m0y, &e->m1x, &e->m1y };
+        for (int i = 0; i < 12; i++)
             if (!(*v[i] = (int16_t*)malloc(nb * sizeof(int16_t)))) { nvdrv_encode_close(e); return -1; }
         if (!(e->mode = (uint8_t*)malloc(nb))) { nvdrv_encode_close(e); return -1; }
     }
@@ -1014,12 +1177,15 @@ void nvdrv_encode_set_report(NvdrvEncoder* e, NvdrvReportFn fn, void* user) {
 
 /*
  * [kind u8][block u8][dx i16][dy i16][body length u32][dx1 i16][dy1 i16]
- * [display u32][0 u16], then the body: for a frame with a field,
+ * [display u32][flags u8][0 u8], then the body: for a frame with a field,
  * [u32 field length][field][container], otherwise the container. dx, dy
  * is the global vector toward the frame before, dx1, dy1 (B frames) the
- * one toward the frame after, both in whole pixels.
+ * one toward the frame after, both in whole pixels. A sequence's field
+ * starts with the affine model of each list whose flag is set (bit 0 the
+ * list before, bit 1 the list after), 12 bytes each; a list without one
+ * takes its global vector as a plain translation.
  */
-static int write_frame(NvdrvEncoder* e, int kind, int display, int block,
+static int write_frame(NvdrvEncoder* e, int kind, int display, int block, int flags,
                        int dx, int dy, int dx1, int dy1,
                        const uint8_t* field, size_t field_len,
                        const uint8_t* payload, size_t len) {
@@ -1034,6 +1200,7 @@ static int write_frame(NvdrvEncoder* e, int kind, int display, int block,
     put_u16v(h + 10, (uint16_t)(int16_t)dx1);
     put_u16v(h + 12, (uint16_t)(int16_t)dy1);
     put_u32v(h + 14, (uint32_t)display);
+    h[18] = (uint8_t)flags;
     if (fwrite(h, 1, sizeof(h), e->f) != sizeof(h)) return -1;
     if (block) {
         uint8_t n[4];
@@ -1046,9 +1213,11 @@ static int write_frame(NvdrvEncoder* e, int kind, int display, int block,
 }
 
 /* One list's field: global vector around `c`, blocks around it and zero,
- * refined to quarter pixels, then smoothed against its bits. */
+ * refined to quarter pixels, the model fitted to them, then smoothed
+ * against its bits. */
 static int motion_list(NvdrvEncoder* e, const NvdrImage* cur, const NvdrImage* ref, int dist, int lambda,
-                       int cx, int cy, int* gdx, int* gdy, int16_t* vx, int16_t* vy, Subpel* sp) {
+                       int cx, int cy, int* gdx, int* gdy, int16_t* vx, int16_t* vy,
+                       Model* model, int* affine, int16_t* mx, int16_t* my, Subpel* sp) {
     int block = e->cfg.block, lim = NVDRV_MV_MAX / 4 - 8;
     cx = clampi(cx, -lim, lim); cy = clampi(cy, -lim, lim);
     /* Next to its reference the whole search range, as a P frame always
@@ -1058,9 +1227,27 @@ static int motion_list(NvdrvEncoder* e, const NvdrImage* cur, const NvdrImage* r
     block_search(cur, ref, block, dist, *gdx, *gdy, vx, vy);
     if (subpel_build(sp, ref) != 0) return -1;
     block_refine(cur, sp, block, NVDRV_MV_MAX, vx, vy);
-    if (lambda > 0)
-        field_rd(cur, sp, block, NVDRV_MV_MAX, *gdx * 4, *gdy * 4, lambda, vx, vy);
+    *affine = model_fit(vx, vy, cur->width, cur->height, block, *gdx * 4, *gdy * 4, model);
+    model_fill(model, cur->width, cur->height, block, mx, my);
+    if (lambda > 0) field_rd(cur, sp, block, NVDRV_MV_MAX, mx, my, lambda, vx, vy);
     return 0;
+}
+
+/* The affine models ahead of the field's coded bytes (NULL for a list
+ * whose model is its global vector). */
+static uint8_t* with_models(const Model* m0, const Model* m1, uint8_t* coded, size_t* len) {
+    if (!coded) return NULL;
+    size_t head = MODEL_BYTES * ((m0 != NULL) + (m1 != NULL));
+    uint8_t* out = (uint8_t*)malloc(head + *len);
+    if (out) {
+        uint8_t* p = out;
+        if (m0) { model_put(m0, p); p += MODEL_BYTES; }
+        if (m1) { model_put(m1, p); p += MODEL_BYTES; }
+        memcpy(p, coded, *len);
+        *len += head;
+    }
+    free(coded);
+    return out;
 }
 
 /* Summed source motion from display d to display r, both within the
@@ -1101,6 +1288,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     int nbx = e->cfg.block ? (e->width + e->cfg.block - 1) / e->cfg.block : 0;
     int nby = e->cfg.block ? (e->height + e->cfg.block - 1) / e->cfg.block : 0;
     const NvdrImage* ref = NULL;
+    Model model0, model1;
+    int aff0 = 0, aff1 = 0;
     /* A bit of field is worth more error the coarser the residual that
      * would have to correct it: mv_lambda is set at the default q of 24. */
     int lambda = e->cfg.mv_lambda;
@@ -1113,7 +1302,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         if (e->cfg.block > 0) {
             block = e->cfg.block;
             Subpel sp;
-            if (motion_list(e, src, r0, display - e->dpb[before].display, lambda, cx, cy, &dx, &dy, e->v0x, e->v0y, &sp) != 0) return -1;
+            if (motion_list(e, src, r0, display - e->dpb[before].display, lambda, cx, cy, &dx, &dy,
+                            e->v0x, e->v0y, &model0, &aff0, e->m0x, e->m0y, &sp) != 0) return -1;
             block_predict(&sp, &e->pred, block, e->v0x, e->v0y);
             subpel_free(&sp);
             ref = &e->pred;
@@ -1140,11 +1330,13 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         group_motion(e, display, c->display, &c1x, &c1y);
         Subpel sp0, sp1;
         memset(&sp1, 0, sizeof(sp1));
-        if (motion_list(e, src, &a->img, display - a->display, lambda, c0x, c0y, &dx, &dy, e->s0x, e->s0y, &sp0) != 0) return -1;
-        if (motion_list(e, src, &c->img, c->display - display, lambda, c1x, c1y, &dx1, &dy1, e->s1x, e->s1y, &sp1) != 0) {
+        if (motion_list(e, src, &a->img, display - a->display, lambda, c0x, c0y, &dx, &dy,
+                        e->s0x, e->s0y, &model0, &aff0, e->m0x, e->m0y, &sp0) != 0) return -1;
+        if (motion_list(e, src, &c->img, c->display - display, lambda, c1x, c1y, &dx1, &dy1,
+                        e->s1x, e->s1y, &model1, &aff1, e->m1x, e->m1y, &sp1) != 0) {
             subpel_free(&sp0); subpel_free(&sp1); return -1;
         }
-        bi_decide(src, &sp0, &sp1, block, lambda, dx * 4, dy * 4, dx1 * 4, dy1 * 4,
+        bi_decide(src, &sp0, &sp1, block, lambda, e->m0x, e->m0y, e->m1x, e->m1y,
                   e->s0x, e->s0y, e->s1x, e->s1y, e->mode, e->v0x, e->v0y, e->v1x, e->v1y);
         block_predict_bi(&sp0, &sp1, &e->pred, block, e->v0x, e->v0y, e->v1x, e->v1y, e->mode);
         subpel_free(&sp0); subpel_free(&sp1);
@@ -1158,10 +1350,14 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
                 (unsigned char)clamp255v((int)src->pixels[i] - (int)ref->pixels[i] + 128);
         to_code = &e->error;
         if (kind == NVDRV_PRED && block)
-            field = pack_field(e->v0x, e->v0y, nbx, nby, dx * 4, dy * 4, MV_ESC_SEQ, &field_len);
+            field = with_models(aff0 ? &model0 : NULL, NULL,
+                                pack_field(e->v0x, e->v0y, e->m0x, e->m0y, nbx, nby, MV_ESC_SEQ, &field_len),
+                                &field_len);
         else if (kind == NVDRV_BI)
-            field = pack_field_bi(e->mode, e->v0x, e->v0y, e->v1x, e->v1y, nbx, nby,
-                                  dx * 4, dy * 4, dx1 * 4, dy1 * 4, &field_len);
+            field = with_models(aff0 ? &model0 : NULL, aff1 ? &model1 : NULL,
+                                pack_field_bi(e->mode, e->v0x, e->v0y, e->v1x, e->v1y, nbx, nby,
+                                              e->m0x, e->m0y, e->m1x, e->m1y, &field_len),
+                                &field_len);
         if (block && !field) return -1;
     }
 
@@ -1194,7 +1390,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     if (nvdr_encode_mem(&blob, &len, to_code, &fcfg, &fh) != 0) { free(field); return -1; }
     if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
-    if (write_frame(e, kind, display, block, dx, dy, dx1, dy1, field, field_len, blob, len) != 0) {
+    int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0);
+    if (write_frame(e, kind, display, block, flags, dx, dy, dx1, dy1, field, field_len, blob, len) != 0) {
         free(blob); free(field); return -1;
     }
     free(field);
@@ -1220,6 +1417,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         r.display = display; r.kind = kind; r.level = kind == NVDRV_BI ? level : 0;
         r.q = fcfg.q; r.dx = dx; r.dy = dy;
         r.bytes = len + NVDRV_FRAME_HEADER + (block ? 4 + field_len : 0);
+        r.field_bytes = field_len;
         e->report(e->user, &r);
     }
     return 0;
@@ -1306,6 +1504,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     free(e->pred.pixels); free(e->error.pixels); free(e->last_src.pixels);
     free(e->s0x); free(e->s0y); free(e->s1x); free(e->s1y);
     free(e->v0x); free(e->v0y); free(e->v1x); free(e->v1y);
+    free(e->m0x); free(e->m0y); free(e->m1x); free(e->m1y);
     free(e->mode);
     free(e);
     return rc;
@@ -1380,9 +1579,12 @@ static int decode_one(NvdrvDecoder* d) {
     size_t len = get_u32v(h + 6);
     int dx1 = (int16_t)get_u16v(h + 10);
     int dy1 = (int16_t)get_u16v(h + 12);
+    int flags = h[18];
     uint32_t display32 = get_u32v(h + 14);
     if (kind != NVDRV_INTRA && kind != NVDRV_PRED && kind != NVDRV_BI) return -1;
     if (kind == NVDRV_INTRA && block) return -1;
+    if (flags & ~(FRAME_MODEL0 | FRAME_MODEL1) || h[19]) return -1;
+    if (flags && (!block || (kind != NVDRV_BI && (flags & FRAME_MODEL1)))) return -1;
     if (kind == NVDRV_BI && (block < 4 || block > 128)) return -1;
     if (kind == NVDRV_PRED && block && (block < 4 || block > 128)) return -1;
     if (display32 > INT_MAX / 2) return -1;
@@ -1408,22 +1610,31 @@ static int decode_one(NvdrvDecoder* d) {
         if (field_len > len - 4 || d->pos + 4 + field_len > d->size) return 0;
         int nbx = (d->width + block - 1) / block, nby = (d->height + block - 1) / block;
         size_t nb = (size_t)nbx * nby;
-        int16_t* v = (int16_t*)malloc(nb * 4 * sizeof(int16_t));
+        /* Vectors of both lists, then the models' vectors of both. */
+        int16_t* v = (int16_t*)malloc(nb * 8 * sizeof(int16_t));
+        int16_t* mv = v + 4 * nb;
         uint8_t* mode = (uint8_t*)malloc(nb);
         Subpel sp0, sp1;
         memset(&sp0, 0, sizeof(sp0)); memset(&sp1, 0, sizeof(sp1));
         int rc = -1;
         const uint8_t* fp = d->data + d->pos + 4;
-        if (v && mode) {
+        size_t head = MODEL_BYTES * (!!(flags & FRAME_MODEL0) + !!(flags & FRAME_MODEL1));
+        if (v && mode && field_len >= head) {
+            Model m0 = { dx * 4, 0, 0, dy * 4, 0, 0 }, m1 = { dx1 * 4, 0, 0, dy1 * 4, 0, 0 };
+            const uint8_t* mp = fp;
+            if (flags & FRAME_MODEL0) { model_get(&m0, mp); mp += MODEL_BYTES; }
+            if (flags & FRAME_MODEL1) model_get(&m1, mp);
+            model_fill(&m0, d->width, d->height, block, mv, mv + nb);
+            if (kind == NVDRV_BI) model_fill(&m1, d->width, d->height, block, mv + 2 * nb, mv + 3 * nb);
             if (kind == NVDRV_PRED) {
-                if (unpack_field(fp, field_len, nbx, nby, dx * 4, dy * 4, MV_ESC_SEQ, NVDRV_MV_MAX,
-                                 v, v + nb) == 0 &&
+                if (unpack_field(fp + head, field_len - head, nbx, nby, mv, mv + nb, MV_ESC_SEQ,
+                                 NVDRV_MV_MAX, v, v + nb) == 0 &&
                     subpel_build(&sp0, ref) == 0) {
                     block_predict(&sp0, &d->pred, block, v, v + nb);
                     rc = 0;
                 }
-            } else if (unpack_field_bi(fp, field_len, nbx, nby, dx * 4, dy * 4, dx1 * 4, dy1 * 4,
-                                       mode, v, v + nb, v + 2 * nb, v + 3 * nb) == 0 &&
+            } else if (unpack_field_bi(fp + head, field_len - head, nbx, nby, mv, mv + nb, mv + 2 * nb,
+                                       mv + 3 * nb, mode, v, v + nb, v + 2 * nb, v + 3 * nb) == 0 &&
                        subpel_build(&sp0, ref) == 0 &&
                        subpel_build(&sp1, &d->dpb[after].img) == 0) {
                 block_predict_bi(&sp0, &sp1, &d->pred, block, v, v + nb, v + 2 * nb, v + 3 * nb, mode);
@@ -1542,27 +1753,32 @@ int nvdrv_motion_find(const NvdrImage* ref, const NvdrImage* cur, const NvdrvCon
     int rc = -1;
     int16_t* vx = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
     int16_t* vy = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
+    int16_t* tx = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
+    int16_t* ty = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
     NvdrImage pred = { NULL, w, h };
     Subpel sp;
     memset(&sp, 0, sizeof(sp));
     m->block = block;
     m->err.width = w; m->err.height = h;
-    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&m->err, w, h)) goto done;
+    if (!vx || !vy || !tx || !ty || alloc_image(&pred, w, h) || alloc_image(&m->err, w, h)) goto done;
 
     find_shift(cur, ref, m->cfg.search, &m->dx, &m->dy);
     block_search(cur, ref, block, 1, m->dx, m->dy, vx, vy);
     if (subpel_build(&sp, ref) != 0) goto done;
     block_refine(cur, &sp, block, 127, vx, vy);
-    if (m->cfg.mv_lambda > 0) field_rd(cur, &sp, block, 127, m->dx * 4, m->dy * 4, m->cfg.mv_lambda, vx, vy);
+    /* An album's field is predicted from one translation, the global
+     * vector, and carries no model. */
+    for (int b = 0; b < nbx * nby; b++) { tx[b] = (int16_t)(m->dx * 4); ty[b] = (int16_t)(m->dy * 4); }
+    if (m->cfg.mv_lambda > 0) field_rd(cur, &sp, block, 127, tx, ty, m->cfg.mv_lambda, vx, vy);
     block_predict(&sp, &pred, block, vx, vy);
     for (size_t i = 0; i < npx; i++)
         m->err.pixels[i] = (unsigned char)clamp255v((int)cur->pixels[i] - (int)pred.pixels[i] + 128);
-    m->field = pack_field(vx, vy, nbx, nby, m->dx * 4, m->dy * 4, MV_ESC_ALBUM, &m->field_len);
+    m->field = pack_field(vx, vy, tx, ty, nbx, nby, MV_ESC_ALBUM, &m->field_len);
     if (m->field) rc = 0;
 
 done:
     subpel_free(&sp);
-    free(vx); free(vy); free(pred.pixels);
+    free(vx); free(vy); free(tx); free(ty); free(pred.pixels);
     if (rc != 0) nvdrv_motion_free(m);
     return rc;
 }
@@ -1628,11 +1844,14 @@ int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
     int rc = -1;
     int16_t* vx = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
     int16_t* vy = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
+    int16_t* tx = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
+    int16_t* ty = (int16_t*)malloc((size_t)nbx * nby * sizeof(int16_t));
     NvdrImage pred = { NULL, w, h }, err = { NULL, w, h };
     Subpel sp;
     memset(&sp, 0, sizeof(sp));
-    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&err, w, h)) goto done;
-    if (unpack_field(data + 9, field_len, nbx, nby, dx * 4, dy * 4, MV_ESC_ALBUM, 127, vx, vy) != 0) goto done;
+    if (!vx || !vy || !tx || !ty || alloc_image(&pred, w, h) || alloc_image(&err, w, h)) goto done;
+    for (int b = 0; b < nbx * nby; b++) { tx[b] = (int16_t)(dx * 4); ty[b] = (int16_t)(dy * 4); }
+    if (unpack_field(data + 9, field_len, nbx, nby, tx, ty, MV_ESC_ALBUM, 127, vx, vy) != 0) goto done;
     if (subpel_build(&sp, ref) != 0) goto done;
     block_predict(&sp, &pred, block, vx, vy);
     if (reconstruct(data + 9 + field_len, len - 9 - field_len, &err) != 0) goto done;
@@ -1643,6 +1862,6 @@ int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
     rc = 0;
 done:
     subpel_free(&sp);
-    free(vx); free(vy); free(pred.pixels); free(err.pixels);
+    free(vx); free(vy); free(tx); free(ty); free(pred.pixels); free(err.pixels);
     return rc;
 }

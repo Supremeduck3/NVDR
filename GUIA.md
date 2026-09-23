@@ -416,6 +416,15 @@ Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
 node scripts/bench_video.mjs pasta_de_quadros/
 ```
 
+E com os melhores encoders que existem, offline e nos presets lentos
+(libaom AV1, x265, x264 e libvpx VP9, pelo ffmpeg). Esse é o comparativo
+que importa: os encoders do navegador são de tempo real e bem mais fracos.
+O ffmpeg com esses encoders vem com `pip install imageio-ffmpeg`:
+
+```bash
+node scripts/bench_video_offline.mjs pasta_de_quadros/ [--only av1,hevc]
+```
+
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.
 

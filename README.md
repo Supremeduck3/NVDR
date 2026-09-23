@@ -308,6 +308,70 @@ A cut file now loses the B frames of the group it lands in: the prefix
 shows every group before the cut, then the next anchor (partial if the
 cut is inside it) and whichever of its B frames arrived.
 
+### The motion model (sequence format 8)
+
+With B frames in, the motion field was most of every predicted frame:
+on the clean realistic clip at q 24, 1036 of an anchor's 2140 bytes and
+340 to 660 of a B frame's 480 to 1200. That clip zooms, and under a zoom
+every block moves by a slightly different vector, varying smoothly
+across the frame; a median of neighbours pays for every step of that
+gradient.
+
+Each list of each predicted frame now has an affine model of the
+frame's motion,
+
+    mx = a0 + (a1 * cx + a2 * cy + 32768) >> 16
+    my = b0 + (b1 * cx + b2 * cy + 32768) >> 16
+
+in quarter pixels at the block's centre, with a0, b0 in quarter pixels
+and the slopes in 65536ths of a quarter pixel per pixel (computed in 64
+bits, so a damaged size cannot overflow it). A vector is predicted as
+the model at its block plus the median of how far the left, top and
+top-right neighbours stray from the model there. With a model that is
+one translation this is exactly the old prediction, which is what albums
+keep using.
+
+The encoder fits the model to its searched vectors by least squares,
+then twice more on the blocks within 2.5 times the median deviation of
+the last fit, so a moving object does not drag the camera's motion with
+it. On a field of noise, flat or periodic texture where every offset
+matches about as well, least squares finds slopes that are not there, so
+the model is kept only when it predicts clearly more blocks to within a
+quarter pixel than the global translation does. When it is not kept, the
+list's model is its header's global vector and costs nothing: a flag in
+the frame header (byte 18) says which lists carry the 12 bytes.
+
+BD-rate against P frames only, luma, 25 frames:
+
+    clip                                      B frames   + model
+    pan over a photo, whole pixels, clean       -10.5%    -11.4%
+    subpixel pan, zoom, object, clean           -30.9%    -36.6%
+    the same with sensor noise                  -28.6%    -35.1%
+
+The regression gate's sequence, which does not zoom, comes out byte for
+byte as it did.
+
+### Against the state of the art
+
+WebCodecs' encoders are real-time encoders, and beating them says
+little. `scripts/bench_video_offline.mjs` runs the best encoders there
+are through ffmpeg, at slow settings, with the same GOP of 48 and PSNR
+tuning where there is one: libaom's AV1 (cpu-used 3), x265 (slow), x264
+(veryslow) and libvpx's VP9 (good, cpu-used 1). Same frames in and out
+as I420, same scoring. BD-rate on PSNR-Y, positive meaning NVDRV needs
+that much more:
+
+    48 frames, 960x540          AV1 libaom    HEVC x265   H.264 x264   VP9 libvpx
+    clean, B frames (fmt 7)       +143.6%       +73.3%      +25.0%       +56.5%
+    clean, + model (fmt 8)        +128.5%       +54.6%      +12.1%       +42.1%
+    noisy, B frames (fmt 7)       +288.1%       +93.1%      +40.4%       +55.4%
+    noisy, + model (fmt 8)        +255.1%       +69.4%      +23.9%       +38.3%
+
+That is the honest position: past the browser's encoders, near x264 at
+its slowest, and AV1 needs well under half the bytes. The intra frame
+alone, measured on the first frame, is 5% behind x264's, 17% behind
+x265's and 38% behind AV1's at equal luma; the rest is prediction.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours

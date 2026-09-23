@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 7;
+const VERSION = 8;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -81,27 +81,28 @@ function mvModels() {
     };
 }
 
-/* mv_predict(): the median of left, top and top-right, the global vector
- * off the frame, the left one alone on the top row. */
-function mvPredict(vx, vy, nbx, b, gdx, gdy, out) {
+/* mv_predict(): the model's vector at the block plus the median of how
+ * far the left, top and top-right neighbours stray from the model (zero
+ * off the frame), the left one alone on the top row. */
+function mvPredict(vx, vy, mx, my, nbx, b, out) {
     const x = b % nbx, y = (b - x) / nbx;
     if (y === 0) {
-        out[0] = x > 0 ? vx[b - 1] : gdx;
-        out[1] = x > 0 ? vy[b - 1] : gdy;
+        out[0] = mx[b] + (x > 0 ? vx[b - 1] - mx[b - 1] : 0);
+        out[1] = my[b] + (x > 0 ? vy[b - 1] - my[b - 1] : 0);
         return;
     }
     const t = b - nbx;
-    const lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
-    const rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
-    out[0] = median3(lx, vx[t], rx);
-    out[1] = median3(ly, vy[t], ry);
+    const lx = x > 0 ? vx[b - 1] - mx[b - 1] : 0, ly = x > 0 ? vy[b - 1] - my[b - 1] : 0;
+    const rx = x + 1 < nbx ? vx[t + 1] - mx[t + 1] : 0, ry = x + 1 < nbx ? vy[t + 1] - my[t + 1] : 0;
+    out[0] = mx[b] + median3(lx, vx[t] - mx[t], rx);
+    out[1] = my[b] + median3(ly, vy[t] - my[t], ry);
 }
 
 const PRED2 = new Int32Array(2);
 
 /* dec_vector(): false for a vector outside -lim-1 .. lim, which is damage. */
-function decVector(dec, m, same, vx, vy, nbx, b, gdx, gdy, esc, lim) {
-    mvPredict(vx, vy, nbx, b, gdx, gdy, PRED2);
+function decVector(dec, m, same, vx, vy, mx, my, nbx, b, esc, lim) {
+    mvPredict(vx, vy, mx, my, nbx, b, PRED2);
     const x = b % nbx;
     const ctx = (x > 0 && same[b - 1] ? 1 : 0) + (b >= nbx && same[b - nbx] ? 1 : 0);
     same[b] = dec.bit(m.same, ctx) ? 0 : 1;
@@ -116,21 +117,42 @@ function decVector(dec, m, same, vx, vy, nbx, b, gdx, gdy, esc, lim) {
     return true;
 }
 
-function inheritVector(same, vx, vy, nbx, b, gdx, gdy) {
-    mvPredict(vx, vy, nbx, b, gdx, gdy, PRED2);
+function inheritVector(same, vx, vy, mx, my, nbx, b) {
+    mvPredict(vx, vy, mx, my, nbx, b, PRED2);
     vx[b] = PRED2[0]; vy[b] = PRED2[1];
     same[b] = 1;
 }
 
 /* Returns false where unpack_field returns -1. */
-function unpackField(bytes, offset, len, nbx, nby, gdx, gdy, vx, vy, esc, lim) {
+function unpackField(bytes, offset, len, nbx, nby, mx, my, vx, vy, esc, lim) {
     const m = mvModels();
     const nb = nbx * nby;
     const same = new Uint8Array(nb);
     const dec = new ArithDecoder(bytes, offset, len);
     for (let b = 0; b < nb; b++)
-        if (!decVector(dec, m, same, vx, vy, nbx, b, gdx, gdy, esc, lim)) return false;
+        if (!decVector(dec, m, same, vx, vy, mx, my, nbx, b, esc, lim)) return false;
     return true;
+}
+
+/* model_get(): an affine model's six int16s. */
+const MODEL_BYTES = 12;
+const FRAME_MODEL0 = 1, FRAME_MODEL1 = 2;
+function modelGet(bytes, at) {
+    const v = new DataView(bytes.buffer, bytes.byteOffset + at, MODEL_BYTES);
+    return [0, 2, 4, 6, 8, 10].map(o => v.getInt16(o, true));
+}
+
+/* model_fill(): the model's vector at every block's centre. */
+function modelFill([a0, a1, a2, b0, b1, b2], width, height, block, mx, my) {
+    const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
+    const clamp = t => (t < -MV_MAX ? -MV_MAX : t > MV_MAX ? MV_MAX : t);
+    for (let by = 0; by < nby; by++)
+        for (let bx = 0; bx < nbx; bx++) {
+            const cx = bx * block + (block >> 1), cy = by * block + (block >> 1), b = by * nbx + bx;
+            // Exact in doubles, and floor() is the C side's 64-bit >> 16.
+            mx[b] = clamp(a0 + Math.floor((a1 * cx + a2 * cy + 32768) / 65536));
+            my[b] = clamp(b0 + Math.floor((b1 * cx + b2 * cy + 32768) / 65536));
+        }
 }
 
 function modeCtx(mode, nbx, b, which) {
@@ -142,7 +164,7 @@ function modeCtx(mode, nbx, b, which) {
 }
 
 /* unpack_field_bi(): per block the mode, then each used list's vector. */
-function unpackFieldBi(bytes, offset, len, nbx, nby, g0x, g0y, g1x, g1y, mode, v0x, v0y, v1x, v1y) {
+function unpackFieldBi(bytes, offset, len, nbx, nby, m0x, m0y, m1x, m1y, mode, v0x, v0y, v1x, v1y) {
     const l0 = mvModels(), l1 = mvModels();
     const notBi = new Uint16Array(3).fill(PROB_INIT), bwd = new Uint16Array(3).fill(PROB_INIT);
     const nb = nbx * nby;
@@ -153,11 +175,11 @@ function unpackFieldBi(bytes, offset, len, nbx, nby, g0x, g0y, g1x, g1y, mode, v
         if (dec.bit(notBi, modeCtx(mode, nbx, b, 0)))
             mode[b] = dec.bit(bwd, modeCtx(mode, nbx, b, 1)) ? MODE_BWD : MODE_FWD;
         if (mode[b] !== MODE_BWD) {
-            if (!decVector(dec, l0, same0, v0x, v0y, nbx, b, g0x, g0y, MV_ESC_SEQ, MV_MAX)) return false;
-        } else inheritVector(same0, v0x, v0y, nbx, b, g0x, g0y);
+            if (!decVector(dec, l0, same0, v0x, v0y, m0x, m0y, nbx, b, MV_ESC_SEQ, MV_MAX)) return false;
+        } else inheritVector(same0, v0x, v0y, m0x, m0y, nbx, b);
         if (mode[b] !== MODE_FWD) {
-            if (!decVector(dec, l1, same1, v1x, v1y, nbx, b, g1x, g1y, MV_ESC_SEQ, MV_MAX)) return false;
-        } else inheritVector(same1, v1x, v1y, nbx, b, g1x, g1y);
+            if (!decVector(dec, l1, same1, v1x, v1y, m1x, m1y, nbx, b, MV_ESC_SEQ, MV_MAX)) return false;
+        } else inheritVector(same1, v1x, v1y, m1x, m1y, nbx, b);
     }
     return true;
 }
@@ -349,7 +371,9 @@ export function predictDecode(ref, width, height, data) {
     if (fieldLen > data.length - 9) return null;
     const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
     const vx = new Int16Array(nbx * nby), vy = new Int16Array(nbx * nby);
-    if (!unpackField(data, 9, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy, MV_ESC_ALBUM, 127)) return null;
+    // An album's field is predicted from one translation and has no model.
+    const tx = new Int16Array(nbx * nby).fill(dx * 4), ty = new Int16Array(nbx * nby).fill(dy * 4);
+    if (!unpackField(data, 9, fieldLen, nbx, nby, tx, ty, vx, vy, MV_ESC_ALBUM, 127)) return null;
     const pred = new Uint8Array(width * height * 3), err = new Uint8Array(width * height * 3);
     blockPredict(ref, pred, width, height, block, vx, vy);
     if (!reconstruct(data.subarray(9 + fieldLen), err, width, height)) return null;
@@ -384,7 +408,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v7 file');
+        if (!this.info) throw new Error('not an NVDRV v8 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -435,8 +459,11 @@ export class SequenceDecoder {
         const dx1 = view.getInt16(10, true);
         const dy1 = view.getInt16(12, true);
         const display = view.getUint32(14, true);
+        const flags = view.getUint8(18);
         if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
         if (kind === INTRA && block) throw new Error('intra frame with a motion field');
+        if ((flags & ~(FRAME_MODEL0 | FRAME_MODEL1)) || view.getUint8(19)) throw new Error('bad frame flags');
+        if (flags && (!block || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
         if (block && (block < 4 || block > 128)) throw new Error('bad block size');
         if (kind === BI && !block) throw new Error('B frame without a motion field');
         if (display > 0x3fffffff) throw new Error('bad display number');
@@ -458,16 +485,29 @@ export class SequenceDecoder {
             if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return false;
             const nbx = Math.ceil(width / block), nby = Math.ceil(height / block), nb = nbx * nby;
             const v0x = new Int16Array(nb), v0y = new Int16Array(nb);
-            // The field is in quarter pixels, the global vectors in whole ones.
+            const m0x = new Int16Array(nb), m0y = new Int16Array(nb);
+            // The field starts with the affine model of each flagged list;
+            // the others are their global vector. Then the vectors, in
+            // quarter pixels.
+            const fp = this.pos + 4;
+            const head = MODEL_BYTES * ((flags & FRAME_MODEL0 ? 1 : 0) + (flags & FRAME_MODEL1 ? 1 : 0));
+            if (fieldLen < head) throw new Error('motion field is damaged');
+            let mp = fp;
+            const model0 = flags & FRAME_MODEL0 ? modelGet(bytes, mp) : [dx * 4, 0, 0, dy * 4, 0, 0];
+            if (flags & FRAME_MODEL0) mp += MODEL_BYTES;
+            const model1 = flags & FRAME_MODEL1 ? modelGet(bytes, mp) : [dx1 * 4, 0, 0, dy1 * 4, 0, 0];
+            modelFill(model0, width, height, block, m0x, m0y);
             if (kind === PRED) {
-                if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4, v0x, v0y,
+                if (!unpackField(bytes, fp + head, fieldLen - head, nbx, nby, m0x, m0y, v0x, v0y,
                                  MV_ESC_SEQ, MV_MAX))
                     throw new Error('motion field is damaged');
                 blockPredict(ref, this.pred, width, height, block, v0x, v0y);
             } else {
                 const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
-                if (!unpackFieldBi(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4,
-                                   dx1 * 4, dy1 * 4, mode, v0x, v0y, v1x, v1y))
+                const m1x = new Int16Array(nb), m1y = new Int16Array(nb);
+                modelFill(model1, width, height, block, m1x, m1y);
+                if (!unpackFieldBi(bytes, fp + head, fieldLen - head, nbx, nby, m0x, m0y, m1x, m1y,
+                                   mode, v0x, v0y, v1x, v1y))
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
                 blockPredict(ref, P0, width, height, block, v0x, v0y, mode, MODE_BWD);

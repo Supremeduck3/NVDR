@@ -87,8 +87,8 @@ static void report(void* user, const NvdrvFrameReport* r) {
     char kind[16];
     if (r->kind == NVDRV_BI) snprintf(kind, sizeof(kind), "bi%d", r->level);
     else snprintf(kind, sizeof(kind), "%s", kind_name(r->kind));
-    printf("  %5d  %-6s %8zu  %+3d%+3d  q%-4d %10zu\n",
-           r->display, kind, r->bytes, r->dx, r->dy, r->q, t->total);
+    printf("  %5d  %-6s %8zu %7zu  %+3d%+3d  q%-4d %10zu\n",
+           r->display, kind, r->bytes, r->field_bytes, r->dx, r->dy, r->q, t->total);
 }
 
 int main(int argc, char** argv) {
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
 
     printf("%d frames  %dx%d  gop %d  search %d  block %d  bframes %d\n", n, first.width, first.height,
            cfg.gop, cfg.search, cfg.block, cfg.bframes);
-    printf("  frame  tipo      bytes    mv     q         acumulado\n");
+    printf("  frame  tipo      bytes   campo    mv     q         acumulado\n");
 
     Totals t = { NVDRV_HEADER_SIZE, 0, 0, 0 };
     nvdrv_encode_set_report(enc, report, &t);
