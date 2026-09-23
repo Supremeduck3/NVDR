@@ -241,6 +241,11 @@ não uma falha.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
   em 420, gráficos e bordas de cor pura em 444).
+- **`--grain off|auto|on`** — síntese de grão: tira o ruído de sensor,
+  codifica a foto limpa e o decodificador recria um grão igual. Para fotos
+  noturnas e de ISO alto (um céu estrelado caiu 32%). `auto` só liga se a
+  foto for ruidosa; desligado por padrão. Na página, o seletor "Grão de
+  sensor" faz o mesmo.
 - **`--quiet`** — só grava o arquivo, sem a tabela por camada (que decodifica
   o arquivo três vezes para medir o PSNR).
 

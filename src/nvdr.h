@@ -120,7 +120,27 @@ typedef struct {
      * max_block of 8 or more. NVDR_CHROMA_AUTO (the default) picks per
      * image: see nvdr_encode_mem_ctx(). */
     int   chroma420;
+    /* Film grain synthesis (see grain.c): the encoder takes the sensor
+     * noise out, codes the clean picture, and stores 22 bytes that let the
+     * decoder lay statistically the same grain back over it. NVDR_GRAIN_OFF,
+     * _AUTO (only when the picture is measurably noisy) or _ON. Carried in
+     * the header's flags. */
+    int   grain;
 } NvdrConfig;
+
+#define NVDR_GRAIN_OFF   0
+#define NVDR_GRAIN_AUTO  1
+#define NVDR_GRAIN_ON    2
+
+/* The grain a decoder lays over the picture: see grain.c. */
+#define NVDR_GRAIN_POINTS 16
+#define NVDR_GRAIN_SIZE   22
+typedef struct {
+    uint16_t seed;
+    uint8_t  kernel;                    /* how far a grain spreads, 0..NVDR_GRAIN_KERNELS-1 */
+    uint8_t  cb, cr;                    /* colour grain, x32 of luma's */
+    uint8_t  sigma[NVDR_GRAIN_POINTS];  /* luma grain x8 at Y = 17 k */
+} NvdrGrain;
 
 #define NVDR_CHROMA_444  0
 #define NVDR_CHROMA_AUTO 1
@@ -140,6 +160,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
 #define NVDR_FLAG_CHROMA420 0x04        /* colour in its own half-resolution tree */
+#define NVDR_FLAG_GRAIN    0x08         /* grain parameters follow the header */
 
 typedef struct {
     uint16_t width, height;
@@ -147,6 +168,8 @@ typedef struct {
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
     uint8_t  band;
+    uint8_t  grain_len;                 /* bytes of grain parameters after the header */
+    NvdrGrain grain;
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */

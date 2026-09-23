@@ -6,6 +6,7 @@
 #include "stb_image.h"
 
 #include "nvdr.h"
+#include "grain.h"
 #include "entropy.h"
 
 #include <math.h>
@@ -160,6 +161,7 @@ NvdrConfig nvdr_default_config(void) {
     c.skip_k = 0.25f;
     c.band = 8;
     c.chroma420 = NVDR_CHROMA_AUTO;
+    c.grain = NVDR_GRAIN_OFF;
     return c;
 }
 
@@ -685,7 +687,15 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
-    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420)) return -1;   /* a flag this decoder does not know */
+    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN))
+        return -1;   /* a flag this decoder does not know */
+    /* Grain parameters sit between the header and the first layer; byte
+     * 29 says how many there are. */
+    h->grain_len = data[29];
+    if (h->flags & NVDR_FLAG_GRAIN) {
+        if (h->grain_len != NVDR_GRAIN_SIZE || size < NVDR_HEADER_SIZE + (size_t)h->grain_len ||
+            nvdr_grain_unpack(data + NVDR_HEADER_SIZE, h->grain_len, &h->grain) != 0) return -1;
+    } else if (h->grain_len) return -1;
     if ((h->flags & NVDR_FLAG_CHROMA420) && h->max_block < 8) return -1;
     for (int k = 0; k < NVDR_LAYERS; k++) if (h->stored_bytes[k] > 0x7fffffffu) return -1;
     if (h->band > 32) return -1;
@@ -1294,11 +1304,10 @@ static double container_cost(const uint8_t* buf, size_t len, const NvdrImage* im
  * that 4:2:0 codes 30% smaller at the same luma. */
 #define CHROMA_AUTO_WEIGHT 0.5
 
-int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
-                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+static int encode_chroma(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                         const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
     *out_buf = NULL; *out_len = 0;
-    tables_init();
-    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    NvdrConfig cfg = *cfg_in;
     if (cfg.chroma420 != NVDR_CHROMA_AUTO) {
         cfg.chroma420 = cfg.chroma420 == NVDR_CHROMA_420;
         return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
@@ -1351,6 +1360,45 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     free(a); free(b);
     nvdr_context_free(start); nvdr_context_free(other); nvdr_context_free(check);
     return rc;
+}
+
+/*
+ * The whole encode: grain first (grain.c). A noisy picture is coded clean
+ * and its grain described after the header, where the decoder finds it
+ * before the first layer. Residuals never carry grain: a predicted frame
+ * or photo would have to cancel its reference's grain and add its own.
+ */
+int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+    *out_buf = NULL; *out_len = 0;
+    tables_init();
+    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || !img->pixels)
+        return encode_chroma(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    NvdrImage clean;
+    NvdrGrain g;
+    int got = nvdr_grain_estimate(img, cfg.grain == NVDR_GRAIN_ON, &clean, &g);
+    if (got < 0) return -1;
+    if (got == 0) return encode_chroma(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    uint8_t* buf; size_t len;
+    NvdrHeader h;
+    int rc = encode_chroma(&buf, &len, &clean, &cfg, &h, ctx);
+    nvdr_image_free(&clean);
+    if (rc != 0) return rc;
+    uint8_t* out = (uint8_t*)malloc(len + NVDR_GRAIN_SIZE);
+    if (!out) { free(buf); return -1; }
+    memcpy(out, buf, NVDR_HEADER_SIZE);
+    out[5] |= NVDR_FLAG_GRAIN;
+    out[29] = NVDR_GRAIN_SIZE;
+    nvdr_grain_pack(&g, out + NVDR_HEADER_SIZE);
+    memcpy(out + NVDR_HEADER_SIZE + NVDR_GRAIN_SIZE, buf + NVDR_HEADER_SIZE, len - NVDR_HEADER_SIZE);
+    free(buf);
+    h.flags |= NVDR_FLAG_GRAIN;
+    h.grain_len = NVDR_GRAIN_SIZE;
+    h.grain = g;
+    if (hdr_out) *hdr_out = h;
+    *out_buf = out; *out_len = len + NVDR_GRAIN_SIZE;
+    return 0;
 }
 
 int nvdr_encode_file(const char* out_path, const NvdrImage* img,
@@ -1556,12 +1604,13 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
     if (read_header(data, size, &h) != 0) return -1;
     if (hdr_out) *hdr_out = h;
 
-    size_t avail0 = size - NVDR_HEADER_SIZE;
+    size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len;
+    size_t avail0 = size - base;
     if (avail0 > h.stored_bytes[0]) avail0 = h.stored_bytes[0];
     /* The range decoder primes itself with five bytes; fewer than that
      * and not one symbol of layer 0 can be read. */
     if (avail0 < 5) return -1;
-    size_t off1 = NVDR_HEADER_SIZE + (size_t)h.stored_bytes[0];
+    size_t off1 = base + (size_t)h.stored_bytes[0];
     size_t avail1 = size > off1 ? size - off1 : 0;
     if (avail1 > h.stored_bytes[1]) avail1 = h.stored_bytes[1];
     size_t off2 = off1 + (size_t)h.stored_bytes[1];
@@ -1605,7 +1654,7 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
         for (int k = 0; k < 2; k++) models_fill((uint16_t*)&tms[k], sizeof(TextureModels) / sizeof(uint16_t));
     }
     NvdrDecoder d0;
-    nvdr_dec_init(&d0, data + NVDR_HEADER_SIZE, avail0);
+    nvdr_dec_init(&d0, data + base, avail0);
     for (int k = 0; k < np; k++) { L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = step; }
     int complete0 = 0, stopped = 0;
     for (int t = 0; t < tiles; t++) {
@@ -1727,6 +1776,13 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
             upsample_plane(planes[1 + c], &cvs[1], up[c], cv->pw, h.width, h.height);
             planes[1 + c] = up[c];
         }
+    }
+    if (h.flags & NVDR_FLAG_GRAIN) {
+        NvdrGrainTemplates* gt = (NvdrGrainTemplates*)malloc(sizeof(NvdrGrainTemplates));
+        if (!gt) { free(out->pixels); out->pixels = NULL; goto done; }
+        nvdr_grain_templates(&h.grain, gt);
+        nvdr_grain_apply(&h.grain, gt, planes[0], planes[1], planes[2], cv->pw, h.width, h.height);
+        free(gt);
     }
     for (int y = 0; y < h.height; y++)
         for (int x = 0; x < h.width; x++) {

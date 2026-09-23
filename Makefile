@@ -11,8 +11,8 @@ OPENMP  = $(shell $(CC) -fopenmp -E - < /dev/null > /dev/null 2>&1 && echo -fope
 CFLAGS  = -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
 LDLIBS  = -lm -lz
 
-CODEC   = src/nvdr.c src/entropy.c
-HEADERS = src/nvdr.h src/entropy.h
+CODEC   = src/nvdr.c src/entropy.c src/grain.c
+HEADERS = src/nvdr.h src/entropy.h src/grain.h
 SEQ     = $(CODEC) src/nvdrv.c
 SEQ_H   = $(HEADERS) src/nvdrv.h
 TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album

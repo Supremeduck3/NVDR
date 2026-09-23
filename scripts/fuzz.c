@@ -136,17 +136,19 @@ int main(int argc, char** argv) {
         /* An image becomes seed containers by encoding it every way that
          * changes what the decoder walks: the default, a fine quantiser
          * (large coefficients, escapes), a coarse one (mostly flat
-         * leaves), and a tree held to 8..16 px. A path no seed reaches is
-         * a path the fuzzer never attacks. */
+         * leaves), a tree held to 8..16 px, and with film grain (its
+         * parameters after the header, its synthesis over the picture).
+         * A path no seed reaches is a path the fuzzer never attacks. */
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
         if (nalbum < 3) album_paths[nalbum++] = argv[i];
-        for (int variant = 0; variant < 4 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 5 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 1) c.q = 1;
             if (variant == 2) c.q = 200;
             if (variant == 3) { c.min_block = 8; c.max_block = 16; c.band = 0; }
             if (variant == 2) c.band = 32;
+            if (variant == 4) { c.grain = NVDR_GRAIN_ON; c.q = 40; }
             if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) == 0) nseeds++;
         }
         nvdr_image_free(&img);
