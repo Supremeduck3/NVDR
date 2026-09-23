@@ -100,6 +100,11 @@ int main(int argc, char** argv) {
     }
     printf("  leaves 4/8/16/32: %u/%u/%u/%u, %u with texture\n",
            hdr.leaves[0], hdr.leaves[1], hdr.leaves[2], hdr.leaves[3], hdr.textured);
+    double planes = hdr.plane_bits[0] + hdr.plane_bits[1] + hdr.plane_bits[2];
+    if (planes > 0)
+        printf("  planes Y/Cb/Cr: %.1f%%/%.1f%%/%.1f%% of the leaves' bits\n",
+               100 * hdr.plane_bits[0] / planes, 100 * hdr.plane_bits[1] / planes,
+               100 * hdr.plane_bits[2] / planes);
 
     nvdr_image_free(&source);
     return 0;

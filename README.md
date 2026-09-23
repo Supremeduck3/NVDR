@@ -301,6 +301,39 @@ answers ranges; any static host (nginx, a CDN, S3) does too.
 `public/galeria.html` is a page built that way, and `make demo` makes
 its files.
 
+#### Off the page's thread
+
+A 13.5 Mpx photo takes 2.6 s to decode in JS, and on the main thread
+that is 2.6 s of a page that neither scrolls nor answers a click. The
+decoding now runs in module workers. `nvdr-tasks.js` holds the work
+(decode a container or a prefix of it, open an album, decode one of its
+photos, fetch one from a server by ranges); `nvdr-worker.js` runs it;
+`nvdr-decoder.js` is the page's side, a promise per task and a few
+workers, with a key always sent to the same one so what it keeps (a
+container put once and cut at every slider position, an open album, the
+ranges fetched from an album URL) is there next time. Pixels come back
+transferred, not copied, and already averaged down to the size the
+canvas is shown at, so the page does not shrink tens of megapixels on
+its own thread either; the full picture comes too, for redrawing when
+the page is resized. A browser that cannot start a module worker gets
+the same results on the main thread: what was waiting, and what had
+been put, is replayed there.
+
+Measured as the longest stretch the page could not respond (Chromium's
+long tasks), on the 13.5 Mpx photo:
+
+                                   main thread   workers
+    opening it                       3961 ms      154 ms
+    moving the truncation slider     3007 ms        none
+
+While a download streams, `<nvdr-img>` has the worker decode the longest
+prefix that has arrived each time it is free, instead of queueing every
+prefix: the demo's hero goes through 22 pictures on its way in, with no
+long task. The slider likewise decodes only its latest position. The
+video tab still decodes on the main thread: its frames take about 30 ms,
+and the time it reports is meant to be the cost of playing the file
+there.
+
 `nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
 image, whether it was predicted and from which, its bytes, and what it
 would cost alone; `unpack --only N` decodes one photo by its chain. On
@@ -998,6 +1031,47 @@ move.
   over the careful way. `scripts/crosscheck.mjs` now flips bits in
   full-length copies too, to hold that path to the C pixels. The page
   gets all three layers from one pass instead of three decodes.
+
+## Against the browser's JPEG and WebP (v11)
+
+`make bench` (`scripts/bench_codecs.mjs`) runs NVDR, and the JPEG and WebP
+encoders a browser has (Chromium's `convertToBlob`), over their quality
+ranges on the same pixels, scores every decoded picture here with one
+implementation of each metric, and compares the curves by Bjontegaard
+delta rate: how much bigger (+) or smaller (-) NVDR's file is than the
+other's at the same quality, over the range both reach.
+
+    image              NVDR vs JPEG                NVDR vs WebP              NVDR bits
+                       PSNR-Y  SSIM-Y  PSNR-RGB    PSNR-Y  SSIM-Y  PSNR-RGB  Y / Cb / Cr
+    OIP-1304511485     -15.5%   -6.1%  -49.8%      +57.1%  +80.6%   -2.8%    54 / 20 / 26
+    OIP-3451121336     -25.4%  -21.8%  -34.6%       +3.7%   +5.7%  -11.5%    84 / 12 / 4
+    OIP-3786546191     -19.4%   -9.2%  -34.7%       +8.2%  +17.1%  -13.2%    76 / 20 / 4
+    OIP-4140498144     -29.4%  -19.8%  -33.8%       -0.6%   +6.7%   -9.3%    85 / 10 / 5
+    macarrao           -36.7%  -31.3%  -46.5%       +2.7%   +4.8%  -11.8%    76 / 15 / 9
+    montanha_pessoas   -29.5%  -21.3%  -33.4%       -3.2%   +0.9%   -8.8%    89 / 6 / 5
+    montanha_ruido     -24.7%  -13.1%  -33.4%       -1.1%   +6.8%  -12.4%    87 / 7 / 6
+    mean               -25.8%  -17.5%  -38.0%       +9.5%  +17.5%  -10.0%
+
+NVDR beats the browser's JPEG everywhere, by a quarter on luma. Against
+WebP it is even on luma for most pictures and ahead once colour counts,
+and loses where colour is most of the picture. That is one choice, not
+tuning: JPEG and WebP keep colour at half resolution each way (4:2:0),
+which the eye barely sees and PSNR-Y does not see at all, and NVDR keeps
+it whole, at 11 to 46% of its bits (last column, the encoder's own count
+at q 24, now in its report). On OIP-1304511485, where the colour takes
+46%, WebP needs 57% fewer bytes for the same luma.
+
+Three things keep the comparison honest. Every codec gets the same
+pixels, read once the way the encoder reads them and handed to the
+browser as a PNG (the script checks the browser sees them). The samples
+are JPEGs, and re-encoding a JPEG on its own 8x8 grid near its own
+quality comes back almost exact: the browser's JPEG jumped from 35.6 to
+49.6 dB between two steps. So JPEG sources are cropped 3 and 5 pixels
+(`output/convert <in> <out> x0 y0`), off both grids. And montanha_ruido
+is montanha_pessoas with high-ISO sensor noise added
+(`scripts/analysis/addnoise.mjs`: spread growing with the light, mostly
+luma, a little over a pixel wide), since a photo straight from a camera
+is not a JPEG thumbnail. No AVIF: there is no encoder for it here.
 
 ## Showing a large picture small
 

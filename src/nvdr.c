@@ -378,14 +378,16 @@ typedef struct {
     double       bits;
 } Sink;
 
+/* A sink with a coder writes the symbol, and either way counts what it
+ * costs at the model's odds before they adapt. */
 static void put_bit(Sink* s, uint16_t* p, int bit) {
+    s->bits += bitcost[bit][*p];
     if (s->enc) nvdr_enc_bit(s->enc, p, bit);
-    else s->bits += bitcost[bit][*p];
 }
 
 static void put_direct(Sink* s, uint32_t v, int n) {
+    s->bits += n;
     if (s->enc) nvdr_enc_direct(s->enc, v, n);
-    else s->bits += n;
 }
 
 /* Magnitude above the unary run: order-0 Exp-Golomb. */
@@ -706,6 +708,7 @@ typedef struct {
     int*           pre_lo[NSIZES][3];
     int*           pre_hi[NSIZES][3];
     int            pre_y;       /* the row's top */
+    double         plane_bits[3];   /* what the coded leaves cost, per plane */
 } Enc;
 
 static size_t node_id(const Enc* e, int x, int y, int n) {
@@ -782,9 +785,11 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
                       const int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK]) {
     int sc = size_class(n), count = n * n, at = e->band_at[sc];
     for (int c = 0; c < 3; c++) {
+        double before = s0->bits + s1[0].bits + s1[1].bits;
         put_dc(s0, &e->cm, sc, c, dl[c]);
         put_texture(&s1[0], &e->tm, sc, c, lv[c], 1, at);
         if (at < count) put_texture(&s1[1], &e->tm2, sc, c, lv[c], at, count);
+        if (s0->enc) e->plane_bits[c] += s0->bits + s1[0].bits + s1[1].bits - before;
     }
 }
 
@@ -1099,6 +1104,7 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     h.stored_bytes[1] = (uint32_t)enc1.count;
     h.stored_bytes[2] = (uint32_t)n2;
     h.band = (uint8_t)band;
+    for (int c = 0; c < 3; c++) h.plane_bits[c] = e.plane_bits[c];
     if (hdr_out) *hdr_out = h;
     *out_buf = buf;
     *out_len = total;

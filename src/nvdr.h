@@ -141,6 +141,9 @@ typedef struct {
      * how many of them carry texture. */
     uint32_t leaves[4];
     uint32_t textured;
+    /* and what the colours and textures of Y, Cb and Cr cost, in bits as
+     * the models priced them (the tree's split flags are in none) */
+    double   plane_bits[3];
 } NvdrHeader;
 
 int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
