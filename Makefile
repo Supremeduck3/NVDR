@@ -49,6 +49,15 @@ fuzz_nvdr: scripts/fuzz.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
 
 fuzz: fuzz_nvdr
 
+output/convert: scripts/analysis/convert.c $(CODEC) $(HEADERS)
+	mkdir -p output
+	$(CC) $(CFLAGS) -o $@ scripts/analysis/convert.c $(CODEC) $(LDLIBS)
+
+# NVDR against the browser's JPEG and WebP at equal quality (see
+# scripts/bench_codecs.mjs); writes output/bench/.
+bench: nvdr_encode nvdr_decode output/convert
+	node scripts/bench_codecs.mjs
+
 # The example files public/galeria.html shows: one image, and an album
 # whose photos are a pan over one sample, interleaved with other samples.
 demo: nvdr_encode nvdr_album
