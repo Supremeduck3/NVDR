@@ -26,7 +26,9 @@ const STATIC_TYPES = {
     // Encoded media, so a page can use them the way it uses a JPEG.
     '.nvdr': 'application/octet-stream',
     '.nvda': 'application/octet-stream',
-    '.nvdrv': 'application/octet-stream'
+    '.nvdrv': 'application/octet-stream',
+    // The decoder as WebAssembly (public/nvdr.wasm).
+    '.wasm': 'application/wasm'
 };
 
 // Ensure output dir exists

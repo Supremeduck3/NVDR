@@ -343,7 +343,19 @@ export function newContext() { return { valid: false, cm: null, tm: null, tm2: n
 
 const RETRY = Symbol('retry');
 
+// A faster decode() with the same results, when one is loaded: the C
+// decoder as WebAssembly (nvdr-wasm.js). Not for a fluid context, whose
+// models only this decoder carries between containers.
+let fastDecoder = null;
+export function setFastDecoder(fn) { fastDecoder = fn; }
+
 export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false) {
+    if (fastDecoder && !ctx) return fastDecoder(buffer, maxLayer, wantFlat, wantLow);
+    return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow);
+}
+
+/* The JavaScript decoder itself, whichever decode() uses. */
+export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false) {
     // A texture layer that arrived whole cannot stop inside a tile unless
     // the file is damaged, so the first attempt does not save each tile to
     // restore it, a fifth of the time on a large image. If it does stop,

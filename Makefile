@@ -58,6 +58,12 @@ output/convert: scripts/analysis/convert.c $(CODEC) $(HEADERS)
 bench: nvdr_encode nvdr_decode output/convert
 	node scripts/bench_codecs.mjs
 
+# The decoder for the browser, as WebAssembly: clang and wasm-ld only.
+wasm: public/nvdr.wasm
+
+public/nvdr.wasm: $(CODEC) $(HEADERS) wasm/api.c wasm/libc.c wasm/include/*.h wasm/build.sh
+	./wasm/build.sh
+
 # The example files public/galeria.html shows: one image, and an album
 # whose photos are a pan over one sample, interleaved with other samples.
 demo: nvdr_encode nvdr_album

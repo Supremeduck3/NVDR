@@ -1165,6 +1165,86 @@ sample read 2.8, a crop of montanha 5.4). Residuals never carry grain
 (a predicted frame would have to cancel its reference's), and albums and
 sequences do not use it. The page has a selector for it.
 
+### Measured but not built: directional prediction
+
+H.264, HEVC and AV1 predict a block by extending its neighbours along a
+direction, and it is worth 8-15% there. A prototype gave a leaf four
+modes beside the average colour (vertical, horizontal, HEVC's planar,
+the 135 degree diagonal), signalled per leaf. Luma PSNR as the encoder
+reconstructs it, and bytes, at q 24:
+
+                          no modes          from flat colours     from full reconstruction
+                                            (best mode by RD)     (best mode by RD)
+    montanha_pessoas      48427 B 33.89     48748 B 33.95         47951 B 33.99
+    OIP-4140498144        19874 B 34.53     19984 B 34.58         19668 B 34.71
+    montanha, 2x size     66047 B 38.34     66358 B 38.39         64827 B 38.38
+
+Predicting from the neighbours' flat colours keeps layer 0 decodable on
+its own and nets about 2%; choosing the mode by absolute difference
+instead of by rate-distortion made files 1-3% bigger. Predicting from
+the neighbours' full reconstruction, which would tie every layer to the
+ones after it and so give up the truncation guarantee, nets 3-5%. The
+quadtree already does most of what the modes do elsewhere: it splits to
+4x4 exactly where an edge runs, and each leaf's transform is chosen by
+rate-distortion, where HEVC's intra modes work on a fixed partition.
+Neither gain pays for its format.
+
+### Measured but not built: adaptive quantisation
+
+x264 moves bits from busy regions, where the eye masks error, to smooth
+ones, where it shows. A prototype gave each 32x32 tile a step offset of
+-4..4 sixths of a doubling (H.264's QP scale), from how far its luma
+activity (mean log variance of its 8x8 blocks) was from the picture's.
+BD-rate against WebP, mean of the seven benchmark images, and on
+montanha at twice its size:
+
+                     7 images               montanha x2
+    strength         PSNR-Y   SSIM-Y        PSNR-Y   SSIM-Y
+    0 (off)          -3.3%    +3.9%         -31.5%   -31.2%
+    0.5              -1.4%    +2.0%         -30.7%   -31.7%
+    1                +2.1%    +3.6%         -29.6%   -32.1%
+
+At a camera's scale it buys one point of SSIM for two of PSNR: a 32x32
+tile of a large photograph mixes smooth and busy parts, and a per-leaf
+offset would cost a symbol in every leaf. Not built.
+
+### At a camera's scale
+
+The benchmark's images are thumbnails of 400 to 800 pixels. On montanha
+at twice its size, a picture closer to a camera's, NVDR against the
+browser's WebP is -31.5% on PSNR-Y, -31.2% on SSIM-Y and -28.6% on
+PSNR-RGB, where the thumbnails averaged -3.3%, +3.9% and -7.7%: the
+quadtree's 32x32 leaves and the colour tree pay most where there are
+large smooth areas to cover, and a photograph at full size has more of
+them. `node scripts/bench_codecs.mjs <images>` runs any picture.
+
+### The decoder as WebAssembly
+
+`public/nvdr.wasm` (24 KB, `make wasm`) is the C decoder compiled for
+the browser by clang and wasm-ld alone: no Emscripten, no wasi-libc.
+`nvdr.c` leaves out its file and image-format code under `NVDR_WASM`;
+`wasm/libc.c` supplies the memory functions (a stack the page rewinds
+between decodes) and `wasm/api.c` the three calls the page makes; the
+linker drops the encoder, and the module imports nothing.
+`public/nvdr-wasm.js` loads it and installs it behind `decode()` in
+nvdr.js, so everything that decodes (the page, the workers, albums,
+`<nvdr-img>`) uses it; a decode with a fluid context, or any decode
+where WebAssembly cannot load, stays in JavaScript.
+
+    decode, 3000x4500           JavaScript   WebAssembly
+    full picture                  2108 ms       856 ms
+    with grain                    2840 ms      1470 ms
+    three views (the page)        3690 ms      1919 ms
+    montanha, 768x512              145 ms        26 ms
+
+It is the same C the command line runs, so the three decoders are held
+to one another: `scripts/crosscheck.mjs` now compares C, JavaScript and
+WebAssembly on every layer, cut and damaged copy. One change went into
+the C decoder with it: like the JavaScript one, it no longer saves each
+tile of a texture layer that arrived whole (only damage can stop one
+mid-tile, and then the decode starts over saving them), which was a
+tenth of its time.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white
