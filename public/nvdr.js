@@ -29,6 +29,7 @@ export const LAYER_NAMES = ['COR', 'COR+TEXTURA BAIXA', 'COR+TEXTURA COMPLETA'];
 const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
 const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
+const FLAG_CHROMA420 = 0x04;  // colour in its own half-resolution tree
 const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
 
@@ -202,6 +203,7 @@ const grid = (outer, inner) => Array.from({ length: outer }, () => probs(inner))
 function colourModels() {
     return {
         split: probs(NSIZES),
+        splitC: probs(NSIZES),   // the colour tree's, in 4:2:0
         dcZero: grid(NSIZES, 3),
         dcSign: probs(3),
         dcMag: grid(3, MAG_UNARY)
@@ -296,7 +298,8 @@ export function readHeader(buffer) {
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK)) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420)) return null;
+    if ((h.flags & FLAG_CHROMA420) && h.maxBlock < 8) return null;
     if (h.storedBytes.some(b => b > 0x7fffffff) || h.band > 32) return null;
     return h;
 }
@@ -340,6 +343,91 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
     return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true);
 }
 
+/*
+ * One quadtree's canvas (mirrors Canvas and the decoder's Layer0 in C):
+ * the whole picture in 4:4:4, three planes from Y; in 4:2:0, Y alone,
+ * then Cb and Cr at half size. Planes index the arrays; components
+ * (comp0 + plane) index the models and steps.
+ */
+function makePart(w, h, tile, minBlock, np, comp0, fixedPred) {
+    const pw = Math.ceil(w / minBlock) * minBlock, ph = Math.ceil(h / minBlock) * minBlock;
+    const P = {
+        w, h, pw, ph, tile, minBlock, np, comp0,
+        flat: Array.from({ length: np }, () => new Uint8Array(pw * ph)),
+        full: Array.from({ length: np }, () => new Uint8Array(pw * ph)),
+        // Texture added so far, unclamped to 16 bits; full = clamp(flat + acc).
+        acc: Array.from({ length: np }, () => new Int16Array(pw * ph)),
+        lx: [], ly: [], ln: [],
+        whole: (x, y, n) => x + n <= pw && y + n <= ph,
+        exists: (x, y) => x < pw && y < ph
+    };
+    // TypedArray.fill costs a call per row, most of a 4-pixel row's time:
+    // short rows are written directly.
+    const fill = (p, x, y, ww, hh, v) => {
+        if (ww > 16) {
+            for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + ww);
+            return;
+        }
+        for (let j = y; j < y + hh; j++)
+            for (let at = j * pw + x, end = at + ww; at < end; at++) p[at] = v;
+    };
+    // Mirrors paint_flat().
+    P.paintFlat = (c, x, y, ww, hh, v) => {
+        if (ww > 16) {
+            fill(P.flat[c], x, y, ww, hh, v);
+            fill(P.full[c], x, y, ww, hh, v);
+            fill(P.acc[c], x, y, ww, hh, 0);
+            return;
+        }
+        const f = P.flat[c], o = P.full[c], a = P.acc[c];
+        for (let j = y; j < y + hh; j++)
+            for (let at = j * pw + x, end = at + ww; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
+    };
+    P.predict = (c, x, y, n) => {
+        if (fixedPred) return 128;
+        const p = P.flat[c];
+        let sum = 0, k = 0;
+        if (y > 0) {
+            const x1 = Math.min(x + n, pw);
+            for (let i = x; i < x1; i++) sum += p[(y - 1) * pw + i];
+            k += x1 - x;
+        }
+        if (x > 0) {
+            const y1 = Math.min(y + n, ph);
+            for (let j = y; j < y1; j++) sum += p[j * pw + x - 1];
+            k += y1 - y;
+        }
+        return k ? Math.floor((sum + (k >> 1)) / k) : 128;
+    };
+    // Neutral grey, as tile_fallback() explains.
+    P.tileFallback = (tx, ty) => {
+        if (tx >= pw || ty >= ph) return;
+        const ww = tx + tile < pw ? tile : pw - tx, hh = ty + tile < ph ? tile : ph - ty;
+        for (let c = 0; c < np; c++) P.paintFlat(c, tx, ty, ww, hh, 128);
+    };
+    return P;
+}
+
+/* Mirrors upsample_plane(): colour back to full size, 9 3 3 1 in
+ * sixteenths, edges held. */
+function upsamplePlane(src, C, dst, dpw, w, h) {
+    const cw = C.w, ch = C.h, cpw = C.pw;
+    for (let y = 0; y < h; y++) {
+        const cy = y >> 1;
+        let oy = (y & 1) ? cy + 1 : cy - 1;
+        if (oy < 0) oy = 0;
+        if (oy >= ch) oy = ch - 1;
+        const r0 = cy * cpw, r1 = oy * cpw, o = y * dpw;
+        for (let x = 0; x < w; x++) {
+            const cx = x >> 1;
+            let ox = (x & 1) ? cx + 1 : cx - 1;
+            if (ox < 0) ox = 0;
+            if (ox >= cw) ox = cw - 1;
+            dst[o + x] = (9 * src[r0 + cx] + 3 * src[r0 + ox] + 3 * src[r1 + cx] + src[r1 + ox] + 8) >> 4;
+        }
+    }
+}
+
 function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
@@ -354,126 +442,86 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const avail2 = Math.min(size > off2 ? size - off2 : 0, h.storedBytes[2]);
     const bandAt = [0, 1, 2, 3].map(sc => bandSplit(sc, h.band));
 
-    const tile = h.maxBlock, minBlock = h.minBlock;
-    const pw = Math.ceil(h.width / minBlock) * minBlock;
-    const ph = Math.ceil(h.height / minBlock) * minBlock;
-    const flat = [0, 1, 2].map(() => new Uint8Array(pw * ph));
-    const full = [0, 1, 2].map(() => new Uint8Array(pw * ph));
-    // Texture added so far, unclamped to 16 bits; full = clamp(flat + acc).
-    const acc = [0, 1, 2].map(() => new Int16Array(pw * ph));
-    const step = [h.qLuma, h.qChroma, h.qChroma];
-    const tilesX = Math.ceil(pw / tile), tilesY = Math.ceil(ph / tile), tiles = tilesX * tilesY;
-
-    const whole = (x, y, n) => x + n <= pw && y + n <= ph;
-    const exists = (x, y) => x < pw && y < ph;
-
-    // TypedArray.fill costs a call per row, most of a 4-pixel row's time:
-    // short rows are written directly.
-    function fill(p, x, y, w, hh, v) {
-        if (w > 16) {
-            for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + w);
-            return;
-        }
-        for (let j = y; j < y + hh; j++)
-            for (let at = j * pw + x, end = at + w; at < end; at++) p[at] = v;
-    }
-
-    // Mirrors paint_flat().
-    function paintFlat(c, x, y, w, hh, v) {
-        if (w > 16) {
-            fill(flat[c], x, y, w, hh, v);
-            fill(full[c], x, y, w, hh, v);
-            fill(acc[c], x, y, w, hh, 0);
-            return;
-        }
-        const f = flat[c], o = full[c], a = acc[c];
-        for (let j = y; j < y + hh; j++)
-            for (let at = j * pw + x, end = at + w; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
-    }
-
+    // One tree in 4:4:4; in 4:2:0 luma's, then colour's at half size,
+    // tile by tile in the same streams. A tile is whole when both are.
     const fixedPred = (h.flags & FLAG_RESIDUAL) !== 0;
-    function predict(c, x, y, n) {
-        if (fixedPred) return 128;
-        const p = flat[c];
-        let sum = 0, k = 0;
-        if (y > 0) {
-            const x1 = Math.min(x + n, pw);
-            for (let i = x; i < x1; i++) sum += p[(y - 1) * pw + i];
-            k += x1 - x;
-        }
-        if (x > 0) {
-            const y1 = Math.min(y + n, ph);
-            for (let j = y; j < y1; j++) sum += p[j * pw + x - 1];
-            k += y1 - y;
-        }
-        return k ? Math.floor((sum + (k >> 1)) / k) : 128;
-    }
-
-    function tileFallback(tx, ty) {
-        const w = tx + tile < pw ? tile : pw - tx;
-        const hh = ty + tile < ph ? tile : ph - ty;
-        // Neutral grey, as tile_fallback() explains.
-        for (let c = 0; c < 3; c++) paintFlat(c, tx, ty, w, hh, 128);
-    }
+    const is420 = (h.flags & FLAG_CHROMA420) !== 0;
+    const parts = [makePart(h.width, h.height, h.maxBlock, h.minBlock, is420 ? 1 : 3, 0, fixedPred)];
+    if (is420) parts.push(makePart((h.width + 1) >> 1, (h.height + 1) >> 1, h.maxBlock >> 1, MIN_BLOCK, 2, 1, fixedPred));
+    const main = parts[0], tile = main.tile, pw = main.pw;
+    const step = [h.qLuma, h.qChroma, h.qChroma];
+    const tilesX = Math.ceil(main.pw / tile), tilesY = Math.ceil(main.ph / tile), tiles = tilesX * tilesY;
+    for (const P of parts) P.tileStart = new Int32Array(tiles + 1);
 
     // Layer 0.
     const warm = ctx && ctx.valid;
     const cm = warm ? ctx.cm : colourModels();
+    if (!cm.splitC) cm.splitC = probs(NSIZES);
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
     const d0 = new ArithDecoder(bytes, HEADER_SIZE, avail0);
     const s0 = { corrupt: false };
-    const lx = [], ly = [], ln = [];
-    const tileStart = new Int32Array(tiles + 1);
 
-    function readNode(x, y, n) {
+    function readNode(P, x, y, n) {
         let split = 0;
-        if (n > minBlock) split = whole(x, y, n) ? d0.bit(cm.split, sizeClass(n)) : 1;
+        if (n > P.minBlock) split = P.whole(x, y, n) ? d0.bit(P.comp0 ? cm.splitC : cm.split, sizeClass(n)) : 1;
         if (d0.overrun || s0.corrupt) return;
         if (split) {
             const hh = n >> 1;
             for (let k = 0; k < 4; k++) {
                 const cx = x + (k & 1) * hh, cy = y + (k >> 1) * hh;
-                if (exists(cx, cy)) readNode(cx, cy, hh);
+                if (P.exists(cx, cy)) readNode(P, cx, cy, hh);
                 if (d0.overrun || s0.corrupt) return;
             }
             return;
         }
         const sc = sizeClass(n);
-        for (let c = 0; c < 3; c++) {
-            const pred = predict(c, x, y, n);
-            const dl = getDc(d0, cm, sc, c, s0);
-            const colour = clampU8(pred + divRound(clampCoef(dl * step[c]), n));
-            paintFlat(c, x, y, n, n, colour);
+        for (let c = 0; c < P.np; c++) {
+            const k = P.comp0 + c;
+            const pred = P.predict(c, x, y, n);
+            const dl = getDc(d0, cm, sc, k, s0);
+            const colour = clampU8(pred + divRound(clampCoef(dl * step[k]), n));
+            P.paintFlat(c, x, y, n, n, colour);
         }
-        lx.push(x); ly.push(y); ln.push(n);
+        P.lx.push(x); P.ly.push(y); P.ln.push(n);
     }
 
     let complete0 = 0, stopped = false;
     for (let t = 0; t < tiles; t++) {
         const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
-        tileStart[t] = lx.length;
-        if (!stopped) {
-            readNode(tx, ty, tile);
-            if (d0.overrun || s0.corrupt) {
-                stopped = true;
-                lx.length = ly.length = ln.length = tileStart[t];
-            } else complete0++;
+        for (const P of parts) P.tileStart[t] = P.lx.length;
+        for (let k = 0; k < parts.length && !stopped; k++) {
+            const P = parts[k], x = tx / (k + 1), y = ty / (k + 1);
+            if (!P.exists(x, y)) continue;
+            readNode(P, x, y, P.tile);
+            if (d0.overrun || s0.corrupt) stopped = true;
         }
-        if (stopped) tileFallback(tx, ty);
+        if (stopped) {
+            parts.forEach((P, k) => {
+                P.lx.length = P.ly.length = P.ln.length = P.tileStart[t];
+                P.tileFallback(tx / (k + 1), ty / (k + 1));
+            });
+        } else complete0++;
     }
-    tileStart[tiles] = lx.length;
+    for (const P of parts) P.tileStart[tiles] = P.lx.length;
 
     // Layers 1 and 2, the low and the high texture band. Mirrors the C
     // loop: each band as far as its bytes reach and no further than the
     // layer before it; a tile cut short is restored to what it showed.
     const complete = [complete0, 0, 0];
-    const texturedLeaf = new Uint8Array(lx.length);
+    for (const P of parts) {
+        P.textured = new Uint8Array(P.lx.length);
+        P.saved = Array.from({ length: P.np }, () => new Uint8Array(P.tile * P.tile));
+        P.savedAcc = Array.from({ length: P.np }, () => new Int16Array(P.tile * P.tile));
+    }
     const lv = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     const coef = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     const res = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     let low = null;
-    const saved = [0, 1, 2].map(() => new Uint8Array(tile * tile));
-    const savedAcc = [0, 1, 2].map(() => new Int16Array(tile * tile));
+    const region = (P, t) => {
+        const tx = (t % tilesX) * P.tile, ty = Math.floor(t / tilesX) * P.tile;
+        if (!P.exists(tx, ty)) return null;
+        return { tx, ty, tw: tx + P.tile < P.pw ? P.tile : P.pw - tx, th: ty + P.tile < P.ph ? P.tile : P.ph - ty };
+    };
     for (let layer = 1; layer < LAYERS; layer++) {
         const avail = layer === 1 ? avail1 : avail2, off = layer === 1 ? off1 : off2;
         if ((maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
@@ -483,68 +531,78 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         const guard = careful || avail < h.storedBytes[layer];
         const st = { corrupt: false };
         for (let t = 0; t < complete[layer - 1]; t++) {
-            const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
-            const tw = tx + tile < pw ? tile : pw - tx, th = ty + tile < ph ? tile : ph - ty;
             // Copied by hand: a subarray per row would be millions of
             // short-lived objects on a large image.
-            if (guard) for (let c = 0; c < 3; c++) {
-                const o = full[c], a = acc[c], so = saved[c], sa = savedAcc[c];
-                for (let j = 0; j < th; j++)
-                    for (let at = (ty + j) * pw + tx, k = j * tile, end = at + tw; at < end; at++, k++) {
-                        so[k] = o[at]; sa[k] = a[at];
-                    }
-            }
-            const first = tileStart[t], last = tileStart[t + 1];
-            const was = guard ? texturedLeaf.slice(first, last) : null;
-            for (let i = first; i < last && !d.overrun && !st.corrupt; i++) {
-                const x = lx[i], y = ly[i], n = ln[i], sc = sizeClass(n), count = n * n;
-                const start = layer === 1 ? 1 : bandAt[sc], end = layer === 1 ? bandAt[sc] : count;
-                if (start >= end) continue;
-                for (let c = 0; c < 3 && !d.overrun && !st.corrupt; c++) {
-                    if (getTexture(d, tm, sc, c, lv, start, end, st) && !d.overrun && !st.corrupt) {
-                        coef.fill(0, 0, count);
-                        const pos = SCAN_POS[sc], sh = log2(n);
-                        let mu = 0, mv = 0;
-                        for (let k = start; k < end; k++) {
-                            if (!lv[k]) continue;
-                            const p = pos[k], u = p & (n - 1), v = p >> sh;
-                            coef[p] = clampCoef(lv[k] * step[c]);
-                            if (u > mu) mu = u;
-                            if (v > mv) mv = v;
+            if (guard) for (const P of parts) {
+                const r = region(P, t);
+                if (!r) continue;
+                for (let c = 0; c < P.np; c++) {
+                    const o = P.full[c], a = P.acc[c], so = P.saved[c], sa = P.savedAcc[c];
+                    for (let j = 0; j < r.th; j++)
+                        for (let at = (r.ty + j) * P.pw + r.tx, k = j * P.tile, end = at + r.tw; at < end; at++, k++) {
+                            so[k] = o[at]; sa[k] = a[at];
                         }
-                        inverseDct(sc, coef, res, mu, mv);
-                        texturedLeaf[i] = 1;
-                        const o = full[c], f = flat[c], a = acc[c];
-                        for (let j = 0; j < n; j++)
-                            for (let ii = 0; ii < n; ii++) {
-                                const at = (y + j) * pw + x + ii;
-                                let v = a[at] + res[j * n + ii];
-                                v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
-                                a[at] = v;
-                                o[at] = clampU8(f[at] + v);
+                }
+                P.was = P.textured.slice(P.tileStart[t], P.tileStart[t + 1]);
+            }
+            for (let k = 0; k < parts.length && !d.overrun && !st.corrupt; k++) {
+                const P = parts[k], ppw = P.pw;
+                for (let i = P.tileStart[t]; i < P.tileStart[t + 1] && !d.overrun && !st.corrupt; i++) {
+                    const x = P.lx[i], y = P.ly[i], n = P.ln[i], sc = sizeClass(n), count = n * n;
+                    const start = layer === 1 ? 1 : bandAt[sc], end = layer === 1 ? bandAt[sc] : count;
+                    if (start >= end) continue;
+                    for (let c = 0; c < P.np && !d.overrun && !st.corrupt; c++) {
+                        const comp = P.comp0 + c;
+                        if (getTexture(d, tm, sc, comp, lv, start, end, st) && !d.overrun && !st.corrupt) {
+                            coef.fill(0, 0, count);
+                            const pos = SCAN_POS[sc], sh = log2(n);
+                            let mu = 0, mv = 0;
+                            for (let q = start; q < end; q++) {
+                                if (!lv[q]) continue;
+                                const p = pos[q], u = p & (n - 1), v = p >> sh;
+                                coef[p] = clampCoef(lv[q] * step[comp]);
+                                if (u > mu) mu = u;
+                                if (v > mv) mv = v;
                             }
+                            inverseDct(sc, coef, res, mu, mv);
+                            P.textured[i] = 1;
+                            const o = P.full[c], f = P.flat[c], a = P.acc[c];
+                            for (let j = 0; j < n; j++)
+                                for (let ii = 0; ii < n; ii++) {
+                                    const at = (y + j) * ppw + x + ii;
+                                    let v = a[at] + res[j * n + ii];
+                                    v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+                                    a[at] = v;
+                                    o[at] = clampU8(f[at] + v);
+                                }
+                        }
                     }
                 }
             }
             if (d.overrun || st.corrupt) {
                 if (!guard) return RETRY;
-                for (let c = 0; c < 3; c++)
-                    for (let j = 0; j < th; j++) {
-                        full[c].set(saved[c].subarray(j * tile, j * tile + tw), (ty + j) * pw + tx);
-                        acc[c].set(savedAcc[c].subarray(j * tile, j * tile + tw), (ty + j) * pw + tx);
-                    }
-                texturedLeaf.set(was, first);
+                for (const P of parts) {
+                    const r = region(P, t);
+                    if (!r) continue;
+                    for (let c = 0; c < P.np; c++)
+                        for (let j = 0; j < r.th; j++) {
+                            P.full[c].set(P.saved[c].subarray(j * P.tile, j * P.tile + r.tw), (r.ty + j) * P.pw + r.tx);
+                            P.acc[c].set(P.savedAcc[c].subarray(j * P.tile, j * P.tile + r.tw), (r.ty + j) * P.pw + r.tx);
+                        }
+                    P.textured.set(P.was, P.tileStart[t]);
+                }
                 break;
             }
             complete[layer]++;
         }
         // What decode(buffer, 1) would show, without a second pass.
-        if (layer === 1 && wantLow) low = { planes: full.map(p => p.slice()), tex: texturedLeaf.slice() };
+        if (layer === 1 && wantLow)
+            low = { planes: parts.map(P => P.full.map(p => p.slice())), tex: parts.map(P => P.textured.slice()) };
     }
 
     /* Mirrors deblock() and deblock_plane(); `tex` is null for colours only. */
-    function deblock(planes, tex) {
-        const gw = pw >> 2, gh = ph >> 2;
+    function deblock(P, planes, tex) {
+        const ppw = P.pw, gw = P.pw >> 2, gh = P.ph >> 2, ptile = P.tile;
         const vedge = new Uint8Array(gw * gh), hedge = new Uint8Array(gw * gh);
         const textured = new Uint8Array(gw * gh);   // the cell's leaf shows texture
         const mark = (x, y, n, t) => {
@@ -553,20 +611,20 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
             if (x > 0) for (let j = y; j < y + n && j < gh; j++) vedge[j * gw + x] = 1;
             if (y > 0) for (let k = x; k < x + n && k < gw; k++) hedge[y * gw + k] = 1;
         };
-        const kept = tileStart[complete0];
-        for (let i = 0; i < kept; i++) mark(lx[i] >> 2, ly[i] >> 2, ln[i] >> 2, tex ? tex[i] : 0);
+        const kept = P.tileStart[complete0];
+        for (let i = 0; i < kept; i++) mark(P.lx[i] >> 2, P.ly[i] >> 2, P.ln[i] >> 2, tex ? tex[i] : 0);
         for (let t = complete0; t < tiles; t++)
-            mark(((t % tilesX) * tile) >> 2, (Math.floor(t / tilesX) * tile) >> 2, tile >> 2, 0);
-        for (let c = 0; c < 3; c++) {
-            const p = planes[c];
-            const alpha = (step[c] * DB_ALPHA + 8) >> 4, beta = (step[c] * DB_BETA + 8) >> 4;
-            const tc = (step[c] * DB_TC + 8) >> 4;
+            mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, 0);
+        for (let c = 0; c < P.np; c++) {
+            const p = planes[c], sp = step[P.comp0 + c];
+            const alpha = (sp * DB_ALPHA + 8) >> 4, beta = (sp * DB_BETA + 8) >> 4;
+            const tc = (sp * DB_TC + 8) >> 4;
             for (let gy = 0; gy < gh; gy++)
                 for (let gx = 1; gx < gw; gx++) {
                     if (!vedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[gy * gw + gx - 1]) continue;
                     for (let y = gy * 4; y < gy * 4 + 4; y++) {
-                        const r = y * pw + gx * 4;
+                        const r = y * ppw + gx * 4;
                         const p1 = p[r - 2], p0 = p[r - 1], q0 = p[r], q1 = p[r + 1];
                         if (Math.abs(p0 - q0) >= alpha || Math.abs(p1 - p0) >= beta ||
                             Math.abs(q1 - q0) >= beta) continue;
@@ -581,22 +639,28 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                     if (!hedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[(gy - 1) * gw + gx]) continue;
                     for (let x = gx * 4; x < gx * 4 + 4; x++) {
-                        const r = gy * 4 * pw + x;
-                        const p1 = p[r - 2 * pw], p0 = p[r - pw], q0 = p[r], q1 = p[r + pw];
+                        const r = gy * 4 * ppw + x;
+                        const p1 = p[r - 2 * ppw], p0 = p[r - ppw], q0 = p[r], q1 = p[r + ppw];
                         if (Math.abs(p0 - q0) >= alpha || Math.abs(p1 - p0) >= beta ||
                             Math.abs(q1 - q0) >= beta) continue;
                         let d = ((q0 - p0) * 4 + (p1 - q1) + 4) >> 3;
                         d = d < -tc ? -tc : d > tc ? tc : d;
-                        p[r - pw] = clampU8(p0 + d);
+                        p[r - ppw] = clampU8(p0 + d);
                         p[r] = clampU8(q0 - d);
                     }
                 }
         }
     }
 
-    const toRgb = planes => {
+    // `views` holds each part's planes; colour comes back to full size first.
+    const toRgb = views => {
         const out = new Uint8Array(h.width * h.height * 3);
-        const [Y, Cb, Cr] = planes;
+        let [Y, Cb, Cr] = views[0];
+        if (is420) {
+            Cb = new Uint8Array(pw * main.ph); Cr = new Uint8Array(pw * main.ph);
+            upsamplePlane(views[1][0], parts[1], Cb, pw, h.width, h.height);
+            upsamplePlane(views[1][1], parts[1], Cr, pw, h.width, h.height);
+        }
         for (let y = 0; y < h.height; y++)
             for (let x = 0; x < h.width; x++) {
                 const at = y * pw + x, o = (y * h.width + x) * 3;
@@ -608,8 +672,6 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         return out;
     };
 
-    // The filter works in place, and a second view of the same planes has
-    // to start from the unfiltered ones, so filter a copy when asked for both.
     if (ctx) {
         // Only a container decoded whole leaves the models where the
         // encoder left them (mirrors nvdr_decode_mem_ctx).
@@ -619,25 +681,28 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         else ctx.valid = false;
     }
 
-    const shown = (planes, tex) => {
-        if (!(h.flags & FLAG_DEBLOCK)) return toRgb(planes);
-        const copy = wantFlat ? planes.map(p => p.slice()) : planes;
-        deblock(copy, tex);
+    // The filter works in place, and a second view of the same planes has
+    // to start from the unfiltered ones, so filter a copy when asked for both.
+    const shown = (views, texs) => {
+        if (!(h.flags & FLAG_DEBLOCK)) return toRgb(views);
+        const copy = wantFlat ? views.map(v => v.map(p => p.slice())) : views;
+        parts.forEach((P, k) => deblock(P, copy[k], texs && texs[k]));
         return toRgb(copy);
     };
 
+    const flats = parts.map(P => P.flat), fulls = parts.map(P => P.full), texs = parts.map(P => P.textured);
     // Before rgb, which may filter `full` in place. No snapshot means the
     // low band never arrived, and then `full` is what it would show.
     const lowRgb = !wantLow ? null
-        : low ? shown(low.planes, low.tex) : shown(full.map(p => p.slice()), texturedLeaf);
+        : low ? shown(low.planes, low.tex) : shown(fulls.map(v => v.map(p => p.slice())), texs);
     return {
         header: h,
         layersPresent: h.band && complete[1] === tiles && avail2 >= 5 ? 3
                      : complete0 === tiles && avail1 >= 5 ? 2 : 1,
         tiles,
         tilesComplete: complete,
-        rgb: maxLayer === 0 ? shown(flat, null) : shown(full, texturedLeaf),
-        flatRgb: wantFlat ? shown(flat, null) : null,
+        rgb: maxLayer === 0 ? shown(flats, null) : shown(fulls, texs),
+        flatRgb: wantFlat ? shown(flats, null) : null,
         lowRgb
     };
 }

@@ -238,6 +238,9 @@ não uma falha.
   (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
   em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
+- **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
+  inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
+  em 420, gráficos e bordas de cor pura em 444).
 - **`--quiet`** — só grava o arquivo, sem a tabela por camada (que decodifica
   o arquivo três vezes para medir o PSNR).
 

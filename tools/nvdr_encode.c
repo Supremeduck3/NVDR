@@ -25,7 +25,9 @@ static void usage(const char* argv0) {
         "  --no-deblock     leave the seams between leaves unfiltered\n"
         "  --band N         0..32, where texture splits between its low and high\n"
         "                   layers (default 8; 0 keeps it in one layer)\n"
-        "  --chroma 420|444 colour at half resolution each way, or whole\n"
+        "  --chroma M       auto (default), 420 or 444: colour at half resolution\n"
+        "                   each way or whole; auto halves it unless that costs\n"
+        "                   more than it saves (graphics, hard colour edges)\n"
         "  --quiet          write the file and skip the per-layer report, which\n"
         "                   decodes it three times\n",
         argv0);
@@ -52,9 +54,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
             const char* v = argv[++i];
-            if (!strcmp(v, "420")) cfg.chroma420 = 1;
-            else if (!strcmp(v, "444")) cfg.chroma420 = 0;
-            else { fprintf(stderr, "--chroma takes 420 or 444\n"); return 2; }
+            if (!strcmp(v, "420")) cfg.chroma420 = NVDR_CHROMA_420;
+            else if (!strcmp(v, "444")) cfg.chroma420 = NVDR_CHROMA_444;
+            else if (!strcmp(v, "auto")) cfg.chroma420 = NVDR_CHROMA_AUTO;
+            else { fprintf(stderr, "--chroma takes auto, 420 or 444\n"); return 2; }
         }
         else { fprintf(stderr, "unknown option '%s'\n", argv[i]); usage(argv[0]); return 2; }
     }
@@ -81,8 +84,9 @@ int main(int argc, char** argv) {
      * file skips it. */
     if (quiet) { nvdr_image_free(&source); return 0; }
 
-    printf("%s  %dx%d  q %d/%d  blocks %d..%d\n", in_path, source.width, source.height,
-           hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block);
+    printf("%s  %dx%d  q %d/%d  blocks %d..%d  colour %s\n", in_path, source.width, source.height,
+           hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block,
+           (hdr.flags & NVDR_FLAG_CHROMA420) ? "4:2:0" : "4:4:4");
     printf("  layer       stored  cumulative     PSNR\n");
     /* One decode per layer, independent of each other: side by side. */
     double psnr[NVDR_LAYERS];

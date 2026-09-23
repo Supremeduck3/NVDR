@@ -117,9 +117,14 @@ typedef struct {
     /* Colour at half resolution each way (4:2:0): Cb and Cr get their own
      * quadtree over a half-size canvas, tile by tile after luma's, and the
      * decoder scales them back up. Carried in the header's flags. Needs
-     * max_block of 8 or more. */
+     * max_block of 8 or more. NVDR_CHROMA_AUTO (the default) picks per
+     * image: see nvdr_encode_mem_ctx(). */
     int   chroma420;
 } NvdrConfig;
+
+#define NVDR_CHROMA_444  0
+#define NVDR_CHROMA_AUTO 1
+#define NVDR_CHROMA_420  2
 
 NvdrConfig nvdr_default_config(void);
 
