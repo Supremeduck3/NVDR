@@ -685,10 +685,28 @@ export function shrinkRGB(rgb, width, height, w, h) {
  * its displayed size changes: a canvas painted while hidden has no size
  * yet, and one on a resized page has a new one.
  */
-export function paintFitted(canvas, rgb, width, height) {
-    canvas._nvdrShown = { rgb, width, height };
+export function paintFitted(canvas, rgb, width, height, fitted = null) {
+    canvas._nvdrShown = { rgb, width, height, fitted };
     if (fitObserver) fitObserver.observe(canvas);
     drawFitted(canvas);
+}
+
+/**
+ * The size, in device pixels, a width x height picture is drawn at on a
+ * canvas `shownWidth` CSS pixels wide: never larger than the picture.
+ * A worker shrinking a picture ahead of time (see `fit` in
+ * nvdr-tasks.js) uses this too, so its result is the one drawFitted
+ * would have made.
+ */
+export function fitSize(width, height, shownWidth, dpr = 1) {
+    const w = Math.min(width, Math.max(1, Math.ceil(shownWidth * dpr)));
+    return { w, h: Math.max(1, Math.round(height * w / width)) };
+}
+
+/* The device-pixel width a canvas is shown at, for fitSize(). */
+export function shownWidth(canvas) {
+    const dpr = (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1;
+    return Math.ceil((canvas.clientWidth || 0) * dpr);
 }
 
 const fitObserver = typeof ResizeObserver === 'undefined' ? null
@@ -697,19 +715,22 @@ const fitObserver = typeof ResizeObserver === 'undefined' ? null
 function drawFitted(canvas) {
     const shownPicture = canvas._nvdrShown;
     if (!shownPicture) return;
-    const { rgb, width, height } = shownPicture;
+    const { rgb, width, height, fitted } = shownPicture;
     const dpr = (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1;
     // Not laid out yet (hidden): a small stand-in with the right shape,
     // until the observer sees the real size.
-    const shown = canvas.clientWidth || Math.min(width, 256);
-    const w = Math.min(width, Math.max(1, Math.ceil(shown * dpr)));
-    const h = Math.max(1, Math.round(height * w / width));
+    const { w, h } = fitSize(width, height, canvas.clientWidth || Math.min(width, 256), dpr);
     const small = w < width;
     if (canvas.width === w && canvas.height === h && canvas._nvdrDrawn === rgb) return;
     canvas.width = w; canvas.height = h;
     canvas._nvdrDrawn = rgb;
     canvas.style.imageRendering = small ? 'auto' : 'pixelated';
-    showRGB(small ? shrinkRGB(rgb, width, height, w, h) : rgb, w, h, canvas.getContext('2d'));
+    // Shrunk ahead of time for this very size, off the main thread, when
+    // the caller has it; otherwise here.
+    const pixels = !small ? rgb
+        : fitted && fitted.w === w && fitted.h === h ? fitted.rgb
+        : shrinkRGB(rgb, width, height, w, h);
+    showRGB(pixels, w, h, canvas.getContext('2d'));
 }
 
 /** Put an RGB buffer on a canvas. The buffer itself is left alone. */

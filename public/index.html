@@ -238,9 +238,16 @@
 </main>
 
 <script type="module">
-import { decode, showRGB, paintFitted, layerThresholds, LAYER_NAMES }
-    from './nvdr.js';
-import { AlbumReader } from './nvda.js';
+import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES } from './nvdr.js';
+import { decoderFor } from './nvdr-decoder.js';
+
+// Decoding runs in workers (nvdr-decoder.js): a large photo takes seconds,
+// and the page stays responsive meanwhile. `shown` counts what the page
+// has started to show, so a decode that answers after a newer file was
+// opened is dropped.
+const imageDecoder = decoderFor('image');
+const albumDecoder = decoderFor('album');
+let shown = 0;
 
 const drop = document.getElementById('drop');
 const fileInput = document.getElementById('file');
@@ -321,10 +328,14 @@ async function openAlbumFile(file) {
     showAlbum(await file.arrayBuffer(), '', 0);
 }
 
-function showAlbum(buffer, report, original) {
-    let reader;
-    try { reader = new AlbumReader(buffer); }
-    catch (e) { setStatus('Não é um álbum NVDA.', true); return; }
+async function showAlbum(buffer, report, original) {
+    const mine = ++shown;
+    let album;
+    try {
+        await albumDecoder.run({ op: 'put', key: 'album', bytes: buffer });
+        album = await albumDecoder.run({ op: 'albumOpen', key: 'album' });
+    } catch (e) { setStatus('Não é um álbum NVDA.', true); return; }
+    if (mine !== shown) return;
     // "sozinha" per image, from the encoder's report when there is one.
     const alone = {};
     for (const line of report.split('\n')) {
@@ -332,35 +343,44 @@ function showAlbum(buffer, report, original) {
         if (m) alone[m[1].trim()] = +m[3];
     }
     albumGrid.innerHTML = '';
+    albumSummary.textContent = `Decodificando ${album.count} imagens…`;
+    albumEl.classList.remove('hidden');
     const t0 = performance.now();
     let total = 0, totalAlone = 0, n = 0;
+    // One photo at a time, each shown as soon as it is decoded.
     try {
-        for (let i = 0; i < reader.count; i++) {
-            const img = reader.decode(i);
-            if (!img) break;
-            const x = reader.index[i], name = reader.name(i);
+        for (let i = 0; i < album.count; i++) {
+            const x = album.index[i], name = album.names[i];
             const bytes = Math.min(x.length, buffer.byteLength - x.offset);
             const wrap = document.createElement('div');
             wrap.className = 'level';
             const solo = alone[name];
-            wrap.innerHTML = `<h3>${i + 1}. ${name.replace(/[<>&]/g, '')}</h3>
-                <div class="meta">${x.kind === 1 ? `prevista da ${i - x.ref + 1} · ` : ''}${formatBytes(bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
-                `(${(100 * (bytes - solo) / solo).toFixed(1)}%)` : ''}${img.partial ? ' · parcial' : ''}</div>`;
+            wrap.innerHTML = `<h3>${i + 1}. ${name.replace(/[<>&]/g, '')}</h3><div class="meta">decodificando…</div>`;
             const canvas = document.createElement('canvas');
             wrap.appendChild(canvas);
             albumGrid.appendChild(wrap);
-            paintFitted(canvas, img.rgb, img.width, img.height);
+            let img;
+            try {
+                img = await albumDecoder.run({ op: 'albumDecode', key: 'album', index: i, fit: shownWidth(canvas) });
+            } catch (e) { wrap.remove(); throw e; }
+            if (mine !== shown) return;
+            if (!img) { wrap.remove(); break; }
+            wrap.querySelector('.meta').innerHTML = `${x.kind === 1 ? `prevista da ${i - x.ref + 1} · ` : ''}${formatBytes(bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
+                `(${(100 * (bytes - solo) / solo).toFixed(1)}%)` : ''}${img.partial ? ' · parcial' : ''}`;
+            paintFitted(canvas, img.rgb, img.width, img.height, img.fitted);
             total += bytes; if (solo) totalAlone += solo; n++;
             if (img.partial) break;
         }
-    } catch (e) { setStatus(`Álbum danificado depois de ${n} imagens.`, true); }
+    } catch (e) {
+        if (mine !== shown) return;
+        setStatus(`Álbum danificado depois de ${n} imagens.`, true);
+    }
     const ms = performance.now() - t0;
-    albumSummary.textContent = `${n} de ${reader.count} imagens, ${formatBytes(buffer.byteLength)} no total` +
+    albumSummary.textContent = `${n} de ${album.count} imagens, ${formatBytes(buffer.byteLength)} no total` +
         (original ? `, ${(100 * buffer.byteLength / original).toFixed(0)}% dos originais` : '') +
         (totalAlone ? `. Codificadas sozinhas seriam ${formatBytes(totalAlone)}: o álbum ` +
             `economizou ${(100 * (totalAlone - total) / totalAlone).toFixed(2)}%` : '') +
-        `. Decodificado em ${ms.toFixed(0)} ms.`;
-    albumEl.classList.remove('hidden');
+        `. Decodificado em ${ms.toFixed(0)} ms` + (albumDecoder.offThread ? ', fora da página.' : '.');
     setStatus(`Álbum com ${n} imagens.`);
 }
 
@@ -391,6 +411,8 @@ async function handleFile(file) {
 
     container = await response.arrayBuffer();
     wholeDecode = null;
+    shown++;
+    imageDecoder.run({ op: 'put', key: 'image', bytes: container }).catch(() => {});
     sourceSize = file.size;
 
     const encoded = response.headers.get('X-Encoder-Report');
@@ -413,49 +435,57 @@ async function handleFile(file) {
 let wholeDecode = null;
 
 async function showLevels() {
-    const t0 = performance.now();
-    const result = decode(container, 2, true, null, true);
-    const low = result && { rgb: result.lowRgb };
+    const t0 = performance.now(), mine = shown;
+    // The three views are laid out first, so the worker knows the size
+    // they are shown at and sends them shrunk to it.
+    levelsEl.innerHTML = '';
+    const views = LAYER_NAMES.map(name => {
+        const wrap = document.createElement('div');
+        wrap.className = 'level';
+        wrap.innerHTML = `<h3>${name}</h3><div class="meta">decodificando…</div>`;
+        const canvas = document.createElement('canvas');
+        wrap.appendChild(canvas);
+        levelsEl.appendChild(wrap);
+        return { meta: wrap.querySelector('.meta'), canvas };
+    });
+    let result;
+    try {
+        result = await imageDecoder.run({ op: 'decode', key: 'image', maxLayer: 2, wantFlat: true,
+                                          wantLow: true, fit: shownWidth(views[0].canvas) });
+    } catch (err) { result = null; }
+    if (mine !== shown) return;
     const decodeMs = performance.now() - t0;
     wholeDecode = result;
 
     if (!result) {
+        levelsEl.innerHTML = '';
         setStatus('Container ilegível.', true);
         return;
     }
 
     const { header } = result;
     const thresholds = layerThresholds(header);
-    levelsEl.innerHTML = '';
-
-    [result.flatRgb, low.rgb, result.rgb].forEach((rgb, k) => {
-        const wrap = document.createElement('div');
-        wrap.className = 'level';
-        wrap.innerHTML = `
-            <h3>${LAYER_NAMES[k]}</h3>
-            <div class="meta">
-              ${formatBytes(thresholds[k])} acumulados
-              ${sourceSize ? `· ${(100 * thresholds[k] / sourceSize).toFixed(0)}% do original` : ''}
-            </div>`;
-        const canvas = document.createElement('canvas');
-        wrap.appendChild(canvas);
-        levelsEl.appendChild(wrap);
-        paintFitted(canvas, rgb, header.width, header.height);
+    const pictures = [[result.flatRgb, result.flatFitted], [result.lowRgb, result.lowFitted],
+                      [result.rgb, result.fitted]];
+    views.forEach(({ meta, canvas }, k) => {
+        meta.innerHTML = `${formatBytes(thresholds[k])} acumulados
+              ${sourceSize ? `· ${(100 * thresholds[k] / sourceSize).toFixed(0)}% do original` : ''}`;
+        paintFitted(canvas, pictures[k][0], header.width, header.height, pictures[k][1]);
     });
 
-    truncCanvas.width = header.width;
-    truncCanvas.height = header.height;
-
     setStatus(statusEl.textContent +
-              ` Decodificado em ${decodeMs.toFixed(0)}ms.`);
+              ` Decodificado em ${decodeMs.toFixed(0)}ms` +
+              (imageDecoder.offThread ? ', fora da página.' : '.'));
 }
 
-let pending = false;
+// While one cut decodes, the slider may move on: when it is done, the
+// latest position is decoded next, and every one in between skipped.
+let truncBusy = false, truncAgain = false;
 truncInput.addEventListener('input', async () => {
-    if (pending) return;
-    pending = true;
-    await showTruncated();
-    pending = false;
+    if (truncBusy) { truncAgain = true; return; }
+    truncBusy = true;
+    do { truncAgain = false; await showTruncated(); } while (truncAgain);
+    truncBusy = false;
 });
 
 async function showTruncated() {
@@ -463,9 +493,18 @@ async function showTruncated() {
 
     const fraction = Number(truncInput.value) / 100;
     const kept = Math.floor(container.byteLength * fraction);
-    const prefix = container.slice(0, kept);
+    const mine = shown;
 
-    const result = kept === container.byteLength && wholeDecode ? wholeDecode : decode(prefix);
+    let result;
+    if (kept === container.byteLength && wholeDecode) result = wholeDecode;
+    else {
+        try {
+            result = await imageDecoder.run({ op: 'decode', key: 'image', length: kept,
+                                              fit: shownWidth(truncCanvas) });
+        }
+        catch { result = null; }
+    }
+    if (mine !== shown) return;
     const ctx = truncCanvas.getContext('2d');
 
     if (!result) {
@@ -478,7 +517,7 @@ async function showTruncated() {
         return;
     }
 
-    paintFitted(truncCanvas, result.rgb, result.header.width, result.header.height);
+    paintFitted(truncCanvas, result.rgb, result.header.width, result.header.height, result.fitted);
     const [cor, baixa, alta] = result.tilesComplete;
     truncOut.innerHTML =
         `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +

@@ -299,7 +299,8 @@ isso vem desligado.
 ### Usando num site
 
 O arquivo continua com as propriedades quando vai para um site. Coloque
-o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`) junto do site e use o
+o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
+`nvdr-worker.js`, `nvdr-tasks.js`) junto do site e use o
 elemento no lugar do `<img>`:
 
 ```html
@@ -314,6 +315,10 @@ elemento no lugar do `<img>`:
   depende (requisições HTTP com `Range`), não o álbum inteiro. Várias fotos
   do mesmo álbum na página compartilham o que já baixaram: uma grade com o
   álbum todo baixa o tamanho do álbum, uma vez.
+- A decodificação roda num **Web Worker**: uma foto grande leva segundos
+  para decodificar, e a página continua rolando e respondendo enquanto
+  isso. Navegador sem suporte a worker de módulo decodifica na própria
+  página, com o mesmo resultado.
 - Qualquer servidor estático serve (nginx, Apache, CDN, S3: todos aceitam
   `Range`). Se o servidor não aceitar, o álbum vem inteiro e funciona igual.
 

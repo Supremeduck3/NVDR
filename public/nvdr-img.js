@@ -18,13 +18,19 @@
  *   predicted from. A server that ignores ranges sends the whole album,
  *   which still works.
  *
+ * - Decoding happens in workers (nvdr-decoder.js), so a page of large
+ *   photos keeps scrolling while they decode. While a download streams,
+ *   the worker decodes the longest prefix that has arrived each time it
+ *   is free; the ones in between are skipped, not queued.
+ *
  * `throttle="bytes-per-second"` slows the download down, to watch the
  * progressive render on a fast connection. The element fires `load` with
  * { detail: { bytes } } when it is done and `error` when it cannot be
- * shown.
+ * shown. Deploy nvdr-img.js with nvdr.js, nvda.js, nvdrv.js,
+ * nvdr-decoder.js, nvdr-worker.js and nvdr-tasks.js next to it.
  */
-import { decode, paintFitted } from './nvdr.js';
-import { openAlbumImage } from './nvda.js';
+import { paintFitted, shownWidth } from './nvdr.js';
+import { decoderFor } from './nvdr-decoder.js';
 
 class NvdrImg extends HTMLElement {
     static get observedAttributes() { return ['src']; }
@@ -45,8 +51,8 @@ class NvdrImg extends HTMLElement {
 
     /* At the size the element is shown, averaged down (see paintFitted):
      * a photo shrunk into a thumbnail keeps its grain as grain. */
-    paint(rgb, width, height) {
-        paintFitted(this.canvas, rgb, width, height);
+    paint(rgb, width, height, fitted) {
+        paintFitted(this.canvas, rgb, width, height, fitted);
     }
 
     async load() {
@@ -60,12 +66,16 @@ class NvdrImg extends HTMLElement {
         try {
             let bytes;
             if (url.toLowerCase().endsWith('.nvda')) {
-                // "#3" is the third photo; anything else is a name.
+                // "#3" is the third photo; anything else is a name. One
+                // worker per album URL, so the elements showing photos of
+                // one album share the ranges it fetched.
                 const key = /^\d+$/.test(which || '') ? Number(which) - 1 : (which || 0);
-                const got = await openAlbumImage(url, key);
+                const absolute = new URL(url, document.baseURI).href;
+                const got = await decoderFor(absolute).run({ op: 'albumImage', url: absolute, which: key,
+                                                             fit: shownWidth(this.canvas) });
                 if (generation !== this.generation) return;
                 if (!got.image) throw new Error('photo did not arrive');
-                this.paint(got.image.rgb, got.image.width, got.image.height);
+                this.paint(got.image.rgb, got.image.width, got.image.height, got.image.fitted);
                 bytes = got.fetched;
             } else {
                 bytes = await this.stream(url, generation);
@@ -78,22 +88,31 @@ class NvdrImg extends HTMLElement {
         }
     }
 
-    /* Fetch a single image, painting every prefix worth painting. */
+    /* Fetch a single image, painting prefixes as the worker keeps up. */
     async stream(url, generation) {
         const res = await fetch(url);
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         const total = Number(res.headers.get('Content-Length')) || 0;
         const rate = Number(this.getAttribute('throttle')) || 0;
-        let buf = new Uint8Array(total || 65536), have = 0, pending = false, lastPaint = 0;
+        const decoder = decoderFor(new URL(url, document.baseURI).href);
+        let buf = new Uint8Array(total || 65536), have = 0;
+        let busy = null, painted = 0;
+        // Decode what has arrived, unless a decode is running: then the
+        // next one, when it ends, takes whatever has arrived by then.
+        const repaint = () => {
+            if (busy || have === painted || generation !== this.generation) return busy;
+            const upto = have;
+            busy = decoder.run({ op: 'decode', bytes: buf.slice(0, upto), fit: shownWidth(this.canvas) }).then(r => {
+                busy = null;
+                if (generation !== this.generation) return;
+                if (r) this.paint(r.rgb, r.header.width, r.header.height, r.fitted);
+                painted = upto;
+                return repaint();
+            }, err => { busy = null; throw err; });
+            return busy;
+        };
         const reader = res.body.getReader();
         const t0 = performance.now();
-        const repaint = () => {
-            pending = false;
-            if (generation !== this.generation) return;
-            const r = decode(buf.subarray(0, have));
-            if (r) this.paint(r.rgb, r.header.width, r.header.height);
-            lastPaint = performance.now();
-        };
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -111,17 +130,15 @@ class NvdrImg extends HTMLElement {
                 buf.set(part, have);
                 have += part.length;
                 if (rate) {
-                    const due = t0 + (have / rate) * 1000;
-                    const wait = due - performance.now();
+                    const wait = t0 + (have / rate) * 1000 - performance.now();
                     if (wait > 0) await new Promise(r => setTimeout(r, wait));
-                    repaint();
-                } else if (!pending && performance.now() - lastPaint > 50) {
-                    pending = true;
-                    requestAnimationFrame(repaint);
                 }
+                repaint();
             }
         }
-        repaint();
+        // The whole file, once whatever is running has finished.
+        while (busy) await busy;
+        await repaint();
         return have;
     }
 }

@@ -301,6 +301,39 @@ answers ranges; any static host (nginx, a CDN, S3) does too.
 `public/galeria.html` is a page built that way, and `make demo` makes
 its files.
 
+#### Off the page's thread
+
+A 13.5 Mpx photo takes 2.6 s to decode in JS, and on the main thread
+that is 2.6 s of a page that neither scrolls nor answers a click. The
+decoding now runs in module workers. `nvdr-tasks.js` holds the work
+(decode a container or a prefix of it, open an album, decode one of its
+photos, fetch one from a server by ranges); `nvdr-worker.js` runs it;
+`nvdr-decoder.js` is the page's side, a promise per task and a few
+workers, with a key always sent to the same one so what it keeps (a
+container put once and cut at every slider position, an open album, the
+ranges fetched from an album URL) is there next time. Pixels come back
+transferred, not copied, and already averaged down to the size the
+canvas is shown at, so the page does not shrink tens of megapixels on
+its own thread either; the full picture comes too, for redrawing when
+the page is resized. A browser that cannot start a module worker gets
+the same results on the main thread: what was waiting, and what had
+been put, is replayed there.
+
+Measured as the longest stretch the page could not respond (Chromium's
+long tasks), on the 13.5 Mpx photo:
+
+                                   main thread   workers
+    opening it                       3961 ms      154 ms
+    moving the truncation slider     3007 ms        none
+
+While a download streams, `<nvdr-img>` has the worker decode the longest
+prefix that has arrived each time it is free, instead of queueing every
+prefix: the demo's hero goes through 22 pictures on its way in, with no
+long task. The slider likewise decodes only its latest position. The
+video tab still decodes on the main thread: its frames take about 30 ms,
+and the time it reports is meant to be the cost of playing the file
+there.
+
 `nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
 image, whether it was predicted and from which, its bytes, and what it
 would cost alone; `unpack --only N` decodes one photo by its chain. On
