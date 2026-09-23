@@ -28,6 +28,9 @@ static void usage(const char* argv0) {
         "  --chroma M       auto (default), 420 or 444: colour at half resolution\n"
         "                   each way or whole; auto halves it unless that costs\n"
         "                   more than it saves (graphics, hard colour edges)\n"
+        "  --grain M        off (default), auto or on: take the sensor noise out,\n"
+        "                   code the clean picture, and have the decoder lay the\n"
+        "                   same kind of grain back (auto: only if noisy)\n"
         "  --quiet          write the file and skip the per-layer report, which\n"
         "                   decodes it three times\n",
         argv0);
@@ -52,6 +55,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
+            const char* v = argv[++i];
+            if (!strcmp(v, "off")) cfg.grain = NVDR_GRAIN_OFF;
+            else if (!strcmp(v, "auto")) cfg.grain = NVDR_GRAIN_AUTO;
+            else if (!strcmp(v, "on")) cfg.grain = NVDR_GRAIN_ON;
+            else { fprintf(stderr, "--grain takes off, auto or on\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
             const char* v = argv[++i];
             if (!strcmp(v, "420")) cfg.chroma420 = NVDR_CHROMA_420;
@@ -87,6 +97,11 @@ int main(int argc, char** argv) {
     printf("%s  %dx%d  q %d/%d  blocks %d..%d  colour %s\n", in_path, source.width, source.height,
            hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block,
            (hdr.flags & NVDR_FLAG_CHROMA420) ? "4:2:0" : "4:4:4");
+    if (hdr.flags & NVDR_FLAG_GRAIN) {
+        printf("  grain: kernel %d, colour %d/%d, luma sigma x8", hdr.grain.kernel, hdr.grain.cb, hdr.grain.cr);
+        for (int k = 0; k < NVDR_GRAIN_POINTS; k++) printf(" %d", hdr.grain.sigma[k]);
+        printf("\n");
+    }
     printf("  layer       stored  cumulative     PSNR\n");
     /* One decode per layer, independent of each other: side by side. */
     double psnr[NVDR_LAYERS];
@@ -103,7 +118,7 @@ int main(int argc, char** argv) {
         nvdr_image_free(&source);
         return 1;
     }
-    size_t cumulative = NVDR_HEADER_SIZE;
+    size_t cumulative = NVDR_HEADER_SIZE + hdr.grain_len;
     for (int k = 0; k < NVDR_LAYERS; k++) {
         cumulative += hdr.stored_bytes[k];
         printf("  %-8s %10u  %10zu   %6.2f dB\n", layer_name(k), hdr.stored_bytes[k],

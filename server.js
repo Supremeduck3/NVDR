@@ -441,6 +441,7 @@ const server = http.createServer((req, res) => {
 
     if (req.url === '/nvdr') {
         const quality = req.headers['x-q'];
+        const grain = req.headers['x-grain'];
 
         receiveUpload(req, res, (inputPath, fileId) => {
             const outNvdr = path.join(outDir, `temp_${fileId}.nvdr`);
@@ -461,6 +462,7 @@ const server = http.createServer((req, res) => {
             // Only forward options that match the encoder's own grammar —
             // a header is untrusted input, and these reach argv directly.
             if (/^[1-9]\d{0,3}$/.test(quality || '')) args.push('--q', quality);
+            if (['off', 'auto', 'on'].includes(grain)) args.push('--grain', grain);
 
             console.log(`PRS encode for ${inputPath}...`);
             runConverter(res, {

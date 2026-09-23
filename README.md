@@ -1104,6 +1104,67 @@ Auto sits between the two because on the most colourful photo it keeps
 420` forces it. At the default q the photographs come out 7-13%
 smaller.
 
+### Film grain synthesis
+
+Sensor noise is the most expensive thing in a photograph to code and the
+least worth keeping exactly: every grain is random, so the codec pays
+full price for detail no one could tell from other grain of the same
+size and strength. With `--grain auto` or `on` (`src/grain.c`) the
+encoder measures the noise, filters it out, codes the clean picture, and
+stores 22 bytes after the header (flag 0x08, their length in header
+byte 29): the noise's strength at 16 brightnesses, how far a grain
+spreads (one of five 3x3 kernels), and its strength in colour against
+luma. Both decoders draw grain from AV1's 16-bit LFSR into a 64x64
+template per component, read it at a hashed offset per 32x32 block and
+lay it over the picture scaled by each pixel's brightness, in integers,
+identically (crosschecked whole, cut and damaged; fuzzed).
+
+Measuring noise on a photograph is the hard part, and what was learned:
+
+- **Where.** In an 8x8 DCT, a block's level is the median of its 63 AC
+  coefficients (texture is sparse, noise is not), and a brightness's the
+  tenth percentile of its blocks (its flattest), each corrected by its
+  bias for pure Gaussian noise (0.6745 and 0.8203, simulated). Reading
+  the flattest blocks' pixels instead is right on flat noise and three
+  times too strong on a textured photo; the DCT reading errs the other
+  way on demosaiced noise (it has almost nothing at the top
+  frequencies), so the strength used is the pixel reading capped at 1.8
+  times the DCT's.
+- **Shape.** Per-frequency noise measured directly let texture in; it is
+  computed instead from the neighbour correlation, taking the noise as
+  separable first-order autoregressive.
+- **Physics.** Sensor noise is sigma^2 = a Y + b (photon noise plus read
+  noise). Fitting that, weighed by block counts, keeps a night sky's
+  stars (few, bright blocks) from reading as noise.
+- **Filter.** Hard thresholding in the DCT (BM3D's first stage without
+  its block matching) removed texture with the noise and came out 3.5 dB
+  further from the clean picture than the noisy one; Wiener shrinkage,
+  c^2 / (c^2 + n^2), came out closer than the noisy one.
+
+On montanha at twice its size with sensor noise added (so the clean
+picture is known), at the same q, against coding the noisy picture:
+
+    q     without grain         with grain (distance to the clean picture,
+                                           decoded before the grain)
+    14    155031 B  33.84 dB    126025 B (-19%)  35.19 dB
+    20    107368 B  33.89 dB     88825 B (-17%)  35.02 dB
+    28     73732 B  33.75 dB     62406 B (-15%)  34.56 dB
+
+Coding the noise keeps the picture 33.8 dB from the clean one however
+many bytes are spent; filtering it gets closer with fewer. On a
+3000x4500 night sky the file goes from 1.98 MB to 1.34 MB (-32%), and
+the codec no longer turns the noise into blotches of blocks. The grain
+laid back is not the source's grain pixel for pixel, and PSNR against
+the noisy source says so; it looks the same.
+
+Grain is off by default. `auto` turns it on when the measured level
+passes 3.0: clean photographs at a camera's resolution read under 1.5,
+the noisy test 3.9, the night sky 10; but small, densely textured
+thumbnails are where texture and noise cannot be told apart (one clean
+sample read 2.8, a crop of montanha 5.4). Residuals never carry grain
+(a predicted frame would have to cancel its reference's), and albums and
+sequences do not use it. The page has a selector for it.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white

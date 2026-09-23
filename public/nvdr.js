@@ -30,6 +30,9 @@ const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
 const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
 const FLAG_CHROMA420 = 0x04;  // colour in its own half-resolution tree
+const FLAG_GRAIN = 0x08;      // grain parameters follow the header
+const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
+const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
 
@@ -293,20 +296,30 @@ export function readHeader(buffer) {
         qChroma: v.getUint16(14, true),
         flags: v.getUint8(5),
         storedBytes: [v.getUint32(16, true), v.getUint32(20, true), v.getUint32(24, true)],
-        band: v.getUint8(28)
+        band: v.getUint8(28),
+        grainLen: v.getUint8(29),
+        grain: null
     };
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420)) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN)) return null;
     if ((h.flags & FLAG_CHROMA420) && h.maxBlock < 8) return null;
+    // Mirrors nvdr_grain_unpack(): parameters between the header and layer 0.
+    if (h.flags & FLAG_GRAIN) {
+        if (h.grainLen !== GRAIN_SIZE || buffer.byteLength < HEADER_SIZE + GRAIN_SIZE) return null;
+        const g = i => v.getUint8(HEADER_SIZE + i);
+        if (g(0) !== 1 || g(3) >= GRAIN_KERNELS.length) return null;
+        h.grain = { seed: g(1) | (g(2) << 8), kernel: g(3), cb: g(4), cr: g(5),
+                    sigma: Array.from({ length: GRAIN_POINTS }, (_, k) => g(6 + k)) };
+    } else if (h.grainLen) return null;
     if (h.storedBytes.some(b => b > 0x7fffffff) || h.band > 32) return null;
     return h;
 }
 
 /** Bytes needed before each layer is complete. */
 export function layerThresholds(header) {
-    const a = HEADER_SIZE + header.storedBytes[0], b = a + header.storedBytes[1];
+    const a = HEADER_SIZE + header.grainLen + header.storedBytes[0], b = a + header.storedBytes[1];
     return [a, b, b + header.storedBytes[2]];
 }
 
@@ -428,15 +441,75 @@ function upsamplePlane(src, C, dst, dpw, w, h) {
     }
 }
 
+/* --- film grain, mirroring src/grain.c --------------------------------- */
+
+const roundDiv = (n, d) => n >= 0 ? Math.floor((n + d / 2) / d) : -Math.floor((-n + d / 2) / d);
+
+function grainHash(seed, bx, by, p) {
+    let h = (Math.imul(seed, 0x9E3779B1) ^ Math.imul(bx, 0x85EBCA77) ^
+             Math.imul(by, 0xC2B2AE3D) ^ Math.imul(p + 1, 0x27D4EB2F)) >>> 0;
+    h = (h ^ (h >>> 15)) >>> 0;
+    h = Math.imul(h, 0x2C1B3C6D) >>> 0;
+    return (h ^ (h >>> 12)) >>> 0;
+}
+
+const grainCache = new Map();
+
+/* Mirrors nvdr_grain_templates(): per component, 64x64 of grain with a
+ * spread of 64, from AV1's LFSR through the kernel. */
+function grainTemplates(g) {
+    const key = `${g.seed}/${g.kernel}`;
+    if (grainCache.has(key)) return grainCache.get(key);
+    const k = GRAIN_KERNELS[g.kernel], R = GRAIN_T + 2, out = [];
+    for (let p = 0; p < 3; p++) {
+        let r = (g.seed ^ ((0x5A5A * (p + 1)) >>> 0)) & 0xffff;
+        if (!r) r = 1;
+        const draw = () => {
+            const bit = ((r >> 0) ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1;
+            r = ((r >> 1) | (bit << 15)) & 0xffff;
+            return (r >> 5) & 2047;
+        };
+        const raw = new Int32Array(R * R);
+        for (let i = 0; i < R * R; i++) raw[i] = draw() + draw() + draw() + draw() - 4096;
+        const f = new Int32Array(GRAIN_T * GRAIN_T);
+        let sum = 0;
+        for (let y = 0; y < GRAIN_T; y++)
+            for (let x = 0; x < GRAIN_T; x++) {
+                const c = (y + 1) * R + x + 1;
+                const v = k[0] * raw[c] + k[1] * (raw[c - 1] + raw[c + 1] + raw[c - R] + raw[c + R]) +
+                          k[2] * (raw[c - R - 1] + raw[c - R + 1] + raw[c + R - 1] + raw[c + R + 1]);
+                f[y * GRAIN_T + x] = v;
+                sum += v;
+            }
+        const mean = Math.floor(sum / (GRAIN_T * GRAIN_T));
+        let variance = 0;
+        for (let i = 0; i < f.length; i++) variance += (f[i] - mean) * (f[i] - mean);
+        variance = Math.floor(variance / (GRAIN_T * GRAIN_T));
+        let sd = Math.floor(Math.sqrt(variance));
+        while (sd * sd > variance) sd--;
+        while ((sd + 1) * (sd + 1) <= variance) sd++;
+        if (sd < 1) sd = 1;
+        const t = new Int16Array(GRAIN_T * GRAIN_T);
+        for (let i = 0; i < f.length; i++) {
+            const v = Math.trunc((f[i] - mean) * 64 / sd);
+            t[i] = v < -255 ? -255 : v > 255 ? 255 : v;
+        }
+        out.push(t);
+    }
+    grainCache.set(key, out);
+    return out;
+}
+
 function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
     if (!h) return null;
     const size = bytes.length;
 
-    let avail0 = Math.min(size - HEADER_SIZE, h.storedBytes[0]);
+    const base = HEADER_SIZE + h.grainLen;
+    let avail0 = Math.min(size - base, h.storedBytes[0]);
     if (avail0 < 5) return null;
-    const off1 = HEADER_SIZE + h.storedBytes[0];
+    const off1 = base + h.storedBytes[0];
     const avail1 = Math.min(size > off1 ? size - off1 : 0, h.storedBytes[1]);
     const off2 = off1 + h.storedBytes[1];
     const avail2 = Math.min(size > off2 ? size - off2 : 0, h.storedBytes[2]);
@@ -458,7 +531,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const cm = warm ? ctx.cm : colourModels();
     if (!cm.splitC) cm.splitC = probs(NSIZES);
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
-    const d0 = new ArithDecoder(bytes, HEADER_SIZE, avail0);
+    const d0 = new ArithDecoder(bytes, base, avail0);
     const s0 = { corrupt: false };
 
     function readNode(P, x, y, n) {
@@ -661,14 +734,34 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
             upsamplePlane(views[1][0], parts[1], Cb, pw, h.width, h.height);
             upsamplePlane(views[1][1], parts[1], Cr, pw, h.width, h.height);
         }
-        for (let y = 0; y < h.height; y++)
+        const G = h.grain, T = G && grainTemplates(G);
+        for (let y = 0; y < h.height; y++) {
+            let bxAt = -1, o0 = 0, o1 = 0, o2 = 0;
             for (let x = 0; x < h.width; x++) {
                 const at = y * pw + x, o = (y * h.width + x) * 3;
-                const yy = Y[at], cb = Cb[at] - 128, cr = Cr[at] - 128;
+                let yy = Y[at], cb = Cb[at] - 128, cr = Cr[at] - 128;
+                if (G) {
+                    // Mirrors nvdr_grain_apply().
+                    if ((x >> 5) !== bxAt) {
+                        bxAt = x >> 5;
+                        const off = p => {
+                            const hh = grainHash(G.seed, bxAt, y >> 5, p);
+                            return ((hh >>> 5) & 31) * GRAIN_T + (y & 31) * GRAIN_T + (hh & 31) - (bxAt << 5);
+                        };
+                        o0 = off(0); o1 = off(1); o2 = off(2);
+                    }
+                    const idx = (yy / 17) | 0, frac = yy - idx * 17, nxt = idx + 1 < GRAIN_POINTS ? idx + 1 : GRAIN_POINTS - 1;
+                    const s = G.sigma[idx] * (17 - frac) + G.sigma[nxt] * frac;
+                    const lum = yy;
+                    yy = clampU8(lum + roundDiv(T[0][o0 + x] * s, 64 * 8 * 17));
+                    cb = clampU8(cb + 128 + roundDiv(T[1][o1 + x] * s * G.cb, 64 * 8 * 17 * 32)) - 128;
+                    cr = clampU8(cr + 128 + roundDiv(T[2][o2 + x] * s * G.cr, 64 * 8 * 17 * 32)) - 128;
+                }
                 out[o] = clampU8(yy + ((91881 * cr + 32768) >> 16));
                 out[o + 1] = clampU8(yy + ((-22554 * cb - 46802 * cr + 32768) >> 16));
                 out[o + 2] = clampU8(yy + ((116130 * cb + 32768) >> 16));
             }
+        }
         return out;
     };
 

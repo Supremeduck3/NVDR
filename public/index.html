@@ -124,6 +124,14 @@
         um álbum <code>.nvda</code>; um <code>.nvda</code> pronto abre direto.</p>
     </div>
     <input type="file" id="file" accept="image/*,.nvda" multiple class="hidden">
+    <label class="note" style="display:block;margin-top:10px">Grão de sensor:
+      <select id="grain">
+        <option value="off">manter como está</option>
+        <option value="auto">sintetizar se a foto for ruidosa</option>
+        <option value="on">sempre sintetizar</option>
+      </select>
+      — tira o ruído, codifica a foto limpa e o decodificador recria um grão igual (fotos noturnas, ISO alto)
+    </label>
     <div id="status"></div>
   </div>
 
@@ -396,7 +404,7 @@ async function handleFile(file) {
     try {
         response = await fetch('/nvdr', {
             method: 'POST',
-            headers: { 'x-file-ext': ext },
+            headers: { 'x-file-ext': ext, 'x-grain': document.getElementById('grain').value },
             body: file
         });
     } catch (err) {
