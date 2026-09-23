@@ -8,7 +8,7 @@ CC      = gcc
 # per-block and shares nothing. Without it the pragmas are ignored and the
 # build still works.
 OPENMP  = $(shell $(CC) -fopenmp -E - < /dev/null > /dev/null 2>&1 && echo -fopenmp)
-CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
+CFLAGS  = -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
 LDLIBS  = -lm -lz
 
 CODEC   = src/nvdr.c src/entropy.c

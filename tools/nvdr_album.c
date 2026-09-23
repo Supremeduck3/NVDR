@@ -2,7 +2,7 @@
  * nvdr_album — many still images in one .nvda file, each coded with what
  * the codec learned on the ones before it (see src/nvda.h).
  *
- *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--window N] [--fluid] [--no-predict]
+ *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict]
  *   nvdr_album unpack <in.nvda> <out-dir>    [--compare <dir>] [--only N]
  *
  * pack reports every image's bytes against what it costs coded alone, and
@@ -19,9 +19,11 @@
 
 static void usage(const char* a0) {
     fprintf(stderr,
-        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--window N] [--fluid] [--no-predict]\n"
+        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict]\n"
         "       %s unpack <in.nvda> <out-dir> [--compare <dir>] [--only N]\n"
         "  --window N     how many earlier photos a photo may be predicted from (default 8)\n"
+        "  --distance D   skip earlier photos whose thumbnails differ by more than D\n"
+        "                 grey levels (default 10; larger tries more, slower)\n"
         "  --fluid        carry the fluid context between photos coded alone (the album\n"
         "                 must then be read in order)\n"
         "  --no-predict   never predict a photo from another\n"
@@ -60,6 +62,7 @@ static int pack(int argc, char** argv) {
         if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) opt.window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--distance") && i + 1 < argc) opt.max_distance = atof(argv[++i]);
         else if (!strcmp(argv[i], "--fluid")) opt.fluid = 1;
         else if (!strcmp(argv[i], "--no-predict")) opt.predict = 0;
         else paths[n++] = argv[i];

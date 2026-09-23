@@ -1,10 +1,12 @@
 /*
  * The C and JS decoders have to agree on every byte, or the viewer shows
  * something the container does not contain. This decodes the same
- * container both ways — each layer, and cuts that land inside either
- * layer — and reports the first pixel where they differ.
+ * container both ways — each layer, cuts that land inside either layer,
+ * and copies with a few bits flipped, whole length, which is where the JS
+ * decoder starts over (see decode() in nvdr.js) — and reports the first
+ * pixel where they differ.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { decode } from '../public/nvdr.js';
 
@@ -72,5 +74,18 @@ for (const pct of [3, 8, 17, 34, 52, 71, 88, 96]) {
     execFileSync('bash', ['-c', `head -c ${Math.floor(size * pct / 100)} ${container} > ${cut}`]);
     check(`cut ${pct}%`, cut, 2);
     check(`cut ${pct}% layer=1`, cut, 1);
+}
+// Damage at full length: a deterministic handful of flipped bits past
+// the header, so the layers read to their end and stop mid-tile.
+const whole = readFileSync(container);
+let seed = 12345;
+const rnd = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 4294967296;
+for (let k = 0; k < 12; k++) {
+    const b = Buffer.from(whole);
+    for (let j = 0, flips = 1 + Math.floor(rnd() * 4); j < flips; j++)
+        b[32 + Math.floor(rnd() * (b.length - 32))] ^= 1 << Math.floor(rnd() * 8);
+    const damaged = `/tmp/cc_damaged_${k}.nvdr`;
+    writeFileSync(damaged, b);
+    check(`damaged ${k}`, damaged, 2);
 }
 process.exit(failures ? 1 : 0);

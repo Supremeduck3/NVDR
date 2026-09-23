@@ -950,6 +950,72 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+### v11, and albums of large photos
+
+A 3000x4500 photo took 13.6 s to encode and an album of three of them
+56 s, 110 s when they repeated each other. Most of it was work done
+again, or done where it could not pay:
+
+    3000x4500, 4 cores                   before   after
+    encode, with the report               13.6 s    6.0 s
+    album, three unrelated photos         56.6 s   19.8 s
+    album, a photo and two pans of it    110.6 s   47.4 s
+    decode in JS, all three layers         7.8 s    2.6 s
+
+Every container and album comes out byte for byte what it was, on every
+sample, the burst and the demo album, and the gate's baseline did not
+move.
+
+- **The forward transforms leave the search.** A leaf's texture is the
+  DCT of its pixels minus its flat colour, and a constant moves only
+  the DC: every other row of the integer DCT sums to exactly zero (odd
+  rows are antisymmetric, even rows fold into the half-size transform,
+  down to the 4-point one). So a block's quantised texture, and the
+  pixels each band of it adds, do not depend on what its neighbours
+  predict. The encoder computes them for a whole row of tiles before
+  searching it, on every core. The search itself stays one tile at a
+  time, because each tile is decided against the models and colours the
+  one before left.
+- **-O3**, with the transforms' loops ordered so the innermost walks
+  contiguous memory and each sum keeps its order: 25% on one core, the
+  same doubles.
+- **A residual leaf coded once, not twice.** Choosing between skipping a
+  leaf and coding it coded it, and the winner was then coded again.
+- **The report's three decodes run side by side.** `--quiet` skips
+  them.
+- **An album's motion search, once per candidate.** It does not depend
+  on the step, and the equal-quality search tried up to six steps. A
+  residual that already costs more than the photo alone is not decoded
+  back.
+- **Thumbnails too far apart are not tried.** A trial on a large photo
+  is three times its encode. Predictions measured to win came up to a
+  distance of 7.6 (a pan, 44 times smaller); pictures with nothing in
+  common from 12.7. The cut is 10 (`--distance`).
+- **The JS decoder** paints short rows by hand instead of a
+  `TypedArray.fill` per row, copies a tile's state without making a
+  subarray per row, and skips that copy when a layer arrived whole: a
+  tile of it can then only stop on damage, and then the decode starts
+  over the careful way. `scripts/crosscheck.mjs` now flips bits in
+  full-length copies too, to hold that path to the C pixels. The page
+  gets all three layers from one pass instead of three decodes.
+
+## Showing a large picture small
+
+A night sky shown on the page at a tenth of its size came out as white
+noise, and a grid of album photos as worse. The pixels were right: C and
+JS agreed on them. The canvas was not. Every canvas carried
+`image-rendering: pixelated`, which is right for enlarging and, for
+shrinking, keeps one pixel of every 10x10 and drops the rest. On a
+smooth picture that passes; on grain it keeps a scatter of single
+grains, the brightest showing as white dots. Only the full layer has
+the grain, so only the third view showed it, and a thumbnail, shrunk
+further, more.
+
+`paintFitted` in `nvdr.js` now draws a picture at the size the canvas is
+shown, in device pixels, averaging every source pixel an output pixel
+covers, and draws it again when that size changes. The page, the album
+grid and `<nvdr-img>` all use it.
+
 ## Playing it
 
 `public/nvdrv.js` is the sequence decoder in the browser, and the page has

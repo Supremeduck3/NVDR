@@ -23,7 +23,7 @@
  * { detail: { bytes } } when it is done and `error` when it cannot be
  * shown.
  */
-import { decode, showRGB } from './nvdr.js';
+import { decode, paintFitted } from './nvdr.js';
 import { openAlbumImage } from './nvda.js';
 
 class NvdrImg extends HTMLElement {
@@ -43,12 +43,10 @@ class NvdrImg extends HTMLElement {
     connectedCallback() { this.load(); }
     attributeChangedCallback() { if (this.isConnected) this.load(); }
 
+    /* At the size the element is shown, averaged down (see paintFitted):
+     * a photo shrunk into a thumbnail keeps its grain as grain. */
     paint(rgb, width, height) {
-        if (this.canvas.width !== width || this.canvas.height !== height) {
-            this.canvas.width = width;
-            this.canvas.height = height;
-        }
-        showRGB(rgb, width, height, this.canvas.getContext('2d'));
+        paintFitted(this.canvas, rgb, width, height);
     }
 
     async load() {

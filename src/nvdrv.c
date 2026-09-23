@@ -979,62 +979,84 @@ static int auto_block(int w, int h, int block) {
     return (long)w * h >= 200000 ? 16 : 8;
 }
 
-int nvdrv_predict_encode(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg_in,
-                         uint8_t** out, size_t* out_len, NvdrImage* recon) {
-    *out = NULL; *out_len = 0; recon->pixels = NULL;
+int nvdrv_motion_find(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg_in,
+                      NvdrvMotion* m) {
+    memset(m, 0, sizeof(*m));
     if (ref->width != cur->width || ref->height != cur->height) return -1;
-    NvdrvConfig cfg = cfg_in ? *cfg_in : nvdrv_default_config();
-    int w = cur->width, h = cur->height, block = auto_block(w, h, cfg.block);
+    m->cfg = cfg_in ? *cfg_in : nvdrv_default_config();
+    int w = cur->width, h = cur->height, block = auto_block(w, h, m->cfg.block);
     size_t npx = (size_t)w * h * 3;
     int nbx = (w + block - 1) / block, nby = (h + block - 1) / block;
     int rc = -1;
     int8_t* vx = (int8_t*)malloc((size_t)nbx * nby);
     int8_t* vy = (int8_t*)malloc((size_t)nbx * nby);
-    NvdrImage pred = { NULL, w, h }, err = { NULL, w, h };
-    uint8_t *field = NULL, *blob = NULL;
-    size_t field_len = 0, len = 0;
+    NvdrImage pred = { NULL, w, h };
     Subpel sp;
     memset(&sp, 0, sizeof(sp));
-    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&err, w, h)) goto done;
+    m->block = block;
+    m->err.width = w; m->err.height = h;
+    if (!vx || !vy || alloc_image(&pred, w, h) || alloc_image(&m->err, w, h)) goto done;
 
-    int dx = 0, dy = 0;
-    find_shift(cur, ref, cfg.search, &dx, &dy);
-    block_search(cur, ref, block, dx, dy, vx, vy);
+    find_shift(cur, ref, m->cfg.search, &m->dx, &m->dy);
+    block_search(cur, ref, block, m->dx, m->dy, vx, vy);
     if (subpel_build(&sp, ref) != 0) goto done;
     block_refine(cur, &sp, block, vx, vy);
-    if (cfg.mv_lambda > 0) field_rd(cur, &sp, block, dx * 4, dy * 4, cfg.mv_lambda, vx, vy);
+    if (m->cfg.mv_lambda > 0) field_rd(cur, &sp, block, m->dx * 4, m->dy * 4, m->cfg.mv_lambda, vx, vy);
     block_predict(&sp, &pred, block, vx, vy);
     for (size_t i = 0; i < npx; i++)
-        err.pixels[i] = (unsigned char)clamp255v((int)cur->pixels[i] - (int)pred.pixels[i] + 128);
-    field = pack_field(vx, vy, nbx, nby, dx * 4, dy * 4, &field_len);
-    if (!field) goto done;
-
-    NvdrConfig fcfg = cfg.frame;
-    fcfg.residual = 1;
-    fcfg.deblock = 0;
-    fcfg.band = 0;
-    if (cfg.pred_q > 0) fcfg.q = cfg.pred_q;
-    if (nvdr_encode_mem(&blob, &len, &err, &fcfg, NULL) != 0) goto done;
-
-    size_t total = 9 + field_len + len;
-    uint8_t* p = (uint8_t*)malloc(total);
-    if (!p) goto done;
-    p[0] = (uint8_t)block;
-    put_u16v(p + 1, (uint16_t)(int16_t)dx);
-    put_u16v(p + 3, (uint16_t)(int16_t)dy);
-    put_u32v(p + 5, (uint32_t)field_len);
-    memcpy(p + 9, field, field_len);
-    memcpy(p + 9 + field_len, blob, len);
-
-    /* What the decoder will show, from the bytes just written. */
-    if (nvdrv_predict_decode(ref, p, total, recon, NULL) != 0) { free(p); goto done; }
-    *out = p; *out_len = total;
-    rc = 0;
+        m->err.pixels[i] = (unsigned char)clamp255v((int)cur->pixels[i] - (int)pred.pixels[i] + 128);
+    m->field = pack_field(vx, vy, nbx, nby, m->dx * 4, m->dy * 4, &m->field_len);
+    if (m->field) rc = 0;
 
 done:
     subpel_free(&sp);
-    free(vx); free(vy); free(pred.pixels); free(err.pixels); free(field); free(blob);
+    free(vx); free(vy); free(pred.pixels);
+    if (rc != 0) nvdrv_motion_free(m);
     return rc;
+}
+
+void nvdrv_motion_free(NvdrvMotion* m) {
+    free(m->field); free(m->err.pixels);
+    m->field = NULL; m->err.pixels = NULL;
+}
+
+int nvdrv_motion_encode(const NvdrvMotion* m, const NvdrImage* ref, int q, size_t limit,
+                        uint8_t** out, size_t* out_len, NvdrImage* recon) {
+    *out = NULL; *out_len = 0; recon->pixels = NULL;
+    NvdrConfig fcfg = m->cfg.frame;
+    fcfg.residual = 1;
+    fcfg.deblock = 0;
+    fcfg.band = 0;
+    if (q > 0) fcfg.q = q;
+    uint8_t* blob = NULL; size_t len = 0;
+    if (nvdr_encode_mem(&blob, &len, &m->err, &fcfg, NULL) != 0) return -1;
+
+    size_t total = 9 + m->field_len + len;
+    if (total >= limit) { free(blob); return 1; }
+    uint8_t* p = (uint8_t*)malloc(total);
+    if (!p) { free(blob); return -1; }
+    p[0] = (uint8_t)m->block;
+    put_u16v(p + 1, (uint16_t)(int16_t)m->dx);
+    put_u16v(p + 3, (uint16_t)(int16_t)m->dy);
+    put_u32v(p + 5, (uint32_t)m->field_len);
+    memcpy(p + 9, m->field, m->field_len);
+    memcpy(p + 9 + m->field_len, blob, len);
+    free(blob);
+
+    /* What the decoder will show, from the bytes just written. */
+    if (nvdrv_predict_decode(ref, p, total, recon, NULL) != 0) { free(p); return -1; }
+    *out = p; *out_len = total;
+    return 0;
+}
+
+int nvdrv_predict_encode(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg_in,
+                         uint8_t** out, size_t* out_len, NvdrImage* recon) {
+    *out = NULL; *out_len = 0; recon->pixels = NULL;
+    NvdrvMotion m;
+    if (nvdrv_motion_find(ref, cur, cfg_in, &m) != 0) return -1;
+    int rc = nvdrv_motion_encode(&m, ref, m.cfg.pred_q, (size_t)-1, out, out_len, recon);
+    nvdrv_motion_free(&m);
+    return rc == 0 ? 0 : -1;
 }
 
 int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,

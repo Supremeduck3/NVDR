@@ -26,6 +26,12 @@ NvdaOptions nvda_default_options(void) {
      * reference on every burst measured; the full trial is the expensive
      * part, the ranking is cheap. */
     o.candidates = 2;
+    /* Photos whose thumbnails differ by more than this (mean grey levels)
+     * are different pictures, and a trial would only cost time: a large
+     * photo's trial is three times its encode. Predictions measured to win
+     * came up to 7.6 (a pan, 44 times smaller); pictures of nothing in
+     * common from 12.7. */
+    o.max_distance = 10.0;
     return o;
 }
 
@@ -96,7 +102,8 @@ static double thumb_distance(const Thumb* a, const Thumb* b) {
  * The best prediction of `img` from `ref` at the quality `target` (squared
  * error) the photo alone reached: the step is made finer until the error
  * is within 2.3% (0.1 dB), and the attempt ends once it would cost more
- * than `limit` bytes, since it only grows from there.
+ * than `limit` bytes, since it only grows from there. The motion search
+ * does not depend on the step and is done once.
  */
 static int best_prediction(const NvdrImage* ref, const NvdrImage* img, const NvdrConfig* cfg,
                            double target, size_t limit, uint8_t** out, size_t* out_len,
@@ -104,19 +111,23 @@ static int best_prediction(const NvdrImage* ref, const NvdrImage* img, const Nvd
     static const float scales[] = { 1.0f, 0.85f, 0.72f, 0.6f, 0.5f, 0.42f };
     NvdrvConfig vcfg = nvdrv_default_config();
     vcfg.frame = *cfg;
-    for (int t = 0; t < 6; t++) {
-        vcfg.pred_q = (int)(cfg->q * scales[t] + 0.5f);
-        if (vcfg.pred_q < 1) vcfg.pred_q = 1;
+    NvdrvMotion m;
+    if (nvdrv_motion_find(ref, img, &vcfg, &m) != 0) return 0;
+    int found = 0;
+    for (int t = 0; t < 6 && !found; t++) {
+        int q = (int)(cfg->q * scales[t] + 0.5f);
+        if (q < 1) q = 1;
         uint8_t* pb; size_t plen; NvdrImage precon;
-        if (nvdrv_predict_encode(ref, img, &vcfg, &pb, &plen, &precon) != 0) return 0;
-        if (plen >= limit) { free(pb); nvdr_image_free(&precon); return 0; }
+        if (nvdrv_motion_encode(&m, ref, q, limit, &pb, &plen, &precon) != 0) break;
         if (sse(img, &precon) <= target * 1.0233) {
             *out = pb; *out_len = plen; *shown = precon;
-            return 1;
+            found = 1;
+        } else {
+            free(pb); nvdr_image_free(&precon);
         }
-        free(pb); nvdr_image_free(&precon);
     }
-    return 0;
+    nvdrv_motion_free(&m);
+    return found;
 }
 
 int nvda_write(const char* path, int count, const char* const* names, const NvdrImage* imgs,
@@ -125,6 +136,7 @@ int nvda_write(const char* path, int count, const char* const* names, const Nvdr
     if (opt.window < 1) opt.window = 1;
     if (opt.window > NVDA_MAX_WINDOW) opt.window = NVDA_MAX_WINDOW;
     if (opt.candidates < 1) opt.candidates = 1;
+    if (!(opt.max_distance >= 0)) opt.max_distance = 0;
     if (count < 0 || count > NVDA_MAX_IMAGES) return -1;
     FILE* f = fopen(path, "wb");
     if (!f) return -1;
@@ -172,6 +184,7 @@ int nvda_write(const char* path, int count, const char* const* names, const Nvdr
                 const NvdrImage* r = &shown_all[i - d];
                 if (!r->pixels || r->width != img->width || r->height != img->height) continue;
                 double s = thumb_distance(&thumbs[i], &thumbs[i - d]);
+                if (s > opt.max_distance) continue;
                 int k = nc++;
                 while (k > 0 && dist[k - 1] > s) { cand[k] = cand[k - 1]; dist[k] = dist[k - 1]; k--; }
                 cand[k] = d; dist[k] = s;
@@ -179,7 +192,8 @@ int nvda_write(const char* path, int count, const char* const* names, const Nvdr
             double di = sse(img, &shown);
             for (int k = 0; k < nc && k < opt.candidates; k++) {
                 uint8_t* pb; size_t plen; NvdrImage precon;
-                if (best_prediction(&shown_all[i - cand[k]], img, cfg, di, len, &pb, &plen, &precon)) {
+                int ok = best_prediction(&shown_all[i - cand[k]], img, cfg, di, len, &pb, &plen, &precon);
+                if (ok) {
                     free(blob); nvdr_image_free(&shown);
                     blob = pb; len = plen; shown = precon;
                     kind = NVDA_KIND_PRED; ref = cand[k];

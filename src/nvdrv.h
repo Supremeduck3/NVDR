@@ -146,6 +146,27 @@ void nvdrv_decode_close(NvdrvDecoder* dec);
  */
 int nvdrv_predict_encode(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg,
                          uint8_t** out, size_t* out_len, NvdrImage* recon);
+
+/*
+ * The same in two steps, for an encoder that codes one prediction at
+ * several steps: the motion search, which does not depend on the step and
+ * is half the work, once; then the residual at any step. The residual
+ * step returns 1, with nothing allocated, as soon as the payload is known
+ * to reach `limit` bytes, before decoding it back.
+ */
+typedef struct {
+    NvdrvConfig cfg;
+    int         block, dx, dy;
+    uint8_t*    field;       /* the packed motion field */
+    size_t      field_len;
+    NvdrImage   err;         /* current - prediction + 128 */
+} NvdrvMotion;
+
+int  nvdrv_motion_find(const NvdrImage* ref, const NvdrImage* cur, const NvdrvConfig* cfg,
+                       NvdrvMotion* m);
+int  nvdrv_motion_encode(const NvdrvMotion* m, const NvdrImage* ref, int q, size_t limit,
+                         uint8_t** out, size_t* out_len, NvdrImage* recon);
+void nvdrv_motion_free(NvdrvMotion* m);
 int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
                          NvdrImage* out, int* partial);
 

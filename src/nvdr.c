@@ -225,22 +225,34 @@ static void tables_init(void) {
 
 /* Encoder only: orthonormal coefficients of an n x n block. */
 static void forward_dct(int s, const double* in, double* out) {
+    /* Every sum runs over its terms in the same order as a plain row-times-
+     * column product; the loops are only nested so the innermost one walks
+     * contiguous memory, which the compiler vectorises. */
     int n = NVDR_MIN_BLOCK << s;
     const int* t = tmat[s];
-    double tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    double tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], tt[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     double scale = 1.0 / (4096.0 * n);
-    for (int y = 0; y < n; y++)
-        for (int u = 0; u < n; u++) {
-            double a = 0;
-            for (int x = 0; x < n; x++) a += t[u * n + x] * in[y * n + x];
-            tmp[y * n + u] = a;
+    for (int u = 0; u < n; u++)
+        for (int x = 0; x < n; x++) tt[x * n + u] = t[u * n + x];
+    for (int y = 0; y < n; y++) {
+        double* row = tmp + y * n;
+        for (int u = 0; u < n; u++) row[u] = 0.0;
+        for (int x = 0; x < n; x++) {
+            double p = in[y * n + x];
+            const double* col = tt + x * n;
+            for (int u = 0; u < n; u++) row[u] += col[u] * p;
         }
-    for (int v = 0; v < n; v++)
-        for (int u = 0; u < n; u++) {
-            double a = 0;
-            for (int y = 0; y < n; y++) a += t[v * n + y] * tmp[y * n + u];
-            out[v * n + u] = a * scale;
+    }
+    for (int v = 0; v < n; v++) {
+        double* row = out + v * n;
+        for (int u = 0; u < n; u++) row[u] = 0.0;
+        for (int y = 0; y < n; y++) {
+            double k = t[v * n + y];
+            const double* src = tmp + y * n;
+            for (int u = 0; u < n; u++) row[u] += k * src[u];
         }
+        for (int u = 0; u < n; u++) row[u] *= scale;
+    }
 }
 
 /*
@@ -252,23 +264,33 @@ static void forward_dct(int s, const double* in, double* out) {
  */
 static void inverse_dct(int s, const int* in, int* out, int mu, int mv) {
     /* mu and mv bound the nonzero coefficients; every term past them is a
-     * zero, so the bounds change the time and nothing else. */
+     * zero, so the bounds change the time and nothing else. Integer sums,
+     * so the loop order, chosen for contiguous inner loops, changes
+     * nothing either. */
     int n = NVDR_MIN_BLOCK << s;
     const int* t = tmat[s];
     int tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int shift2 = 6 + log2_int(n);
-    for (int y = 0; y < n; y++)
+    for (int y = 0; y < n; y++) {
+        int a[NVDR_MAX_BLOCK];
+        for (int u = 0; u <= mu; u++) a[u] = 0;
+        for (int v = 0; v <= mv; v++) {
+            int k = t[v * n + y];
+            const int* row = in + v * n;
+            for (int u = 0; u <= mu; u++) a[u] += k * row[u];
+        }
+        for (int u = 0; u <= mu; u++) tmp[y * n + u] = clamp_coef((a[u] + 32) >> 6);
+    }
+    for (int y = 0; y < n; y++) {
+        int a[NVDR_MAX_BLOCK];
+        for (int x = 0; x < n; x++) a[x] = 0;
         for (int u = 0; u <= mu; u++) {
-            int a = 0;
-            for (int v = 0; v <= mv; v++) a += t[v * n + y] * in[v * n + u];
-            tmp[y * n + u] = clamp_coef((a + 32) >> 6);
+            int k = tmp[y * n + u];
+            const int* row = t + u * n;
+            for (int x = 0; x < n; x++) a[x] += k * row[x];
         }
-    for (int y = 0; y < n; y++)
-        for (int x = 0; x < n; x++) {
-            int a = 0;
-            for (int u = 0; u <= mu; u++) a += t[u * n + x] * tmp[y * n + u];
-            out[y * n + x] = (a + (1 << (shift2 - 1))) >> shift2;
-        }
+        for (int x = 0; x < n; x++) out[y * n + x] = (a[x] + (1 << (shift2 - 1))) >> shift2;
+    }
 }
 
 /* Round a / n to nearest, halves away from zero, n a power of two. */
@@ -584,12 +606,10 @@ static void tile_fallback(Canvas* cv, int tx, int ty) {
     }
 }
 
-/* Adds the texture in scan positions [start, end) to the leaf's
- * accumulated texture, and shows flat + texture clamped. */
-static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
-                          int start, int end, int step) {
-    int s = size_class(n), count = n * n;
-    int coef[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+/* The pixels the texture in scan positions [start, end) adds to a leaf. */
+static void texture_residual(int s, const int* lv, int start, int end, int step, int* res) {
+    int n = NVDR_MIN_BLOCK << s, count = n * n;
+    int coef[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     memset(coef, 0, sizeof(int) * count);
     int mu = 0, mv = 0, sh = log2_int(n);
     for (int i = start; i < end; i++) {
@@ -600,6 +620,11 @@ static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
         if (v > mv) mv = v;
     }
     inverse_dct(s, coef, res, mu, mv);
+}
+
+/* Adds them to the leaf's accumulated texture, and shows flat + texture
+ * clamped. */
+static void add_residual(Canvas* cv, int c, int x, int y, int n, const int* res) {
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) {
             size_t at = (size_t)(y + j) * cv->pw + x + i;
@@ -608,6 +633,13 @@ static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
             cv->acc[c][at] = (int16_t)a;
             cv->full[c][at] = (uint8_t)clamp_u8(cv->flat[c][at] + a);
         }
+}
+
+static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
+                          int start, int end, int step) {
+    int res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    texture_residual(size_class(n), lv, start, end, step, res);
+    add_residual(cv, c, x, y, n, res);
 }
 
 /* ============================================================== header */
@@ -663,6 +695,17 @@ typedef struct {
     int*           split;       /* one decision per node, per size */
     size_t         grid_base[NSIZES];
     int            grid_w[NSIZES];
+    /* Every whole block's quantised texture, in scan order, for the row of
+     * tiles being searched: [size][plane], block (bx, by) of the row at
+     * ((by * (pw / n) + bx) * n * n). See precompute_row(). */
+    int*           pre[NSIZES][3];
+    /* and per block: the sum of its pixels, whether it has texture, and
+     * the pixels its low and its high band add (same layout as pre) */
+    double*        pre_sum[NSIZES][3];
+    uint8_t*       pre_nz[NSIZES][3];
+    int*           pre_lo[NSIZES][3];
+    int*           pre_hi[NSIZES][3];
+    int            pre_y;       /* the row's top */
 } Enc;
 
 static size_t node_id(const Enc* e, int x, int y, int n) {
@@ -701,10 +744,9 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
         int step = e->step[c];
         int pred = predict(cv, c, x, y, n);
         dl[c] = 0;
+        size_t b = (size_t)((y - e->pre_y) / n) * (cv->pw / n) + (size_t)(x / n);
         if (!skip) {
-            double sum = 0.0;
-            for (int j = 0; j < n; j++)
-                for (int i = 0; i < n; i++) sum += e->src[c][(size_t)(y + j) * cv->pw + x + i];
+            double sum = e->pre_sum[sc][c][b];
             /* The orthonormal DC of (block - prediction) is n * its mean. */
             double dc = (sum / count - pred) * n;
             dl[c] = quantise(dc / step, 0.0);
@@ -715,20 +757,12 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
         memset(lv[c], 0, sizeof(int) * count);
         int nonzero = 0;
         if (!skip) {
-            double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-            for (int j = 0; j < n; j++)
-                for (int i = 0; i < n; i++)
-                    blk[j * n + i] = e->src[c][(size_t)(y + j) * cv->pw + x + i] - colour;
-            forward_dct(sc, blk, co);
-            for (int i = 1; i < count; i++) {
-                lv[c][i] = quantise(co[scan_pos[sc][i]] / step, e->deadzone);
-                nonzero |= lv[c][i];
-            }
+            memcpy(lv[c], e->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
+            nonzero = e->pre_nz[sc][c][b];
         }
         if (nonzero) {
-            int at = e->band_at[sc];
-            apply_texture(cv, c, x, y, n, lv[c], 1, at, step);
-            if (at < count) apply_texture(cv, c, x, y, n, lv[c], at, count, step);
+            add_residual(cv, c, x, y, n, e->pre_lo[sc][c] + b * count);
+            if (e->band_at[sc] < count) add_residual(cv, c, x, y, n, e->pre_hi[sc][c] + b * count);
             any = 1;
         }
 
@@ -774,10 +808,18 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* te
         leaf_emit(e, &c0, c1, n, dl, lv);
         double j_skip = d_skip + e->skip_lambda * (c0.bits + c1[0].bits + c1[1].bits);
         Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
-        double d_code = leaf_levels(e, x, y, n, 0, dl, lv, NULL);
+        int tex = 0;
+        double d_code = leaf_levels(e, x, y, n, 0, dl, lv, &tex);
         leaf_emit(e, &k0, k1, n, dl, lv);
         double j_code = d_code + e->skip_lambda * (k0.bits + k1[0].bits + k1[1].bits);
         skip = j_skip <= j_code;
+        /* Coded wins: the canvas, dl and lv already hold it, and redoing
+         * it would give the same (costing only bits is not coding). */
+        if (!skip) {
+            if (textured) *textured = tex;
+            leaf_emit(e, s0, s1, n, dl, lv);
+            return d_code;
+        }
     }
     double err = leaf_levels(e, x, y, n, skip, dl, lv, textured);
     leaf_emit(e, s0, s1, n, dl, lv);
@@ -803,6 +845,62 @@ static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
             memcpy(cv->full[c] + at, buf, (size_t)n); buf += n;
             memcpy(cv->acc[c] + at, buf, sizeof(int16_t) * (size_t)n); buf += 2 * n;
         }
+}
+
+/*
+ * The texture of a leaf is the DCT of its pixels minus its flat colour,
+ * and a constant moves only the DC: every other row of the transform sums
+ * to exactly zero (odd rows are antisymmetric, even rows fold into the
+ * half-size transform, down to the 4-point one). So a block's quantised
+ * texture does not depend on the colour its neighbours predict, and the
+ * forward transforms, most of the encoder's time, can all be done before
+ * the search, for a whole row of tiles at once and on every core, where
+ * the search itself has to go tile by tile: each tile is decided against
+ * the models and colours the one before it left.
+ */
+static void precompute_row(Enc* e, int ty) {
+    /* The inverse transforms go too: the pixels a band adds are its
+     * coefficients' alone, so what the search does per leaf and per size
+     * is only adding them to the flat colour and measuring the error. */
+    Canvas* cv = &e->cv;
+    e->pre_y = ty;
+    for (int s = 0; s < NSIZES; s++) {
+        int n = NVDR_MIN_BLOCK << s, count = n * n;
+        if (!e->pre[s][0]) continue;
+        int gw = cv->pw / n, gh = cv->tile / n, blocks = gw * gh;
+        for (int c = 0; c < 3; c++) {
+            int* dst = e->pre[s][c];
+            const double* src = e->src[c];
+            int step = e->step[c];
+            double dz = e->deadzone;
+            #pragma omp parallel for schedule(static)
+            for (int b = 0; b < blocks; b++) {
+                int x = (b % gw) * n, y = ty + (b / gw) * n;
+                if (y + n > cv->ph) continue;
+                double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                for (int j = 0; j < n; j++)
+                    for (int i = 0; i < n; i++) blk[j * n + i] = src[(size_t)(y + j) * cv->pw + x + i];
+                double sum = 0.0;
+                for (int j = 0; j < n; j++)
+                    for (int i = 0; i < n; i++) sum += blk[j * n + i];
+                e->pre_sum[s][c][b] = sum;
+                forward_dct(s, blk, co);
+                int* q = dst + (size_t)b * count;
+                int nonzero = 0;
+                q[0] = 0;
+                for (int i = 1; i < count; i++) {
+                    q[i] = quantise(co[scan_pos[s][i]] / step, dz);
+                    nonzero |= q[i];
+                }
+                e->pre_nz[s][c][b] = (uint8_t)(nonzero != 0);
+                if (nonzero) {
+                    int at = e->band_at[s];
+                    texture_residual(s, q, 1, at, step, e->pre_lo[s][c] + (size_t)b * count);
+                    if (at < count) texture_residual(s, q, at, count, step, e->pre_hi[s][c] + (size_t)b * count);
+                }
+            }
+        }
+    }
 }
 
 /*
@@ -930,6 +1028,21 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     }
     e.split = (int*)calloc(nodes, sizeof(int));
     if (!e.split) goto done;
+    for (int s = 0; s < NSIZES; s++) {
+        int n = NVDR_MIN_BLOCK << s;
+        if (n < cv->min_block || n > cv->tile) continue;
+        for (int c = 0; c < 3; c++) {
+            size_t blocks = (size_t)(cv->pw / n) * (cv->tile / n);
+            if (!blocks) blocks = 1;
+            e.pre[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            e.pre_lo[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            e.pre_hi[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            e.pre_sum[s][c] = (double*)malloc(sizeof(double) * blocks);
+            e.pre_nz[s][c] = (uint8_t*)malloc(blocks);
+            if (!e.pre[s][c] || !e.pre_lo[s][c] || !e.pre_hi[s][c] || !e.pre_sum[s][c] || !e.pre_nz[s][c])
+                goto done;
+        }
+    }
 
     if (ctx && ctx->valid) {
         e.cm = ctx->cm; e.tm = ctx->tm; e.tm2 = ctx->tm2;
@@ -944,11 +1057,13 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
 
     /* Each tile is searched against the models as they stand, then coded
      * for real, which is what adapts them for the next. */
-    for (int ty = 0; ty < cv->ph; ty += cv->tile)
+    for (int ty = 0; ty < cv->ph; ty += cv->tile) {
+        precompute_row(&e, ty);
         for (int tx = 0; tx < cv->pw; tx += cv->tile) {
             search(&e, tx, ty, cv->tile);
             emit(&e, &s0, s1, tx, ty, cv->tile, &h);
         }
+    }
     if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
         nvdr_enc_finish(&enc2) != 0) goto done;
     /* With no high band the stream holds no symbols, only the coder's
@@ -996,6 +1111,11 @@ done:
     nvdr_enc_free(&enc2);
     for (int c = 0; c < 3; c++) free(e.src[c]);
     free(e.split);
+    for (int s = 0; s < NSIZES; s++)
+        for (int c = 0; c < 3; c++) {
+            free(e.pre[s][c]); free(e.pre_lo[s][c]); free(e.pre_hi[s][c]);
+            free(e.pre_sum[s][c]); free(e.pre_nz[s][c]);
+        }
     canvas_free(&e.cv);
     return rc;
 }

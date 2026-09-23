@@ -168,21 +168,29 @@ function divRound(a, n) {
  * time: most leaves carry only a few low frequencies.
  */
 const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+const ROW = new Int32Array(MAX_BLOCK);
 function inverseDct(s, input, out, mu, mv) {
+    // Integer sums, so the order, chosen for contiguous inner loops and to
+    // skip zero terms, changes nothing.
     const n = MIN_BLOCK << s, t = TMAT[s], shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
-    for (let y = 0; y < n; y++)
-        for (let u = 0; u <= mu; u++) {
-            let a = 0;
-            for (let v = 0; v <= mv; v++) a += t[v * n + y] * input[v * n + u];
-            TMP[y * n + u] = clampCoef((a + 32) >> 6);
+    for (let y = 0; y < n; y++) {
+        ROW.fill(0, 0, mu + 1);
+        for (let v = 0; v <= mv; v++) {
+            const k = t[v * n + y], r = v * n;
+            for (let u = 0; u <= mu; u++) ROW[u] += k * input[r + u];
         }
+        for (let u = 0; u <= mu; u++) TMP[y * n + u] = clampCoef((ROW[u] + 32) >> 6);
+    }
     for (let y = 0; y < n; y++) {
         const row = y * n;
-        for (let x = 0; x < n; x++) {
-            let a = 0;
-            for (let u = 0; u <= mu; u++) a += t[u * n + x] * TMP[row + u];
-            out[row + x] = (a + half) >> shift2;
+        ROW.fill(0, 0, n);
+        for (let u = 0; u <= mu; u++) {
+            const k = TMP[row + u];
+            if (k === 0) continue;
+            const r = u * n;
+            for (let x = 0; x < n; x++) ROW[x] += k * t[r + x];
         }
+        for (let x = 0; x < n; x++) out[row + x] = (ROW[x] + half) >> shift2;
     }
 }
 
@@ -306,7 +314,9 @@ export function layerThresholds(header) {
  * returns -1, otherwise
  *   { header, layersPresent, tiles, tilesComplete: [l0, l1],
  *     rgb,        // the image at maxLayer, RGB, width * height * 3
- *     flatRgb }   // layer 0 alone, only when wantFlat
+ *     flatRgb,    // layer 0 alone, only when wantFlat
+ *     lowRgb }    // layers 0 and 1, what maxLayer = 1 shows, only when
+ *                 // wantLow (with maxLayer 2): all three views in one pass
  */
 /**
  * A fluid context: the adaptive models one container leaves behind,
@@ -315,7 +325,22 @@ export function layerThresholds(header) {
  */
 export function newContext() { return { valid: false, cm: null, tm: null, tm2: null }; }
 
-export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null) {
+const RETRY = Symbol('retry');
+
+export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false) {
+    // A texture layer that arrived whole cannot stop inside a tile unless
+    // the file is damaged, so the first attempt does not save each tile to
+    // restore it, a fifth of the time on a large image. If it does stop,
+    // the decode starts over the careful way and gives what that gives. A
+    // warm context is changed in place and cannot be started over.
+    if (!(ctx && ctx.valid)) {
+        const r = decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, false);
+        if (r !== RETRY) return r;
+    }
+    return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true);
+}
+
+function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
     if (!h) return null;
@@ -342,15 +367,28 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
     const whole = (x, y, n) => x + n <= pw && y + n <= ph;
     const exists = (x, y) => x < pw && y < ph;
 
+    // TypedArray.fill costs a call per row, most of a 4-pixel row's time:
+    // short rows are written directly.
     function fill(p, x, y, w, hh, v) {
-        for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + w);
+        if (w > 16) {
+            for (let j = y; j < y + hh; j++) p.fill(v, j * pw + x, j * pw + x + w);
+            return;
+        }
+        for (let j = y; j < y + hh; j++)
+            for (let at = j * pw + x, end = at + w; at < end; at++) p[at] = v;
     }
 
     // Mirrors paint_flat().
     function paintFlat(c, x, y, w, hh, v) {
-        fill(flat[c], x, y, w, hh, v);
-        fill(full[c], x, y, w, hh, v);
-        fill(acc[c], x, y, w, hh, 0);
+        if (w > 16) {
+            fill(flat[c], x, y, w, hh, v);
+            fill(full[c], x, y, w, hh, v);
+            fill(acc[c], x, y, w, hh, 0);
+            return;
+        }
+        const f = flat[c], o = full[c], a = acc[c];
+        for (let j = y; j < y + hh; j++)
+            for (let at = j * pw + x, end = at + w; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
     }
 
     const fixedPred = (h.flags & FLAG_RESIDUAL) !== 0;
@@ -433,6 +471,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
     const lv = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     const coef = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     const res = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    let low = null;
     const saved = [0, 1, 2].map(() => new Uint8Array(tile * tile));
     const savedAcc = [0, 1, 2].map(() => new Int16Array(tile * tile));
     for (let layer = 1; layer < LAYERS; layer++) {
@@ -441,18 +480,22 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
         if (layer === 2 && h.band === 0) break;
         const tm = tms[layer - 1];
         const d = new ArithDecoder(bytes, off, avail);
+        const guard = careful || avail < h.storedBytes[layer];
         const st = { corrupt: false };
         for (let t = 0; t < complete[layer - 1]; t++) {
             const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
             const tw = tx + tile < pw ? tile : pw - tx, th = ty + tile < ph ? tile : ph - ty;
-            for (let c = 0; c < 3; c++)
-                for (let j = 0; j < th; j++) {
-                    const at = (ty + j) * pw + tx;
-                    saved[c].set(full[c].subarray(at, at + tw), j * tile);
-                    savedAcc[c].set(acc[c].subarray(at, at + tw), j * tile);
-                }
+            // Copied by hand: a subarray per row would be millions of
+            // short-lived objects on a large image.
+            if (guard) for (let c = 0; c < 3; c++) {
+                const o = full[c], a = acc[c], so = saved[c], sa = savedAcc[c];
+                for (let j = 0; j < th; j++)
+                    for (let at = (ty + j) * pw + tx, k = j * tile, end = at + tw; at < end; at++, k++) {
+                        so[k] = o[at]; sa[k] = a[at];
+                    }
+            }
             const first = tileStart[t], last = tileStart[t + 1];
-            const was = texturedLeaf.slice(first, last);
+            const was = guard ? texturedLeaf.slice(first, last) : null;
             for (let i = first; i < last && !d.overrun && !st.corrupt; i++) {
                 const x = lx[i], y = ly[i], n = ln[i], sc = sizeClass(n), count = n * n;
                 const start = layer === 1 ? 1 : bandAt[sc], end = layer === 1 ? bandAt[sc] : count;
@@ -484,6 +527,7 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
                 }
             }
             if (d.overrun || st.corrupt) {
+                if (!guard) return RETRY;
                 for (let c = 0; c < 3; c++)
                     for (let j = 0; j < th; j++) {
                         full[c].set(saved[c].subarray(j * tile, j * tile + tw), (ty + j) * pw + tx);
@@ -494,6 +538,8 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
             }
             complete[layer]++;
         }
+        // What decode(buffer, 1) would show, without a second pass.
+        if (layer === 1 && wantLow) low = { planes: full.map(p => p.slice()), tex: texturedLeaf.slice() };
     }
 
     /* Mirrors deblock() and deblock_plane(); `tex` is null for colours only. */
@@ -580,6 +626,10 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
         return toRgb(copy);
     };
 
+    // Before rgb, which may filter `full` in place. No snapshot means the
+    // low band never arrived, and then `full` is what it would show.
+    const lowRgb = !wantLow ? null
+        : low ? shown(low.planes, low.tex) : shown(full.map(p => p.slice()), texturedLeaf);
     return {
         header: h,
         layersPresent: h.band && complete[1] === tiles && avail2 >= 5 ? 3
@@ -587,8 +637,79 @@ export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = nu
         tiles,
         tilesComplete: complete,
         rgb: maxLayer === 0 ? shown(flat, null) : shown(full, texturedLeaf),
-        flatRgb: wantFlat ? shown(flat, null) : null
+        flatRgb: wantFlat ? shown(flat, null) : null,
+        lowRgb
     };
+}
+
+/**
+ * The picture reduced to `w` x `h` by averaging, for every output pixel,
+ * all the source pixels it covers. A browser shrinking a canvas samples
+ * it instead: with `image-rendering: pixelated` one pixel in every k x k,
+ * and even when smoothing, a handful. On a smooth picture that passes; on
+ * grain, a night sky or a textured wall, it keeps a scatter of the
+ * brightest and darkest grains and the picture shows as white noise, the
+ * worse the smaller it is shown. Averaging shows it as the eye would.
+ */
+export function shrinkRGB(rgb, width, height, w, h) {
+    const out = new Uint8ClampedArray(w * h * 3);
+    const bin = new Int32Array(width), binCount = new Int32Array(w);
+    for (let i = 0; i < width; i++) { bin[i] = Math.floor(i * w / width); binCount[bin[i]]++; }
+    const sum = new Uint32Array(w * 3);
+    let y0 = 0;
+    for (let y = 0; y < h; y++) {
+        const y1 = Math.floor((y + 1) * height / h);
+        sum.fill(0);
+        for (let j = y0; j < y1; j++) {
+            let k = j * width * 3;
+            for (let i = 0; i < width; i++, k += 3) {
+                const b = bin[i] * 3;
+                sum[b] += rgb[k]; sum[b + 1] += rgb[k + 1]; sum[b + 2] += rgb[k + 2];
+            }
+        }
+        const rows = y1 - y0;
+        for (let x = 0, o = y * w * 3; x < w; x++, o += 3) {
+            const n = binCount[x] * rows, half = n >> 1, b = x * 3;
+            out[o] = (sum[b] + half) / n; out[o + 1] = (sum[b + 1] + half) / n; out[o + 2] = (sum[b + 2] + half) / n;
+        }
+        y0 = y1;
+    }
+    return out;
+}
+
+/**
+ * Show a picture on a canvas at the size the canvas is displayed, in
+ * device pixels: reduced by averaging when that is smaller than the
+ * picture (see shrinkRGB), and at its own size, drawn crisp, when it is
+ * shown larger. The canvas keeps the picture and is drawn again whenever
+ * its displayed size changes: a canvas painted while hidden has no size
+ * yet, and one on a resized page has a new one.
+ */
+export function paintFitted(canvas, rgb, width, height) {
+    canvas._nvdrShown = { rgb, width, height };
+    if (fitObserver) fitObserver.observe(canvas);
+    drawFitted(canvas);
+}
+
+const fitObserver = typeof ResizeObserver === 'undefined' ? null
+    : new ResizeObserver(entries => { for (const e of entries) drawFitted(e.target); });
+
+function drawFitted(canvas) {
+    const shownPicture = canvas._nvdrShown;
+    if (!shownPicture) return;
+    const { rgb, width, height } = shownPicture;
+    const dpr = (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1;
+    // Not laid out yet (hidden): a small stand-in with the right shape,
+    // until the observer sees the real size.
+    const shown = canvas.clientWidth || Math.min(width, 256);
+    const w = Math.min(width, Math.max(1, Math.ceil(shown * dpr)));
+    const h = Math.max(1, Math.round(height * w / width));
+    const small = w < width;
+    if (canvas.width === w && canvas.height === h && canvas._nvdrDrawn === rgb) return;
+    canvas.width = w; canvas.height = h;
+    canvas._nvdrDrawn = rgb;
+    canvas.style.imageRendering = small ? 'auto' : 'pixelated';
+    showRGB(small ? shrinkRGB(rgb, width, height, w, h) : rgb, w, h, canvas.getContext('2d'));
 }
 
 /** Put an RGB buffer on a canvas. The buffer itself is left alone. */

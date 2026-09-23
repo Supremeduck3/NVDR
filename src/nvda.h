@@ -63,6 +63,7 @@ typedef struct {
     int    predict;    /* try predicting photos from earlier ones */
     int    window;     /* how many earlier photos a prediction may reach, 1..32 */
     int    candidates; /* how many of them, the most similar first, to try in full */
+    double max_distance; /* thumbnails further apart than this are not tried */
 } NvdaOptions;
 
 NvdaOptions nvda_default_options(void);
