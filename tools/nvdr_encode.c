@@ -25,6 +25,7 @@ static void usage(const char* argv0) {
         "  --no-deblock     leave the seams between leaves unfiltered\n"
         "  --band N         0..32, where texture splits between its low and high\n"
         "                   layers (default 8; 0 keeps it in one layer)\n"
+        "  --chroma 420|444 colour at half resolution each way, or whole\n"
         "  --quiet          write the file and skip the per-layer report, which\n"
         "                   decodes it three times\n",
         argv0);
@@ -49,6 +50,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--chroma") && i + 1 < argc) {
+            const char* v = argv[++i];
+            if (!strcmp(v, "420")) cfg.chroma420 = 1;
+            else if (!strcmp(v, "444")) cfg.chroma420 = 0;
+            else { fprintf(stderr, "--chroma takes 420 or 444\n"); return 2; }
+        }
         else { fprintf(stderr, "unknown option '%s'\n", argv[i]); usage(argv[0]); return 2; }
     }
 
