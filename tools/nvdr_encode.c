@@ -24,7 +24,9 @@ static void usage(const char* argv0) {
         "  --min-block N    smallest leaf, 4..max (default 4)\n"
         "  --no-deblock     leave the seams between leaves unfiltered\n"
         "  --band N         0..32, where texture splits between its low and high\n"
-        "                   layers (default 8; 0 keeps it in one layer)\n",
+        "                   layers (default 8; 0 keeps it in one layer)\n"
+        "  --quiet          write the file and skip the per-layer report, which\n"
+        "                   decodes it three times\n",
         argv0);
 }
 
@@ -35,6 +37,7 @@ int main(int argc, char** argv) {
     const char* in_path  = argv[1];
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
+    int quiet = 0;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
@@ -45,6 +48,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--min-block") && i + 1 < argc) cfg.min_block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else { fprintf(stderr, "unknown option '%s'\n", argv[i]); usage(argv[0]); return 2; }
     }
 
@@ -66,21 +70,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* The report decodes the file once per layer: whoever only wants the
+     * file skips it. */
+    if (quiet) { nvdr_image_free(&source); return 0; }
+
     printf("%s  %dx%d  q %d/%d  blocks %d..%d\n", in_path, source.width, source.height,
            hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block);
     printf("  layer       stored  cumulative     PSNR\n");
-    size_t cumulative = NVDR_HEADER_SIZE;
+    /* One decode per layer, independent of each other: side by side. */
+    double psnr[NVDR_LAYERS];
+    int failed = 0;
+    #pragma omp parallel for reduction(|:failed)
     for (int k = 0; k < NVDR_LAYERS; k++) {
         NvdrImage shown;
-        if (nvdr_decode_file(out_path, k, &shown, NULL, NULL) != 0) {
-            fprintf(stderr, "wrote a container that does not read back\n");
-            nvdr_image_free(&source);
-            return 1;
-        }
+        if (nvdr_decode_file(out_path, k, &shown, NULL, NULL) != 0) { failed = 1; continue; }
+        psnr[k] = nvdr_psnr(&source, &shown);
+        nvdr_image_free(&shown);
+    }
+    if (failed) {
+        fprintf(stderr, "wrote a container that does not read back\n");
+        nvdr_image_free(&source);
+        return 1;
+    }
+    size_t cumulative = NVDR_HEADER_SIZE;
+    for (int k = 0; k < NVDR_LAYERS; k++) {
         cumulative += hdr.stored_bytes[k];
         printf("  %-8s %10u  %10zu   %6.2f dB\n", layer_name(k), hdr.stored_bytes[k],
-               cumulative, nvdr_psnr(&source, &shown));
-        nvdr_image_free(&shown);
+               cumulative, psnr[k]);
     }
     printf("  leaves 4/8/16/32: %u/%u/%u/%u, %u with texture\n",
            hdr.leaves[0], hdr.leaves[1], hdr.leaves[2], hdr.leaves[3], hdr.textured);

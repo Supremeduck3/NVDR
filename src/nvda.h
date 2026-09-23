@@ -1,72 +1,122 @@
 /*
- * NVDA — an album: many still images in one file, the fluid context
- * carried from each to the next.
+ * NVDA — an album: many still images in one file, where a photo that
+ * repeats an earlier one is coded as what changed.
  *
- *   [header 16B]  "NVDA", version 2, flags, image count u32, 6 reserved
- *   per image:    name length u16, name (UTF-8, at most 255 bytes),
- *                 kind u8, payload length u32, payload
+ *   [header 16B]  "NVDA", version 3, flags, image count u32, window u8,
+ *                 5 reserved
+ *   [index]       16 bytes per image:
+ *                   payload offset u32 (from the start of the file)
+ *                   payload length u32
+ *                   kind u8, reference distance u8 (1..window; 0 when alone)
+ *                   width u16, height u16, name length u16
+ *   [images]      per image: its name (UTF-8), then its payload
  *
  * kind 0: the payload is an NVDR container, the image on its own.
- * kind 1: the image is predicted from the one before it, which must be
- *         the same size: nvdrv_predict_encode()'s payload, block motion in
- *         quarter pixels plus a residual container. This is the reuse that
- *         pays: a photo that repeats most of the one before it (a burst,
- *         the same scene, screenshots) costs only what changed.
+ * kind 1: the image is predicted from the image `reference distance`
+ *         places before it, which must be the same size: block motion in
+ *         quarter pixels plus a residual container (nvdrv_predict_encode).
  *
- * With NVDA_FLAG_FLUID every container starts from the adaptive models
- * the one before it ended with (nvdr.h, the fluid context), so the album
- * reads in order. What that is worth, measured on the six samples: 0.7%
- * of the bytes, up to 1.5% on one image. The models adapt within a few
- * dozen symbols, so starting from even odds costs an image little. It is
- * on because it costs nothing either. Only kind-0 images carry it.
+ * WHY AN INDEX, AND A WINDOW
+ * --------------------------
+ * A predicted photo does not exist on its own: showing it means decoding
+ * the photo it was predicted from, and that one's reference in turn. The
+ * index says, before a single image is read, where every image is and
+ * what it depends on, so a viewer that wants one photo fetches that photo
+ * and its chain of references and nothing else, with HTTP range requests
+ * when the file is on a server. The window bounds how far back a
+ * reference may reach, so a decoder holds at most `window` images, and a
+ * chain is only as long as the photos really repeat each other.
  *
- * With NVDA_FLAG_PREDICT the encoder tries both kinds for every image the
- * size of the one before, at equal quality: the prediction is coded with a
- * finer step until it is within 0.1 dB of the image coded alone, and is
- * kept if it is still smaller.
+ * THE FLUID CONTEXT
+ * -----------------
+ * With NVDA_FLAG_FLUID, every photo coded on its own starts from the
+ * models the one before it left (nvdr.h). That is worth 0.7% on the
+ * samples and makes every photo depend on all the ones before it, so it
+ * is off unless asked for: an album a site serves one photo at a time
+ * wants each photo reachable on its own.
  *
- * A file cut short gives every image before the cut whole and the one
- * the cut lands in as far as its bytes reach.
+ * The encoder tries, for every photo, the photo alone and a prediction
+ * from the most similar earlier photos of the same size in the window, at
+ * equal quality: a prediction is coded with a finer step until it is
+ * within 0.1 dB of the photo alone, and is kept only if it is still
+ * smaller. An album is never bigger than its photos coded alone.
  */
 #ifndef NVDA_H
 #define NVDA_H
 
 #include "nvdr.h"
 
-#define NVDA_MAGIC       "NVDA"
-#define NVDA_VERSION     2
-#define NVDA_HEADER_SIZE 16
-#define NVDA_FLAG_FLUID  0x01
+#define NVDA_MAGIC        "NVDA"
+#define NVDA_VERSION      3
+#define NVDA_HEADER_SIZE  16
+#define NVDA_ENTRY_SIZE   16
+#define NVDA_FLAG_FLUID   0x01
 #define NVDA_FLAG_PREDICT 0x02   /* informational: the encoder tried kind 1 */
-#define NVDA_KIND_INTRA  0
-#define NVDA_KIND_PRED   1
-#define NVDA_MAX_IMAGES  4096
+#define NVDA_KIND_INTRA   0
+#define NVDA_KIND_PRED    1
+#define NVDA_MAX_IMAGES   4096
+#define NVDA_MAX_WINDOW   32
+#define NVDA_DEFAULT_WINDOW 8
 
-/* Encode `count` images into `path`. `bytes_out`, when given, receives each
- * image's payload size, `cold_out` what it would have been coded alone
- * with no context (encoded a second time, for the report), and `kind_out`
- * each image's kind. */
+typedef struct {
+    int    fluid;      /* carry the fluid context between photos coded alone */
+    int    predict;    /* try predicting photos from earlier ones */
+    int    window;     /* how many earlier photos a prediction may reach, 1..32 */
+    int    candidates; /* how many of them, the most similar first, to try in full */
+    double max_distance; /* thumbnails further apart than this are not tried */
+} NvdaOptions;
+
+NvdaOptions nvda_default_options(void);
+
+typedef struct {
+    size_t bytes;      /* payload */
+    size_t alone;      /* the photo coded alone, for the report */
+    int    kind;
+    int    ref;        /* reference distance, 0 when alone */
+} NvdaReport;
+
+/* Encode `count` images into `path`. `report`, when given, gets one entry
+ * per image. */
 int nvda_write(const char* path, int count, const char* const* names, const NvdrImage* imgs,
-               const NvdrConfig* cfg, int fluid, int predict,
-               size_t* bytes_out, size_t* cold_out, int* kind_out);
+               const NvdrConfig* cfg, const NvdaOptions* opt, NvdaReport* report);
+
+typedef struct {
+    uint32_t offset, length;
+    int      kind, ref, width, height, name_len;
+} NvdaEntry;
 
 typedef struct {
     const uint8_t* data;
-    size_t         size, pos;
-    uint32_t       count, index;
-    int            flags;
+    size_t         size;
+    uint32_t       count;
+    int            flags, window;
+    NvdaEntry*     index;
+    /* Decoded images kept for references: the last `window` decoded, by
+     * position. */
+    NvdrImage*     ring;
+    int*           ring_of;     /* which image each ring slot holds, -1 empty */
     NvdrContext*   ctx;
-    NvdrImage      prev;    /* the last image, what a kind-1 image predicts from */
+    int            next_fluid;  /* with the fluid context: the next image in order */
 } NvdaReader;
 
-/* 0 on success; -1 when this is not an album. `data` must outlive it. */
+/*
+ * Open an album from the bytes available. The header and the whole index
+ * must be there; images need not be. 0 on success, -1 when it is not an
+ * album or its index is damaged.
+ */
 int  nvda_open(NvdaReader* r, const uint8_t* data, size_t size);
 void nvda_close(NvdaReader* r);
 
-/* The next image: 1 with `out` allocated, 0 at the end (or at a cut before
- * any of this image's colour), -1 on damage. `name` gets the stored name,
- * NUL-terminated and cut to `cap`. */
-int  nvda_next(NvdaReader* r, char* name, size_t cap, NvdrImage* out, int* kind,
-               int* partial);
+/*
+ * Decode image `i`, decoding the images its chain of references needs
+ * first when they are not already held. 1 with `out` allocated; 0 when its
+ * bytes (or a reference's) have not arrived; -1 on damage. With the fluid
+ * context images must be read in order, and any other order returns -1.
+ * `partial` is set when the image's own bytes were cut short.
+ */
+int  nvda_decode(NvdaReader* r, int i, NvdrImage* out, int* partial);
+
+/* The image's stored name, NUL-terminated and cut to `cap`. */
+void nvda_name(const NvdaReader* r, int i, char* name, size_t cap);
 
 #endif /* NVDA_H */

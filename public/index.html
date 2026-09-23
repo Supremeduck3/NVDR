@@ -97,6 +97,9 @@
   .hud b { color: var(--text); }
   .hud .ok { color: #3fb950; }
   .hud .bad { color: #f85149; }
+  /* Video frames change 25 times a second: the browser's own smoothing,
+     not an average per frame, and never pixelated when shrunk. */
+  #vcanvas { image-rendering: auto; }
   #strip { height: 46px; margin-top: 14px; image-rendering: auto; cursor: pointer; }
 </style>
 </head>
@@ -128,10 +131,10 @@
     <div class="panel">
       <h3 style="margin:0 0 4px;font-size:.95rem">Álbum</h3>
       <p class="note" style="margin:0 0 14px">
-        As imagens vão num arquivo só, em ordem. Uma foto parecida com a anterior (rajada,
+        As imagens vão num arquivo só. Uma foto parecida com alguma das 8 anteriores (rajada,
         mesmo cenário) é prevista dela e custa só o que mudou; as outras são codificadas
-        sozinhas, com o que o codec aprendeu nas anteriores (o codebook fluido). "Sozinha" é
-        quanto cada uma custaria codificada à parte, com a mesma qualidade.
+        sozinhas, e cada foto pode ser aberta sem as outras (só com as de que depende).
+        "Sozinha" é quanto cada uma custaria codificada à parte, com a mesma qualidade.
       </p>
       <div id="albumSummary" class="note" style="margin:0 0 14px"></div>
       <div class="levels" id="albumGrid"></div>
@@ -235,7 +238,7 @@
 </main>
 
 <script type="module">
-import { decode, showRGB, layerThresholds, LAYER_NAMES }
+import { decode, showRGB, paintFitted, layerThresholds, LAYER_NAMES }
     from './nvdr.js';
 import { AlbumReader } from './nvda.js';
 
@@ -325,27 +328,30 @@ function showAlbum(buffer, report, original) {
     // "sozinha" per image, from the encoder's report when there is one.
     const alone = {};
     for (const line of report.split('\n')) {
-        const m = line.match(/^\s+(.+?)\s+(?:sozinha|prevista)\s+(\d+)\s+(\d+)\s+[-+][\d.]+%/);
-        if (m && m[1] !== 'total') alone[m[1].trim()] = +m[3];
+        const m = line.match(/^\s+(.+?)\s+(?:sozinha|prevista #\d+)\s+(\d+)\s+(\d+)\s+[-+][\d.]+%/);
+        if (m) alone[m[1].trim()] = +m[3];
     }
     albumGrid.innerHTML = '';
     const t0 = performance.now();
-    let total = 0, totalAlone = 0, n = 0, entry;
+    let total = 0, totalAlone = 0, n = 0;
     try {
-        while ((entry = reader.next())) {
-            const { width, height, rgb } = entry;
+        for (let i = 0; i < reader.count; i++) {
+            const img = reader.decode(i);
+            if (!img) break;
+            const x = reader.index[i], name = reader.name(i);
+            const bytes = Math.min(x.length, buffer.byteLength - x.offset);
             const wrap = document.createElement('div');
             wrap.className = 'level';
-            const solo = alone[entry.name];
-            wrap.innerHTML = `<h3>${entry.index + 1}. ${entry.name.replace(/[<>&]/g, '')}</h3>
-                <div class="meta">${entry.kind === 1 ? 'prevista da anterior · ' : ''}${formatBytes(entry.bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
-                `(${(100 * (entry.bytes - solo) / solo).toFixed(1)}%)` : ''}${entry.partial ? ' · parcial' : ''}</div>`;
+            const solo = alone[name];
+            wrap.innerHTML = `<h3>${i + 1}. ${name.replace(/[<>&]/g, '')}</h3>
+                <div class="meta">${x.kind === 1 ? `prevista da ${i - x.ref + 1} · ` : ''}${formatBytes(bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
+                `(${(100 * (bytes - solo) / solo).toFixed(1)}%)` : ''}${img.partial ? ' · parcial' : ''}</div>`;
             const canvas = document.createElement('canvas');
-            canvas.width = width; canvas.height = height;
             wrap.appendChild(canvas);
             albumGrid.appendChild(wrap);
-            showRGB(rgb, width, height, canvas.getContext('2d'));
-            total += entry.bytes; if (solo) totalAlone += solo; n++;
+            paintFitted(canvas, img.rgb, img.width, img.height);
+            total += bytes; if (solo) totalAlone += solo; n++;
+            if (img.partial) break;
         }
     } catch (e) { setStatus(`Álbum danificado depois de ${n} imagens.`, true); }
     const ms = performance.now() - t0;
@@ -384,6 +390,7 @@ async function handleFile(file) {
     }
 
     container = await response.arrayBuffer();
+    wholeDecode = null;
     sourceSize = file.size;
 
     const encoded = response.headers.get('X-Encoder-Report');
@@ -401,11 +408,16 @@ async function handleFile(file) {
     await showTruncated();
 }
 
+// The last decode of the whole container: the slider at 100% shows it
+// rather than decoding the same bytes again.
+let wholeDecode = null;
+
 async function showLevels() {
     const t0 = performance.now();
-    const result = decode(container, 2, true);
-    const low = decode(container, 1);
+    const result = decode(container, 2, true, null, true);
+    const low = result && { rgb: result.lowRgb };
     const decodeMs = performance.now() - t0;
+    wholeDecode = result;
 
     if (!result) {
         setStatus('Container ilegível.', true);
@@ -426,11 +438,9 @@ async function showLevels() {
               ${sourceSize ? `· ${(100 * thresholds[k] / sourceSize).toFixed(0)}% do original` : ''}
             </div>`;
         const canvas = document.createElement('canvas');
-        canvas.width = header.width;
-        canvas.height = header.height;
         wrap.appendChild(canvas);
         levelsEl.appendChild(wrap);
-        showRGB(rgb, header.width, header.height, canvas.getContext('2d'));
+        paintFitted(canvas, rgb, header.width, header.height);
     });
 
     truncCanvas.width = header.width;
@@ -455,10 +465,11 @@ async function showTruncated() {
     const kept = Math.floor(container.byteLength * fraction);
     const prefix = container.slice(0, kept);
 
-    const result = decode(prefix);
+    const result = kept === container.byteLength && wholeDecode ? wholeDecode : decode(prefix);
     const ctx = truncCanvas.getContext('2d');
 
     if (!result) {
+        truncCanvas._nvdrShown = null;   // nothing for a resize to redraw
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, truncCanvas.width, truncCanvas.height);
         truncOut.innerHTML =
@@ -467,7 +478,7 @@ async function showTruncated() {
         return;
     }
 
-    showRGB(result.rgb, result.header.width, result.header.height, ctx);
+    paintFitted(truncCanvas, result.rgb, result.header.width, result.header.height);
     const [cor, baixa, alta] = result.tilesComplete;
     truncOut.innerHTML =
         `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +

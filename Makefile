@@ -8,7 +8,7 @@ CC      = gcc
 # per-block and shares nothing. Without it the pragmas are ignored and the
 # build still works.
 OPENMP  = $(shell $(CC) -fopenmp -E - < /dev/null > /dev/null 2>&1 && echo -fopenmp)
-CFLAGS  = -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
+CFLAGS  = -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
 LDLIBS  = -lm -lz
 
 CODEC   = src/nvdr.c src/entropy.c
@@ -49,7 +49,18 @@ fuzz_nvdr: scripts/fuzz.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
 
 fuzz: fuzz_nvdr
 
+# The example files public/galeria.html shows: one image, and an album
+# whose photos are a pan over one sample, interleaved with other samples.
+demo: nvdr_encode nvdr_album
+	mkdir -p public/demo output/demo_frames
+	$(CC) -std=c11 -O2 -Isrc -Ivendor -o output/frames scripts/analysis/frames.c $(CODEC) $(LDLIBS)
+	./output/frames samples/montanha_pessoas.jpg output/demo_frames pan 6
+	./nvdr_encode samples/montanha_pessoas.jpg public/demo/montanha.nvdr > /dev/null
+	./nvdr_album pack public/demo/galeria.nvda output/demo_frames/f000.ppm samples/OIP-1304511485.jpg \
+	    output/demo_frames/f001.ppm output/demo_frames/f002.ppm samples/OIP-4140498144.jpg \
+	    output/demo_frames/f003.ppm output/demo_frames/f004.ppm output/demo_frames/f005.ppm
+
 clean:
 	rm -f $(TOOLS) fuzz_nvdr
 
-.PHONY: all check clean fuzz
+.PHONY: all check clean fuzz demo

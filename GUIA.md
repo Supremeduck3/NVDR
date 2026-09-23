@@ -238,6 +238,8 @@ não uma falha.
   (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
   em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
+- **`--quiet`** — só grava o arquivo, sem a tabela por camada (que decodifica
+  o arquivo três vezes para medir o PSNR).
 
 ---
 
@@ -251,17 +253,24 @@ não uma falha.
 As imagens vão em ordem num `.nvda`. Cada uma é codificada de um de dois
 jeitos, e o encoder escolhe:
 
-- **prevista da anterior**, quando é do mesmo tamanho e parecida (rajada,
-  mesmo cenário, capturas de tela). Usa o mesmo mecanismo dos quadros de
-  vídeo: movimento em quarto de pixel, skip e só o que mudou.
-- **sozinha**, aproveitando o que o codec aprendeu nas anteriores (o
-  **codebook fluido**: as probabilidades do codificador aritmético, em vez
-  de começar do zero).
+- **prevista de uma foto anterior**: de **qualquer uma** das últimas 8
+  (`--window N`, até 32), desde que do mesmo tamanho. O encoder procura as
+  mais parecidas por miniatura e tenta as duas melhores. Usa o mesmo
+  mecanismo dos quadros de vídeo: movimento em quarto de pixel, skip e só
+  o que mudou. Serve para rajada, mesmo cenário, capturas de tela, e
+  também para um ensaio que vai e volta entre dois assuntos.
+- **sozinha**, quando nenhuma anterior ajuda.
 
 A comparação é feita **com a mesma qualidade**: a versão prevista é
 refinada até ficar tão boa quanto a sozinha, e só ganha se continuar
-menor. O `pack` mostra, por imagem, o tipo escolhido, quanto ela custou e
-quanto custaria sozinha.
+menor. O `pack` mostra, por imagem, o tipo escolhido (`prevista #k` diz de
+qual foto), quanto ela custou e quanto custaria sozinha.
+
+Para tirar **uma foto só** do álbum (decodifica só ela e as de que depende):
+
+```bash
+./nvdr_album unpack /tmp/album.nvda /tmp/saida --only 3
+```
 
 Na página, solte **várias imagens de uma vez** na aba Imagem: elas viram
 um álbum, mostrado em grade com o tamanho de cada uma. Um `.nvda` pronto
@@ -271,11 +280,49 @@ abre direto.
 
 | álbum | economia |
 |---|---|
-| fotos sem relação | ~0,7% (só o codebook fluido) |
+| fotos sem relação | 0% (nunca fica maior) |
 | fotos do mesmo cenário, 0,4 s entre elas | ~39% |
 | rajada, 0,12 s entre elas | ~58% |
+| dois cenários intercalados | ~66% (com `--window 1` seria 0%) |
 
-Um álbum nunca sai maior que as imagens codificadas sozinhas.
+Álbuns de fotos grandes demoram: cada foto é codificada sozinha e,
+quando parece com uma anterior, também prevista dela, para comparar. Fotos
+cujas miniaturas diferem mais que `--distance` (10 por padrão) nem são
+tentadas. Numa máquina de 4 núcleos, três fotos de 13,5 Mpx levam ~20 s
+sem relação entre si e ~47 s quando uma repete a outra.
+
+`--fluid` liga o **codebook fluido** (as probabilidades do codificador
+aritmético passam de uma foto para a próxima): mais ~0,7%, mas aí cada foto
+depende de todas as anteriores e o álbum só pode ser lido em ordem. Por
+isso vem desligado.
+
+### Usando num site
+
+O arquivo continua com as propriedades quando vai para um site. Coloque
+o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`) junto do site e use o
+elemento no lugar do `<img>`:
+
+```html
+<script type="module" src="nvdr-img.js"></script>
+<nvdr-img src="foto.nvdr" alt="Montanha"></nvdr-img>
+<nvdr-img src="galeria.nvda#3" alt="Terceira foto do álbum"></nvdr-img>
+<nvdr-img src="galeria.nvda#praia.jpg"></nvdr-img>
+```
+
+- **Uma imagem `.nvdr`** aparece enquanto baixa e melhora a cada byte.
+- **Uma foto de álbum** baixa só o índice, ela e as fotos de que ela
+  depende (requisições HTTP com `Range`), não o álbum inteiro. Várias fotos
+  do mesmo álbum na página compartilham o que já baixaram: uma grade com o
+  álbum todo baixa o tamanho do álbum, uma vez.
+- Qualquer servidor estático serve (nginx, Apache, CDN, S3: todos aceitam
+  `Range`). Se o servidor não aceitar, o álbum vem inteiro e funciona igual.
+
+Para ver funcionando:
+
+```bash
+make demo          # gera public/demo/montanha.nvdr e public/demo/galeria.nvda
+node server.js     # abra http://localhost:3000/galeria.html
+```
 
 ---
 
@@ -385,3 +432,11 @@ entre dois blocos chapados a emenda é a própria imagem e fica.
 
 **PSNR não enxerga tudo.** Ele mede erro absoluto, então é cego para onde
 o erro está. Quando avaliar uma mudança, olhe a imagem, não só o número.
+
+**Uma foto granulada (céu noturno, parede texturizada) aparecia cheia de
+pontos brancos na terceira camada ou na grade do álbum.** Os pixels
+estavam certos; o navegador é que, ao reduzir o canvas, pegava um pixel a
+cada 10×10 e jogava o resto fora, e sobravam grãos soltos. Agora a página
+reduz a imagem pela média de todos os pixels, como o olho faria. Se ainda
+aparecer, compare com `./nvdr_decode arquivo.nvdr saida.png` aberto num
+visualizador de imagens: se lá estiver limpo, o problema é de exibição.

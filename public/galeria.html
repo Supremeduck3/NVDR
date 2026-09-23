@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVDR num site</title>
+<style>
+  :root { --bg: #f6f5f2; --fg: #1d1d1b; --muted: #6b6a66; --line: #dddbd5; --accent: #2f5d8a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --fg: #ecebe7; --muted: #9a9892; --line: #2f2e2b; --accent: #8db4dc; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 40px 0 6px; }
+  p { color: var(--muted); margin: 0 0 14px; max-width: 70ch; }
+  code { font-size: .9em; }
+  .hero { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .row { display: flex; gap: 12px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line);
+           background: transparent; color: var(--fg); cursor: pointer; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+  figure { margin: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  figcaption { font-size: .82rem; color: var(--muted); padding: 6px 10px; }
+  nvdr-img { width: 100%; }
+  #missing { color: #b3261e; }
+</style>
+<script type="module" src="nvdr-img.js"></script>
+</head>
+<body>
+<main>
+  <h1>NVDR num site</h1>
+  <p>Esta página usa as imagens como um site usaria: um elemento <code>&lt;nvdr-img&gt;</code> no
+    lugar do <code>&lt;img&gt;</code>, apontando para arquivos servidos como qualquer outro.</p>
+  <p id="missing" hidden>Os arquivos de exemplo ainda não existem: rode <code>make demo</code> e recarregue.</p>
+
+  <h2>Uma imagem, chegando aos poucos</h2>
+  <p>A imagem aparece antes do download terminar e melhora a cada byte: primeiro a cor, depois a
+    textura grossa da imagem inteira, depois o detalhe. Aqui a conexão está limitada a
+    <span id="rate">24</span> KB/s para dar para ver.</p>
+  <div class="row">
+    <button id="again">Carregar de novo</button>
+    <span id="heroInfo"></span>
+  </div>
+  <div class="hero"><nvdr-img id="hero" src="demo/montanha.nvdr" throttle="24000" alt="Montanha com pessoas"></nvdr-img></div>
+
+  <h2>Uma galeria, foto por foto</h2>
+  <p>As fotos estão todas num álbum <code>galeria.nvda</code>, onde uma foto parecida com uma anterior
+    guarda só o que mudou. Cada foto abaixo é um elemento separado, e cada um baixa só a sua parte do
+    arquivo: a própria foto e as fotos de que ela depende, pelo índice no começo do álbum. O que
+    uma foto já baixou as outras reaproveitam, então a página inteira baixa o álbum uma vez só.</p>
+  <p id="albumInfo"></p>
+  <div class="grid" id="grid"></div>
+</main>
+<script type="module">
+const hero = document.getElementById('hero');
+const heroInfo = document.getElementById('heroInfo');
+hero.addEventListener('load', e => { heroInfo.textContent = `${(e.detail.bytes / 1024).toFixed(1)} KB`; });
+hero.addEventListener('error', () => { document.getElementById('missing').hidden = false; });
+document.getElementById('again').addEventListener('click', () => {
+    heroInfo.textContent = 'carregando…';
+    hero.setAttribute('src', 'demo/montanha.nvdr?' + Date.now());
+});
+
+// How many photos the album holds: its first 16 bytes say so.
+const res = await fetch('demo/galeria.nvda', { headers: { Range: 'bytes=0-15' } });
+if (!res.ok) { document.getElementById('missing').hidden = false; }
+else {
+    const head = new DataView(await res.arrayBuffer());
+    const count = head.getUint32(6, true);
+    const size = Number((res.headers.get('Content-Range') || '').split('/')[1]) || 0;
+    const info = document.getElementById('albumInfo');
+    let fetched = 0, done = 0;
+    const grid = document.getElementById('grid');
+    for (let i = 1; i <= count; i++) {
+        const fig = document.createElement('figure');
+        const img = document.createElement('nvdr-img');
+        const cap = document.createElement('figcaption');
+        cap.textContent = `foto ${i}`;
+        img.addEventListener('load', e => {
+            cap.textContent = `foto ${i} · +${(e.detail.bytes / 1024).toFixed(1)} KB`;
+            fetched += e.detail.bytes;
+            if (++done === count && size)
+                info.textContent = `O álbum inteiro tem ${(size / 1024).toFixed(1)} KB; a página baixou ` +
+                    `${(fetched / 1024).toFixed(1)} KB para mostrar todas as fotos. Uma página ` +
+                    `que mostrasse uma foto só baixaria a foto e a corrente dela.`;
+        });
+        img.setAttribute('src', `demo/galeria.nvda#${i}`);
+        fig.append(img, cap);
+        grid.append(fig);
+    }
+}
+</script>
+</body>
+</html>
