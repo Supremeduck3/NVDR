@@ -15,13 +15,18 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 6;
+const VERSION = 7;
 const HEADER_SIZE = 24;
-const FRAME_HEADER = 12;
+const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
+const MV_MAX = 384;            // NVDRV_MV_MAX, quarter pixels
+const MAX_DPB = 15 + 3;        // NVDRV_MAX_DPB
+const MV_ESC_ALBUM = 8, MV_ESC_SEQ = 10;
 
 export const INTRA = 0;
 export const PRED = 1;
+export const BI = 2;
+const MODE_BI = 0, MODE_FWD = 1, MODE_BWD = 2;
 
 function clamp255(v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
@@ -34,7 +39,8 @@ export function readSequenceHeader(buffer) {
         height: view.getUint16(8, true),
         frameCount: view.getUint32(10, true),
         fps: view.getUint8(14),
-        gop: view.getUint8(15)
+        gop: view.getUint8(15),
+        bframes: view.getUint8(16)
     };
     // Every frame buffer is sized from this before a frame is read.
     if (!info.width || !info.height || info.width * info.height > MAX_PIXELS) return null;
@@ -53,7 +59,7 @@ function median3(a, b, c) {
     return c < a ? a : (c > b ? b : c);
 }
 
-function mvComponent(dec, m, c, canBeZero) {
+function mvComponent(dec, m, c, canBeZero, esc) {
     if (canBeZero && !dec.bit(m.zero, c)) return 0;
     const negative = dec.bit(m.sign, c);
     let remaining = 0, i = 0;
@@ -61,45 +67,97 @@ function mvComponent(dec, m, c, canBeZero) {
         if (!dec.bit(m.mag[c], i)) break;
         remaining = i + 1;
     }
-    if (i === MV_MAG_CTX) remaining = MV_MAG_CTX + dec.direct(8);
+    if (i === MV_MAG_CTX) remaining = MV_MAG_CTX + dec.direct(esc);
     return negative ? -(remaining + 1) : remaining + 1;
 }
 
-/* Returns false where unpack_field returns -1: a vector outside int8. */
-function unpackField(bytes, offset, len, nbx, nby, gdx, gdy, vx, vy) {
-    const m = {
+function mvModels() {
+    return {
         same: new Uint16Array(3).fill(PROB_INIT),
         zero: new Uint16Array(2).fill(PROB_INIT),
         sign: new Uint16Array(2).fill(PROB_INIT),
         mag: [new Uint16Array(MV_MAG_CTX).fill(PROB_INIT),
               new Uint16Array(MV_MAG_CTX).fill(PROB_INIT)]
     };
+}
+
+/* mv_predict(): the median of left, top and top-right, the global vector
+ * off the frame, the left one alone on the top row. */
+function mvPredict(vx, vy, nbx, b, gdx, gdy, out) {
+    const x = b % nbx, y = (b - x) / nbx;
+    if (y === 0) {
+        out[0] = x > 0 ? vx[b - 1] : gdx;
+        out[1] = x > 0 ? vy[b - 1] : gdy;
+        return;
+    }
+    const t = b - nbx;
+    const lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
+    const rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
+    out[0] = median3(lx, vx[t], rx);
+    out[1] = median3(ly, vy[t], ry);
+}
+
+const PRED2 = new Int32Array(2);
+
+/* dec_vector(): false for a vector outside -lim-1 .. lim, which is damage. */
+function decVector(dec, m, same, vx, vy, nbx, b, gdx, gdy, esc, lim) {
+    mvPredict(vx, vy, nbx, b, gdx, gdy, PRED2);
+    const x = b % nbx;
+    const ctx = (x > 0 && same[b - 1] ? 1 : 0) + (b >= nbx && same[b - nbx] ? 1 : 0);
+    same[b] = dec.bit(m.same, ctx) ? 0 : 1;
+    let ex = 0, ey = 0;
+    if (!same[b]) {
+        ex = mvComponent(dec, m, 0, true, esc);
+        ey = mvComponent(dec, m, 1, ex !== 0, esc);
+    }
+    const nx = PRED2[0] + ex, ny = PRED2[1] + ey;
+    if (nx < -lim - 1 || nx > lim || ny < -lim - 1 || ny > lim) return false;
+    vx[b] = nx; vy[b] = ny;
+    return true;
+}
+
+function inheritVector(same, vx, vy, nbx, b, gdx, gdy) {
+    mvPredict(vx, vy, nbx, b, gdx, gdy, PRED2);
+    vx[b] = PRED2[0]; vy[b] = PRED2[1];
+    same[b] = 1;
+}
+
+/* Returns false where unpack_field returns -1. */
+function unpackField(bytes, offset, len, nbx, nby, gdx, gdy, vx, vy, esc, lim) {
+    const m = mvModels();
     const nb = nbx * nby;
     const same = new Uint8Array(nb);
     const dec = new ArithDecoder(bytes, offset, len);
+    for (let b = 0; b < nb; b++)
+        if (!decVector(dec, m, same, vx, vy, nbx, b, gdx, gdy, esc, lim)) return false;
+    return true;
+}
+
+function modeCtx(mode, nbx, b, which) {
+    const x = b % nbx;
+    let n = 0;
+    if (x > 0) n += which ? (mode[b - 1] === MODE_BWD ? 1 : 0) : (mode[b - 1] !== MODE_BI ? 1 : 0);
+    if (b >= nbx) n += which ? (mode[b - nbx] === MODE_BWD ? 1 : 0) : (mode[b - nbx] !== MODE_BI ? 1 : 0);
+    return n;
+}
+
+/* unpack_field_bi(): per block the mode, then each used list's vector. */
+function unpackFieldBi(bytes, offset, len, nbx, nby, g0x, g0y, g1x, g1y, mode, v0x, v0y, v1x, v1y) {
+    const l0 = mvModels(), l1 = mvModels();
+    const notBi = new Uint16Array(3).fill(PROB_INIT), bwd = new Uint16Array(3).fill(PROB_INIT);
+    const nb = nbx * nby;
+    const same0 = new Uint8Array(nb), same1 = new Uint8Array(nb);
+    const dec = new ArithDecoder(bytes, offset, len);
     for (let b = 0; b < nb; b++) {
-        const x = b % nbx, y = (b - x) / nbx;
-        let px, py;
-        if (y === 0) {
-            px = x > 0 ? vx[b - 1] : gdx;
-            py = x > 0 ? vy[b - 1] : gdy;
-        } else {
-            const t = b - nbx;
-            const lx = x > 0 ? vx[b - 1] : gdx, ly = x > 0 ? vy[b - 1] : gdy;
-            const rx = x + 1 < nbx ? vx[t + 1] : gdx, ry = x + 1 < nbx ? vy[t + 1] : gdy;
-            px = median3(lx, vx[t], rx);
-            py = median3(ly, vy[t], ry);
-        }
-        const ctx = (x > 0 && same[b - 1] ? 1 : 0) + (y > 0 && same[b - nbx] ? 1 : 0);
-        same[b] = dec.bit(m.same, ctx) ? 0 : 1;
-        let ex = 0, ey = 0;
-        if (!same[b]) {
-            ex = mvComponent(dec, m, 0, true);
-            ey = mvComponent(dec, m, 1, ex !== 0);
-        }
-        const nx = px + ex, ny = py + ey;
-        if (nx < -128 || nx > 127 || ny < -128 || ny > 127) return false;
-        vx[b] = nx; vy[b] = ny;
+        mode[b] = MODE_BI;
+        if (dec.bit(notBi, modeCtx(mode, nbx, b, 0)))
+            mode[b] = dec.bit(bwd, modeCtx(mode, nbx, b, 1)) ? MODE_BWD : MODE_FWD;
+        if (mode[b] !== MODE_BWD) {
+            if (!decVector(dec, l0, same0, v0x, v0y, nbx, b, g0x, g0y, MV_ESC_SEQ, MV_MAX)) return false;
+        } else inheritVector(same0, v0x, v0y, nbx, b, g0x, g0y);
+        if (mode[b] !== MODE_FWD) {
+            if (!decVector(dec, l1, same1, v1x, v1y, nbx, b, g1x, g1y, MV_ESC_SEQ, MV_MAX)) return false;
+        } else inheritVector(same1, v1x, v1y, nbx, b, g1x, g1y);
     }
     return true;
 }
@@ -146,7 +204,9 @@ const SG = new Int32Array((MAXB + 6) * (MAXB + 6) * 3);
 
 const clip8 = v => (v < 0 ? 0 : v > 255 ? 255 : v);
 
-function blockPredict(src, dst, width, height, block, vx, vy) {
+/* Blocks whose `mode` is `skip` are left alone (a B frame's blocks that do
+ * not read this reference). */
+function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip = -1) {
     const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
     const stride = width * 3;
     for (let by = 0; by < nby; by++) {
@@ -154,6 +214,7 @@ function blockPredict(src, dst, width, height, block, vx, vy) {
         for (let bx = 0; bx < nbx; bx++) {
             const x0 = bx * block, bw = Math.min(block, width - x0);
             const b = by * nbx + bx, fx = vx[b], fy = vy[b];
+            if (mode && mode[b] === skip) continue;
             const X0 = x0 + (fx >> 2), Y0 = y0 + (fy >> 2);
             const phase = ((fy & 3) << 2) | (fx & 3);
             // Clamped source columns X0-2 .. X0+bw+3 and rows Y0-2 .. Y0+bh+3.
@@ -287,8 +348,8 @@ export function predictDecode(ref, width, height, data) {
     const fieldLen = v.getUint32(5, true);
     if (fieldLen > data.length - 9) return null;
     const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
-    const vx = new Int8Array(nbx * nby), vy = new Int8Array(nbx * nby);
-    if (!unpackField(data, 9, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy)) return null;
+    const vx = new Int16Array(nbx * nby), vy = new Int16Array(nbx * nby);
+    if (!unpackField(data, 9, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy, MV_ESC_ALBUM, 127)) return null;
     const pred = new Uint8Array(width * height * 3), err = new Uint8Array(width * height * 3);
     blockPredict(ref, pred, width, height, block, vx, vy);
     if (!reconstruct(data.subarray(9 + fieldLen), err, width, height)) return null;
@@ -296,33 +357,74 @@ export function predictDecode(ref, width, height, data) {
     return pred;
 }
 
+/*
+ * find_refs(): among the held frames, the nearest before `display` and
+ * the nearest after it, as indices, -1 where there is none.
+ */
+function findRefs(dpb, display) {
+    let before = -1, after = -1;
+    for (let i = 0; i < dpb.length; i++) {
+        const d = dpb[i].display;
+        if (d < display && (before < 0 || d > dpb[before].display)) before = i;
+        if (d > display && (after < 0 || d < dpb[after].display)) after = i;
+    }
+    return [before, after];
+}
+
 /**
- * Plays a sequence frame by frame. `next()` resolves to
- *   { kind, partial, pixels }   — a frame; `pixels` is the decoder state
- *   null                        — the stream ended
+ * Plays a sequence frame by frame, in display order. `next()` resolves to
+ *   { index, kind, partial, pixels }   — a frame; `index` is its display
+ *                                        number, `pixels` its RGB
+ *   null                               — the stream ended
  * and throws on a container that does not make sense, where the C decoder
- * returns -1.
- *
- * `pixels` is the live state, overwritten by the next frame: copy it if
- * it has to outlive the call.
+ * returns -1. Frames are stored in coding order (an anchor, then the B
+ * frames before it), so a frame is shown once every frame before it has
+ * been; mirrors nvdrv_decode_next().
  */
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v6 file');
+        if (!this.info) throw new Error('not an NVDRV v7 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
-        this.state = new Uint8Array(n);
-        this.scratch = new Uint8Array(n);
+        this.pred = new Uint8Array(n);
+        this.pred1 = new Uint8Array(n);
         this.error = new Uint8Array(n);
-        this.index = 0;
+        this.dpb = [];
+        this.nextOut = 0;
+        this.ended = false;
     }
 
     async next() {
+        for (;;) {
+            const i = this.dpb.findIndex(s => s.display === this.nextOut);
+            if (i >= 0) {
+                const s = this.dpb[i];
+                const shown = this.nextOut++;
+                // Every frame still to come predicts from this one or later.
+                this.dpb = this.dpb.filter(x => x.display >= shown);
+                return { index: s.display, kind: s.kind, partial: s.partial, pixels: s.pixels };
+            }
+            if (!this.ended) {
+                if (!this.decodeOne()) this.ended = true;
+                continue;
+            }
+            // A cut file ended with frames missing: skip to the next one
+            // that did arrive.
+            let next = -1;
+            for (const s of this.dpb) if (s.display > this.nextOut && (next < 0 || s.display < next)) next = s.display;
+            if (next < 0) return null;
+            this.nextOut = next;
+        }
+    }
+
+    /* decode_one(): true when a frame was decoded, false at the end of the
+     * stream; throws on damage. */
+    decodeOne() {
         const { width, height } = this.info;
         const bytes = this.bytes, size = bytes.length;
-        if (this.pos + FRAME_HEADER > size) return null;
+        if (this.pos + FRAME_HEADER > size) return false;
 
         const view = new DataView(bytes.buffer, bytes.byteOffset + this.pos, FRAME_HEADER);
         const kind = view.getUint8(0);
@@ -330,31 +432,66 @@ export class SequenceDecoder {
         const dx = view.getInt16(2, true);
         const dy = view.getInt16(4, true);
         let len = view.getUint32(6, true);
-        if (kind !== INTRA && kind !== PRED) throw new Error('bad frame type');
+        const dx1 = view.getInt16(10, true);
+        const dy1 = view.getInt16(12, true);
+        const display = view.getUint32(14, true);
+        if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
         if (kind === INTRA && block) throw new Error('intra frame with a motion field');
+        if (block && (block < 4 || block > 128)) throw new Error('bad block size');
+        if (kind === BI && !block) throw new Error('B frame without a motion field');
+        if (display > 0x3fffffff) throw new Error('bad display number');
+        if (display < this.nextOut || this.dpb.length >= MAX_DPB ||
+            this.dpb.some(s => s.display === display)) throw new Error('frame out of order');
+        const [before, after] = findRefs(this.dpb, display);
+        if (kind !== INTRA && before < 0) throw new Error('predicted frame without a reference');
+        if (kind === BI && after < 0) throw new Error('B frame without a reference after it');
         this.pos += FRAME_HEADER;
 
-        let ref = this.state;
-        if (kind === PRED && block) {
+        let ref = kind === INTRA ? null : this.dpb[before].pixels;
+        if (block) {
             // The field has to arrive whole: without it there is no
             // reference to add the residual to, so a cut inside it ends
             // the stream.
-            if (this.pos + 4 > size || len < 4) return null;
+            if (this.pos + 4 > size || len < 4) return false;
             const fieldLen = new DataView(bytes.buffer, bytes.byteOffset + this.pos, 4)
                 .getUint32(0, true);
-            if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return null;
-            const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
-            const vx = new Int8Array(nbx * nby), vy = new Int8Array(nbx * nby);
-            // The field is in quarter pixels, the global vector in whole ones.
-            if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4, vx, vy))
-                throw new Error('motion field is damaged');
-            blockPredict(this.state, this.scratch, width, height, block, vx, vy);
-            ref = this.scratch;
+            if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return false;
+            const nbx = Math.ceil(width / block), nby = Math.ceil(height / block), nb = nbx * nby;
+            const v0x = new Int16Array(nb), v0y = new Int16Array(nb);
+            // The field is in quarter pixels, the global vectors in whole ones.
+            if (kind === PRED) {
+                if (!unpackField(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4, v0x, v0y,
+                                 MV_ESC_SEQ, MV_MAX))
+                    throw new Error('motion field is damaged');
+                blockPredict(ref, this.pred, width, height, block, v0x, v0y);
+            } else {
+                const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
+                if (!unpackFieldBi(bytes, this.pos + 4, fieldLen, nbx, nby, dx * 4, dy * 4,
+                                   dx1 * 4, dy1 * 4, mode, v0x, v0y, v1x, v1y))
+                    throw new Error('motion field is damaged');
+                const P0 = this.pred, P1 = this.pred1;
+                blockPredict(ref, P0, width, height, block, v0x, v0y, mode, MODE_BWD);
+                blockPredict(this.dpb[after].pixels, P1, width, height, block, v1x, v1y, mode, MODE_FWD);
+                // Backward blocks take the second prediction, the mean
+                // blocks the rounded mean of both; forward ones are in P0.
+                const stride = width * 3;
+                for (let b = 0; b < nb; b++) {
+                    if (mode[b] === MODE_FWD) continue;
+                    const x0 = (b % nbx) * block, y0 = Math.floor(b / nbx) * block;
+                    const n = Math.min(block, width - x0) * 3, h = Math.min(block, height - y0);
+                    for (let j = 0; j < h; j++) {
+                        const o = (y0 + j) * stride + x0 * 3;
+                        if (mode[b] === MODE_BWD) P0.set(P1.subarray(o, o + n), o);
+                        else for (let k = o; k < o + n; k++) P0[k] = (P0[k] + P1[k] + 1) >> 1;
+                    }
+                }
+            }
+            ref = this.pred;
             this.pos += 4 + fieldLen;
             len -= 4 + fieldLen;
         } else if (kind === PRED && (dx || dy)) {
-            shiftInto(this.state, this.scratch, width, height, dx, dy);
-            ref = this.scratch;
+            shiftInto(ref, this.pred, width, height, dx, dy);
+            ref = this.pred;
         }
 
         // A cut file ends mid-frame. The still decoder reads as far as the
@@ -362,28 +499,22 @@ export class SequenceDecoder {
         const have = size - this.pos;
         let partial = false;
         if (len > have) { len = have; partial = true; }
-        if (len === 0) return null;
+        if (len === 0) return false;
 
         const body = bytes.subarray(this.pos, this.pos + len);
-        if (kind === INTRA) {
-            // A frame cut before its colour layer ends the stream.
-            if (!reconstruct(body, this.state, width, height)) {
-                if (partial) return null;
-                throw new Error('frame does not decode');
-            }
-        } else {
-            if (!reconstruct(body, this.error, width, height)) {
-                if (partial) return null;
-                throw new Error('frame does not decode');
-            }
-            const err = this.error, st = this.state;
-            for (let i = 0; i < st.length; i++)
-                st[i] = clamp255(err[i] - 128 + ref[i]);
+        const pixels = new Uint8Array(width * height * 3);
+        // A frame cut before its colour layer ends the stream.
+        if (!reconstruct(body, kind === INTRA ? pixels : this.error, width, height)) {
+            if (partial) return false;
+            throw new Error('frame does not decode');
         }
-
+        if (kind !== INTRA) {
+            const err = this.error;
+            for (let i = 0; i < pixels.length; i++) pixels[i] = clamp255(err[i] - 128 + ref[i]);
+        }
+        this.dpb.push({ display, kind, partial, pixels });
         this.pos += len;
-        const index = this.index++;
-        return { index, kind, partial, pixels: this.state };
+        return true;
     }
 }
 

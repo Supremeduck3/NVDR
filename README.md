@@ -234,6 +234,80 @@ The filter alone is 1.6% on luma and 2.4 to 3.1% on RGB. The rest is the
 colour, which is worth most where the noise is: colour noise costs a
 residual as much as detail does.
 
+### B frames (sequence format 7)
+
+Every eighth frame is now an anchor, an I or a P frame, and the seven
+between are B frames. The encoder holds them until the anchor arrives,
+codes the anchor from the anchor before it, then the frame halfway
+between the two, then the frame halfway through each half. Each B frame
+is predicted per block from the nearest decoded frame before it, the
+nearest after it, or the rounded mean of both. The mean is what makes
+them cheap: two independent guesses at the same content average their
+noise and interpolation error down, and the background a moving object
+uncovers, which one reference cannot see, the other usually can.
+
+Nothing in the file names a reference. Every frame header carries its
+display number (the header grew to 20 bytes), and a P frame predicts
+from the decoded frame nearest before it in display order, a B frame
+from the nearest before and after. The coding order above makes that
+rule pick the frames it means. Decoders keep the decoded frames from the
+one last shown onward (never more than NVDRV_MAX_DPB) and show a frame
+once every frame before it has been shown.
+
+The field of a B frame codes, per block, its mode as two adaptive bits
+("not the mean", then "backward"), each conditioned on the left and top
+neighbours, then the vector of each list it uses against that list's own
+median prediction. A list the block does not use takes its prediction as
+its vector, for free, so the next blocks' predictions stay continuous.
+The encoder searches each list like a P frame's field, then walks the
+blocks in coding order and picks mode and vectors by error plus bits.
+
+Four more things were needed before B frames paid off:
+
+- **Vectors of 16 bits.** An anchor eight frames from its reference
+  under a pan moves 25 px or more, past the int8 field's 32 px limit for
+  anything faster. Sequence fields now hold +-96 px (NVDRV_MV_MAX); album
+  fields keep int8 and their 8-bit escape, so albums are unchanged.
+- **A coarse search.** At eight frames an object crossing at 5 px a frame
+  is 40 px off, far outside the +-4 px window around the global vector.
+  Each block also searches a 4x4-averaged copy of both frames over 8 px
+  per frame of distance, and the full-resolution search looks around the
+  coarse winner too. On the 25-frame clips that took B frames from -1.7%
+  and +42% to -29% and -8%.
+- **Lambda that follows q.** A bit of field is worth more error the
+  coarser the residual that would fix it: the vector weight is now
+  `mv_lambda * q / 24`. Before, B frames at q 80 spent more on their
+  field than on their residual, picking modes by one-level differences.
+- **Mode switches priced higher.** A mode unlike its neighbours' costs
+  more than its own bits; weighing a mismatch as 4 bits was 1.5 to 2%.
+
+The steps: P frames 1.4 times the intra step when B frames are on, and
+each B level 1 + 0.5 x level times the P step (so 1.5, 2 and 2.5 times).
+Within a group the luma PSNR swings about 0.5 dB between levels.
+
+BD-rate against format 6 (P frames only), luma, q 12 to 48, 25 frames:
+
+    clip                                      bframes 7   bframes 3   15
+    pan over a photo, whole pixels, clean       -11.4%      -8.9%   -12.2%
+    subpixel pan, zoom, object, clean           -31.5%     -29.2%   -29.8%
+    the same with sensor noise                  -29.1%     -25.3%   -27.9%
+
+And the full 48 frames against the browser's own encoders
+(`scripts/bench_video.mjs`, WebCodecs, BD-rate on PSNR-Y, negative means
+NVDRV is smaller):
+
+    clip                                   vs VP8    vs VP9    vs AV1
+    subpixel pan, zoom, object, clean      -44.3%    -25.6%    -18.9%
+    the same with sensor noise             -40.3%    -15.7%     -0.6%
+
+Before B frames the same clips stood at +18 to +22% against VP9 and AV1.
+WebCodecs' encoders are built for real time; an offline encoder at its
+slow settings is the harder comparison, measured below.
+
+A cut file now loses the B frames of the group it lands in: the prefix
+shows every group before the cut, then the next anchor (partial if the
+cut is inside it) and whichever of its B frames arrived.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
@@ -1750,7 +1824,7 @@ the motion that stays whole where the vectors agree. At the default
 tolerance the residual is still 12 KB of the 15 KB frame, and that is
 fix (b).
 
-Not here yet: B-frames.
+B frames came later: see "B frames (sequence format 7)".
 
 ## Layout
 

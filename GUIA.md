@@ -376,12 +376,20 @@ Parâmetros:
   intra mesmo fora do GOP (default 24). É assim que corte de cena é
   detectado, não declarado.
 - **`--q N`** — o passo de quantização dos quadros intra (default 24), e
-  **`--pred-q N`** o dos quadros preditos (default 1,2× o `--q`).
+  **`--pred-q N`** o dos quadros P (default 1,4× o `--q` com quadros B,
+  1,2× sem).
 - **`--block N`** — movimento por bloco de NxN, com vetores em **quarto de
   pixel** (default: 16 a partir de 0,2 Mpx, 8 abaixo; `0` usa um vetor só
   para o quadro todo).
 - **`--mv-lambda N`** — quanto um bit de vetor pesa contra o erro do bloco
   (default 16).
+- **`--bframes N`** — quadros B entre duas âncoras (default 7; `0` volta a
+  só quadros P). Cada B é previsto do quadro decodificado mais próximo antes
+  e do mais próximo depois, por bloco de um, do outro ou da média dos dois.
+  Nos clipes de teste isso deixou o arquivo **11 a 31% menor** na mesma
+  qualidade.
+- **`--b-q-step F`** — quanto cada nível de B é mais grosso que os P
+  (default 0,5: níveis 1, 2 e 3 a 1,5×, 2× e 2,5× o passo dos P).
 - **`--skip-k F`** — quão facilmente um quadro predito deixa um bloco
   **exatamente como estava** no quadro anterior, em vez de recodificar a
   pequena diferença (default 0,25; `0` corrige todos). É o que tira a

@@ -67,7 +67,28 @@ static void usage(const char* a0) {
         "                   (default 0.25; 0 corrects every block)\n"
         "  --mv-lambda N    weight of one motion-field bit against block error\n"
         "                   (default 16; 0 keeps each block's best-matching vector)\n"
+        "  --bframes N      B frames between anchors (default 7; 0 = P frames only)\n"
+        "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.15)\n"
         "  --limit N        stop after N frames\n", a0);
+}
+
+typedef struct { size_t total, intra_total; int intra_count, count; } Totals;
+
+static const char* kind_name(int kind) {
+    return kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : "bi";
+}
+
+/* Frames are reported as they are written, in coding order. */
+static void report(void* user, const NvdrvFrameReport* r) {
+    Totals* t = (Totals*)user;
+    t->total += r->bytes;
+    t->count++;
+    if (r->kind == NVDRV_INTRA) { t->intra_count++; t->intra_total += r->bytes; }
+    char kind[16];
+    if (r->kind == NVDRV_BI) snprintf(kind, sizeof(kind), "bi%d", r->level);
+    else snprintf(kind, sizeof(kind), "%s", kind_name(r->kind));
+    printf("  %5d  %-6s %8zu  %+3d%+3d  q%-4d %10zu\n",
+           r->display, kind, r->bytes, r->dx, r->dy, r->q, t->total);
 }
 
 int main(int argc, char** argv) {
@@ -87,6 +108,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--pred-q") && i+1 < argc) cfg.pred_q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--skip-k") && i+1 < argc) cfg.frame.skip_k = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--mv-lambda") && i+1 < argc) cfg.mv_lambda = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bframes") && i+1 < argc) cfg.bframes = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--b-q-step") && i+1 < argc) cfg.b_q_step = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
     }
 
@@ -108,12 +131,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("%d frames  %dx%d  gop %d  search %d  block %d\n", n, first.width, first.height,
-           cfg.gop, cfg.search, cfg.block);
-    printf("  frame  tipo      bytes    mv     acumulado\n");
+    printf("%d frames  %dx%d  gop %d  search %d  block %d  bframes %d\n", n, first.width, first.height,
+           cfg.gop, cfg.search, cfg.block, cfg.bframes);
+    printf("  frame  tipo      bytes    mv     q         acumulado\n");
 
-    size_t total = NVDRV_HEADER_SIZE, intra_total = 0;
-    int intra_count = 0;
+    Totals t = { NVDRV_HEADER_SIZE, 0, 0, 0 };
+    nvdrv_encode_set_report(enc, report, &t);
     for (int i = 0; i < n; i++) {
         NvdrImage f;
         if (i == 0) f = first;
@@ -126,17 +149,11 @@ int main(int argc, char** argv) {
             nvdr_image_free(&f);
             break;
         }
-        int kind = 0, dx = 0, dy = 0;
-        size_t bytes = 0;
-        if (nvdrv_encode_frame(enc, &f, &kind, &bytes, &dx, &dy) != 0) {
+        if (nvdrv_encode_frame(enc, &f) != 0) {
             fprintf(stderr, "encode failed on %s\n", names[i]);
             nvdr_image_free(&f);
             break;
         }
-        total += bytes;
-        if (kind == NVDRV_INTRA) { intra_count++; intra_total += bytes; }
-        printf("  %5d  %-6s %8zu  %+3d%+3d  %10zu\n",
-               i, kind == NVDRV_INTRA ? "INTRA" : "pred", bytes, dx, dy, total);
         nvdr_image_free(&f);
     }
 
@@ -144,11 +161,12 @@ int main(int argc, char** argv) {
     free_frames(names, n);
     if (close_rc != 0) { fprintf(stderr, "close failed\n"); return 1; }
 
+    size_t inter = t.total - t.intra_total - NVDRV_HEADER_SIZE;
+    int ninter = t.count - t.intra_count;
     printf("\n  %zu bytes total, %d intra (%zu bytes), %d preditos (%zu bytes)\n",
-           total, intra_count, intra_total, n - intra_count, total - intra_total - NVDRV_HEADER_SIZE);
-    if (n > intra_count && intra_count > 0)
+           t.total, t.intra_count, t.intra_total, ninter, inter);
+    if (ninter > 0 && t.intra_count > 0)
         printf("  quadro predito medio %zu B contra intra medio %zu B\n",
-               (total - intra_total - NVDRV_HEADER_SIZE) / (size_t)(n - intra_count),
-               intra_total / (size_t)intra_count);
+               inter / (size_t)ninter, t.intra_total / (size_t)t.intra_count);
     return 0;
 }

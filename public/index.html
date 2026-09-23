@@ -547,7 +547,7 @@ async function showTruncated() {
  * shows it at the rate the source was shot, one decode per animation tick,
  * so the timing it reports is the real cost of playing the file here.
  */
-import { SequenceDecoder, readSequenceHeader, showRGB, INTRA } from './nvdrv.js';
+import { SequenceDecoder, readSequenceHeader, showRGB, INTRA, PRED } from './nvdrv.js';
 
 const $ = (id) => document.getElementById(id);
 const AHEAD = 6;          // frames decoded ahead of the one on screen
@@ -643,19 +643,20 @@ function indexFrames(bytes) {
     const out = [];
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let pos = 24;
-    while (pos + 12 <= bytes.length) {
+    while (pos + 20 <= bytes.length) {
         const len = dv.getUint32(pos + 6, true);
-        out.push({ kind: bytes[pos], start: pos, end: pos + 12 + len });
-        pos += 12 + len;
+        out.push({ kind: bytes[pos], display: dv.getUint32(pos + 14, true), start: pos, end: pos + 20 + len });
+        pos += 20 + len;
     }
     return out;
 }
 
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v6.', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV v7.', true); return; }
     const frames = indexFrames(new Uint8Array(buffer));
     const intra = frames.filter(f => f.kind === INTRA).length;
+    const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;
     seq = { buffer, info, frames, name };
 
     const canvas = $('vcanvas');
@@ -667,7 +668,7 @@ function openSequence(buffer, name, sourceSize, report, seconds) {
     const bitrate = buffer.byteLength * 8 * info.fps / Math.max(1, frames.length) / 1000;
     setStatus(
         `<b>${name}</b> · ${info.width}×${info.height} · ${frames.length} quadros a ${info.fps} fps ` +
-        `(${intra} intra) · ${formatBytes(buffer.byteLength)} ≈ ${bitrate.toFixed(0)} kbit/s` +
+        `(${intra} intra, ${bi} B) · ${formatBytes(buffer.byteLength)} ≈ ${bitrate.toFixed(0)} kbit/s` +
         (sourceSize ? ` · ${(100 * buffer.byteLength / sourceSize).toFixed(0)}% do vídeo enviado` : '') +
         (seconds ? ` · codificado em ${seconds.toFixed(1)} s` : ''));
 
@@ -679,7 +680,7 @@ function setKept(bytes) {
     player.kept = bytes;
     rewind();
     const whole = seq.frames.filter(f => f.end <= bytes).length;
-    const partial = seq.frames.some(f => f.start + 12 < bytes && f.end > bytes);
+    const partial = seq.frames.some(f => f.start + 20 < bytes && f.end > bytes);
     $('vtruncOut').innerHTML =
         `<b>${formatBytes(bytes)}</b> de ${formatBytes(seq.buffer.byteLength)} — ` +
         `${whole} quadro${whole === 1 ? '' : 's'} inteiro${whole === 1 ? '' : 's'}` +
@@ -774,7 +775,8 @@ function updateHud() {
     const budget = 1000 / seq.info.fps;
     const realtime = dec + show <= budget;
     $('vhud').innerHTML =
-        `quadro <b>${f.index + 1}</b>/${seq.frames.length} · ${f.kind === INTRA ? 'intra' : 'predito'}` +
+        `quadro <b>${f.index + 1}</b>/${seq.frames.length} · ` +
+        `${f.kind === INTRA ? 'intra' : f.kind === PRED ? 'predito (P)' : 'bidirecional (B)'}` +
         (f.partial ? ' · <b>parcial</b>' : '') +
         ` · decodificar <b>${dec.toFixed(1)} ms</b> + exibir ${show.toFixed(1)} ms` +
         ` de ${budget.toFixed(1)} ms por quadro · ` +
@@ -796,10 +798,13 @@ function drawStrip() {
     const total = seq.buffer.byteLength;
     const x = (b) => (b / total) * w;
     const cur = player.current ? player.current.index : -1;
-    seq.frames.forEach((f, i) => {
+    // Frames lie in the file in coding order: each anchor, then the B
+    // frames shown before it.
+    seq.frames.forEach((f) => {
         const x0 = x(f.start), x1 = Math.max(x0 + 1, x(f.end) - 0.5);
-        const hh = f.kind === INTRA ? h : h * 0.5;
-        ctx.fillStyle = i === cur ? '#e6edf3' : (f.kind === INTRA ? '#4b9fff' : '#3a4a5e');
+        const hh = f.kind === INTRA ? h : f.kind === PRED ? h * 0.6 : h * 0.35;
+        ctx.fillStyle = f.display === cur ? '#e6edf3'
+                      : (f.kind === INTRA ? '#4b9fff' : f.kind === PRED ? '#3a4a5e' : '#2c3746');
         ctx.globalAlpha = f.start >= player.kept ? 0.25 : 1;
         ctx.fillRect(x0, h - hh, x1 - x0, hh);
     });

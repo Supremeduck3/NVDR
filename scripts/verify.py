@@ -124,7 +124,7 @@ def check_sequence(tmp, psnr_slack):
     """Encode the sequence twice and report bytes, quality and drift.
 
     The loop run holds everything that trades quality over time still:
-    equal quantisers for intra and predicted frames, and no skipped blocks.
+    equal quantisers for intra, P and B frames, and no skipped blocks.
     What it is after is a reference that walks away from the source, and
     by design the defaults settle a little below the intra frame. The
     default run is the encoder as it ships, held to the baseline on bytes
@@ -136,7 +136,8 @@ def check_sequence(tmp, psnr_slack):
     make_sequence(srcdir)
 
     results, problems = {}, []
-    for name, args in (("loop", ["--gop", "0", "--q", "24", "--pred-q", "24", "--skip-k", "0"]),
+    for name, args in (("loop", ["--gop", "0", "--q", "24", "--pred-q", "24", "--b-q-step", "0",
+                                 "--skip-k", "0"]),
                        ("default", ["--gop", "0"])):
         out = tmp / f"seq_{name}.nvdrv"
         r = subprocess.run([str(enc), str(srcdir), str(out)] + args,
@@ -158,7 +159,7 @@ def check_sequence(tmp, psnr_slack):
         if r.returncode != 0:
             return None, [r.stderr.strip() or f"{name} sequence decode failed"]
         per_frame = [float(m) for m in
-                     re.findall(r"(?:INTRA|pred)\s+([0-9.]+) dB", r.stdout)]
+                     re.findall(r"(?:INTRA|pred|bi)\s+([0-9.]+) dB", r.stdout)]
         if len(per_frame) < 12:
             return None, [f"{name}: only {len(per_frame)} of 12 frames decoded"]
 
