@@ -1073,6 +1073,37 @@ is montanha_pessoas with high-ISO sensor noise added
 luma, a little over a pixel wide), since a photo straight from a camera
 is not a JPEG thumbnail. No AVIF: there is no encoder for it here.
 
+### Colour at half resolution (4:2:0)
+
+Header flag 0x04 gives Cb and Cr their own quadtree over a half-size
+canvas: per 32x32 tile, luma's tree, then colour's 16x16 tree, in the
+same three streams, so truncation and the progressive layers work as
+before. The encoder averages colour 2x2 and weighs a colour sample's
+error by four (it stands for four pixels); the decoders scale it back
+with integer bilinear weights 9 3 3 1 in sixteenths, identical in C and
+JS. The colour tree has its own split models.
+
+`--chroma auto` (the default) picks per image. When halving the colour
+costs little on its own (mean squared error under 2 per colour sample
+after averaging and scaling back: every photograph measured), it is
+4:2:0 straight away. Otherwise both modes are coded and the cheaper kept,
+counting colour error at half luma's weight: at that weight every
+photograph keeps 4:2:0 and every synthetic picture (blocos, circulos,
+the gate's sequence) goes 4:4:4, where 4:2:0 cost blocos 21 dB. Residuals
+(predicted video frames and album photos) stay 4:4:4: halving their
+colour every frame drifted 1.3 dB over the gate's twelve frames.
+
+    BD-rate, mean of 7 images      vs JPEG            vs WebP
+                                   PSNR-Y  SSIM-Y     PSNR-Y  SSIM-Y  PSNR-RGB
+    4:4:4 (before)                 -25.8%  -17.5%     +9.5%  +17.5%  -10.0%
+    4:2:0 forced                   -36.0%  -29.1%     -6.3%   -0.5%   -5.5%
+    auto (default)                 -34.7%  -27.3%     -3.3%   +3.9%   -7.7%
+
+Auto sits between the two because on the most colourful photo it keeps
+4:4:4 at the high qualities, where its colour detail shows; `--chroma
+420` forces it. At the default q the photographs come out 7-13%
+smaller.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white

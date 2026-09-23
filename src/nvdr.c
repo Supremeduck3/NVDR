@@ -159,7 +159,7 @@ NvdrConfig nvdr_default_config(void) {
      * 0.1 dB below. */
     c.skip_k = 0.25f;
     c.band = 8;
-    c.chroma420 = 0;
+    c.chroma420 = NVDR_CHROMA_AUTO;
     return c;
 }
 
@@ -1006,11 +1006,11 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     return nvdr_encode_mem_ctx(out_buf, out_len, img, cfg_in, hdr_out, NULL);
 }
 
-int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
-                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+/* One encode in the mode cfg->chroma420 names (420 when nonzero). */
+static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                       const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
     *out_buf = NULL; *out_len = 0;
-    tables_init();
-    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    NvdrConfig cfg = *cfg_in;
     if (img->width <= 0 || img->height <= 0 || img->width > 65535 || img->height > 65535 ||
         (size_t)img->width * img->height > NVDR_MAX_PIXELS) return -1;
     if (!valid_block(cfg.max_block)) cfg.max_block = NVDR_MAX_BLOCK;
@@ -1030,7 +1030,8 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     memset(&h, 0, sizeof(h));
 
     /* 4:2:0 needs a colour tile of at least the smallest leaf. */
-    int use420 = cfg.chroma420 && cfg.max_block >= 8;
+    int use420 = cfg.chroma420 && cfg.max_block >= 8 && cfg.max_block <= NVDR_MAX_BLOCK &&
+                 (cfg.max_block & (cfg.max_block - 1)) == 0;
     e.nparts = use420 ? 2 : 1;
     if (canvas_init(&e.part[0].cv, img->width, img->height, cfg.max_block, cfg.min_block,
                     use420 ? 1 : 3, 0) != 0) goto done;
@@ -1213,6 +1214,142 @@ done:
             }
         canvas_free(&P->cv);
     }
+    return rc;
+}
+
+/*
+ * What halving the colour costs on its own: the mean squared error, per
+ * colour sample, of Cb and Cr averaged 2x2 and scaled back up the way
+ * the decoder does. A photograph's colour is smooth and it stays under 1;
+ * saturated shapes with hard edges (graphics, text, the synthetic probes)
+ * run past 10, and so do some strongly coloured photos.
+ */
+static double chroma_halving_mse(const NvdrImage* img) {
+    int w = img->width, h = img->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    double* c = (double*)malloc(sizeof(double) * w * h);
+    double* d = (double*)malloc(sizeof(double) * cw * ch);
+    double total = 0;
+    if (!c || !d) { free(c); free(d); return 1e9; }
+    for (int k = 1; k < 3; k++) {
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            double o[3];
+            rgb_to_ycc(img->pixels + i * 3, o);
+            c[i] = o[k];
+        }
+        for (int y = 0; y < ch; y++)
+            for (int x = 0; x < cw; x++) {
+                double sum = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        int fy = 2 * y + j < h ? 2 * y + j : h - 1, fx = 2 * x + i < w ? 2 * x + i : w - 1;
+                        sum += c[(size_t)fy * w + fx];
+                    }
+                d[(size_t)y * cw + x] = sum / 4;
+            }
+        for (int y = 0; y < h; y++) {
+            int cy = y >> 1, oy = (y & 1) ? cy + 1 : cy - 1;
+            if (oy < 0) oy = 0;
+            if (oy >= ch) oy = ch - 1;
+            for (int x = 0; x < w; x++) {
+                int cx = x >> 1, ox = (x & 1) ? cx + 1 : cx - 1;
+                if (ox < 0) ox = 0;
+                if (ox >= cw) ox = cw - 1;
+                double u = (9 * d[(size_t)cy * cw + cx] + 3 * d[(size_t)cy * cw + ox] +
+                            3 * d[(size_t)oy * cw + cx] + d[(size_t)oy * cw + ox]) / 16;
+                double e = u - c[(size_t)y * w + x];
+                total += e * e;
+            }
+        }
+    }
+    free(c); free(d);
+    return total / (2.0 * w * h);
+}
+
+/* The rate-distortion cost of a container: squared error of the whole
+ * picture in YCbCr, colour weighed by `wc`, plus lambda per bit. */
+static double container_cost(const uint8_t* buf, size_t len, const NvdrImage* img, NvdrContext* ctx,
+                             double lambda, double wc) {
+    NvdrImage shown;
+    if (nvdr_decode_mem_ctx(buf, len, -1, &shown, NULL, NULL, ctx) != 0) return 1e300;
+    double d = 0;
+    for (size_t i = 0; i < (size_t)img->width * img->height; i++) {
+        double a[3], b[3];
+        rgb_to_ycc(img->pixels + i * 3, a);
+        rgb_to_ycc(shown.pixels + i * 3, b);
+        d += (a[0] - b[0]) * (a[0] - b[0]) + wc * ((a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+    }
+    nvdr_image_free(&shown);
+    return d + lambda * 8.0 * (double)len;
+}
+
+/* Below this, halving the colour is taken as free (see
+ * chroma_halving_mse): every photograph measured, and it saves the second
+ * encode. */
+#define CHROMA_AUTO_FREE 2.0
+/* How much colour error counts against luma's when the two modes are
+ * compared. Swept over 0.25, 0.5 and 1: at 0.5 every photograph measured
+ * keeps 4:2:0 and every synthetic picture (blocos, circulos, the gate's
+ * sequence) goes 4:4:4; 0.25 let circulos and the sequence halve their
+ * colour for 6 dB of loss, and 1 kept a strongly coloured photo whole
+ * that 4:2:0 codes 30% smaller at the same luma. */
+#define CHROMA_AUTO_WEIGHT 0.5
+
+int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+    *out_buf = NULL; *out_len = 0;
+    tables_init();
+    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    if (cfg.chroma420 != NVDR_CHROMA_AUTO) {
+        cfg.chroma420 = cfg.chroma420 == NVDR_CHROMA_420;
+        return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    }
+    if (img->width <= 0 || img->height <= 0 || !img->pixels) return -1;
+    /* A residual (a sequence's predicted frame, an album's predicted
+     * photo) keeps its colour whole: halving it every frame lets colour
+     * error build up along the chain of references, 1.3 dB over the
+     * gate's twelve frames where the limit is 0.25. Halving a sequence's
+     * colour belongs in its references too, as video codecs do it. */
+    if (cfg.residual) {
+        cfg.chroma420 = 0;
+        return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    }
+    cfg.chroma420 = 1;
+    if (chroma_halving_mse(img) < CHROMA_AUTO_FREE)
+        return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
+
+    /* Both ways, each from the context as it was, and the cheaper kept
+     * with the context it leaves. */
+    NvdrContext* start = ctx ? nvdr_context_new() : NULL;
+    NvdrContext* other = ctx ? nvdr_context_new() : NULL;
+    NvdrContext* check = ctx ? nvdr_context_new() : NULL;
+    if (ctx && (!start || !other || !check)) {
+        nvdr_context_free(start); nvdr_context_free(other); nvdr_context_free(check);
+        return -1;
+    }
+    if (ctx) { nvdr_context_copy(start, ctx); nvdr_context_copy(other, ctx); }
+    uint8_t *a = NULL, *b = NULL; size_t alen = 0, blen = 0;
+    NvdrHeader ha, hb;
+    NvdrConfig c444 = cfg;
+    c444.chroma420 = 0;
+    int rc = -1;
+    if (encode_mode(&a, &alen, img, &cfg, &ha, ctx) == 0 &&
+        encode_mode(&b, &blen, img, &c444, &hb, other) == 0) {
+        int q = cfg.q < 1 ? 1 : (cfg.q > 4095 ? 4095 : cfg.q);
+        double lambda = cfg.lambda_k * (double)q * q;
+        if (ctx) nvdr_context_copy(check, start);
+        double ja = container_cost(a, alen, img, check, lambda, CHROMA_AUTO_WEIGHT);
+        if (ctx) nvdr_context_copy(check, start);
+        double jb = container_cost(b, blen, img, check, lambda, CHROMA_AUTO_WEIGHT);
+        if (jb < ja) {
+            free(a); a = b; alen = blen; b = NULL; ha = hb;
+            if (ctx) nvdr_context_copy(ctx, other);
+        }
+        *out_buf = a; *out_len = alen; a = NULL;
+        if (hdr_out) *hdr_out = ha;
+        rc = 0;
+    }
+    free(a); free(b);
+    nvdr_context_free(start); nvdr_context_free(other); nvdr_context_free(check);
     return rc;
 }
 
