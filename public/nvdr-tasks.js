@@ -12,6 +12,13 @@
  */
 import { decode, shrinkRGB, fitSize } from './nvdr.js';
 import { AlbumReader, openAlbumImage } from './nvda.js';
+import { loadWasm, wasmActive } from './nvdr-wasm.js';
+
+// The C decoder as WebAssembly, when it loads: from then on decode()
+// (here and in nvda.js) uses it, twice as fast on a large photo and
+// several times on a small one. Until it has loaded, or where it cannot,
+// the JavaScript decoder answers.
+const wasm = loadWasm();
 
 const stored = new Map();   // key -> Uint8Array
 const albums = new Map();   // key -> AlbumReader
@@ -64,6 +71,7 @@ const ops = {
         if (!r) return { result: null, transfer: [] };
         const { width, height } = r.header;
         const result = {
+            engine: wasmActive() ? 'WebAssembly' : 'JavaScript',
             header: r.header, layersPresent: r.layersPresent, tiles: r.tiles,
             tilesComplete: r.tilesComplete, rgb: r.rgb, flatRgb: r.flatRgb, lowRgb: r.lowRgb,
             fitted: fitted(r.rgb, width, height, m.fit),
@@ -106,5 +114,6 @@ const ops = {
 export async function runTask(m) {
     const op = ops[m.op];
     if (!op) throw new Error(`unknown task ${m.op}`);
+    await wasm;
     return op(m);
 }

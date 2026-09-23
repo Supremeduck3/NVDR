@@ -1218,6 +1218,33 @@ quadtree's 32x32 leaves and the colour tree pay most where there are
 large smooth areas to cover, and a photograph at full size has more of
 them. `node scripts/bench_codecs.mjs <images>` runs any picture.
 
+### The decoder as WebAssembly
+
+`public/nvdr.wasm` (24 KB, `make wasm`) is the C decoder compiled for
+the browser by clang and wasm-ld alone: no Emscripten, no wasi-libc.
+`nvdr.c` leaves out its file and image-format code under `NVDR_WASM`;
+`wasm/libc.c` supplies the memory functions (a stack the page rewinds
+between decodes) and `wasm/api.c` the three calls the page makes; the
+linker drops the encoder, and the module imports nothing.
+`public/nvdr-wasm.js` loads it and installs it behind `decode()` in
+nvdr.js, so everything that decodes (the page, the workers, albums,
+`<nvdr-img>`) uses it; a decode with a fluid context, or any decode
+where WebAssembly cannot load, stays in JavaScript.
+
+    decode, 3000x4500           JavaScript   WebAssembly
+    full picture                  2108 ms       856 ms
+    with grain                    2840 ms      1470 ms
+    three views (the page)        3690 ms      1919 ms
+    montanha, 768x512              145 ms        26 ms
+
+It is the same C the command line runs, so the three decoders are held
+to one another: `scripts/crosscheck.mjs` now compares C, JavaScript and
+WebAssembly on every layer, cut and damaged copy. One change went into
+the C decoder with it: like the JavaScript one, it no longer saves each
+tile of a texture layer that arrived whole (only damage can stop one
+mid-tile, and then the decode starts over saving them), which was a
+tenth of its time.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white

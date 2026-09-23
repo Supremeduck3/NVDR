@@ -2,8 +2,12 @@
  * NVDR still images, format v10. See nvdr.h for the design; README.md
  * for the measurements behind it.
  */
+/* NVDR_WASM builds the decoder for the browser (wasm/): no files, no
+ * image formats, no zlib; everything else is the same code. */
+#ifndef NVDR_WASM
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#endif
 
 #include "nvdr.h"
 #include "grain.h"
@@ -13,10 +17,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef NVDR_WASM
 #include <zlib.h>
+#endif
 
 /* ================================================================ image */
 
+#ifndef NVDR_WASM
 int nvdr_image_load(NvdrImage* img, const char* path) {
     int channels;
     img->pixels = stbi_load(path, &img->width, &img->height, &channels, 3);
@@ -105,6 +112,7 @@ int nvdr_image_write(const NvdrImage* img, const char* path) {
         return nvdr_image_write_png(img, path);
     return nvdr_image_write_ppm(img, path);
 }
+#endif
 
 void nvdr_image_free(NvdrImage* img) {
     free(img->pixels);
@@ -217,11 +225,13 @@ static void tables_init(void) {
                 at++;
             }
     }
+#ifndef NVDR_WASM   /* what symbols cost is for the encoder's search */
     for (int p = 1; p < (1 << NVDR_PROB_BITS); p++) {
         double p0 = (double)p / (1 << NVDR_PROB_BITS);
         bitcost[0][p] = -log2(p0);
         bitcost[1][p] = -log2(1.0 - p0);
     }
+#endif
     bitcost[0][0] = bitcost[1][0] = 16.0;
     done = 1;
 }
@@ -1401,6 +1411,7 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     return 0;
 }
 
+#ifndef NVDR_WASM
 int nvdr_encode_file(const char* out_path, const NvdrImage* img,
                      const NvdrConfig* cfg, NvdrHeader* hdr_out) {
     uint8_t* buf; size_t len;
@@ -1414,6 +1425,7 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
     free(buf);
     return rc;
 }
+#endif
 
 /* ============================================================= decoder */
 
@@ -1596,8 +1608,27 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
     return nvdr_decode_mem_ctx(data, size, max_layer, out, hdr_out, info, NULL);
 }
 
+/* decode_once() when a tile of a layer that arrived whole stops, which
+ * only damage makes it do: the decode starts over, saving tiles. */
+#define DECODE_AGAIN (-2)
+
+static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
+                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful);
+
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
+    /* A texture layer that arrived whole cannot stop inside a tile unless
+     * the file is damaged, so the first attempt does not save every tile
+     * to restore it (a tenth of the time); if one stops, the decode starts
+     * over the careful way and gives what that gives. The context is only
+     * written when a decode finishes, so starting over is safe. */
+    int rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 0);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 1);
+    return rc;
+}
+
+static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
+                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
@@ -1696,12 +1727,13 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
         nvdr_dec_init(&d, stream, avail);
         int corrupt = 0;
         int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+        int guard = careful || avail < h.stored_bytes[layer];
         for (int t = 0; t < complete[layer - 1]; t++) {
             /* Every plane of both trees saved, luma's then colour's, in
              * one buffer: a colour tile is a quarter of a luma tile. */
             uint8_t* keep = saved;
             uint8_t was[2][1024];   /* a tile holds at most (32 / 4)^2 leaves */
-            for (int k = 0; k < np; k++) {
+            for (int k = 0; k < np && guard; k++) {
                 Canvas* pc = &cvs[k];
                 int tx = (t % tiles_x) * pc->tile, ty = (t / tiles_x) * pc->tile;
                 if (!node_exists(pc, tx, ty)) continue;
@@ -1733,6 +1765,7 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
                 }
             }
             if (d.overrun || corrupt) {
+                if (!guard) { rc = DECODE_AGAIN; goto done; }
                 const uint8_t* back = saved;
                 for (int k = 0; k < np; k++) {
                     Canvas* pc = &cvs[k];
@@ -1820,6 +1853,7 @@ done:
     return rc;
 }
 
+#ifndef NVDR_WASM
 int nvdr_decode_file(const char* path, int max_layer,
                      NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info) {
     out->pixels = NULL;
@@ -1837,3 +1871,4 @@ int nvdr_decode_file(const char* path, int max_layer,
     free(data);
     return rc;
 }
+#endif

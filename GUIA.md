@@ -308,7 +308,8 @@ isso vem desligado.
 
 O arquivo continua com as propriedades quando vai para um site. Coloque
 o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
-`nvdr-worker.js`, `nvdr-tasks.js`) junto do site e use o
+`nvdr-worker.js`, `nvdr-tasks.js`, `nvdr-wasm.js` e `nvdr.wasm`) junto do
+site e use o
 elemento no lugar do `<img>`:
 
 ```html
@@ -323,6 +324,10 @@ elemento no lugar do `<img>`:
   depende (requisições HTTP com `Range`), não o álbum inteiro. Várias fotos
   do mesmo álbum na página compartilham o que já baixaram: uma grade com o
   álbum todo baixa o tamanho do álbum, uma vez.
+- A decodificação usa o **decodificador C compilado para WebAssembly**
+  (`nvdr.wasm`, 24 KB): 2 a 5 vezes mais rápido que o JavaScript. Se o
+  arquivo não carregar, o JavaScript decodifica igual. Para recompilar:
+  `make wasm` (precisa só de clang e wasm-ld).
 - A decodificação roda num **Web Worker**: uma foto grande leva segundos
   para decodificar, e a página continua rolando e respondendo enquanto
   isso. Navegador sem suporte a worker de módulo decodifica na própria

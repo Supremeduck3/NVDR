@@ -8,7 +8,14 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { decode } from '../public/nvdr.js';
+import { decodeJs as decode } from '../public/nvdr.js';
+import { loadWasmBytes, decodeWasm } from '../public/nvdr-wasm.js';
+
+// The WebAssembly build of the C decoder is held to the same pixels, when
+// it has been built (make wasm).
+const wasmPath = new URL('../public/nvdr.wasm', import.meta.url).pathname;
+let wasm = false;
+try { await loadWasmBytes(readFileSync(wasmPath)); wasm = true; } catch { }
 
 const [, , container] = process.argv;
 if (!container) {
@@ -55,6 +62,15 @@ function check(label, file, layer) {
         return;
     }
     const ref = readPPM('/tmp/cc.ppm');
+    if (wasm) {
+        const w = decodeWasm(new Uint8Array(bytes), layer);
+        for (let i = 0; i < ref.pixels.length; i++)
+            if (!w || w.rgb[i] !== ref.pixels[i]) {
+                console.log(`${label}: WebAssembly differs from C at pixel ${Math.floor(i / 3)}`);
+                failures++;
+                return;
+            }
+    }
     const got = result.rgb;
     for (let i = 0; i < got.length; i++)
         if (got[i] !== ref.pixels[i]) {
@@ -63,7 +79,7 @@ function check(label, file, layer) {
             failures++;
             return;
         }
-    console.log(`${label}: identical (${result.header.width}x${result.header.height}, ` +
+    console.log(`${label}: identical${wasm ? ' (C, JS, WASM)' : ''} (${result.header.width}x${result.header.height}, ` +
                 `tiles ${result.tilesComplete.join('/')} of ${result.tiles})`);
 }
 

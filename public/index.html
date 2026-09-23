@@ -483,7 +483,8 @@ async function showLevels() {
 
     setStatus(statusEl.textContent +
               ` Decodificado em ${decodeMs.toFixed(0)}ms` +
-              (imageDecoder.offThread ? ', fora da página.' : '.'));
+              (imageDecoder.offThread ? ', fora da página' : '') +
+              (result.engine ? `, em ${result.engine}.` : '.'));
 }
 
 // While one cut decodes, the slider may move on: when it is done, the
