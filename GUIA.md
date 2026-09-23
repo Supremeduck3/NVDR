@@ -391,6 +391,18 @@ O VP8 faz 605 kbit/s a 37,2 dB. A interpolação de quarto de pixel usa o
 filtro de 6 taps do H.264, que no laço fechado vale ~1 dB sobre a
 bilinear.
 
+Quando o quadro intra sai com a cor em meia resolução (4:2:0, o que toda
+fotografia faz), os quadros preditos seguem: o resíduo também vai em
+4:2:0 e passa pelo filtro de desblocagem. Em BD-rate, a mesma qualidade
+de luma sai **6 a 8% menor** nos clipes limpos e **23% menor** num clipe
+com ruído de sensor. Desenho e tela (intra em 4:4:4) ficam como antes.
+
+Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
+
+```bash
+node scripts/bench_video.mjs pasta_de_quadros/
+```
+
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.
 

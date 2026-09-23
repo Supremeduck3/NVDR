@@ -600,6 +600,7 @@ struct NvdrvEncoder {
     NvdrImage   error;     /* the biased prediction error */
     int8_t*     vx;        /* block motion field, when enabled */
     int8_t*     vy;
+    int         chroma420; /* the last intra frame halved its colour */
 };
 
 static int alloc_image(NvdrImage* img, int w, int h) {
@@ -760,9 +761,23 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
     NvdrConfig fcfg = e->cfg.frame;
     if (kind == NVDRV_PRED) {
         fcfg.residual = 1;
-        /* The filter smooths seams in a picture; a residual is not one,
-         * and its seams are not what the viewer sees. */
-        fcfg.deblock = 0;
+        /* When the intra frame halved its colour, as it does for anything
+         * photographic, the residuals do too: the reference's colour is
+         * already smooth, and a residual coded whole spends its bytes on
+         * colour detail, and colour noise, the viewer does not see. Their
+         * leaf seams are filtered as well, since over a continuous
+         * prediction they land in the picture as they are. The filter is
+         * the still decoder's, driven by the container's own flag, so
+         * decoders need nothing new. Together, at equal luma: 6 to 8%
+         * smaller on the clean test clips, 23% on the noisy one.
+         *
+         * A sequence whose intra frame keeps its colour whole (a drawing,
+         * a screen) keeps both off: halving there piles colour error up
+         * along the chain of references, and on the regression gate's
+         * sawtooth texture the filter cost 9% for nothing. */
+        int photo = e->chroma420 && e->cfg.frame.chroma420 == NVDR_CHROMA_AUTO;
+        fcfg.chroma420 = photo ? NVDR_CHROMA_420 : e->cfg.frame.chroma420;
+        fcfg.deblock = photo && e->cfg.frame.deblock;
         /* Coarser than the intra frames by 1.2 unless told otherwise: on the
          * clean clip that was 0.1 dB better at equal rate across q 16-40. */
         fcfg.q = e->cfg.pred_q > 0 ? e->cfg.pred_q : (e->cfg.frame.q * 6 + 2) / 5;
@@ -772,6 +787,7 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame,
     size_t len = 0;
     NvdrHeader fh;
     if (nvdr_encode_mem(&blob, &len, to_code, &fcfg, &fh) != 0) { free(field); return -1; }
+    if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
     if (write_frame(e, kind, dx, dy, block, field, field_len, blob, len) != 0) {
         free(blob); free(field); return -1;

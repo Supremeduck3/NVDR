@@ -208,6 +208,32 @@ drift is how a reference that walks away from the source shows up. The
 default run holds the encoder as it ships to the baseline, 25% smaller
 than the loop run.
 
+### Colour and seams in predicted frames
+
+A predicted frame's residual was coded 4:4:4 and without the deblocking
+filter, whatever the picture. Both were decided on the regression gate's
+128x128 sequence, whose sawtooth texture is exactly the kind of picture
+that wants neither. Now, when the intra frame chose 4:2:0 (every
+photograph measured does), the residuals are coded 4:2:0 and filtered
+too. The reference's colour is already smooth, so a residual coded whole
+spends its bytes on colour detail and colour noise nobody sees. Over a
+continuous prediction a residual's leaf seams show in the picture as
+they are. The filter is the still decoder's, switched by the container's
+own flag, so neither decoder changes. A sequence whose intra frame keeps
+4:4:4 (a drawing, a screen, the gate) keeps both off.
+
+BD-rate against the previous encoder, 48 frames, q 12 to 48
+(`scripts/bench_video.mjs`'s NVDR half):
+
+    clip                                        PSNR-Y   PSNR-RGB
+    pan over a photo, whole pixels, clean        -8.2%     -5.1%
+    subpixel pan, zoom, object crossing, clean   -6.2%     -0.3%
+    the same with sensor noise every frame      -22.8%    -19.9%
+
+The filter alone is 1.6% on luma and 2.4 to 3.1% on RGB. The rest is the
+colour, which is worth most where the noise is: colour noise costs a
+residual as much as detail does.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
@@ -1089,9 +1115,11 @@ after averaging and scaling back: every photograph measured), it is
 4:2:0 straight away. Otherwise both modes are coded and the cheaper kept,
 counting colour error at half luma's weight: at that weight every
 photograph keeps 4:2:0 and every synthetic picture (blocos, circulos,
-the gate's sequence) goes 4:4:4, where 4:2:0 cost blocos 21 dB. Residuals
-(predicted video frames and album photos) stay 4:4:4: halving their
-colour every frame drifted 1.3 dB over the gate's twelve frames.
+the gate's sequence) goes 4:4:4, where 4:2:0 cost blocos 21 dB. Album
+photos predicted from another stay 4:4:4. A sequence's predicted frames
+follow their intra frame (see "Colour and seams in predicted frames"):
+halving the colour of residuals over a 4:4:4 reference drifted 1.3 dB
+over the gate's twelve frames.
 
     BD-rate, mean of 7 images      vs JPEG            vs WebP
                                    PSNR-Y  SSIM-Y     PSNR-Y  SSIM-Y  PSNR-RGB
