@@ -1165,6 +1165,30 @@ sample read 2.8, a crop of montanha 5.4). Residuals never carry grain
 (a predicted frame would have to cancel its reference's), and albums and
 sequences do not use it. The page has a selector for it.
 
+### Measured but not built: directional prediction
+
+H.264, HEVC and AV1 predict a block by extending its neighbours along a
+direction, and it is worth 8-15% there. A prototype gave a leaf four
+modes beside the average colour (vertical, horizontal, HEVC's planar,
+the 135 degree diagonal), signalled per leaf. Luma PSNR as the encoder
+reconstructs it, and bytes, at q 24:
+
+                          no modes          from flat colours     from full reconstruction
+                                            (best mode by RD)     (best mode by RD)
+    montanha_pessoas      48427 B 33.89     48748 B 33.95         47951 B 33.99
+    OIP-4140498144        19874 B 34.53     19984 B 34.58         19668 B 34.71
+    montanha, 2x size     66047 B 38.34     66358 B 38.39         64827 B 38.38
+
+Predicting from the neighbours' flat colours keeps layer 0 decodable on
+its own and nets about 2%; choosing the mode by absolute difference
+instead of by rate-distortion made files 1-3% bigger. Predicting from
+the neighbours' full reconstruction, which would tie every layer to the
+ones after it and so give up the truncation guarantee, nets 3-5%. The
+quadtree already does most of what the modes do elsewhere: it splits to
+4x4 exactly where an edge runs, and each leaf's transform is chosen by
+rate-distortion, where HEVC's intra modes work on a fixed partition.
+Neither gain pays for its format.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white
