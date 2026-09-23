@@ -35,6 +35,8 @@ const SRC = join(OUT, 'src');
 mkdirSync(SRC, { recursive: true });
 
 const NVDR_Q = [6, 8, 12, 16, 24, 32, 48, 64, 96];
+// Extra encoder options for every NVDR run, e.g. NVDR_ARGS="--chroma 444".
+const NVDR_ARGS = (process.env.NVDR_ARGS || '').split(/\s+/).filter(Boolean);
 const BROWSER_Q = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95];
 
 async function playwright() {
@@ -164,7 +166,7 @@ function runNvdr(img) {
     const file = join(OUT, 'tmp.nvdr'), dec = join(OUT, 'tmp.ppm');
     let planes = null;
     for (const q of NVDR_Q) {
-        const report = execFileSync(join(ROOT, 'nvdr_encode'), [img.ppm, file, '--q', String(q)]).toString();
+        const report = execFileSync(join(ROOT, 'nvdr_encode'), [img.ppm, file, '--q', String(q), ...NVDR_ARGS]).toString();
         execFileSync(join(ROOT, 'nvdr_decode'), [file, dec]);
         const bytes = statSync(file).size;
         const m = /planes Y\/Cb\/Cr: ([\d.]+)%\/([\d.]+)%\/([\d.]+)%/.exec(report);

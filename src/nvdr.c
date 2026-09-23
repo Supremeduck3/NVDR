@@ -159,6 +159,7 @@ NvdrConfig nvdr_default_config(void) {
      * 0.1 dB below. */
     c.skip_k = 0.25f;
     c.band = 8;
+    c.chroma420 = 0;
     return c;
 }
 
@@ -322,6 +323,7 @@ static void ycc_to_rgb(int y, int cb, int cr, unsigned char* p) {
 
 typedef struct {
     uint16_t split[NSIZES];
+    uint16_t split_c[NSIZES];    /* the colour tree's, in 4:2:0 */
     uint16_t dc_zero[NSIZES][3];
     uint16_t dc_sign[3];
     uint16_t dc_mag[3][MAG_UNARY];
@@ -532,6 +534,11 @@ static int band_split(int sc, int band) {
  */
 typedef struct {
     int w, h, pw, ph, tile, min_block;
+    /* How many planes, and which component the first is: 3 from Y for
+     * the one tree of 4:4:4; Y alone, then Cb and Cr at half size, for
+     * the two of 4:2:0. Planes index the arrays below; components index
+     * the models and the steps. */
+    int np, comp0;
     int fixed_pred;              /* NVDR_FLAG_RESIDUAL: every colour predicted as 128 */
     uint8_t* flat[3];
     uint8_t* full[3];
@@ -541,12 +548,13 @@ typedef struct {
     int16_t* acc[3];
 } Canvas;
 
-static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block) {
+static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block, int np, int comp0) {
     memset(cv, 0, sizeof(*cv));
     cv->w = w; cv->h = h; cv->tile = tile; cv->min_block = min_block;
+    cv->np = np; cv->comp0 = comp0;
     cv->pw = (w + min_block - 1) / min_block * min_block;
     cv->ph = (h + min_block - 1) / min_block * min_block;
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < np; c++) {
         cv->flat[c] = (uint8_t*)malloc((size_t)cv->pw * cv->ph);
         cv->full[c] = (uint8_t*)malloc((size_t)cv->pw * cv->ph);
         cv->acc[c] = (int16_t*)calloc((size_t)cv->pw * cv->ph, sizeof(int16_t));
@@ -601,9 +609,10 @@ static void paint_flat(Canvas* cv, int c, int x, int y, int w, int h, int v) {
  * cannot be made worse by a tile arriving.
  */
 static void tile_fallback(Canvas* cv, int tx, int ty) {
+    if (tx >= cv->pw || ty >= cv->ph) return;
     int w = tx + cv->tile < cv->pw ? cv->tile : cv->pw - tx;
     int h = ty + cv->tile < cv->ph ? cv->tile : cv->ph - ty;
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < cv->np; c++) {
         paint_flat(cv, c, tx, ty, w, h, 128);
     }
 }
@@ -676,24 +685,25 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
-    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK)) return -1;   /* a flag this decoder does not know */
+    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420)) return -1;   /* a flag this decoder does not know */
+    if ((h->flags & NVDR_FLAG_CHROMA420) && h->max_block < 8) return -1;
     for (int k = 0; k < NVDR_LAYERS; k++) if (h->stored_bytes[k] > 0x7fffffffu) return -1;
     if (h->band > 32) return -1;
     return 0;
 }
 
+static uint16_t* split_model(ColourModels* m, const Canvas* cv, int n) {
+    return cv->comp0 ? &m->split_c[size_class(n)] : &m->split[size_class(n)];
+}
+
 /* ============================================================= encoder */
 
+/* One quadtree's worth of encoder state: the whole picture in 4:4:4; in
+ * 4:2:0, luma, then colour at half size. */
 typedef struct {
     Canvas         cv;
-    double*        src[3];      /* YCbCr, padded by replication */
-    int            step[3];
-    double         deadzone, lambda;
-    double         skip_lambda;  /* 0: every leaf coded; see code_leaf() */
-    ColourModels   cm;
-    TextureModels  tm;           /* the low band */
-    TextureModels  tm2;          /* the high band */
-    int            band_at[NSIZES];   /* first high-band scan position per size */
+    double*        src[3];      /* the planes' source, padded by replication */
+    double         lambda, skip_lambda;   /* see code_leaf() */
     int*           split;       /* one decision per node, per size */
     size_t         grid_base[NSIZES];
     int            grid_w[NSIZES];
@@ -708,12 +718,24 @@ typedef struct {
     int*           pre_lo[NSIZES][3];
     int*           pre_hi[NSIZES][3];
     int            pre_y;       /* the row's top */
-    double         plane_bits[3];   /* what the coded leaves cost, per plane */
+} Part;
+
+typedef struct {
+    Part           part[2];
+    int            nparts;
+    Part*          p;           /* the tree being searched or coded */
+    int            step[3];     /* per component */
+    double         deadzone;
+    ColourModels   cm;
+    TextureModels  tm;           /* the low band */
+    TextureModels  tm2;          /* the high band */
+    int            band_at[NSIZES];   /* first high-band scan position per size */
+    double         plane_bits[3];   /* what the coded leaves cost, per component */
 } Enc;
 
 static size_t node_id(const Enc* e, int x, int y, int n) {
     int s = size_class(n);
-    return e->grid_base[s] + (size_t)(y / n) * e->grid_w[s] + (size_t)(x / n);
+    return e->p->grid_base[s] + (size_t)(y / n) * e->p->grid_w[s] + (size_t)(x / n);
 }
 
 static int node_whole(const Canvas* cv, int x, int y, int n) { return x + n <= cv->pw && y + n <= cv->ph; }
@@ -739,17 +761,18 @@ static int quantise(double v, double dz) {
  */
 static double leaf_levels(Enc* e, int x, int y, int n, int skip,
                           int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], int* textured) {
-    Canvas* cv = &e->cv;
+    Part* P = e->p;
+    Canvas* cv = &P->cv;
     int sc = size_class(n), count = n * n;
     double err = 0.0;
     int any = 0;
-    for (int c = 0; c < 3; c++) {
-        int step = e->step[c];
+    for (int c = 0; c < cv->np; c++) {
+        int step = e->step[cv->comp0 + c];
         int pred = predict(cv, c, x, y, n);
         dl[c] = 0;
-        size_t b = (size_t)((y - e->pre_y) / n) * (cv->pw / n) + (size_t)(x / n);
+        size_t b = (size_t)((y - P->pre_y) / n) * (cv->pw / n) + (size_t)(x / n);
         if (!skip) {
-            double sum = e->pre_sum[sc][c][b];
+            double sum = P->pre_sum[sc][c][b];
             /* The orthonormal DC of (block - prediction) is n * its mean. */
             double dc = (sum / count - pred) * n;
             dl[c] = quantise(dc / step, 0.0);
@@ -760,19 +783,19 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
         memset(lv[c], 0, sizeof(int) * count);
         int nonzero = 0;
         if (!skip) {
-            memcpy(lv[c], e->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
-            nonzero = e->pre_nz[sc][c][b];
+            memcpy(lv[c], P->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
+            nonzero = P->pre_nz[sc][c][b];
         }
         if (nonzero) {
-            add_residual(cv, c, x, y, n, e->pre_lo[sc][c] + b * count);
-            if (e->band_at[sc] < count) add_residual(cv, c, x, y, n, e->pre_hi[sc][c] + b * count);
+            add_residual(cv, c, x, y, n, P->pre_lo[sc][c] + b * count);
+            if (e->band_at[sc] < count) add_residual(cv, c, x, y, n, P->pre_hi[sc][c] + b * count);
             any = 1;
         }
 
         for (int j = 0; j < n && y + j < cv->h; j++)
             for (int i = 0; i < n && x + i < cv->w; i++) {
                 size_t at = (size_t)(y + j) * cv->pw + x + i;
-                double d = e->src[c][at] - cv->full[c][at];
+                double d = P->src[c][at] - cv->full[c][at];
                 err += d * d;
             }
     }
@@ -784,12 +807,14 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
 static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
                       const int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK]) {
     int sc = size_class(n), count = n * n, at = e->band_at[sc];
-    for (int c = 0; c < 3; c++) {
+    const Canvas* cv = &e->p->cv;
+    for (int c = 0; c < cv->np; c++) {
+        int k = cv->comp0 + c;
         double before = s0->bits + s1[0].bits + s1[1].bits;
-        put_dc(s0, &e->cm, sc, c, dl[c]);
-        put_texture(&s1[0], &e->tm, sc, c, lv[c], 1, at);
-        if (at < count) put_texture(&s1[1], &e->tm2, sc, c, lv[c], at, count);
-        if (s0->enc) e->plane_bits[c] += s0->bits + s1[0].bits + s1[1].bits - before;
+        put_dc(s0, &e->cm, sc, k, dl[c]);
+        put_texture(&s1[0], &e->tm, sc, k, lv[c], 1, at);
+        if (at < count) put_texture(&s1[1], &e->tm2, sc, k, lv[c], at, count);
+        if (s0->enc) e->plane_bits[k] += s0->bits + s1[0].bits + s1[1].bits - before;
     }
 }
 
@@ -807,16 +832,17 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
 static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* textured) {
     static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int skip = 0;
-    if (e->skip_lambda > 0.0) {
+    double skip_lambda = e->p->skip_lambda;
+    if (skip_lambda > 0.0) {
         Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
         double d_skip = leaf_levels(e, x, y, n, 1, dl, lv, NULL);
         leaf_emit(e, &c0, c1, n, dl, lv);
-        double j_skip = d_skip + e->skip_lambda * (c0.bits + c1[0].bits + c1[1].bits);
+        double j_skip = d_skip + skip_lambda * (c0.bits + c1[0].bits + c1[1].bits);
         Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
         int tex = 0;
         double d_code = leaf_levels(e, x, y, n, 0, dl, lv, &tex);
         leaf_emit(e, &k0, k1, n, dl, lv);
-        double j_code = d_code + e->skip_lambda * (k0.bits + k1[0].bits + k1[1].bits);
+        double j_code = d_code + skip_lambda * (k0.bits + k1[0].bits + k1[1].bits);
         skip = j_skip <= j_code;
         /* Coded wins: the canvas, dl and lv already hold it, and redoing
          * it would give the same (costing only bits is not coding). */
@@ -833,7 +859,7 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* te
 
 /* A block's flat, full and accumulated texture: 12 bytes a pixel. */
 static void save_block(const Canvas* cv, int x, int y, int n, uint8_t* buf) {
-    for (int c = 0; c < 3; c++)
+    for (int c = 0; c < cv->np; c++)
         for (int j = 0; j < n; j++) {
             size_t at = (size_t)(y + j) * cv->pw + x;
             memcpy(buf, cv->flat[c] + at, (size_t)n); buf += n;
@@ -843,7 +869,7 @@ static void save_block(const Canvas* cv, int x, int y, int n, uint8_t* buf) {
 }
 
 static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
-    for (int c = 0; c < 3; c++)
+    for (int c = 0; c < cv->np; c++)
         for (int j = 0; j < n; j++) {
             size_t at = (size_t)(y + j) * cv->pw + x;
             memcpy(cv->flat[c] + at, buf, (size_t)n); buf += n;
@@ -867,16 +893,17 @@ static void precompute_row(Enc* e, int ty) {
     /* The inverse transforms go too: the pixels a band adds are its
      * coefficients' alone, so what the search does per leaf and per size
      * is only adding them to the flat colour and measuring the error. */
-    Canvas* cv = &e->cv;
-    e->pre_y = ty;
+    Part* P = e->p;
+    Canvas* cv = &P->cv;
+    P->pre_y = ty;
     for (int s = 0; s < NSIZES; s++) {
         int n = NVDR_MIN_BLOCK << s, count = n * n;
-        if (!e->pre[s][0]) continue;
+        if (!P->pre[s][0]) continue;
         int gw = cv->pw / n, gh = cv->tile / n, blocks = gw * gh;
-        for (int c = 0; c < 3; c++) {
-            int* dst = e->pre[s][c];
-            const double* src = e->src[c];
-            int step = e->step[c];
+        for (int c = 0; c < cv->np; c++) {
+            int* dst = P->pre[s][c];
+            const double* src = P->src[c];
+            int step = e->step[cv->comp0 + c];
             double dz = e->deadzone;
             #pragma omp parallel for schedule(static)
             for (int b = 0; b < blocks; b++) {
@@ -888,7 +915,7 @@ static void precompute_row(Enc* e, int ty) {
                 double sum = 0.0;
                 for (int j = 0; j < n; j++)
                     for (int i = 0; i < n; i++) sum += blk[j * n + i];
-                e->pre_sum[s][c][b] = sum;
+                P->pre_sum[s][c][b] = sum;
                 forward_dct(s, blk, co);
                 int* q = dst + (size_t)b * count;
                 int nonzero = 0;
@@ -897,11 +924,11 @@ static void precompute_row(Enc* e, int ty) {
                     q[i] = quantise(co[scan_pos[s][i]] / step, dz);
                     nonzero |= q[i];
                 }
-                e->pre_nz[s][c][b] = (uint8_t)(nonzero != 0);
+                P->pre_nz[s][c][b] = (uint8_t)(nonzero != 0);
                 if (nonzero) {
                     int at = e->band_at[s];
-                    texture_residual(s, q, 1, at, step, e->pre_lo[s][c] + (size_t)b * count);
-                    if (at < count) texture_residual(s, q, at, count, step, e->pre_hi[s][c] + (size_t)b * count);
+                    texture_residual(s, q, 1, at, step, P->pre_lo[s][c] + (size_t)b * count);
+                    if (at < count) texture_residual(s, q, at, count, step, P->pre_hi[s][c] + (size_t)b * count);
                 }
             }
         }
@@ -916,7 +943,8 @@ static void precompute_row(Enc* e, int ty) {
  * and must split; one wholly past it does not exist.
  */
 static double search(Enc* e, int x, int y, int n) {
-    Canvas* cv = &e->cv;
+    Part* P = e->p;
+    Canvas* cv = &P->cv;
     size_t id = node_id(e, x, y, n);
     int whole = node_whole(cv, x, y, n);
     int can_split = n > cv->min_block;
@@ -925,17 +953,17 @@ static double search(Enc* e, int x, int y, int n) {
 
     if (whole) {
         Sink s0 = { NULL, 0 }, s1[2] = { { NULL, 0 }, { NULL, 0 } };
-        if (can_split) put_bit(&s0, &e->cm.split[size_class(n)], 0);
+        if (can_split) put_bit(&s0, split_model(&e->cm, cv, n), 0);
         double d = code_leaf(e, &s0, s1, x, y, n, NULL);
-        whole_cost = d + e->lambda * (s0.bits + s1[0].bits + s1[1].bits);
-        if (!can_split) { e->split[id] = 0; return whole_cost; }
+        whole_cost = d + P->lambda * (s0.bits + s1[0].bits + s1[1].bits);
+        if (!can_split) { P->split[id] = 0; return whole_cost; }
         kept = (uint8_t*)malloc((size_t)12 * n * n);
         if (kept) save_block(cv, x, y, n, kept);
     }
 
     Sink s0 = { NULL, 0 };
-    if (whole) put_bit(&s0, &e->cm.split[size_class(n)], 1);
-    split_cost = e->lambda * s0.bits;
+    if (whole) put_bit(&s0, split_model(&e->cm, cv, n), 1);
+    split_cost = P->lambda * s0.bits;
     int h = n / 2;
     for (int k = 0; k < 4; k++) {
         int cx = x + (k & 1) * h, cy = y + (k >> 1) * h;
@@ -945,20 +973,21 @@ static double search(Enc* e, int x, int y, int n) {
     if (whole && kept && whole_cost <= split_cost) {
         load_block(cv, x, y, n, kept);
         free(kept);
-        e->split[id] = 0;
+        P->split[id] = 0;
         return whole_cost;
     }
     free(kept);
-    e->split[id] = 1;
+    P->split[id] = 1;
     return split_cost;
 }
 
 static void emit(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, NvdrHeader* h) {
-    Canvas* cv = &e->cv;
+    Canvas* cv = &e->p->cv;
     size_t id = node_id(e, x, y, n);
     int whole = node_whole(cv, x, y, n);
-    if (n > cv->min_block && whole) put_bit(s0, &e->cm.split[size_class(n)], e->split[id]);
-    if (n > cv->min_block && (e->split[id] || !whole)) {
+    int split = e->p->split[id];
+    if (n > cv->min_block && whole) put_bit(s0, split_model(&e->cm, cv, n), split);
+    if (n > cv->min_block && (split || !whole)) {
         int half = n / 2;
         for (int k = 0; k < 4; k++) {
             int cx = x + (k & 1) * half, cy = y + (k >> 1) * half;
@@ -1000,52 +1029,100 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     NvdrHeader h;
     memset(&h, 0, sizeof(h));
 
-    if (canvas_init(&e.cv, img->width, img->height, cfg.max_block, cfg.min_block) != 0) goto done;
-    Canvas* cv = &e.cv;
-    cv->fixed_pred = cfg.residual != 0;
-    for (int c = 0; c < 3; c++) {
-        e.src[c] = (double*)malloc(sizeof(double) * cv->pw * cv->ph);
-        if (!e.src[c]) goto done;
-    }
-    for (int y = 0; y < cv->ph; y++)
-        for (int x = 0; x < cv->pw; x++) {
-            int sx = x < cv->w ? x : cv->w - 1, sy = y < cv->h ? y : cv->h - 1;
-            double o[3];
-            rgb_to_ycc(img->pixels + ((size_t)sy * cv->w + sx) * 3, o);
-            for (int c = 0; c < 3; c++) e.src[c][(size_t)y * cv->pw + x] = o[c];
+    /* 4:2:0 needs a colour tile of at least the smallest leaf. */
+    int use420 = cfg.chroma420 && cfg.max_block >= 8;
+    e.nparts = use420 ? 2 : 1;
+    if (canvas_init(&e.part[0].cv, img->width, img->height, cfg.max_block, cfg.min_block,
+                    use420 ? 1 : 3, 0) != 0) goto done;
+    if (use420 && canvas_init(&e.part[1].cv, (img->width + 1) / 2, (img->height + 1) / 2,
+                              cfg.max_block / 2, NVDR_MIN_BLOCK, 2, 1) != 0) goto done;
+    for (int k = 0; k < e.nparts; k++) {
+        Canvas* pc = &e.part[k].cv;
+        pc->fixed_pred = cfg.residual != 0;
+        for (int c = 0; c < pc->np; c++) {
+            e.part[k].src[c] = (double*)malloc(sizeof(double) * pc->pw * pc->ph);
+            if (!e.part[k].src[c]) goto done;
         }
+    }
+    {
+        /* YCbCr at full resolution, padded by replication; in 4:2:0 the
+         * colour planes are then averaged 2x2, each sample centred between
+         * the four pixels it stands for. */
+        Canvas* cv = &e.part[0].cv;
+        double* full[3] = { NULL, NULL, NULL };
+        for (int c = 0; c < 3; c++) {
+            full[c] = (!use420 || c == 0) ? e.part[0].src[c]
+                    : (double*)malloc(sizeof(double) * cv->pw * cv->ph);
+            if (!full[c]) goto done;
+        }
+        for (int y = 0; y < cv->ph; y++)
+            for (int x = 0; x < cv->pw; x++) {
+                int sx = x < cv->w ? x : cv->w - 1, sy = y < cv->h ? y : cv->h - 1;
+                double o[3];
+                rgb_to_ycc(img->pixels + ((size_t)sy * cv->w + sx) * 3, o);
+                for (int c = 0; c < 3; c++) full[c][(size_t)y * cv->pw + x] = o[c];
+            }
+        if (use420) {
+            Canvas* cc = &e.part[1].cv;
+            for (int c = 1; c < 3; c++) {
+                for (int y = 0; y < cc->ph; y++)
+                    for (int x = 0; x < cc->pw; x++) {
+                        double sum = 0;
+                        for (int j = 0; j < 2; j++)
+                            for (int i = 0; i < 2; i++) {
+                                int fx = 2 * x + i, fy = 2 * y + j;
+                                if (fx >= cv->pw) fx = cv->pw - 1;
+                                if (fy >= cv->ph) fy = cv->ph - 1;
+                                sum += full[c][(size_t)fy * cv->pw + fx];
+                            }
+                        e.part[1].src[c - 1][(size_t)y * cc->pw + x] = sum / 4;
+                    }
+                free(full[c]);
+            }
+        }
+    }
 
     int qc = (int)(cfg.q * cfg.chroma_q + 0.5f);
     if (qc < 1) qc = 1;
     if (qc > 4095) qc = 4095;
     e.step[0] = cfg.q; e.step[1] = e.step[2] = qc;
     e.deadzone = cfg.deadzone;
-    e.lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
-    e.skip_lambda = cfg.residual ? cfg.skip_k * e.lambda : 0.0;
+    double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
+    for (int k = 0; k < e.nparts; k++) {
+        /* A colour sample at half size stands for four pixels: its error
+         * weighs four times, which is lambda a quarter. */
+        double scale = e.part[k].cv.comp0 && use420 ? 0.25 : 1.0;
+        e.part[k].lambda = lambda * scale;
+        e.part[k].skip_lambda = cfg.residual ? cfg.skip_k * lambda * scale : 0.0;
+    }
     for (int s = 0; s < NSIZES; s++) e.band_at[s] = band_split(s, band);
 
-    size_t nodes = 0;
-    for (int s = 0; s < NSIZES; s++) {
-        int n = NVDR_MIN_BLOCK << s;
-        e.grid_base[s] = nodes;
-        e.grid_w[s] = (cv->pw + n - 1) / n;
-        nodes += (size_t)e.grid_w[s] * ((cv->ph + n - 1) / n);
-    }
-    e.split = (int*)calloc(nodes, sizeof(int));
-    if (!e.split) goto done;
-    for (int s = 0; s < NSIZES; s++) {
-        int n = NVDR_MIN_BLOCK << s;
-        if (n < cv->min_block || n > cv->tile) continue;
-        for (int c = 0; c < 3; c++) {
-            size_t blocks = (size_t)(cv->pw / n) * (cv->tile / n);
-            if (!blocks) blocks = 1;
-            e.pre[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-            e.pre_lo[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-            e.pre_hi[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-            e.pre_sum[s][c] = (double*)malloc(sizeof(double) * blocks);
-            e.pre_nz[s][c] = (uint8_t*)malloc(blocks);
-            if (!e.pre[s][c] || !e.pre_lo[s][c] || !e.pre_hi[s][c] || !e.pre_sum[s][c] || !e.pre_nz[s][c])
-                goto done;
+    for (int k = 0; k < e.nparts; k++) {
+        Part* P = &e.part[k];
+        Canvas* pc = &P->cv;
+        size_t nodes = 0;
+        for (int s = 0; s < NSIZES; s++) {
+            int n = NVDR_MIN_BLOCK << s;
+            P->grid_base[s] = nodes;
+            P->grid_w[s] = (pc->pw + n - 1) / n;
+            nodes += (size_t)P->grid_w[s] * ((pc->ph + n - 1) / n);
+        }
+        P->split = (int*)calloc(nodes, sizeof(int));
+        if (!P->split) goto done;
+        for (int s = 0; s < NSIZES; s++) {
+            int n = NVDR_MIN_BLOCK << s;
+            if (n < pc->min_block || n > pc->tile) continue;
+            for (int c = 0; c < pc->np; c++) {
+                size_t blocks = (size_t)(pc->pw / n) * (pc->tile / n);
+                if (!blocks) blocks = 1;
+                P->pre[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+                P->pre_lo[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+                P->pre_hi[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+                P->pre_sum[s][c] = (double*)malloc(sizeof(double) * blocks);
+                P->pre_nz[s][c] = (uint8_t*)malloc(blocks);
+                if (!P->pre[s][c] || !P->pre_lo[s][c] || !P->pre_hi[s][c] || !P->pre_sum[s][c] || !P->pre_nz[s][c])
+                    goto done;
+            }
         }
     }
 
@@ -1061,13 +1138,22 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     Sink s0 = { &enc0, 0 }, s1[2] = { { &enc1, 0 }, { &enc2, 0 } };
 
     /* Each tile is searched against the models as they stand, then coded
-     * for real, which is what adapts them for the next. */
+     * for real, which is what adapts them for the next. In 4:2:0 a tile is
+     * luma's tree, then colour's over the same area at half size. */
+    Canvas* cv = &e.part[0].cv;
     for (int ty = 0; ty < cv->ph; ty += cv->tile) {
-        precompute_row(&e, ty);
-        for (int tx = 0; tx < cv->pw; tx += cv->tile) {
-            search(&e, tx, ty, cv->tile);
-            emit(&e, &s0, s1, tx, ty, cv->tile, &h);
+        for (int k = 0; k < e.nparts; k++) {
+            e.p = &e.part[k];
+            if (ty / (k + 1) < e.p->cv.ph) precompute_row(&e, ty / (k + 1));
         }
+        for (int tx = 0; tx < cv->pw; tx += cv->tile)
+            for (int k = 0; k < e.nparts; k++) {
+                e.p = &e.part[k];
+                int x = tx / (k + 1), y = ty / (k + 1);
+                if (!node_exists(&e.p->cv, x, y)) continue;
+                search(&e, x, y, e.p->cv.tile);
+                emit(&e, &s0, s1, x, y, e.p->cv.tile, &h);
+            }
     }
     if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
         nvdr_enc_finish(&enc2) != 0) goto done;
@@ -1081,7 +1167,8 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = NVDR_VERSION;
-    buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0));
+    buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
+                       (use420 ? NVDR_FLAG_CHROMA420 : 0));
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -1115,14 +1202,17 @@ done:
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
     nvdr_enc_free(&enc2);
-    for (int c = 0; c < 3; c++) free(e.src[c]);
-    free(e.split);
-    for (int s = 0; s < NSIZES; s++)
-        for (int c = 0; c < 3; c++) {
-            free(e.pre[s][c]); free(e.pre_lo[s][c]); free(e.pre_hi[s][c]);
-            free(e.pre_sum[s][c]); free(e.pre_nz[s][c]);
-        }
-    canvas_free(&e.cv);
+    for (int k = 0; k < 2; k++) {
+        Part* P = &e.part[k];
+        for (int c = 0; c < 3; c++) free(P->src[c]);
+        free(P->split);
+        for (int s = 0; s < NSIZES; s++)
+            for (int c = 0; c < 3; c++) {
+                free(P->pre[s][c]); free(P->pre_lo[s][c]); free(P->pre_hi[s][c]);
+                free(P->pre_sum[s][c]); free(P->pre_nz[s][c]);
+            }
+        canvas_free(&P->cv);
+    }
     return rc;
 }
 
@@ -1141,6 +1231,33 @@ int nvdr_encode_file(const char* out_path, const NvdrImage* img,
 }
 
 /* ============================================================= decoder */
+
+/*
+ * Colour back to full size, for 4:2:0. A colour sample sits at the centre
+ * of the 2x2 pixels it was averaged from, so a pixel lies a quarter of a
+ * sample from the nearest one each way: bilinear weights 3/4 and 1/4,
+ * 9 3 3 1 in sixteenths, with edges held. Integer, and identical in
+ * nvdr.js.
+ */
+static void upsample_plane(const uint8_t* src, const Canvas* cc, uint8_t* dst, int dpw, int w, int h) {
+    int cw = cc->w, ch = cc->h;
+    for (int y = 0; y < h; y++) {
+        int cy = y >> 1, oy = (y & 1) ? cy + 1 : cy - 1;
+        if (oy < 0) oy = 0;
+        if (oy >= ch) oy = ch - 1;
+        const uint8_t* r0 = src + (size_t)cy * cc->pw;
+        const uint8_t* r1 = src + (size_t)oy * cc->pw;
+        uint8_t* out = dst + (size_t)y * dpw;
+        for (int x = 0; x < w; x++) {
+            int cx = x >> 1, ox = (x & 1) ? cx + 1 : cx - 1;
+            if (ox < 0) ox = 0;
+            if (ox >= cw) ox = cw - 1;
+            out[x] = (uint8_t)((9 * r0[cx] + 3 * r0[ox] + 3 * r1[cx] + r1[ox] + 8) >> 4);
+        }
+    }
+}
+
+
 
 typedef struct { uint16_t x, y; uint8_t n; } Leaf;
 
@@ -1172,7 +1289,7 @@ static int read_node(Layer0* L, int x, int y, int n) {
     Canvas* cv = L->cv;
     int whole = node_whole(cv, x, y, n);
     int split = 0;
-    if (n > cv->min_block) split = whole ? nvdr_dec_bit(L->d, &L->cm->split[size_class(n)]) : 1;
+    if (n > cv->min_block) split = whole ? nvdr_dec_bit(L->d, split_model(L->cm, cv, n)) : 1;
     if (L->d->overrun || L->corrupt) return 0;
     if (split) {
         int h = n / 2;
@@ -1184,10 +1301,11 @@ static int read_node(Layer0* L, int x, int y, int n) {
         return 0;
     }
     int sc = size_class(n);
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < cv->np; c++) {
+        int k = cv->comp0 + c;
         int pred = predict(cv, c, x, y, n);
-        int dl = get_dc(L->d, L->cm, sc, c, &L->corrupt);
-        int colour = clamp_u8(pred + div_round(clamp_coef((long)dl * L->step[c]), n));
+        int dl = get_dc(L->d, L->cm, sc, k, &L->corrupt);
+        int colour = clamp_u8(pred + div_round(clamp_coef((long)dl * L->step[k]), n));
         paint_flat(cv, c, x, y, n, n, colour);
     }
     return push_leaf(L, x, y, n);
@@ -1282,7 +1400,8 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
         if (x > 0) for (int j = y; j < y + n && j < gh; j++) vedge[(size_t)j * gw + x] = 1;
         if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
     }
-    for (int c = 0; c < 3; c++) deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[c]);
+    for (int c = 0; c < cv->np; c++)
+        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c]);
     free(vedge); free(hedge); free(cell);
     return 0;
 }
@@ -1314,18 +1433,29 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
     int band_at[NSIZES];
     for (int s = 0; s < NSIZES; s++) band_at[s] = band_split(s, h.band);
 
-    Canvas cv;
+    /* One tree in 4:4:4; in 4:2:0 luma's, then colour's at half size,
+     * tile by tile in the same streams. A tile is whole when both are. */
+    int np = (h.flags & NVDR_FLAG_CHROMA420) ? 2 : 1;
+    Canvas cvs[2];
+    Layer0 L[2];
+    size_t* tile_start[2] = { NULL, NULL };
+    uint8_t* textured[2] = { NULL, NULL };
     int rc = -1;
-    Layer0 L;
-    memset(&L, 0, sizeof(L));
-    size_t* tile_start = NULL;
-    uint8_t* textured = NULL;
-    if (canvas_init(&cv, h.width, h.height, h.max_block, h.min_block) != 0) goto done;
-    cv.fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
-    int tiles_x = (cv.pw + cv.tile - 1) / cv.tile, tiles_y = (cv.ph + cv.tile - 1) / cv.tile;
+    memset(cvs, 0, sizeof(cvs));
+    memset(L, 0, sizeof(L));
+    uint8_t* up[2] = { NULL, NULL };
+    uint8_t* saved = NULL;
+    if (canvas_init(&cvs[0], h.width, h.height, h.max_block, h.min_block, np == 2 ? 1 : 3, 0) != 0) goto done;
+    if (np == 2 && canvas_init(&cvs[1], (h.width + 1) / 2, (h.height + 1) / 2, h.max_block / 2,
+                               NVDR_MIN_BLOCK, 2, 1) != 0) goto done;
+    Canvas* cv = &cvs[0];
+    for (int k = 0; k < np; k++) cvs[k].fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
+    int tiles_x = (cv->pw + cv->tile - 1) / cv->tile, tiles_y = (cv->ph + cv->tile - 1) / cv->tile;
     int tiles = tiles_x * tiles_y;
-    tile_start = (size_t*)malloc(sizeof(size_t) * (tiles + 1));
-    if (!tile_start) goto done;
+    for (int k = 0; k < np; k++) {
+        tile_start[k] = (size_t*)malloc(sizeof(size_t) * (tiles + 1));
+        if (!tile_start[k]) goto done;
+    }
     int step[3] = { h.q_luma, h.q_chroma, h.q_chroma };
 
     /* Layer 0: every tile that arrives whole; the rest predicted. */
@@ -1339,29 +1469,37 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
     }
     NvdrDecoder d0;
     nvdr_dec_init(&d0, data + NVDR_HEADER_SIZE, avail0);
-    L.cv = &cv; L.d = &d0; L.cm = &cm; L.step = step;
+    for (int k = 0; k < np; k++) { L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = step; }
     int complete0 = 0, stopped = 0;
     for (int t = 0; t < tiles; t++) {
-        int tx = (t % tiles_x) * cv.tile, ty = (t / tiles_x) * cv.tile;
-        tile_start[t] = L.count;
-        if (!stopped) {
-            if (read_node(&L, tx, ty, cv.tile) != 0) goto done;
-            if (d0.overrun || L.corrupt) { stopped = 1; L.count = tile_start[t]; }
-            else complete0++;
+        int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
+        for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
+        for (int k = 0; k < np && !stopped; k++) {
+            int x = tx / (k + 1), y = ty / (k + 1);
+            if (!node_exists(&cvs[k], x, y)) continue;
+            if (read_node(&L[k], x, y, cvs[k].tile) != 0) goto done;
+            if (d0.overrun || L[k].corrupt) stopped = 1;
         }
-        if (stopped) tile_fallback(&cv, tx, ty);
+        if (stopped) {
+            for (int k = 0; k < np; k++) {
+                L[k].count = tile_start[k][t];
+                tile_fallback(&cvs[k], tx / (k + 1), ty / (k + 1));
+            }
+        } else complete0++;
     }
-    tile_start[tiles] = L.count;
+    for (int k = 0; k < np; k++) tile_start[k][tiles] = L[k].count;
 
     /* Layers 1 and 2: the low and the high band of every leaf's texture,
      * each as far as its own bytes reach and no further than the layer
      * before it. A tile cut short is restored to what it showed before
      * its band arrived. */
     int complete[NVDR_LAYERS] = { complete0, 0, 0 };
-    uint8_t* saved = NULL;
-    textured = (uint8_t*)calloc(L.count ? L.count : 1, 1);
-    saved = (uint8_t*)malloc((size_t)cv.tile * cv.tile * 9);   /* full and acc, 3 channels */
-    if (!textured || !saved) { free(saved); goto done; }
+    for (int k = 0; k < np; k++) {
+        textured[k] = (uint8_t*)calloc(L[k].count ? L[k].count : 1, 1);
+        if (!textured[k]) goto done;
+    }
+    saved = (uint8_t*)malloc((size_t)cv->tile * cv->tile * 9);   /* full and acc, 3 planes */
+    if (!saved) goto done;
     for (int layer = 1; layer < NVDR_LAYERS; layer++) {
         const uint8_t* stream = data + (layer == 1 ? off1 : off2);
         size_t avail = layer == 1 ? avail1 : avail2;
@@ -1373,58 +1511,89 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
         int corrupt = 0;
         int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
         for (int t = 0; t < complete[layer - 1]; t++) {
-            int tx = (t % tiles_x) * cv.tile, ty = (t / tiles_x) * cv.tile;
-            int tw = tx + cv.tile < cv.pw ? cv.tile : cv.pw - tx;
-            int th = ty + cv.tile < cv.ph ? cv.tile : cv.ph - ty;
-            for (int c = 0; c < 3; c++)
-                for (int j = 0; j < th; j++) {
-                    size_t at = (size_t)(ty + j) * cv.pw + tx;
-                    memcpy(saved + ((size_t)c * cv.tile + j) * cv.tile * 3, cv.full[c] + at, (size_t)tw);
-                    memcpy(saved + ((size_t)c * cv.tile + j) * cv.tile * 3 + cv.tile,
-                           cv.acc[c] + at, sizeof(int16_t) * (size_t)tw);
-                }
-            uint8_t was[1024];   /* a tile holds at most (32 / 4)^2 leaves */
-            size_t first = tile_start[t], nl = tile_start[t + 1] - first;
-            for (size_t i = 0; i < nl && i < sizeof(was); i++) was[i] = textured[first + i];
-            for (size_t i = first; i < tile_start[t + 1] && !d.overrun && !corrupt; i++) {
-                const Leaf* f = &L.leaves[i];
-                int sc = size_class(f->n), count = f->n * f->n;
-                int start = layer == 1 ? 1 : band_at[sc], end = layer == 1 ? band_at[sc] : count;
-                if (start >= end) continue;
-                for (int c = 0; c < 3 && !d.overrun && !corrupt; c++)
-                    if (get_texture(&d, tm, sc, c, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
-                        apply_texture(&cv, c, f->x, f->y, f->n, lv, start, end, step[c]);
-                        textured[i] = 1;
+            /* Every plane of both trees saved, luma's then colour's, in
+             * one buffer: a colour tile is a quarter of a luma tile. */
+            uint8_t* keep = saved;
+            uint8_t was[2][1024];   /* a tile holds at most (32 / 4)^2 leaves */
+            for (int k = 0; k < np; k++) {
+                Canvas* pc = &cvs[k];
+                int tx = (t % tiles_x) * pc->tile, ty = (t / tiles_x) * pc->tile;
+                if (!node_exists(pc, tx, ty)) continue;
+                int tw = tx + pc->tile < pc->pw ? pc->tile : pc->pw - tx;
+                int th = ty + pc->tile < pc->ph ? pc->tile : pc->ph - ty;
+                for (int c = 0; c < pc->np; c++)
+                    for (int j = 0; j < th; j++) {
+                        size_t at = (size_t)(ty + j) * pc->pw + tx;
+                        memcpy(keep, pc->full[c] + at, (size_t)tw); keep += tw;
+                        memcpy(keep, pc->acc[c] + at, sizeof(int16_t) * (size_t)tw); keep += 2 * tw;
                     }
+                size_t first = tile_start[k][t], nl = tile_start[k][t + 1] - first;
+                for (size_t i = 0; i < nl && i < sizeof(was[k]); i++) was[k][i] = textured[k][first + i];
+            }
+            for (int k = 0; k < np && !d.overrun && !corrupt; k++) {
+                Canvas* pc = &cvs[k];
+                for (size_t i = tile_start[k][t]; i < tile_start[k][t + 1] && !d.overrun && !corrupt; i++) {
+                    const Leaf* f = &L[k].leaves[i];
+                    int sc = size_class(f->n), count = f->n * f->n;
+                    int start = layer == 1 ? 1 : band_at[sc], end = layer == 1 ? band_at[sc] : count;
+                    if (start >= end) continue;
+                    for (int c = 0; c < pc->np && !d.overrun && !corrupt; c++) {
+                        int comp = pc->comp0 + c;
+                        if (get_texture(&d, tm, sc, comp, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
+                            apply_texture(pc, c, f->x, f->y, f->n, lv, start, end, step[comp]);
+                            textured[k][i] = 1;
+                        }
+                    }
+                }
             }
             if (d.overrun || corrupt) {
-                for (int c = 0; c < 3; c++)
-                    for (int j = 0; j < th; j++) {
-                        size_t at = (size_t)(ty + j) * cv.pw + tx;
-                        memcpy(cv.full[c] + at, saved + ((size_t)c * cv.tile + j) * cv.tile * 3, (size_t)tw);
-                        memcpy(cv.acc[c] + at, saved + ((size_t)c * cv.tile + j) * cv.tile * 3 + cv.tile,
-                               sizeof(int16_t) * (size_t)tw);
-                    }
-                for (size_t i = 0; i < nl && i < sizeof(was); i++) textured[first + i] = was[i];
+                const uint8_t* back = saved;
+                for (int k = 0; k < np; k++) {
+                    Canvas* pc = &cvs[k];
+                    int tx = (t % tiles_x) * pc->tile, ty = (t / tiles_x) * pc->tile;
+                    if (!node_exists(pc, tx, ty)) continue;
+                    int tw = tx + pc->tile < pc->pw ? pc->tile : pc->pw - tx;
+                    int th = ty + pc->tile < pc->ph ? pc->tile : pc->ph - ty;
+                    for (int c = 0; c < pc->np; c++)
+                        for (int j = 0; j < th; j++) {
+                            size_t at = (size_t)(ty + j) * pc->pw + tx;
+                            memcpy(pc->full[c] + at, back, (size_t)tw); back += tw;
+                            memcpy(pc->acc[c] + at, back, sizeof(int16_t) * (size_t)tw); back += 2 * tw;
+                        }
+                    size_t first = tile_start[k][t], nl = tile_start[k][t + 1] - first;
+                    for (size_t i = 0; i < nl && i < sizeof(was[k]); i++) textured[k][first + i] = was[k][i];
+                }
                 break;
             }
             complete[layer]++;
         }
     }
-    free(saved);
 
     out->pixels = (unsigned char*)malloc((size_t)h.width * h.height * 3);
     if (!out->pixels) goto done;
     out->width = h.width; out->height = h.height;
-    uint8_t** planes = (max_layer == 0) ? cv.flat : cv.full;
-    if ((h.flags & NVDR_FLAG_DEBLOCK) &&
-        deblock(&cv, planes, L.leaves, max_layer == 0 ? NULL : textured, tile_start[complete0],
-                complete0, tiles_x, tiles, step) != 0) {
-        free(out->pixels); out->pixels = NULL; goto done;
+    uint8_t* planes[3];
+    for (int k = 0; k < np; k++) {
+        uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
+        if ((h.flags & NVDR_FLAG_DEBLOCK) &&
+            deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][complete0],
+                    complete0, tiles_x, tiles, step) != 0) {
+            free(out->pixels); out->pixels = NULL; goto done;
+        }
+        for (int c = 0; c < cvs[k].np; c++) planes[cvs[k].comp0 + c] = pl[c];
+    }
+    if (np == 2) {
+        /* Colour back to full size (see upsample_plane()). */
+        for (int c = 0; c < 2; c++) {
+            up[c] = (uint8_t*)malloc((size_t)cv->pw * cv->ph);
+            if (!up[c]) { free(out->pixels); out->pixels = NULL; goto done; }
+            upsample_plane(planes[1 + c], &cvs[1], up[c], cv->pw, h.width, h.height);
+            planes[1 + c] = up[c];
+        }
     }
     for (int y = 0; y < h.height; y++)
         for (int x = 0; x < h.width; x++) {
-            size_t at = (size_t)y * cv.pw + x;
+            size_t at = (size_t)y * cv->pw + x;
             ycc_to_rgb(planes[0][at], planes[1][at], planes[2][at],
                        out->pixels + ((size_t)y * h.width + x) * 3);
         }
@@ -1447,10 +1616,14 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
     rc = 0;
 
 done:
-    free(L.leaves);
-    free(tile_start);
-    free(textured);
-    canvas_free(&cv);
+    free(saved);
+    for (int k = 0; k < 2; k++) {
+        free(L[k].leaves);
+        free(tile_start[k]);
+        free(textured[k]);
+        free(up[k]);
+        canvas_free(&cvs[k]);
+    }
     return rc;
 }
 

@@ -114,6 +114,11 @@ typedef struct {
      * u + v <= max(1, n * band / 32) in an n x n leaf. 0 keeps all texture
      * in one layer (see band_split() in nvdr.c). */
     int   band;
+    /* Colour at half resolution each way (4:2:0): Cb and Cr get their own
+     * quadtree over a half-size canvas, tile by tile after luma's, and the
+     * decoder scales them back up. Carried in the header's flags. Needs
+     * max_block of 8 or more. */
+    int   chroma420;
 } NvdrConfig;
 
 NvdrConfig nvdr_default_config(void);
@@ -129,6 +134,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
+#define NVDR_FLAG_CHROMA420 0x04        /* colour in its own half-resolution tree */
 
 typedef struct {
     uint16_t width, height;
