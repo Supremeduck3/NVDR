@@ -1189,6 +1189,35 @@ quadtree already does most of what the modes do elsewhere: it splits to
 rate-distortion, where HEVC's intra modes work on a fixed partition.
 Neither gain pays for its format.
 
+### Measured but not built: adaptive quantisation
+
+x264 moves bits from busy regions, where the eye masks error, to smooth
+ones, where it shows. A prototype gave each 32x32 tile a step offset of
+-4..4 sixths of a doubling (H.264's QP scale), from how far its luma
+activity (mean log variance of its 8x8 blocks) was from the picture's.
+BD-rate against WebP, mean of the seven benchmark images, and on
+montanha at twice its size:
+
+                     7 images               montanha x2
+    strength         PSNR-Y   SSIM-Y        PSNR-Y   SSIM-Y
+    0 (off)          -3.3%    +3.9%         -31.5%   -31.2%
+    0.5              -1.4%    +2.0%         -30.7%   -31.7%
+    1                +2.1%    +3.6%         -29.6%   -32.1%
+
+At a camera's scale it buys one point of SSIM for two of PSNR: a 32x32
+tile of a large photograph mixes smooth and busy parts, and a per-leaf
+offset would cost a symbol in every leaf. Not built.
+
+### At a camera's scale
+
+The benchmark's images are thumbnails of 400 to 800 pixels. On montanha
+at twice its size, a picture closer to a camera's, NVDR against the
+browser's WebP is -31.5% on PSNR-Y, -31.2% on SSIM-Y and -28.6% on
+PSNR-RGB, where the thumbnails averaged -3.3%, +3.9% and -7.7%: the
+quadtree's 32x32 leaves and the colour tree pay most where there are
+large smooth areas to cover, and a photograph at full size has more of
+them. `node scripts/bench_codecs.mjs <images>` runs any picture.
+
 ## Showing a large picture small
 
 A night sky shown on the page at a tenth of its size came out as white
