@@ -109,6 +109,11 @@ esse toca direto, sem passar pelo servidor.
 - **Duração** (3 a 20 s) e **largura máxima** limitam o trabalho: codificar
   é a direção lenta, e os quadros ficam em PNG no disco enquanto isso.
   Com os padrões (5 s, 1280 px), um clipe de 960×540 levou 14 s ida e volta.
+- **Qualidade** escolhe o `--q` dos quadros intra (os preditos usam 1,2×):
+  Máxima 12, **Alta 17 (padrão)**, Média 24, Leve 34. O padrão era 24, o
+  do próprio encoder, e deixava grama e pele visivelmente moles em 720p.
+  Num clipe de teste de 960×540 com panorâmica, zoom e um objeto se
+  movendo, Alta dá 36,7 dB a ~1,1 Mbit/s e Média 34,6 dB a ~0,6 Mbit/s.
 
 O player mostra, por quadro, quanto custou **decodificar** e **exibir**
 contra o orçamento do fps do vídeo, e quantas vezes travou. A faixa embaixo

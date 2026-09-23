@@ -208,6 +208,12 @@
             <option value="1280" selected>1280 px (720p)</option><option value="1920">1920 px (1080p)</option>
           </select>
         </label>
+        <label>Qualidade
+          <select id="vquality">
+            <option value="12">Máxima</option><option value="17" selected>Alta</option>
+            <option value="24">Média</option><option value="34">Leve</option>
+          </select>
+        </label>
       </div>
       <div id="vstatus" class="status"></div>
     </div>
@@ -601,7 +607,8 @@ async function loadFile(file) {
             headers: {
                 'x-file-ext': ext,
                 'x-seconds': $('vseconds').value,
-                'x-max-width': $('vwidth').value
+                'x-max-width': $('vwidth').value,
+                'x-q': $('vquality').value
             },
             body: file
         });
