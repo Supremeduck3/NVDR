@@ -512,6 +512,9 @@ that much more:
     clean, + model (fmt 8)        +128.5%       +54.6%      +12.1%       +42.1%
     noisy, B frames (fmt 7)       +288.1%       +93.1%      +40.4%       +55.4%
     noisy, + model (fmt 8)        +255.1%       +69.4%      +23.9%       +38.3%
+    clean, + look-ahead, RDOQ,
+      contexts, directional       +102.6%       +37.3%       +0.1%
+    noisy, the same               +216.0%       +50.0%       +9.8%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame
