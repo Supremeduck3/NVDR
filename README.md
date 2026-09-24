@@ -420,6 +420,33 @@ Intra frames, BD-rate on PSNR-Y, mean of five photographs:
 On the sequences, on top of the look-ahead: 2.5, 2.1 and 4.4 points more
 on the three 25-frame clips, most where the noise is.
 
+### Texture contexts from the neighbourhood (format v12)
+
+More than 90% of an intra frame's bits are luma texture, so its
+contexts were next. A coefficient is likelier to be significant, and
+large, when the ones next to it in frequency are. Significance is now
+conditioned on the position's class (its diagonal: 1, 2, 3-4, 5-7, 8 on)
+and on what is already coded around it: the levels at (u-1, v),
+(u, v-1), (u-1, v-1), (u-2, v) and (u, v-2), each counted up to 3, the
+template AV1 and VVC use. All five lie on earlier diagonals, so the
+diagonal scan has decoded them; one in the other band counts as zero, so
+the layers stay decodable on their own. The "more than 1" flag of a
+magnitude takes the same sum and whether a level over 1 has been seen.
+
+Intra frames, mean of five photographs, BD-rate on PSNR-Y:
+
+                                 vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    RDOQ, contexts by position          +18.5%                  +3.9%
+    + neighbourhood contexts            +17.2%                  +2.9%
+
+Tried and left out, each within a tenth of a point: conditioning the
+larger magnitudes and the "last" flag on the neighbourhood as well, and
+an adaptation rate that starts fast and slows with a per-context count
+(what AV1 does), worth 0.4 points for touching every stream the codec
+writes. The remaining distance is not in the entropy coder: it is in
+what the texture has to carry, a block minus its flat colour, where AV1
+first predicts the block along a direction and from its luma.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

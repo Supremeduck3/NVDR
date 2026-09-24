@@ -136,6 +136,8 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b) {
 
 #define NSIZES     4           /* 4, 8, 16, 32 */
 #define POS_CTX    15
+#define SIG_CTX    25          /* 5 position classes x 5 neighbourhoods */
+#define GT1_CTX    10          /* 5 neighbourhoods x (a level over 1 yet or not) */
 #define MAG_UNARY  14
 #define EG_LIMIT   24          /* longest Exp-Golomb prefix a decoder accepts */
 #define COEF_MAX   32767
@@ -193,6 +195,7 @@ static int tmat[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* [k * n + x] */
 static int scan_pos[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_ctx[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_diag[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* u + v */
+static int16_t scan_idx[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* raster -> scan */
 static double bitcost[2][1 << NVDR_PROB_BITS];
 
 static int cos_entry(int j) {
@@ -222,6 +225,7 @@ static void tables_init(void) {
                 int u = d - v;
                 if (u < 0 || u >= n) continue;
                 scan_pos[s][at] = v * n + u;
+                scan_idx[s][v * n + u] = (int16_t)at;
                 scan_ctx[s][at] = (uint8_t)(d < 8 ? d : 8 + ((d - 8) / 4 < 6 ? (d - 8) / 4 : 6));
                 scan_diag[s][at] = (uint8_t)d;
                 at++;
@@ -366,9 +370,9 @@ typedef struct {
 
 typedef struct {
     uint16_t cbf[NSIZES][3];
-    uint16_t sig[NSIZES][3][POS_CTX];
+    uint16_t sig[NSIZES][3][SIG_CTX];
     uint16_t last[NSIZES][3][POS_CTX];
-    uint16_t gt1[3][4];
+    uint16_t gt1[3][GT1_CTX];
     uint16_t mag[3][MAG_UNARY];
 } TextureModels;
 
@@ -492,6 +496,45 @@ static int get_tq(NvdrDecoder* d, ColourModels* m) {
     return neg ? -(r + 1) : r + 1;
 }
 
+/*
+ * TEXTURE CONTEXTS
+ * ----------------
+ * A coefficient is likelier to be significant, and large, when the ones
+ * next to it in frequency are: the energy of a block runs in ridges and
+ * falls off together. So significance is conditioned on the position's
+ * class (its diagonal: 1, 2, 3-4, 5-7, 8 on) and on how much is already
+ * coded around it, the levels at (u-1, v), (u, v-1), (u-1, v-1), (u-2, v)
+ * and (u, v-2), each counted up to 3, the template AV1 and VVC use. All
+ * five lie on earlier diagonals, so the diagonal scan has coded them. A
+ * neighbour in the other band (the other layer) counts as zero, which
+ * keeps the layers decodable on their own. The "more than 1" flag of a
+ * magnitude is conditioned on the same sum and on whether a level over 1
+ * has been seen in the band yet.
+ */
+static int nb_mag(const int* lv, int s, int i, int start) {
+    static const int du[5] = { 1, 0, 1, 2, 0 }, dv[5] = { 0, 1, 1, 0, 2 };
+    int n = NVDR_MIN_BLOCK << s, p = scan_pos[s][i];
+    int u = p & (n - 1), v = p / n, t = 0;
+    for (int k = 0; k < 5; k++) {
+        int uu = u - du[k], vv = v - dv[k];
+        if (uu < 0 || vv < 0) continue;
+        int j = scan_idx[s][vv * n + uu];
+        if (j < start || j >= i) continue;
+        int a = lv[j] < 0 ? -lv[j] : lv[j];
+        t += a < 3 ? a : 3;
+    }
+    return t;
+}
+
+static int sig_ctx(int s, int i, int t) {
+    int d = scan_diag[s][i];
+    int pc = d <= 1 ? 0 : d == 2 ? 1 : d <= 4 ? 2 : d <= 7 ? 3 : 4;
+    int nb = (t + 1) >> 1;
+    return pc * 5 + (nb < 4 ? nb : 4);
+}
+
+static int gt1_ctx(int t, int g) { return (t < 4 ? t : 4) + (g ? 5 : 0); }
+
 static void put_mag(Sink* s, TextureModels* m, int c, int g, int a) {
     put_bit(s, &m->gt1[c][g], a > 1);
     if (a == 1) return;
@@ -519,11 +562,11 @@ static void put_texture(Sink* s, TextureModels* m, int sc, int c, const int* lv,
     int g = 0;
     for (int i = start; i <= last; i++) {
         int a = lv[i] < 0 ? -lv[i] : lv[i];
-        int pc = scan_ctx[sc][i];
-        if (i < end - 1) put_bit(s, &m->sig[sc][c][pc], a != 0);
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        if (i < end - 1) put_bit(s, &m->sig[sc][c][sig_ctx(sc, i, t)], a != 0);
         if (!a) continue;
         if (i < end - 1) put_bit(s, &m->last[sc][c][pc], i == last);
-        put_mag(s, m, c, g < 3 ? g : 3, a);
+        put_mag(s, m, c, gt1_ctx(t, g), a);
         put_direct(s, lv[i] < 0, 1);
         if (a > 1) g++;
     }
@@ -536,12 +579,12 @@ static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
     if (!nvdr_dec_bit(d, &m->cbf[sc][c])) return 0;
     int g = 0;
     for (int i = start; i < end; i++) {
-        int pc = scan_ctx[sc][i];
-        int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][pc]) : 1;
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][sig_ctx(sc, i, t)]) : 1;
         if (!sig) continue;
         int last = i < end - 1 ? nvdr_dec_bit(d, &m->last[sc][c][pc]) : 1;
         int a;
-        if (!nvdr_dec_bit(d, &m->gt1[c][g < 3 ? g : 3])) a = 1;
+        if (!nvdr_dec_bit(d, &m->gt1[c][gt1_ctx(t, g)])) a = 1;
         else {
             int r = 0, k = 0;
             for (; k < MAG_UNARY; k++) {
@@ -1003,11 +1046,11 @@ static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv
     int g = 0;
     for (int i = start; i < end; i++) {
         double a = fabs(v[i]);
-        int pc = scan_ctx[sc][i];
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start), sp = sig_ctx(sc, i, t);
         int l = (int)(a + 0.5);
         if (l > COEF_MAX) l = COEF_MAX;
         drop[i] = a * a;
-        double zero_bits = i < end - 1 ? rd_bit(&m->sig[sc][c][pc], 0) : 0.0;
+        double zero_bits = i < end - 1 ? rd_bit(&m->sig[sc][c][sp], 0) : 0.0;
         double best = drop[i] + lam * zero_bits;
         int bl = 0;
         if (i < keep) {
@@ -1015,18 +1058,18 @@ static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv
             bl = (int)(a + 0.4);
             if (bl > COEF_MAX) bl = COEF_MAX;
             lv[i] = v[i] < 0 ? -bl : bl;
-            double bits = bl ? rd_mag_bits(m, c, g < 3 ? g : 3, bl) + 1.0 +
-                               (i < end - 1 ? rd_bit(&m->sig[sc][c][pc], 1) + rd_bit(&m->last[sc][c][pc], 0) : 0.0)
+            double bits = bl ? rd_mag_bits(m, c, gt1_ctx(t, g), bl) + 1.0 +
+                               (i < end - 1 ? rd_bit(&m->sig[sc][c][sp], 1) + rd_bit(&m->last[sc][c][pc], 0) : 0.0)
                              : zero_bits;
             cost[i] = (a - bl) * (a - bl) + lam * bits;
             if (bl > 1) g++;
             continue;
         }
-        for (int t = l; t >= 1 && t >= l - 1; t--) {
-            double bits = rd_mag_bits(m, c, g < 3 ? g : 3, t) + 1.0;
-            if (i < end - 1) bits += rd_bit(&m->sig[sc][c][pc], 1) + rd_bit(&m->last[sc][c][pc], 0);
-            double j = (a - t) * (a - t) + lam * bits;
-            if (j < best) { best = j; bl = t; }
+        for (int lvl = l; lvl >= 1 && lvl >= l - 1; lvl--) {
+            double bits = rd_mag_bits(m, c, gt1_ctx(t, g), lvl) + 1.0;
+            if (i < end - 1) bits += rd_bit(&m->sig[sc][c][sp], 1) + rd_bit(&m->last[sc][c][pc], 0);
+            double j = (a - lvl) * (a - lvl) + lam * bits;
+            if (j < best) { best = j; bl = lvl; }
         }
         lv[i] = v[i] < 0 ? -bl : bl;
         cost[i] = best;

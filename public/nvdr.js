@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-const VERSION = 11;
+const VERSION = 12;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -46,6 +46,7 @@ const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
+const SIG_CTX = 25, GT1_CTX = 10;
 
 /* --- entropy layer, mirroring src/entropy.c -------------------------- */
 
@@ -137,6 +138,9 @@ function cosEntry(j) {
 }
 
 const TMAT = [], SCAN_POS = [], SCAN_CTX = [], SCAN_DIAG = [];
+// Per scan position, the scan positions of the five neighbours nb_mag()
+// reads, -1 off the block.
+const SCAN_NB = [];
 
 /* Mirrors band_split(): the first scan position of the high band. */
 function bandSplit(sc, band) {
@@ -163,8 +167,40 @@ for (let s = 0; s < NSIZES; s++) {
             diag[at] = d;
             at++;
         }
-    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag);
+    const idx = new Int32Array(n * n);
+    for (let i = 0; i < n * n; i++) idx[pos[i]] = i;
+    const nb = new Int32Array(n * n * 5).fill(-1);
+    const du = [1, 0, 1, 2, 0], dv = [0, 1, 1, 0, 2];
+    for (let i = 0; i < n * n; i++) {
+        const u = pos[i] & (n - 1), v = (pos[i] - u) / n;
+        for (let k = 0; k < 5; k++) {
+            const uu = u - du[k], vv = v - dv[k];
+            if (uu >= 0 && vv >= 0) nb[i * 5 + k] = idx[vv * n + uu];
+        }
+    }
+    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag); SCAN_NB.push(nb);
 }
+
+/* Mirrors nb_mag(), sig_ctx() and gt1_ctx(): what is coded around a
+ * position, neighbours outside the band counting as zero. */
+function nbMag(lv, sc, i, start) {
+    const nb = SCAN_NB[sc];
+    let t = 0;
+    for (let k = i * 5; k < i * 5 + 5; k++) {
+        const j = nb[k];
+        if (j < start || j >= i) continue;
+        const a = lv[j] < 0 ? -lv[j] : lv[j];
+        t += a < 3 ? a : 3;
+    }
+    return t;
+}
+function sigCtx(sc, i, t) {
+    const d = SCAN_DIAG[sc][i];
+    const pc = d <= 1 ? 0 : d === 2 ? 1 : d <= 4 ? 2 : d <= 7 ? 3 : 4;
+    const nb = (t + 1) >> 1;
+    return pc * 5 + (nb < 4 ? nb : 4);
+}
+const gt1Ctx = (t, g) => (t < 4 ? t : 4) + (g ? 5 : 0);
 
 const sizeClass = n => (n === 4 ? 0 : n === 8 ? 1 : n === 16 ? 2 : 3);
 const log2 = n => 31 - Math.clz32(n);
@@ -240,9 +276,9 @@ function getTq(d, m) {
 function textureModels() {
     return {
         cbf: grid(NSIZES, 3),
-        sig: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
+        sig: Array.from({ length: NSIZES }, () => grid(3, SIG_CTX)),
         last: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
-        gt1: grid(3, 4),
+        gt1: grid(3, GT1_CTX),
         mag: grid(3, MAG_UNARY)
     };
 }
@@ -276,12 +312,12 @@ function getTexture(d, m, sc, c, lv, start, end, state) {
     if (!d.bit(m.cbf[sc], c)) return false;
     let g = 0;
     for (let i = start; i < end; i++) {
-        const pc = SCAN_CTX[sc][i];
-        const sig = i < end - 1 ? d.bit(m.sig[sc][c], pc) : 1;
+        const pc = SCAN_CTX[sc][i], t = nbMag(lv, sc, i, start);
+        const sig = i < end - 1 ? d.bit(m.sig[sc][c], sigCtx(sc, i, t)) : 1;
         if (!sig) continue;
         const last = i < end - 1 ? d.bit(m.last[sc][c], pc) : 1;
         let a;
-        if (!d.bit(m.gt1[c], g < 3 ? g : 3)) a = 1;
+        if (!d.bit(m.gt1[c], gt1Ctx(t, g))) a = 1;
         else {
             let r = 0, k = 0;
             for (; k < MAG_UNARY; k++) {
