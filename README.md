@@ -497,6 +497,48 @@ clips against P frames only: -14.0/-40.6/-39.8% before, -19.6/-45.1/-43.9%
 after; the two still-camera clips go from -5.1 and -8.0% to -13.3 and
 -15.2%.
 
+### Variable block size (sequence format 9)
+
+A field of 16x16 blocks follows the camera cheaply and an object's edge
+badly: the block that straddles the edge takes one vector for two
+motions. Each block of a sequence's field may now split into its four
+halves, each with its own vector and, in a B frame, its own mode. The
+field lives on the half-size grid; a whole block writes one vector into
+its four cells.
+
+Per block, in raster order: a split bit, conditioned on whether the left
+and upper blocks split; then its units (the block, or its halves in
+z-order), each coded as a block was. A unit's vector is predicted as the
+motion model at the unit's centre plus the median of its neighbours'
+deviations: left of its top-left cell, above it, and above-right of the
+unit, or above-left when that is not coded yet (the lower right half,
+whose above-right is in the next block), as H.264 does. Each cell keeps
+the deviation of its unit from the model at the unit's own centre, so a
+field that follows a zoom is predicted exactly; measuring it against
+the model at the cell's centre instead lost 3 to 4 points, from
+rounding.
+
+The encoder searches every list at both sizes and smooths both fields
+against their bits, then walks the blocks in coding order and codes each
+whole or split, whichever costs less error plus lambda times its bits
+(3 extra bits charged to a split; 0 and 8 measured the same). Blocks of
+8 split into 4.
+
+BD-rate on PSNR-Y against format 8, 25 frames:
+
+    clip                                             format 9
+    pan over a photo, whole pixels, clean              +0.5%
+    subpixel pan, zoom, one object, clean              -0.1%
+    the same with sensor noise                         -0.1%
+    slow pan, three elliptical objects each moving
+      its own way, one turning, light noise            -2.5%
+
+These clips move mostly with the camera, and splitting pays only where
+motions meet; footage with people in it has far more such edges than a
+rectangle crossing a pan. The regression gate's sequence (8x8 blocks
+splitting into 4x4) comes out 4.9% smaller in the closed loop and 0.8%
+smaller and 0.15 dB better by default.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

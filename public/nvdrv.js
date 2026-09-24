@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 8;
+const VERSION = 9;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -117,11 +117,6 @@ function decVector(dec, m, same, vx, vy, mx, my, nbx, b, esc, lim) {
     return true;
 }
 
-function inheritVector(same, vx, vy, mx, my, nbx, b) {
-    mvPredict(vx, vy, mx, my, nbx, b, PRED2);
-    vx[b] = PRED2[0]; vy[b] = PRED2[1];
-    same[b] = 1;
-}
 
 /* Returns false where unpack_field returns -1. */
 function unpackField(bytes, offset, len, nbx, nby, mx, my, vx, vy, esc, lim) {
@@ -142,45 +137,120 @@ function modelGet(bytes, at) {
     return [0, 2, 4, 6, 8, 10].map(o => v.getInt16(o, true));
 }
 
-/* model_fill(): the model's vector at every block's centre. */
-function modelFill([a0, a1, a2, b0, b1, b2], width, height, block, mx, my) {
-    const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
-    const clamp = t => (t < -MV_MAX ? -MV_MAX : t > MV_MAX ? MV_MAX : t);
-    for (let by = 0; by < nby; by++)
-        for (let bx = 0; bx < nbx; bx++) {
-            const cx = bx * block + (block >> 1), cy = by * block + (block >> 1), b = by * nbx + bx;
-            // Exact in doubles, and floor() is the C side's 64-bit >> 16.
-            mx[b] = clamp(a0 + Math.floor((a1 * cx + a2 * cy + 32768) / 65536));
-            my[b] = clamp(b0 + Math.floor((b1 * cx + b2 * cy + 32768) / 65536));
-        }
-}
 
-function modeCtx(mode, nbx, b, which) {
-    const x = b % nbx;
-    let n = 0;
-    if (x > 0) n += which ? (mode[b - 1] === MODE_BWD ? 1 : 0) : (mode[b - 1] !== MODE_BI ? 1 : 0);
-    if (b >= nbx) n += which ? (mode[b - nbx] === MODE_BWD ? 1 : 0) : (mode[b - nbx] !== MODE_BI ? 1 : 0);
-    return n;
-}
 
-/* unpack_field_bi(): per block the mode, then each used list's vector. */
-function unpackFieldBi(bytes, offset, len, nbx, nby, m0x, m0y, m1x, m1y, mode, v0x, v0y, v1x, v1y) {
-    const l0 = mvModels(), l1 = mvModels();
-    const notBi = new Uint16Array(3).fill(PROB_INIT), bwd = new Uint16Array(3).fill(PROB_INIT);
-    const nb = nbx * nby;
-    const same0 = new Uint8Array(nb), same1 = new Uint8Array(nb);
-    const dec = new ArithDecoder(bytes, offset, len);
-    for (let b = 0; b < nb; b++) {
-        mode[b] = MODE_BI;
-        if (dec.bit(notBi, modeCtx(mode, nbx, b, 0)))
-            mode[b] = dec.bit(bwd, modeCtx(mode, nbx, b, 1)) ? MODE_BWD : MODE_FWD;
-        if (mode[b] !== MODE_BWD) {
-            if (!decVector(dec, l0, same0, v0x, v0y, m0x, m0y, nbx, b, MV_ESC_SEQ, MV_MAX)) return false;
-        } else inheritVector(same0, v0x, v0y, m0x, m0y, nbx, b);
-        if (mode[b] !== MODE_FWD) {
-            if (!decVector(dec, l1, same1, v1x, v1y, m1x, m1y, nbx, b, MV_ESC_SEQ, MV_MAX)) return false;
-        } else inheritVector(same1, v1x, v1y, m1x, m1y, nbx, b);
+
+/*
+ * The variable field of a sequence (format 9), mirroring grid_init(),
+ * model_point(), unit_model(), vf_pred() and unpack_vfield() in nvdrv.c:
+ * every block whole or split into halves, the field on the half-size
+ * grid, each unit's vector predicted as the model at its centre plus the
+ * median of its neighbours' deviations from their units' models.
+ */
+function makeGrid(w, h, block) {
+    const g = block >> 1;
+    return { g, block, w, h, nfx: Math.ceil(w / g), nfy: Math.ceil(h / g),
+             nbx: Math.ceil(w / block), nby: Math.ceil(h / block) };
+}
+function modelPoint(M, px, py, which) {
+    const s = which ? Math.floor((M[4] * px + M[5] * py + 32768) / 65536)
+                    : Math.floor((M[1] * px + M[2] * py + 32768) / 65536);
+    const v = (which ? M[3] : M[0]) + s;
+    return v < -MV_MAX ? -MV_MAX : v > MV_MAX ? MV_MAX : v;
+}
+function vfPred(G, M, dx, dy, fx, fy, w, out) {
+    const cx = fx * G.g + Math.floor(w * G.g / 2), cy = fy * G.g + Math.floor(w * G.g / 2);
+    const ux = modelPoint(M, cx, cy, 0), uy = modelPoint(M, cx, cy, 1);
+    const n = G.nfx, c = fy * n + fx;
+    if (fy === 0) {
+        out[0] = ux + (fx > 0 ? dx[c - 1] : 0);
+        out[1] = uy + (fx > 0 ? dy[c - 1] : 0);
+        return;
     }
+    const t = c - n;
+    const lx = fx > 0 ? dx[c - 1] : 0, ly = fx > 0 ? dy[c - 1] : 0;
+    const trx = fx + w, trOk = trx < G.nfx && (!(fy & 1) || (trx >> 1) === (fx >> 1));
+    let rx = 0, ry = 0;
+    if (trOk) { rx = dx[t + w]; ry = dy[t + w]; }
+    else if (fx > 0) { rx = dx[t - 1]; ry = dy[t - 1]; }
+    out[0] = ux + median3(lx, dx[t], rx);
+    out[1] = uy + median3(ly, dy[t], ry);
+}
+function vfFill(G, a, fx, fy, w, v) {
+    for (let j = fy; j < fy + w && j < G.nfy; j++)
+        for (let i = fx; i < fx + w && i < G.nfx; i++) a[j * G.nfx + i] = v;
+}
+function vfSet(L, fx, fy, w, vx, vy) {
+    const G = L.G, cx = fx * G.g + Math.floor(w * G.g / 2), cy = fy * G.g + Math.floor(w * G.g / 2);
+    vfFill(G, L.vx, fx, fy, w, vx); vfFill(G, L.vy, fx, fy, w, vy);
+    vfFill(G, L.dx, fx, fy, w, vx - modelPoint(L.M, cx, cy, 0));
+    vfFill(G, L.dy, fx, fy, w, vy - modelPoint(L.M, cx, cy, 1));
+}
+function vfDecVector(dec, L, fx, fy, w) {
+    const G = L.G;
+    vfPred(G, L.M, L.dx, L.dy, fx, fy, w, PRED2);
+    const c = fy * G.nfx + fx;
+    const ctx = (fx > 0 && L.same[c - 1] ? 1 : 0) + (fy > 0 && L.same[c - G.nfx] ? 1 : 0);
+    const same = !dec.bit(L.mm.same, ctx);
+    let ex = 0, ey = 0;
+    if (!same) {
+        ex = mvComponent(dec, L.mm, 0, true, MV_ESC_SEQ);
+        ey = mvComponent(dec, L.mm, 1, ex !== 0, MV_ESC_SEQ);
+    }
+    const x = PRED2[0] + ex, y = PRED2[1] + ey;
+    if (x < -MV_MAX - 1 || x > MV_MAX || y < -MV_MAX - 1 || y > MV_MAX) return false;
+    vfFill(G, L.same, fx, fy, w, same ? 1 : 0);
+    vfSet(L, fx, fy, w, x, y);
+    return true;
+}
+function vfInherit(L, fx, fy, w) {
+    vfPred(L.G, L.M, L.dx, L.dy, fx, fy, w, PRED2);
+    vfSet(L, fx, fy, w, PRED2[0], PRED2[1]);
+    vfFill(L.G, L.same, fx, fy, w, 1);
+}
+/* Returns false where unpack_vfield returns -1. `mode` null for P. */
+function unpackVfield(bytes, offset, len, G, split, mode, l0, l1) {
+    const nf = G.nfx * G.nfy;
+    l0.same = new Uint8Array(nf); l0.mm = mvModels();
+    if (l1) { l1.same = new Uint8Array(nf); l1.mm = mvModels(); }
+    const splitM = new Uint16Array(3).fill(PROB_INIT), notBi = new Uint16Array(3).fill(PROB_INIT);
+    const bwd = new Uint16Array(3).fill(PROB_INIT);
+    if (mode) mode.fill(0);
+    const dec = new ArithDecoder(bytes, offset, len);
+    const modeCtxF = (fx, fy, which) => {
+        const c = fy * G.nfx + fx;
+        let n = 0;
+        if (fx > 0) n += which ? (mode[c - 1] === MODE_BWD ? 1 : 0) : (mode[c - 1] !== MODE_BI ? 1 : 0);
+        if (fy > 0) n += which ? (mode[c - G.nfx] === MODE_BWD ? 1 : 0) : (mode[c - G.nfx] !== MODE_BI ? 1 : 0);
+        return n;
+    };
+    for (let by = 0; by < G.nby; by++)
+        for (let bx = 0; bx < G.nbx; bx++) {
+            const canSplit = 2 * bx + 1 < G.nfx || 2 * by + 1 < G.nfy;
+            const sctx = (bx > 0 && split[by * G.nbx + bx - 1] ? 1 : 0) + (by > 0 && split[(by - 1) * G.nbx + bx] ? 1 : 0);
+            const sp = canSplit ? dec.bit(splitM, sctx) : 0;
+            split[by * G.nbx + bx] = sp;
+            const units = [];
+            if (!sp) units.push([2 * bx, 2 * by, 2]);
+            else for (let q = 0; q < 4; q++) {
+                const fx = 2 * bx + (q & 1), fy = 2 * by + (q >> 1);
+                if (fx < G.nfx && fy < G.nfy) units.push([fx, fy, 1]);
+            }
+            for (const [fx, fy, w] of units) {
+                let md = MODE_FWD;
+                if (mode) {
+                    md = MODE_BI;
+                    if (dec.bit(notBi, modeCtxF(fx, fy, 0))) md = dec.bit(bwd, modeCtxF(fx, fy, 1)) ? MODE_BWD : MODE_FWD;
+                    vfFill(G, mode, fx, fy, w, md);
+                }
+                if (md !== MODE_BWD) { if (!vfDecVector(dec, l0, fx, fy, w)) return false; }
+                else vfInherit(l0, fx, fy, w);
+                if (l1) {
+                    if (md !== MODE_FWD) { if (!vfDecVector(dec, l1, fx, fy, w)) return false; }
+                    else vfInherit(l1, fx, fy, w);
+                }
+            }
+        }
     return true;
 }
 
@@ -408,7 +478,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v8 file');
+        if (!this.info) throw new Error('not an NVDRV v9 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -464,7 +534,7 @@ export class SequenceDecoder {
         if (kind === INTRA && block) throw new Error('intra frame with a motion field');
         if ((flags & ~(FRAME_MODEL0 | FRAME_MODEL1)) || view.getUint8(19)) throw new Error('bad frame flags');
         if (flags && (!block || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
-        if (block && (block < 4 || block > 128)) throw new Error('bad block size');
+        if (block && (block < 8 || block > 128 || (block & 1))) throw new Error('bad block size');
         if (kind === BI && !block) throw new Error('B frame without a motion field');
         if (display > 0x3fffffff) throw new Error('bad display number');
         if (display < this.nextOut || this.dpb.length >= MAX_DPB ||
@@ -483,12 +553,13 @@ export class SequenceDecoder {
             const fieldLen = new DataView(bytes.buffer, bytes.byteOffset + this.pos, 4)
                 .getUint32(0, true);
             if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return false;
-            const nbx = Math.ceil(width / block), nby = Math.ceil(height / block), nb = nbx * nby;
+            const G = makeGrid(width, height, block), nb = G.nfx * G.nfy;
             const v0x = new Int16Array(nb), v0y = new Int16Array(nb);
-            const m0x = new Int16Array(nb), m0y = new Int16Array(nb);
+            const d0x = new Int16Array(nb), d0y = new Int16Array(nb);
+            const split = new Uint8Array(G.nbx * G.nby);
             // The field starts with the affine model of each flagged list;
             // the others are their global vector. Then the vectors, in
-            // quarter pixels.
+            // quarter pixels, on the half-size grid.
             const fp = this.pos + 4;
             const head = MODEL_BYTES * ((flags & FRAME_MODEL0 ? 1 : 0) + (flags & FRAME_MODEL1 ? 1 : 0));
             if (fieldLen < head) throw new Error('motion field is damaged');
@@ -496,29 +567,26 @@ export class SequenceDecoder {
             const model0 = flags & FRAME_MODEL0 ? modelGet(bytes, mp) : [dx * 4, 0, 0, dy * 4, 0, 0];
             if (flags & FRAME_MODEL0) mp += MODEL_BYTES;
             const model1 = flags & FRAME_MODEL1 ? modelGet(bytes, mp) : [dx1 * 4, 0, 0, dy1 * 4, 0, 0];
-            modelFill(model0, width, height, block, m0x, m0y);
+            const l0 = { G, M: model0, vx: v0x, vy: v0y, dx: d0x, dy: d0y };
             if (kind === PRED) {
-                if (!unpackField(bytes, fp + head, fieldLen - head, nbx, nby, m0x, m0y, v0x, v0y,
-                                 MV_ESC_SEQ, MV_MAX))
+                if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
                     throw new Error('motion field is damaged');
-                blockPredict(ref, this.pred, width, height, block, v0x, v0y);
+                blockPredict(ref, this.pred, width, height, G.g, v0x, v0y);
             } else {
                 const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
-                const m1x = new Int16Array(nb), m1y = new Int16Array(nb);
-                modelFill(model1, width, height, block, m1x, m1y);
-                if (!unpackFieldBi(bytes, fp + head, fieldLen - head, nbx, nby, m0x, m0y, m1x, m1y,
-                                   mode, v0x, v0y, v1x, v1y))
+                const l1 = { G, M: model1, vx: v1x, vy: v1y, dx: new Int16Array(nb), dy: new Int16Array(nb) };
+                if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, mode, l0, l1))
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
-                blockPredict(ref, P0, width, height, block, v0x, v0y, mode, MODE_BWD);
-                blockPredict(this.dpb[after].pixels, P1, width, height, block, v1x, v1y, mode, MODE_FWD);
+                blockPredict(ref, P0, width, height, G.g, v0x, v0y, mode, MODE_BWD);
+                blockPredict(this.dpb[after].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD);
                 // Backward blocks take the second prediction, the mean
                 // blocks the rounded mean of both; forward ones are in P0.
                 const stride = width * 3;
                 for (let b = 0; b < nb; b++) {
                     if (mode[b] === MODE_FWD) continue;
-                    const x0 = (b % nbx) * block, y0 = Math.floor(b / nbx) * block;
-                    const n = Math.min(block, width - x0) * 3, h = Math.min(block, height - y0);
+                    const x0 = (b % G.nfx) * G.g, y0 = Math.floor(b / G.nfx) * G.g;
+                    const n = Math.min(G.g, width - x0) * 3, h = Math.min(G.g, height - y0);
                     for (let j = 0; j < h; j++) {
                         const o = (y0 + j) * stride + x0 * 3;
                         if (mode[b] === MODE_BWD) P0.set(P1.subarray(o, o + n), o);

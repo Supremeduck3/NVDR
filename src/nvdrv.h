@@ -58,7 +58,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      8
+#define NVDRV_VERSION      9
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20
 
