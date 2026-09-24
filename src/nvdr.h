@@ -92,6 +92,9 @@ typedef struct {
      * 0 rounds to nearest; larger values trade small coefficients for
      * bytes. */
     float deadzone;
+    /* Choose every texture level by rate-distortion against the models
+     * (see rdoq() in nvdr.c) instead of rounding with `deadzone`. */
+    int   rdoq;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;

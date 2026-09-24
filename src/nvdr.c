@@ -153,6 +153,7 @@ NvdrConfig nvdr_default_config(void) {
     /* Measured on the samples: chroma at luma's step beat 1.5x and 2.5x. */
     c.chroma_q = 1.0f;
     c.deadzone = 0.1f;
+    c.rdoq = 1;
     /* The split decision is flat across 0.06..0.3; this is the middle. */
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
@@ -769,6 +770,7 @@ typedef struct {
     Canvas         cv;
     double*        src[3];      /* the planes' source, padded by replication */
     double         lambda, skip_lambda;   /* see code_leaf() */
+    double         lambda_base; /* lambda at the header's step, for rdoq() */
     int*           split;       /* one decision per node, per size */
     size_t         grid_base[NSIZES];
     int            grid_w[NSIZES];
@@ -794,6 +796,7 @@ typedef struct {
     const int8_t*  tq;          /* tile step offsets, or NULL */
     int            tiles_x;
     double         deadzone;
+    int            rdoq;
     ColourModels   cm;
     TextureModels  tm;           /* the low band */
     TextureModels  tm2;          /* the high band */
@@ -947,6 +950,112 @@ static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
 }
 
 /*
+ * RATE-DISTORTION QUANTISATION
+ * ----------------------------
+ * Rounding each coefficient to its nearest level with a fixed dead zone
+ * spends bits wherever a level is barely over a half: a 1 that costs
+ * eight bits to say buys less error than eight bits are worth. rdoq()
+ * decides the levels of one band of one block the way HEVC's reference
+ * encoder does, against the texture models as they stand when the row is
+ * prepared:
+ *
+ *   1. front to back, each coefficient takes whichever of its rounded
+ *      level and one less (down to zero) costs less error plus lambda
+ *      times the bits the models charge for it: significance, the
+ *      "not last" flag, magnitude and sign;
+ *   2. then the block's last level is chosen: every nonzero position is
+ *      tried as the last, everything after it dropped, against dropping
+ *      the whole band.
+ *
+ * Errors are in units of the step squared, so lambda there is the tree's
+ * lambda over the step squared, the same at every step.
+ */
+/* The tree's lambda scaled for levels, swept from 0.4 to 1.5 on five
+ * photographs (BD-rate against AV1's and x265's intra frames) and three
+ * clips: 0.6 for pictures; residuals do as well at 0.6 as at 1, and 1
+ * lets the regression gate's closed loop drift past its limit. The
+ * first RDOQ_KEEP scan positions of a picture are left to the dead zone
+ * (see the caller). */
+#define RDOQ_PICTURE  0.6
+#define RDOQ_RESIDUAL 0.6
+#define RDOQ_KEEP     4
+
+static double rd_bit(const uint16_t* p, int b) { return bitcost[b][*p]; }
+
+static double rd_mag_bits(const TextureModels* m, int c, int g, int a) {
+    double bits = rd_bit(&m->gt1[c][g], a > 1);
+    if (a == 1) return bits;
+    int r = a - 2;
+    for (int i = 0; i < MAG_UNARY; i++) {
+        bits += rd_bit(&m->mag[c][i], r > i);
+        if (r <= i) return bits;
+    }
+    unsigned v = (unsigned)(r - MAG_UNARY) + 1;
+    int n = 0;
+    while ((v >> n) > 1) n++;
+    return bits + 2 * n + 1;
+}
+
+static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv,
+                 int start, int end, double lam, int keep) {
+    double cost[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* coded cost of each position */
+    double drop[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* its error if dropped */
+    int g = 0;
+    for (int i = start; i < end; i++) {
+        double a = fabs(v[i]);
+        int pc = scan_ctx[sc][i];
+        int l = (int)(a + 0.5);
+        if (l > COEF_MAX) l = COEF_MAX;
+        drop[i] = a * a;
+        double zero_bits = i < end - 1 ? rd_bit(&m->sig[sc][c][pc], 0) : 0.0;
+        double best = drop[i] + lam * zero_bits;
+        int bl = 0;
+        if (i < keep) {
+            /* Kept as rounded with the dead zone: see the caller. */
+            bl = (int)(a + 0.4);
+            if (bl > COEF_MAX) bl = COEF_MAX;
+            lv[i] = v[i] < 0 ? -bl : bl;
+            double bits = bl ? rd_mag_bits(m, c, g < 3 ? g : 3, bl) + 1.0 +
+                               (i < end - 1 ? rd_bit(&m->sig[sc][c][pc], 1) + rd_bit(&m->last[sc][c][pc], 0) : 0.0)
+                             : zero_bits;
+            cost[i] = (a - bl) * (a - bl) + lam * bits;
+            if (bl > 1) g++;
+            continue;
+        }
+        for (int t = l; t >= 1 && t >= l - 1; t--) {
+            double bits = rd_mag_bits(m, c, g < 3 ? g : 3, t) + 1.0;
+            if (i < end - 1) bits += rd_bit(&m->sig[sc][c][pc], 1) + rd_bit(&m->last[sc][c][pc], 0);
+            double j = (a - t) * (a - t) + lam * bits;
+            if (j < best) { best = j; bl = t; }
+        }
+        lv[i] = v[i] < 0 ? -bl : bl;
+        cost[i] = best;
+        if (bl > 1) g++;
+    }
+    /* The last level: coding up to k costs what positions start..k cost,
+     * the flag that says k is last instead of not, and the error of
+     * everything after k. */
+    double tail = 0.0;
+    for (int i = start; i < end; i++) tail += drop[i];
+    double best = tail + lam * rd_bit(&m->cbf[sc][c], 0);
+    int best_last = -1;
+    double prefix = 0.0;
+    int first_last = start;     /* no cut drops a kept level */
+    for (int i = start; i < end && i < keep; i++) if (lv[i]) first_last = i;
+    if (first_last > start || (keep > start && lv[start])) best = 1e300;
+    for (int k = start; k < end; k++) {
+        prefix += cost[k];
+        tail -= drop[k];
+        if (!lv[k] || k < first_last) continue;
+        int pc = scan_ctx[sc][k];
+        double flag = k < end - 1 ? rd_bit(&m->last[sc][c][pc], 1) - rd_bit(&m->last[sc][c][pc], 0) : 0.0;
+        double j = prefix + tail + lam * (rd_bit(&m->cbf[sc][c], 1) + flag);
+        if (j < best) { best = j; best_last = k; }
+    }
+    for (int i = best_last < start ? start : best_last + 1; i < end; i++) lv[i] = 0;
+}
+
+/*
  * The texture of a leaf is the DCT of its pixels minus its flat colour,
  * and a constant moves only the DC: every other row of the transform sums
  * to exactly zero (odd rows are antisymmetric, even rows fold into the
@@ -989,10 +1098,25 @@ static void precompute_row(Enc* e, int ty) {
                 int* q = dst + (size_t)b * count;
                 int nonzero = 0;
                 q[0] = 0;
-                for (int i = 1; i < count; i++) {
-                    q[i] = quantise(co[scan_pos[s][i]] / step, dz);
-                    nonzero |= q[i];
-                }
+                if (e->rdoq) {
+                    /* Each band against its own layer's models. */
+                    double v[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                    for (int i = 1; i < count; i++) v[i] = co[scan_pos[s][i]] / step;
+                    double lam = P->lambda_base / ((double)base * base) * (cv->fixed_pred ? RDOQ_RESIDUAL : RDOQ_PICTURE);
+                    int at = e->band_at[s];
+                    /* In a picture the lowest frequencies are left to the
+                     * dead zone: they draw ramps, and dropping their level
+                     * 1s turned the gate's gradient into bands (-6 dB for
+                     * 18% of its bytes). */
+                    int keep = cv->fixed_pred ? 0 : RDOQ_KEEP;
+                    rdoq(&e->tm, s, cv->comp0 + c, v, q, 1, at < count ? at : count, lam, keep);
+                    if (at < count) rdoq(&e->tm2, s, cv->comp0 + c, v, q, at, count, lam, keep);
+                    for (int i = 1; i < count; i++) nonzero |= q[i];
+                } else
+                    for (int i = 1; i < count; i++) {
+                        q[i] = quantise(co[scan_pos[s][i]] / step, dz);
+                        nonzero |= q[i];
+                    }
                 P->pre_nz[s][c][b] = (uint8_t)(nonzero != 0);
                 if (nonzero) {
                     int at = e->band_at[s];
@@ -1159,12 +1283,14 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     e.step[0] = cfg.q; e.step[1] = e.step[2] = qc;
     for (int c = 0; c < 3; c++) e.base_step[c] = e.step[c];
     e.deadzone = cfg.deadzone;
+    e.rdoq = cfg.rdoq;
     double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     for (int k = 0; k < e.nparts; k++) {
         /* A colour sample at half size stands for four pixels: its error
          * weighs four times, which is lambda a quarter. */
         double scale = e.part[k].cv.comp0 && use420 ? 0.25 : 1.0;
         e.part[k].lambda = lambda * scale;
+        e.part[k].lambda_base = lambda * scale;
         e.part[k].skip_lambda = cfg.residual ? cfg.skip_k * lambda * scale : 0.0;
     }
     for (int s = 0; s < NSIZES; s++) e.band_at[s] = band_split(s, band);

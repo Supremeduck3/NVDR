@@ -1633,7 +1633,6 @@ static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile
         scale = (float)pow(2.0, -offset / 6.0);
         if (scale < 0.35f) scale = 0.35f;
     }
-    if (getenv("TPLDBG")) fprintf(stderr, "tpl: %d frames, scale %.3f\n", frames, scale);
 done:
     free(luma); free(intra); free(prop); free(mvx); free(mvy); free(inter);
     return scale;
@@ -1694,7 +1693,7 @@ static int flush_group(NvdrvEncoder* e, int closing) {
     int intra = is_intra_slot(e, g);
     int idx = g - a - 1;
     e->intra_scale = 1.0f;
-    int tiles_on = e->cfg.frame.max_block >= 2 * TPL_B && !getenv("TPLFRAME");
+    int tiles_on = e->cfg.frame.max_block >= 2 * TPL_B;
     if (intra && e->cfg.tpl_strength > 0) {
         if (tiles_on && !e->tile_q) {
             int tile = e->cfg.frame.max_block;

@@ -391,6 +391,35 @@ the intra frame finer than the frames after it can use. The remaining
 distance to AV1's intra frame is in coding it, not in how its bits are
 spread.
 
+### Choosing levels by rate-distortion
+
+Every texture level used to be the coefficient rounded with a fixed dead
+zone of 0.1. That spends bits wherever a level barely clears a half: a 1
+that costs eight bits buys less error than eight bits are worth. The
+encoder now decides the levels of each band of each block the way HEVC's
+reference encoder does (rdoq() in nvdr.c), against the texture models as
+they stand when the row is prepared: front to back, each coefficient
+takes its rounded level or one less, whichever costs less error plus
+lambda times the bits the models charge (significance, the "not last"
+flag, magnitude, sign); then every nonzero position is tried as the
+block's last, against dropping the band. Lambda is the tree's, over the
+step squared, times 0.6. Nothing in the format changes.
+
+In a picture the four lowest-frequency positions stay with the dead
+zone: they draw ramps, and choosing them by rate-distortion turned the
+gate's gradient into bands. (A first version also emptied a block's low
+band whenever its high band came out empty, which is what the gradient
+first showed.)
+
+Intra frames, BD-rate on PSNR-Y, mean of five photographs:
+
+                             vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    dead zone                       +21.0%                  +6.7%
+    rate-distortion levels          +18.5%                  +3.9%
+
+On the sequences, on top of the look-ahead: 2.5, 2.1 and 4.4 points more
+on the three 25-frame clips, most where the noise is.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
