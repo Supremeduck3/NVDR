@@ -242,6 +242,11 @@ não uma falha.
 - **`--band N`** — onde a textura se divide entre as camadas baixa e alta
   (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
   em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
+- **`--directional`** — cada bloco é previsto a partir dos vizinhos já
+  decodificados, ao longo de uma de 15 direções (os ângulos do HEVC).
+  Deixa a imagem ~5% menor, mas ela deixa de ser progressiva: cor e
+  textura são lidas juntas e a imagem só aparece inteira. Os quadros intra
+  dos vídeos usam isso sempre.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem

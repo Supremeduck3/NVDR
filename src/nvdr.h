@@ -95,6 +95,13 @@ typedef struct {
     /* Choose every texture level by rate-distortion against the models
      * (see rdoq() in nvdr.c) instead of rounding with `deadzone`. */
     int   rdoq;
+    /* Predict each leaf from its neighbours' full reconstruction, along
+     * one of NVDR_MODES modes chosen per leaf (see dir_predict() in
+     * nvdr.c). The picture is then no longer progressive: colour and
+     * texture are decoded together, leaf by leaf, in one texture layer
+     * (band is forced to 0). For a sequence's intra frames, which are
+     * never shown half-arrived. Flagged in the header. */
+    int   directional;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -169,6 +176,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_CHROMA420 0x04        /* colour in its own half-resolution tree */
 #define NVDR_FLAG_GRAIN    0x08         /* grain parameters follow the header */
 #define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
+#define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
 
 typedef struct {
     uint16_t width, height;

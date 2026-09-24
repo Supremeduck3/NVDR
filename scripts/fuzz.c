@@ -138,7 +138,8 @@ int main(int argc, char** argv) {
          * (large coefficients, escapes), a coarse one (mostly flat
          * leaves), a tree held to 8..16 px, with film grain (its
          * parameters after the header, its synthesis over the picture),
-         * and with a step offset per tile.
+         * with a step offset per tile, and with directional prediction
+         * (colour and texture read together, leaf by leaf).
          * A path no seed reaches is a path the fuzzer never attacks. */
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
@@ -146,9 +147,10 @@ int main(int argc, char** argv) {
         size_t ntiles = (size_t)((img.width + 31) / 32) * ((img.height + 31) / 32);
         int8_t* tq = (int8_t*)malloc(ntiles);
         for (size_t t = 0; tq && t < ntiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
-        for (int variant = 0; variant < 6 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 7 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 5) { if (!tq) continue; c.tile_q = tq; }
+            if (variant == 6) { c.directional = 1; c.q = 30; }
             if (variant == 1) c.q = 1;
             if (variant == 2) c.q = 200;
             if (variant == 3) { c.min_block = 8; c.max_block = 16; c.band = 0; }

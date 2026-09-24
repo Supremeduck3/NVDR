@@ -26,6 +26,10 @@ NvdrvConfig nvdrv_default_config(void) {
     /* Every frame's texture in one layer: nobody watches a video frame
      * arrive, and the split costs bytes. */
     c.frame.band = 0;
+    /* Intra frames predicted along directions from their own decoded
+     * pixels: a frame is shown whole, so it gives up nothing. The
+     * residuals of P and B frames ignore it. */
+    c.frame.directional = 1;
     /* Two seconds at 24fps. Short enough to join a stream quickly, long
      * enough that the intra frames — four times the size of a predicted
      * one — do not dominate the bitrate. */

@@ -447,6 +447,56 @@ writes. The remaining distance is not in the entropy coder: it is in
 what the texture has to carry, a block minus its flat colour, where AV1
 first predicts the block along a direction and from its luma.
 
+### Directional prediction for intra frames (flag 0x20)
+
+This was measured once before and not built, because predicting a leaf
+from its neighbours' full reconstruction ties every layer to the ones
+after it and gives up the truncation guarantee. A sequence's intra
+frame is never shown half-arrived, though, so there it costs nothing.
+With NVDR_FLAG_DIRPRED (`--directional`, on for a sequence's intra
+frames, off for stills) the picture has one texture layer, read in step
+with layer 0: each leaf's mode and colours, then its texture straight
+away, since the next leaf predicts from it. A texture layer that runs
+out is damage.
+
+A leaf takes one of 15 modes: flat (the mean of the row above and the
+column to the left, now of the full reconstruction), HEVC's planar, and
+13 of HEVC's angular modes, seven from above (angles -32 -17 -9 0 9 17
+32 in 32nds of a pixel per row) and six from the left. They are HEVC's
+exactly: interpolation in 32nds, the other side projected round the
+corner with the inverse angles for negative angles, and the references
+filtered [1 2 1] for leaves of 8 and up. The row above runs on past the
+leaf while those pixels have been decoded (an earlier tile, or earlier
+in this tile's quadtree, by the z-order of their 4x4 cells) and then
+repeats its last pixel; the left column likewise down. The DC level
+moves the whole prediction by a constant and the texture is the DCT of
+what is left, so the transform, the RDOQ and the contexts are as before.
+The mode is a "flat or not" bit by size, then four bits down a tree of
+contexts. The encoder screens the 14 other modes by the Hadamard sum of
+their error, as HEVC's reference encoder does, and tries flat and the
+best five in full.
+
+Intra frames, mean of five photographs, BD-rate on PSNR-Y:
+
+                                     vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    neighbourhood contexts (v12)            +17.2%                  +2.9%
+    + 7 modes (4 directions, planar)        +13.7%                  +0.0%
+    + 15 modes, HEVC's angles               +12.6%                  -1.0%
+    + filtered references                   +11.2%                  -2.2%
+    + references past the leaf              +11.0%                  -2.4%
+    screening, 5 of 14 in full (default)    +11.2%                  -2.2%
+
+Trying all 15 modes in full took a 960x540 frame from 0.1 to 2.9
+seconds; screening brings it to 1.5 for 0.2 points. Coding the mode
+against a likeliest one, the left or upper leaf's, was worse either way
+tried (13.5% and 13.2%): neighbours seldom share a direction, and flat,
+the commonest answer, lost its cheap bit.
+
+In the sequences, together with the contexts, on the three 25-frame
+clips against P frames only: -14.0/-40.6/-39.8% before, -19.6/-45.1/-43.9%
+after; the two still-camera clips go from -5.1 and -8.0% to -13.3 and
+-15.2%.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
