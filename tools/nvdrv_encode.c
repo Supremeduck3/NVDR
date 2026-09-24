@@ -68,7 +68,9 @@ static void usage(const char* a0) {
         "  --mv-lambda N    weight of one motion-field bit against block error\n"
         "                   (default 16; 0 keeps each block's best-matching vector)\n"
         "  --bframes N      B frames between anchors (default 7; 0 = P frames only)\n"
-        "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.15)\n"
+        "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.5)\n"
+        "  --lookahead N    frames looked ahead of each intra frame (default 16)\n"
+        "  --tpl F          how much their reuse refines the intra frame (default 2; 0 = off)\n"
         "  --limit N        stop after N frames\n", a0);
 }
 
@@ -110,6 +112,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mv-lambda") && i+1 < argc) cfg.mv_lambda = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bframes") && i+1 < argc) cfg.bframes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--b-q-step") && i+1 < argc) cfg.b_q_step = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--lookahead") && i+1 < argc) cfg.lookahead = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tpl") && i+1 < argc) cfg.tpl_strength = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
     }
 

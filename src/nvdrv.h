@@ -74,6 +74,7 @@
  * last shown). */
 #define NVDRV_MAX_B    15
 #define NVDRV_MAX_DPB  (NVDRV_MAX_B + 3)
+#define NVDRV_MAX_LOOKAHEAD 32
 
 typedef struct {
     NvdrConfig frame;      /* how each frame's container is built */
@@ -120,6 +121,14 @@ typedef struct {
     /* How much coarser each level of B frames is than the P frames: level
      * l (1 halfway, 2 the quarters, ...) takes pred_q * (1 + b_q_step * l). */
     float b_q_step;
+    /* Frames the encoder looks ahead of each intra frame, 0 to
+     * NVDRV_MAX_LOOKAHEAD, to measure how much of it the frames after will
+     * reuse (see "Looking ahead" in nvdrv.c). */
+    int   lookahead;
+    /* How strongly that reuse refines the intra frame's step: x264's
+     * macroblock-tree strength, in sixths of a doubling per doubling of
+     * reuse. 0 codes the intra frame at `frame.q` whatever follows it. */
+    float tpl_strength;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 

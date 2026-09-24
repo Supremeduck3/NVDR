@@ -32,7 +32,9 @@ static void usage(const char* argv0) {
         "                   code the clean picture, and have the decoder lay the\n"
         "                   same kind of grain back (auto: only if noisy)\n"
         "  --quiet          write the file and skip the per-layer report, which\n"
-        "                   decodes it three times\n",
+        "                   decodes it three times\n"
+        "  --tile-q-test    give every tile a step offset from a fixed pattern,\n"
+        "                   to exercise the decoders' per-tile steps\n",
         argv0);
 }
 
@@ -43,7 +45,7 @@ int main(int argc, char** argv) {
     const char* in_path  = argv[1];
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
-    int quiet = 0;
+    int quiet = 0, tile_q_test = 0;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
@@ -55,6 +57,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];
             if (!strcmp(v, "off")) cfg.grain = NVDR_GRAIN_OFF;
@@ -83,8 +86,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Offsets from -12 to 12 in a pattern that changes every tile, so the
+     * steps, the deblocking and the differences between tiles are all
+     * exercised. */
+    int8_t* tq = NULL;
+    if (tile_q_test) {
+        int tile = cfg.max_block;
+        size_t tiles = (size_t)((source.width + tile - 1) / tile) * ((source.height + tile - 1) / tile);
+        tq = (int8_t*)malloc(tiles);
+        if (!tq) { nvdr_image_free(&source); return 1; }
+        for (size_t t = 0; t < tiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
+        cfg.tile_q = tq;
+    }
+
     NvdrHeader hdr;
-    if (nvdr_encode_file(out_path, &source, &cfg, &hdr) != 0) {
+    int enc_rc = nvdr_encode_file(out_path, &source, &cfg, &hdr);
+    free(tq);
+    if (enc_rc != 0) {
         fprintf(stderr, "encode failed\n");
         nvdr_image_free(&source);
         return 1;

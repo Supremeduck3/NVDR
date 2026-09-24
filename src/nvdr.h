@@ -126,6 +126,10 @@ typedef struct {
      * _AUTO (only when the picture is measurably noisy) or _ON. Carried in
      * the header's flags. */
     int   grain;
+    /* A step offset per tile (max_block square, raster order), in sixths
+     * of a doubling, -12 to 12; NULL for none. Carried in layer 0 at the
+     * start of each tile, flagged in the header. */
+    const int8_t* tile_q;
 } NvdrConfig;
 
 #define NVDR_GRAIN_OFF   0
@@ -161,6 +165,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
 #define NVDR_FLAG_CHROMA420 0x04        /* colour in its own half-resolution tree */
 #define NVDR_FLAG_GRAIN    0x08         /* grain parameters follow the header */
+#define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
 
 typedef struct {
     uint16_t width, height;

@@ -170,6 +170,7 @@ NvdrConfig nvdr_default_config(void) {
     c.band = 8;
     c.chroma420 = NVDR_CHROMA_AUTO;
     c.grain = NVDR_GRAIN_OFF;
+    c.tile_q = NULL;
     return c;
 }
 
@@ -331,6 +332,26 @@ static void ycc_to_rgb(int y, int cb, int cr, unsigned char* p) {
     p[2] = (unsigned char)clamp_u8(y + ((116130 * cb + 32768) >> 16));
 }
 
+/*
+ * TILE STEP OFFSETS
+ * -----------------
+ * With NVDR_FLAG_TILEQ each tile carries, at its start in layer 0, how
+ * far its step sits from the header's, in sixths of a doubling (H.264's
+ * QP scale), -TQ_MAX to TQ_MAX, coded as the difference from the tile
+ * before. A sequence's encoder uses it to give the parts of an intra frame
+ * that the frames after it reuse a finer step (see nvdrv.c). The scale is
+ * integer, identical in every decoder: 1024 * 2^(d / 6), rounded.
+ */
+#define TQ_MAX 12
+static const int TQ_SCALE[2 * TQ_MAX + 1] = {
+    256, 287, 323, 362, 406, 456, 512, 575, 645, 724, 813, 912,
+    1024, 1149, 1290, 1448, 1625, 1825, 2048, 2299, 2580, 2896, 3251, 3649, 4096
+};
+static int tq_step(int step, int d) {
+    int s = (step * TQ_SCALE[d + TQ_MAX] + 512) >> 10;
+    return s < 1 ? 1 : (s > 65535 ? 65535 : s);
+}
+
 /* =============================================================== models */
 
 typedef struct {
@@ -339,6 +360,7 @@ typedef struct {
     uint16_t dc_zero[NSIZES][3];
     uint16_t dc_sign[3];
     uint16_t dc_mag[3][MAG_UNARY];
+    uint16_t tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
 } ColourModels;
 
 typedef struct {
@@ -444,6 +466,28 @@ static int get_dc(NvdrDecoder* d, ColourModels* m, int sc, int c, int* corrupt) 
     }
     if (i == MAG_UNARY) r = MAG_UNARY + get_escape(d, corrupt);
     if (r > COEF_MAX) { *corrupt = 1; r = COEF_MAX; }
+    return neg ? -(r + 1) : r + 1;
+}
+
+static void put_tq(Sink* s, ColourModels* m, int v) {
+    put_bit(s, &m->tq_zero, v != 0);
+    if (!v) return;
+    put_bit(s, &m->tq_sign, v < 0);
+    int r = (v < 0 ? -v : v) - 1;
+    for (int i = 0; i < 2 * TQ_MAX - 1; i++) {
+        put_bit(s, &m->tq_mag[i], r > i);
+        if (r <= i) return;
+    }
+}
+
+static int get_tq(NvdrDecoder* d, ColourModels* m) {
+    if (!nvdr_dec_bit(d, &m->tq_zero)) return 0;
+    int neg = nvdr_dec_bit(d, &m->tq_sign);
+    int r = 0;
+    for (int i = 0; i < 2 * TQ_MAX - 1; i++) {
+        if (!nvdr_dec_bit(d, &m->tq_mag[i])) break;
+        r = i + 1;
+    }
     return neg ? -(r + 1) : r + 1;
 }
 
@@ -697,7 +741,8 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
-    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN))
+    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN |
+                     NVDR_FLAG_TILEQ))
         return -1;   /* a flag this decoder does not know */
     /* Grain parameters sit between the header and the first layer; byte
      * 29 says how many there are. */
@@ -744,7 +789,10 @@ typedef struct {
     Part           part[2];
     int            nparts;
     Part*          p;           /* the tree being searched or coded */
-    int            step[3];     /* per component */
+    int            step[3];     /* per component, for the tile being coded */
+    int            base_step[3];   /* the header's */
+    const int8_t*  tq;          /* tile step offsets, or NULL */
+    int            tiles_x;
     double         deadzone;
     ColourModels   cm;
     TextureModels  tm;           /* the low band */
@@ -923,12 +971,13 @@ static void precompute_row(Enc* e, int ty) {
         for (int c = 0; c < cv->np; c++) {
             int* dst = P->pre[s][c];
             const double* src = P->src[c];
-            int step = e->step[cv->comp0 + c];
+            int base = e->base_step[cv->comp0 + c];
             double dz = e->deadzone;
             #pragma omp parallel for schedule(static)
             for (int b = 0; b < blocks; b++) {
                 int x = (b % gw) * n, y = ty + (b / gw) * n;
                 if (y + n > cv->ph) continue;
+                int step = e->tq ? tq_step(base, e->tq[(ty / cv->tile) * e->tiles_x + x / cv->tile]) : base;
                 double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
                 for (int j = 0; j < n; j++)
                     for (int i = 0; i < n; i++) blk[j * n + i] = src[(size_t)(y + j) * cv->pw + x + i];
@@ -1041,6 +1090,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     Enc e;
     memset(&e, 0, sizeof(e));
     int rc = -1;
+    int8_t* tq = NULL;
     NvdrEncoder enc0, enc1, enc2;
     memset(&enc0, 0, sizeof(enc0));
     memset(&enc1, 0, sizeof(enc1));
@@ -1107,6 +1157,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (qc < 1) qc = 1;
     if (qc > 4095) qc = 4095;
     e.step[0] = cfg.q; e.step[1] = e.step[2] = qc;
+    for (int c = 0; c < 3; c++) e.base_step[c] = e.step[c];
     e.deadzone = cfg.deadzone;
     double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     for (int k = 0; k < e.nparts; k++) {
@@ -1162,12 +1213,37 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
      * for real, which is what adapts them for the next. In 4:2:0 a tile is
      * luma's tree, then colour's over the same area at half size. */
     Canvas* cv = &e.part[0].cv;
+    e.tiles_x = (cv->pw + cv->tile - 1) / cv->tile;
+    if (cfg.tile_q) {
+        size_t tiles = (size_t)e.tiles_x * ((cv->ph + cv->tile - 1) / cv->tile);
+        tq = (int8_t*)malloc(tiles);
+        if (!tq) goto done;
+        for (size_t t = 0; t < tiles; t++)
+            tq[t] = (int8_t)(cfg.tile_q[t] < -TQ_MAX ? -TQ_MAX : cfg.tile_q[t] > TQ_MAX ? TQ_MAX : cfg.tile_q[t]);
+        e.tq = tq;
+    }
+    double lambda0[2], skip0[2];
+    for (int k = 0; k < e.nparts; k++) { lambda0[k] = e.part[k].lambda; skip0[k] = e.part[k].skip_lambda; }
+    int tq_prev = 0;
     for (int ty = 0; ty < cv->ph; ty += cv->tile) {
         for (int k = 0; k < e.nparts; k++) {
             e.p = &e.part[k];
             if (ty / (k + 1) < e.p->cv.ph) precompute_row(&e, ty / (k + 1));
         }
-        for (int tx = 0; tx < cv->pw; tx += cv->tile)
+        for (int tx = 0; tx < cv->pw; tx += cv->tile) {
+            if (e.tq) {
+                /* The tile's offset, then its trees at its step; lambda
+                 * follows the step squared, as it does across q. */
+                int d = e.tq[(ty / cv->tile) * e.tiles_x + tx / cv->tile];
+                put_tq(&s0, &e.cm, d - tq_prev);
+                tq_prev = d;
+                for (int c = 0; c < 3; c++) e.step[c] = tq_step(e.base_step[c], d);
+                double r = TQ_SCALE[d + TQ_MAX] / 1024.0;
+                for (int k = 0; k < e.nparts; k++) {
+                    e.part[k].lambda = lambda0[k] * r * r;
+                    e.part[k].skip_lambda = skip0[k] * r * r;
+                }
+            }
             for (int k = 0; k < e.nparts; k++) {
                 e.p = &e.part[k];
                 int x = tx / (k + 1), y = ty / (k + 1);
@@ -1175,7 +1251,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                 search(&e, x, y, e.p->cv.tile);
                 emit(&e, &s0, s1, x, y, e.p->cv.tile, &h);
             }
+        }
     }
+    for (int c = 0; c < 3; c++) e.step[c] = e.base_step[c];
     if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
         nvdr_enc_finish(&enc2) != 0) goto done;
     /* With no high band the stream holds no symbols, only the coder's
@@ -1189,7 +1267,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = NVDR_VERSION;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
-                       (use420 ? NVDR_FLAG_CHROMA420 : 0));
+                       (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0));
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -1220,6 +1298,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     rc = 0;
 
 done:
+    free(tq);
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
     nvdr_enc_free(&enc2);
@@ -1330,6 +1409,22 @@ static int encode_chroma(uint8_t** out_buf, size_t* out_len, const NvdrImage* im
      * colour belongs in its references too, as video codecs do it. */
     if (cfg.residual) {
         cfg.chroma420 = 0;
+        return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    }
+    /* Tile step offsets move the two modes' costs apart in ways that have
+     * nothing to do with colour (a sequence's intra frame, refined where
+     * it is reused, came out 4:2:0 on the gate's saturated drawing and
+     * lost 5 dB of RGB), so the mode is chosen without them and then
+     * coded with them. */
+    if (cfg.tile_q && !ctx) {
+        NvdrConfig plain = cfg;
+        plain.tile_q = NULL;
+        uint8_t* trial = NULL;
+        size_t trial_len = 0;
+        NvdrHeader th;
+        if (encode_chroma(&trial, &trial_len, img, &plain, &th, NULL) != 0) return -1;
+        free(trial);
+        cfg.chroma420 = (th.flags & NVDR_FLAG_CHROMA420) ? 1 : 0;
         return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
     }
     cfg.chroma420 = 1;
@@ -1546,8 +1641,10 @@ static int db_param(int step, int k16) { return (step * k16 + 8) >> 4; }
  */
 static int edge_filtered(int ca, int cb) { return ((ca | cb) & 0x80) != 0; }
 
+/* The step at an edge is that of the tile its second side lies in. */
 static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
-                          const uint8_t* vedge, const uint8_t* hedge, int step) {
+                          const uint8_t* vedge, const uint8_t* hedge, int base,
+                          const int8_t* tq, int tile, int tiles_x) {
     int gw = pw / 4, gh = ph / 4;
     for (int pass = 0; pass < 2; pass++)
         for (int gy = pass; gy < gh; gy++)
@@ -1556,6 +1653,7 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
                 if (!edge[gy * gw + gx]) continue;
                 int other = pass ? (gy - 1) * gw + gx : gy * gw + gx - 1;
                 if (!edge_filtered(cell[gy * gw + gx], cell[other])) continue;
+                int step = tq ? tq_step(base, tq[(gy * 4 / tile) * tiles_x + gx * 4 / tile]) : base;
                 int alpha = db_param(step, DB_ALPHA), beta = db_param(step, DB_BETA);
                 int tc = db_param(step, DB_TC);
                 int along = pass ? 1 : pw, across = pass ? pw : 1;
@@ -1576,7 +1674,8 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
  * leaf's size in cells and 0x80 when the leaf shows texture; `textured` is
  * NULL when only colours are shown. */
 static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const uint8_t* textured,
-                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step) {
+                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step,
+                   const int8_t* tq) {
     int gw = cv->pw / 4, gh = cv->ph / 4;
     uint8_t* vedge = (uint8_t*)calloc((size_t)gw * gh, 1);
     uint8_t* hedge = (uint8_t*)calloc((size_t)gw * gh, 1);
@@ -1598,7 +1697,7 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
         if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
     }
     for (int c = 0; c < cv->np; c++)
-        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c]);
+        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c], tq, cv->tile, tiles_x);
     free(vedge); free(hedge); free(cell);
     return 0;
 }
@@ -1662,6 +1761,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     memset(L, 0, sizeof(L));
     uint8_t* up[2] = { NULL, NULL };
     uint8_t* saved = NULL;
+    int8_t* tq = NULL;
     if (canvas_init(&cvs[0], h.width, h.height, h.max_block, h.min_block, np == 2 ? 1 : 3, 0) != 0) goto done;
     if (np == 2 && canvas_init(&cvs[1], (h.width + 1) / 2, (h.height + 1) / 2, h.max_block / 2,
                                NVDR_MIN_BLOCK, 2, 1) != 0) goto done;
@@ -1674,6 +1774,10 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
         if (!tile_start[k]) goto done;
     }
     int step[3] = { h.q_luma, h.q_chroma, h.q_chroma };
+    int tstep[3] = { step[0], step[1], step[2] };
+    /* The tiles' step offsets, as layer 0 delivers them; zero where it
+     * never did. */
+    if ((h.flags & NVDR_FLAG_TILEQ) && !(tq = (int8_t*)calloc((size_t)tiles, 1))) goto done;
 
     /* Layer 0: every tile that arrives whole; the rest predicted. */
     ColourModels cm;
@@ -1686,11 +1790,19 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     }
     NvdrDecoder d0;
     nvdr_dec_init(&d0, data + base, avail0);
-    for (int k = 0; k < np; k++) { L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = step; }
-    int complete0 = 0, stopped = 0;
+    for (int k = 0; k < np; k++) { L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = tstep; }
+    int complete0 = 0, stopped = 0, tq_prev = 0;
     for (int t = 0; t < tiles; t++) {
         int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
         for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
+        if (tq && !stopped) {
+            int d = tq_prev + get_tq(&d0, &cm);
+            if (d0.overrun || d < -TQ_MAX || d > TQ_MAX) stopped = 1;
+            else {
+                tq[t] = (int8_t)d; tq_prev = d;
+                for (int c = 0; c < 3; c++) tstep[c] = tq_step(step[c], d);
+            }
+        }
         for (int k = 0; k < np && !stopped; k++) {
             int x = tx / (k + 1), y = ty / (k + 1);
             if (!node_exists(&cvs[k], x, y)) continue;
@@ -1750,6 +1862,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
             }
             for (int k = 0; k < np && !d.overrun && !corrupt; k++) {
                 Canvas* pc = &cvs[k];
+                int tile_step[3] = { step[0], step[1], step[2] };
+                if (tq) for (int c = 0; c < 3; c++) tile_step[c] = tq_step(step[c], tq[t]);
                 for (size_t i = tile_start[k][t]; i < tile_start[k][t + 1] && !d.overrun && !corrupt; i++) {
                     const Leaf* f = &L[k].leaves[i];
                     int sc = size_class(f->n), count = f->n * f->n;
@@ -1758,7 +1872,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
                     for (int c = 0; c < pc->np && !d.overrun && !corrupt; c++) {
                         int comp = pc->comp0 + c;
                         if (get_texture(&d, tm, sc, comp, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
-                            apply_texture(pc, c, f->x, f->y, f->n, lv, start, end, step[comp]);
+                            apply_texture(pc, c, f->x, f->y, f->n, lv, start, end, tile_step[comp]);
                             textured[k][i] = 1;
                         }
                     }
@@ -1796,7 +1910,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
         uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
         if ((h.flags & NVDR_FLAG_DEBLOCK) &&
             deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][complete0],
-                    complete0, tiles_x, tiles, step) != 0) {
+                    complete0, tiles_x, tiles, step, tq) != 0) {
             free(out->pixels); out->pixels = NULL; goto done;
         }
         for (int c = 0; c < cvs[k].np; c++) planes[cvs[k].comp0 + c] = pl[c];
@@ -1843,6 +1957,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
 
 done:
     free(saved);
+    free(tq);
     for (int k = 0; k < 2; k++) {
         free(L[k].leaves);
         free(tile_start[k]);

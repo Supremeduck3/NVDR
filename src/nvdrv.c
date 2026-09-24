@@ -50,6 +50,8 @@ NvdrvConfig nvdrv_default_config(void) {
     c.mv_lambda = 16;
     c.bframes = 7;
     c.b_q_step = 0.5f;
+    c.lookahead = 16;
+    c.tpl_strength = 1.0f;
     c.fps = 24;
     return c;
 }
@@ -1059,6 +1061,8 @@ typedef struct {
     NvdrImage img;
 } Slot;
 
+#define QCAP (NVDRV_MAX_B + 2 + NVDRV_MAX_LOOKAHEAD)
+
 struct NvdrvEncoder {
     FILE*       f;
     NvdrvConfig cfg;
@@ -1071,12 +1075,16 @@ struct NvdrvEncoder {
      * predicting from the source is how a codec drifts. */
     Slot        dpb[NVDRV_MAX_DPB];
     int         ndpb;
-    /* Source frames waiting for the anchor that ends their group, and the
-     * global motion from each source frame to the one before it, summed
-     * from the last anchor: cum[i] for display anchor + i. */
-    NvdrImage   pend[NVDRV_MAX_B + 1];
+    /* Source frames after the last anchor, displays anchor + 1 on: the
+     * next group, and the frames an intra frame looks ahead to. With them
+     * the global motion from each source frame to the one before it,
+     * summed from the last anchor: cum[i] for display anchor + i. */
+    NvdrImage   pend[QCAP];
     int         npend;
-    int         cumx[NVDRV_MAX_B + 2], cumy[NVDRV_MAX_B + 2];
+    int         cumx[QCAP + 1], cumy[QCAP + 1];
+    float       intra_scale; /* the next intra frame's step, as a fraction of frame.q */
+    int8_t*     tile_q;      /* the next intra frame's tile offsets */
+    int         use_tile_q;
     NvdrImage   last_src;
     int         anchor;      /* display number of the last anchor, -1 before any */
     NvdrImage   pred, error;
@@ -1133,6 +1141,9 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     if (e->cfg.block > 128) e->cfg.block = 0;
     if (e->cfg.bframes < 0) e->cfg.bframes = 0;
     if (e->cfg.bframes > NVDRV_MAX_B) e->cfg.bframes = NVDRV_MAX_B;
+    if (e->cfg.lookahead < 0) e->cfg.lookahead = 0;
+    if (e->cfg.lookahead > NVDRV_MAX_LOOKAHEAD) e->cfg.lookahead = NVDRV_MAX_LOOKAHEAD;
+    e->intra_scale = 1.0f;
     /* B frames need per-block vectors; a GOP shorter than a group bounds
      * the group anyway. */
     if (e->cfg.block == 0) e->cfg.bframes = 0;
@@ -1260,7 +1271,10 @@ static void group_motion(const NvdrvEncoder* e, int d, int r, int* x, int* y) {
 
 static int q_for(const NvdrvEncoder* e, int kind, int level) {
     int q = e->cfg.frame.q;
-    if (kind == NVDRV_INTRA) return q;
+    if (kind == NVDRV_INTRA) {
+        int qi = (int)(q * e->intra_scale + 0.5f);
+        return qi < 1 ? 1 : qi;
+    }
     /* P frames coarser than the intra frames unless told otherwise: by
      * 1.2 when every frame is a P frame (on the clean clip that was 0.1 dB
      * better at equal rate across q 16-40), by 1.4 between B frames (2%
@@ -1363,6 +1377,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
 
     NvdrConfig fcfg = e->cfg.frame;
     fcfg.q = q_for(e, kind, level);
+    fcfg.tile_q = kind == NVDRV_INTRA && e->use_tile_q ? e->tile_q : NULL;
     if (kind != NVDRV_INTRA) {
         fcfg.residual = 1;
         /* When the intra frame halved its colour, as it does for anything
@@ -1423,8 +1438,210 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     return 0;
 }
 
+/*
+ * LOOKING AHEAD
+ * -------------
+ * An intra frame is coded as if nothing came after it, but the frames
+ * that follow copy it: a background that stays on screen for the whole
+ * group is paid for once here and inherited forty times, and every level
+ * of quality it gets here is quality they do not have to pay for again.
+ * So before an intra frame is coded, the encoder looks at up to
+ * `lookahead` source frames after it and estimates how much of it they
+ * reuse, the way x264's macroblock tree and AV1's temporal dependency
+ * model do.
+ *
+ * Every 16x16 luma block of every frame gets an intra cost (the Hadamard
+ * sum of its detail, what coding it from nothing would take) and an inter
+ * cost (the Hadamard sum of its error against the best match in the frame
+ * before, whole pixels, searched around the global motion). Walking back
+ * from the last frame, each block passes on to the blocks it came from
+ *
+ *     (intra + inherited) * (1 - inter / intra)
+ *
+ * that is, the share of its information that was prediction and not new,
+ * spread over the blocks its match overlaps. What reaches the intra frame
+ * says, per block, how many times over it is reused; the step is refined
+ * by `tpl_strength` sixths of a doubling for each doubling of
+ * (intra + inherited) / intra, weighted over the frame by intra cost.
+ */
+#define TPL_B 16
+
+static void to_luma(const NvdrImage* img, uint8_t* y) {
+    size_t n = (size_t)img->width * img->height;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char* p = img->pixels + i * 3;
+        y[i] = (uint8_t)((77 * p[0] + 150 * p[1] + 29 * p[2] + 128) >> 8);
+    }
+}
+
+/* Sum of absolute 8x8 Hadamard coefficients of d, the DC left out when
+ * `ac` is set. */
+static int hadamard8(int d[64], int ac) {
+    for (int r = 0; r < 8; r++) {
+        int* v = d + 8 * r;
+        for (int len = 1; len < 8; len <<= 1)
+            for (int i = 0; i < 8; i += 2 * len)
+                for (int j = i; j < i + len; j++) {
+                    int a = v[j], b = v[j + len];
+                    v[j] = a + b; v[j + len] = a - b;
+                }
+    }
+    for (int c = 0; c < 8; c++)
+        for (int len = 1; len < 8; len <<= 1)
+            for (int i = 0; i < 8; i += 2 * len)
+                for (int j = i; j < i + len; j++) {
+                    int a = d[8 * j + c], b = d[8 * (j + len) + c];
+                    d[8 * j + c] = a + b; d[8 * (j + len) + c] = a - b;
+                }
+    int acc = 0;
+    for (int i = ac ? 1 : 0; i < 64; i++) acc += d[i] < 0 ? -d[i] : d[i];
+    return acc;
+}
+
+/* Hadamard cost of block (x0, y0) of `cur` against `ref` moved by (dx,
+ * dy), or of its own detail when ref is NULL. */
+static int tpl_cost(const uint8_t* cur, const uint8_t* ref, int w, int h, int x0, int y0, int dx, int dy) {
+    int acc = 0, d[64];
+    for (int sy = 0; sy < TPL_B; sy += 8)
+        for (int sx = 0; sx < TPL_B; sx += 8) {
+            for (int j = 0; j < 8; j++)
+                for (int i = 0; i < 8; i++) {
+                    int x = x0 + sx + i, y = y0 + sy + j;
+                    int c = cur[(size_t)y * w + x];
+                    int r = ref ? ref[(size_t)clampi(y + dy, 0, h - 1) * w + clampi(x + dx, 0, w - 1)] : 0;
+                    d[8 * j + i] = c - r;
+                }
+            acc += hadamard8(d, ref == NULL);
+        }
+    return acc;
+}
+
+static int tpl_sad(const uint8_t* cur, const uint8_t* ref, int w, int h, int x0, int y0, int dx, int dy, int limit) {
+    int acc = 0;
+    for (int y = y0; y < y0 + TPL_B; y++) {
+        const uint8_t* a = cur + (size_t)y * w;
+        const uint8_t* b = ref + (size_t)clampi(y + dy, 0, h - 1) * w;
+        for (int x = x0; x < x0 + TPL_B; x++) {
+            int v = a[x] - b[clampi(x + dx, 0, w - 1)];
+            acc += v < 0 ? -v : v;
+        }
+        if (acc >= limit) return acc;
+    }
+    return acc;
+}
+
+/* The intra frame pend[first]'s step, as a fraction of frame.q, from the
+ * `count` frames held from it on; with `tile_q`, per tile instead (the
+ * frame's scale is then 1). */
+static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile_q) {
+    int w = e->width, h = e->height;
+    int nbx = w / TPL_B, nby = h / TPL_B, nb = nbx * nby;
+    int frames = count - 1 < e->cfg.lookahead ? count - 1 : e->cfg.lookahead;
+    if (frames < 1 || nb < 1) return 1.0f;
+    size_t npx = (size_t)w * h;
+    uint8_t* luma = (uint8_t*)malloc(npx * (size_t)(frames + 1));
+    float* intra = (float*)malloc(sizeof(float) * (size_t)nb * (frames + 1));
+    float* prop = (float*)calloc((size_t)nb * (frames + 1), sizeof(float));
+    int* mvx = (int*)malloc(sizeof(int) * (size_t)nb);
+    int* mvy = (int*)malloc(sizeof(int) * (size_t)nb);
+    float* inter = (float*)malloc(sizeof(float) * (size_t)nb);
+    float scale = 1.0f;
+    if (!luma || !intra || !prop || !mvx || !mvy || !inter) goto done;
+    for (int k = 0; k <= frames; k++) {
+        to_luma(&e->pend[first + k], luma + npx * k);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16)
+#endif
+        for (int b = 0; b < nb; b++)
+            intra[(size_t)k * nb + b] = (float)tpl_cost(luma + npx * k, NULL, w, h,
+                                                        (b % nbx) * TPL_B, (b / nbx) * TPL_B, 0, 0);
+    }
+    /* Back from the last frame: each passes on what it predicted. */
+    for (int k = frames; k >= 1; k--) {
+        const uint8_t* cur = luma + npx * k;
+        const uint8_t* ref = luma + npx * (k - 1);
+        int j = first + k + 1;                   /* cum index of this frame */
+        int gx = e->cumx[j] - e->cumx[j - 1], gy = e->cumy[j] - e->cumy[j - 1];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16)
+#endif
+        for (int b = 0; b < nb; b++) {
+            int x0 = (b % nbx) * TPL_B, y0 = (b / nbx) * TPL_B;
+            int best = INT_MAX, bx = 0, by = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                int cx = pass ? 0 : gx, cy = pass ? 0 : gy;
+                if (pass && !gx && !gy) break;
+                for (int dy = cy - NVDRV_LOCAL_RANGE; dy <= cy + NVDRV_LOCAL_RANGE; dy++)
+                    for (int dx = cx - NVDRV_LOCAL_RANGE; dx <= cx + NVDRV_LOCAL_RANGE; dx++) {
+                        int c = tpl_sad(cur, ref, w, h, x0, y0, dx, dy, best);
+                        if (c < best) { best = c; bx = dx; by = dy; }
+                    }
+            }
+            mvx[b] = bx; mvy[b] = by;
+            inter[b] = (float)tpl_cost(cur, ref, w, h, x0, y0, bx, by);
+        }
+        const float* in = intra + (size_t)k * nb;
+        const float* pr = prop + (size_t)k * nb;
+        float* back = prop + (size_t)(k - 1) * nb;
+        for (int b = 0; b < nb; b++) {
+            if (in[b] <= 0.0f) continue;
+            float ratio = inter[b] < in[b] ? inter[b] / in[b] : 1.0f;
+            float amount = (in[b] + pr[b]) * (1.0f - ratio);
+            if (amount <= 0.0f) continue;
+            /* Spread over the up to four blocks the match overlaps. */
+            int px = (b % nbx) * TPL_B + mvx[b], py = (b / nbx) * TPL_B + mvy[b];
+            int bx0 = px >= 0 ? px / TPL_B : -1 - (-px - 1) / TPL_B;
+            int by0 = py >= 0 ? py / TPL_B : -1 - (-py - 1) / TPL_B;
+            int fx = px - bx0 * TPL_B, fy = py - by0 * TPL_B;
+            for (int t = 0; t < 4; t++) {
+                int tx = bx0 + (t & 1), ty = by0 + (t >> 1);
+                if (tx < 0 || ty < 0 || tx >= nbx || ty >= nby) continue;
+                int ow = (t & 1) ? fx : TPL_B - fx, oh = (t >> 1) ? fy : TPL_B - fy;
+                back[ty * nbx + tx] += amount * (float)(ow * oh) / (float)(TPL_B * TPL_B);
+            }
+        }
+    }
+    if (tile_q) {
+        /* Per tile, the same average over the blocks it holds. */
+        int tile = e->cfg.frame.max_block, per = tile / TPL_B;
+        int tx_n = (w + tile - 1) / tile, ty_n = (h + tile - 1) / tile;
+        for (int t = 0; t < tx_n * ty_n; t++) {
+            double ws = 0.0, ls = 0.0;
+            for (int j = 0; j < per; j++)
+                for (int i = 0; i < per; i++) {
+                    int bx = (t % tx_n) * per + i, by = (t / tx_n) * per + j;
+                    if (bx >= nbx || by >= nby) continue;
+                    double in = intra[by * nbx + bx] + 1.0;
+                    ws += in;
+                    ls += in * log2((in + prop[by * nbx + bx]) / in);
+                }
+            int d = ws > 0.0 ? (int)lrint(-e->cfg.tpl_strength * ls / ws) : 0;
+            tile_q[t] = (int8_t)(d < -12 ? -12 : d > 0 ? 0 : d);
+        }
+        goto done;
+    }
+    /* The intra frame's reuse, per block as a doubling count, averaged
+     * over the frame by what each block costs. */
+    double wsum = 0.0, lsum = 0.0;
+    for (int b = 0; b < nb; b++) {
+        double in = intra[b] + 1.0;
+        wsum += in;
+        lsum += in * log2((in + prop[b]) / in);
+    }
+    if (wsum > 0.0) {
+        double offset = e->cfg.tpl_strength * lsum / wsum;       /* sixths of a doubling */
+        scale = (float)pow(2.0, -offset / 6.0);
+        if (scale < 0.35f) scale = 0.35f;
+    }
+    if (getenv("TPLDBG")) fprintf(stderr, "tpl: %d frames, scale %.3f\n", frames, scale);
+done:
+    free(luma); free(intra); free(prop); free(mvx); free(mvy); free(inter);
+    return scale;
+}
+
 /* The frames strictly between displays lo and hi, halfway first. */
 static int code_between(NvdrvEncoder* e, int lo, int hi, int level) {
+    /* pend[i] is display anchor + 1 + i, and the anchor is still lo. */
     if (hi - lo < 2) return 0;
     int mid = (lo + hi) / 2;
     if (code_frame(e, &e->pend[mid - e->anchor - 1], mid, 0, level) != 0) return -1;
@@ -1441,18 +1658,70 @@ static void drop_before(NvdrvEncoder* e, int display) {
     e->ndpb = k;
 }
 
-/* The held frames as one group: the last is the anchor. */
-static int flush_group(NvdrvEncoder* e) {
+static int is_intra_slot(const NvdrvEncoder* e, int display) {
+    return display == 0 || (e->cfg.gop > 0 && display % e->cfg.gop == 0);
+}
+
+/* The display number of the anchor that ends the next group. */
+static int group_end(const NvdrvEncoder* e) {
+    int a = e->anchor;
+    if (a < 0) return 0;
+    int g = a + e->cfg.bframes + 1;
+    if (e->cfg.gop > 0) {
+        int next_intra = (a / e->cfg.gop + 1) * e->cfg.gop;
+        if (next_intra < g) g = next_intra;
+    }
+    return g;
+}
+
+/* Whether the next group can be coded: its frames have arrived, and so
+ * have the frames an intra anchor looks ahead to, unless the stream is
+ * closing. */
+static int group_ready(const NvdrvEncoder* e, int closing) {
     if (e->npend == 0) return 0;
-    int last = e->anchor + e->npend;
-    int gop = e->cfg.gop;
-    int force = gop > 0 && last % gop == 0;
-    if (code_frame(e, &e->pend[e->npend - 1], last, force, 0) != 0) return -1;
-    if (code_between(e, e->anchor, last, 1) != 0) return -1;
+    if (closing) return 1;
+    int g = group_end(e), last = e->anchor + e->npend;
+    int ahead = is_intra_slot(e, g) && e->cfg.tpl_strength > 0 ? e->cfg.lookahead : 0;
+    return last >= g + ahead;
+}
+
+static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile_q);
+
+/* Code the next group: its anchor, then the B frames before it. */
+static int flush_group(NvdrvEncoder* e, int closing) {
+    int a = e->anchor, g = group_end(e);
+    if (closing && g > a + e->npend) g = a + e->npend;
+    int intra = is_intra_slot(e, g);
+    int idx = g - a - 1;
+    e->intra_scale = 1.0f;
+    int tiles_on = e->cfg.frame.max_block >= 2 * TPL_B && !getenv("TPLFRAME");
+    if (intra && e->cfg.tpl_strength > 0) {
+        if (tiles_on && !e->tile_q) {
+            int tile = e->cfg.frame.max_block;
+            e->tile_q = (int8_t*)calloc((size_t)((e->width + tile - 1) / tile) * ((e->height + tile - 1) / tile), 1);
+        }
+        e->intra_scale = tpl_scale(e, idx, e->npend - idx, tiles_on ? e->tile_q : NULL);
+    }
+    int use_tiles = intra && tiles_on && e->tile_q && e->cfg.tpl_strength > 0;
+    e->use_tile_q = use_tiles;
+    if (code_frame(e, &e->pend[idx], g, intra, 0) != 0) return -1;
+    e->use_tile_q = 0;
+    e->intra_scale = 1.0f;
+    if (a >= 0 && code_between(e, a, g, 1) != 0) return -1;
     /* Frames before the new anchor are never a reference again. */
-    drop_before(e, last);
-    e->anchor = last;
-    e->npend = 0;
+    drop_before(e, g);
+    /* The frames after the anchor move to the front, their buffers with
+     * them, and the summed motion is measured from the new anchor. */
+    int shift = g - a;
+    NvdrImage keep[QCAP];
+    for (int i = 0; i < e->npend; i++) keep[i] = e->pend[i];
+    for (int i = 0; i < e->npend; i++) e->pend[i] = keep[(i + shift) % e->npend];
+    for (int i = 0; i + shift <= e->npend; i++) {
+        e->cumx[i] = e->cumx[i + shift] - e->cumx[shift];
+        e->cumy[i] = e->cumy[i + shift] - e->cumy[shift];
+    }
+    e->npend -= shift;
+    e->anchor = g;
     return 0;
 }
 
@@ -1460,30 +1729,26 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame) {
     if (frame->width != e->width || frame->height != e->height) return -1;
     size_t npx = (size_t)e->width * e->height * 3;
     int display = (int)e->count;
+    int i = display - e->anchor;
+    if (e->npend >= QCAP || i > QCAP) return -1;
 
-    if (e->anchor < 0) {
-        if (code_frame(e, frame, display, 1, 0) != 0) return -1;
-        e->anchor = display;
-        e->cumx[0] = e->cumy[0] = 0;
-    } else {
-        /* Global motion from the frame before, measured on the sources:
-         * it only centres the searches against the decoded references. */
-        int i = display - e->anchor, sx = 0, sy = 0;
-        if (e->cfg.bframes > 0) find_shift(frame, &e->last_src, e->cfg.search, &sx, &sy);
-        e->cumx[i] = e->cumx[i - 1] + sx;
-        e->cumy[i] = e->cumy[i - 1] + sy;
-        NvdrImage* p = &e->pend[e->npend];
-        if (!p->pixels && alloc_image(p, e->width, e->height) != 0) return -1;
-        memcpy(p->pixels, frame->pixels, npx);
-        e->npend++;
-        /* The group ends after `bframes` B frames, or on the frame the GOP
-         * wants intra. */
-        int gop = e->cfg.gop;
-        if (e->npend > e->cfg.bframes || (gop > 0 && display % gop == 0))
-            if (flush_group(e) != 0) return -1;
-    }
+    /* Global motion from the frame before, measured on the sources: it
+     * only centres the searches against the decoded references, and the
+     * look ahead. */
+    int sx = 0, sy = 0;
+    if (display > 0 && (e->cfg.bframes > 0 || e->cfg.tpl_strength > 0))
+        find_shift(frame, &e->last_src, e->cfg.search, &sx, &sy);
+    if (i == 1) e->cumx[0] = e->cumy[0] = 0;
+    e->cumx[i] = e->cumx[i - 1] + sx;
+    e->cumy[i] = e->cumy[i - 1] + sy;
+    NvdrImage* p = &e->pend[e->npend];
+    if (!p->pixels && alloc_image(p, e->width, e->height) != 0) return -1;
+    memcpy(p->pixels, frame->pixels, npx);
+    e->npend++;
     memcpy(e->last_src.pixels, frame->pixels, npx);
     e->count++;
+    while (group_ready(e, 0))
+        if (flush_group(e, 0) != 0) return -1;
     return 0;
 }
 
@@ -1491,7 +1756,8 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     int rc = 0;
     if (!e) return 0;
     if (e->f) {
-        if (flush_group(e) != 0) rc = -1;
+        while (rc == 0 && e->npend > 0)
+            if (flush_group(e, 1) != 0) rc = -1;
         if (fseek(e->f, 10, SEEK_SET) == 0) {
             uint8_t n[4];
             put_u32v(n, e->coded);
@@ -1500,12 +1766,13 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
         if (fclose(e->f) != 0) rc = -1;
     }
     for (int i = 0; i < e->ndpb; i++) nvdr_image_free(&e->dpb[i].img);
-    for (int i = 0; i <= NVDRV_MAX_B; i++) free(e->pend[i].pixels);
+    for (int i = 0; i < QCAP; i++) free(e->pend[i].pixels);
     free(e->pred.pixels); free(e->error.pixels); free(e->last_src.pixels);
     free(e->s0x); free(e->s0y); free(e->s1x); free(e->s1y);
     free(e->v0x); free(e->v0y); free(e->v1x); free(e->v1y);
     free(e->m0x); free(e->m0y); free(e->m1x); free(e->m1y);
     free(e->mode);
+    free(e->tile_q);
     free(e);
     return rc;
 }

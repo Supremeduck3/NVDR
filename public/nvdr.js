@@ -31,6 +31,17 @@ const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
 const FLAG_CHROMA420 = 0x04;  // colour in its own half-resolution tree
 const FLAG_GRAIN = 0x08;      // grain parameters follow the header
+const FLAG_TILEQ = 0x10;      // a step offset per tile, in layer 0
+
+/* Mirrors TQ_SCALE and tq_step(): a tile's step from the header's and its
+ * offset in sixths of a doubling. */
+const TQ_MAX = 12;
+const TQ_SCALE = [256, 287, 323, 362, 406, 456, 512, 575, 645, 724, 813, 912,
+                  1024, 1149, 1290, 1448, 1625, 1825, 2048, 2299, 2580, 2896, 3251, 3649, 4096];
+function tqStep(step, d) {
+    const s = (step * TQ_SCALE[d + TQ_MAX] + 512) >> 10;
+    return s < 1 ? 1 : s > 65535 ? 65535 : s;
+}
 const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
@@ -209,8 +220,21 @@ function colourModels() {
         splitC: probs(NSIZES),   // the colour tree's, in 4:2:0
         dcZero: grid(NSIZES, 3),
         dcSign: probs(3),
-        dcMag: grid(3, MAG_UNARY)
+        dcMag: grid(3, MAG_UNARY),
+        tqZero: probs(1), tqSign: probs(1), tqMag: probs(2 * TQ_MAX)
     };
+}
+
+/* Mirrors get_tq(). */
+function getTq(d, m) {
+    if (!d.bit(m.tqZero, 0)) return 0;
+    const neg = d.bit(m.tqSign, 0);
+    let r = 0;
+    for (let i = 0; i < 2 * TQ_MAX - 1; i++) {
+        if (!d.bit(m.tqMag, i)) break;
+        r = i + 1;
+    }
+    return neg ? -(r + 1) : r + 1;
 }
 
 function textureModels() {
@@ -303,7 +327,7 @@ export function readHeader(buffer) {
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN)) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN | FLAG_TILEQ)) return null;
     if ((h.flags & FLAG_CHROMA420) && h.maxBlock < 8) return null;
     // Mirrors nvdr_grain_unpack(): parameters between the header and layer 0.
     if (h.flags & FLAG_GRAIN) {
@@ -542,6 +566,11 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const warm = ctx && ctx.valid;
     const cm = warm ? ctx.cm : colourModels();
     if (!cm.splitC) cm.splitC = probs(NSIZES);
+    if (!cm.tqZero) { cm.tqZero = probs(1); cm.tqSign = probs(1); cm.tqMag = probs(2 * TQ_MAX); }
+    // The tiles' step offsets as layer 0 delivers them, zero where it
+    // never did, and the step of the tile being read.
+    const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
+    const tstep = step.slice();
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
     const d0 = new ArithDecoder(bytes, base, avail0);
     const s0 = { corrupt: false };
@@ -564,16 +593,24 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
             const k = P.comp0 + c;
             const pred = P.predict(c, x, y, n);
             const dl = getDc(d0, cm, sc, k, s0);
-            const colour = clampU8(pred + divRound(clampCoef(dl * step[k]), n));
+            const colour = clampU8(pred + divRound(clampCoef(dl * tstep[k]), n));
             P.paintFlat(c, x, y, n, n, colour);
         }
         P.lx.push(x); P.ly.push(y); P.ln.push(n);
     }
 
-    let complete0 = 0, stopped = false;
+    let complete0 = 0, stopped = false, tqPrev = 0;
     for (let t = 0; t < tiles; t++) {
         const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
         for (const P of parts) P.tileStart[t] = P.lx.length;
+        if (tq && !stopped) {
+            const dq = tqPrev + getTq(d0, cm);
+            if (d0.overrun || dq < -TQ_MAX || dq > TQ_MAX) stopped = true;
+            else {
+                tq[t] = dq; tqPrev = dq;
+                for (let c = 0; c < 3; c++) tstep[c] = tqStep(step[c], dq);
+            }
+        }
         for (let k = 0; k < parts.length && !stopped; k++) {
             const P = parts[k], x = tx / (k + 1), y = ty / (k + 1);
             if (!P.exists(x, y)) continue;
@@ -630,6 +667,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                 }
                 P.was = P.textured.slice(P.tileStart[t], P.tileStart[t + 1]);
             }
+            const tileStep = tq ? step.map(q => tqStep(q, tq[t])) : step;
             for (let k = 0; k < parts.length && !d.overrun && !st.corrupt; k++) {
                 const P = parts[k], ppw = P.pw;
                 for (let i = P.tileStart[t]; i < P.tileStart[t + 1] && !d.overrun && !st.corrupt; i++) {
@@ -645,7 +683,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                             for (let q = start; q < end; q++) {
                                 if (!lv[q]) continue;
                                 const p = pos[q], u = p & (n - 1), v = p >> sh;
-                                coef[p] = clampCoef(lv[q] * step[comp]);
+                                coef[p] = clampCoef(lv[q] * tileStep[comp]);
                                 if (u > mu) mu = u;
                                 if (v > mv) mv = v;
                             }
@@ -701,13 +739,19 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         for (let t = complete0; t < tiles; t++)
             mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, 0);
         for (let c = 0; c < P.np; c++) {
-            const p = planes[c], sp = step[P.comp0 + c];
-            const alpha = (sp * DB_ALPHA + 8) >> 4, beta = (sp * DB_BETA + 8) >> 4;
-            const tc = (sp * DB_TC + 8) >> 4;
+            const p = planes[c], base = step[P.comp0 + c];
+            // The step at an edge is its second side's tile's.
+            let alpha = 0, beta = 0, tc = 0;
+            const at = (gx, gy) => {
+                const sp = tq ? tqStep(base, tq[Math.floor(gy * 4 / ptile) * tilesX + Math.floor(gx * 4 / ptile)]) : base;
+                alpha = (sp * DB_ALPHA + 8) >> 4; beta = (sp * DB_BETA + 8) >> 4; tc = (sp * DB_TC + 8) >> 4;
+            };
+            at(0, 0);
             for (let gy = 0; gy < gh; gy++)
                 for (let gx = 1; gx < gw; gx++) {
                     if (!vedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[gy * gw + gx - 1]) continue;
+                    if (tq) at(gx, gy);
                     for (let y = gy * 4; y < gy * 4 + 4; y++) {
                         const r = y * ppw + gx * 4;
                         const p1 = p[r - 2], p0 = p[r - 1], q0 = p[r], q1 = p[r + 1];
@@ -723,6 +767,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                 for (let gx = 0; gx < gw; gx++) {
                     if (!hedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[(gy - 1) * gw + gx]) continue;
+                    if (tq) at(gx, gy);
                     for (let x = gx * 4; x < gx * 4 + 4; x++) {
                         const r = gy * 4 * ppw + x;
                         const p1 = p[r - 2 * ppw], p0 = p[r - ppw], q0 = p[r], q1 = p[r + ppw];
