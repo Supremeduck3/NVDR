@@ -390,6 +390,10 @@ Parâmetros:
   qualidade.
 - **`--b-q-step F`** — quanto cada nível de B é mais grosso que os P
   (default 0,5: níveis 1, 2 e 3 a 1,5×, 2× e 2,5× o passo dos P).
+- **`--lookahead N`** e **`--tpl F`** — antes de um quadro intra o encoder
+  olha até N quadros à frente (default 16) e dá q mais fino às regiões que
+  eles vão reaproveitar, com intensidade F (default 1; `0` desliga). Rende
+  de 0 a 3% nos clipes de teste.
 - **`--skip-k F`** — quão facilmente um quadro predito deixa um bloco
   **exatamente como estava** no quadro anterior, em vez de recodificar a
   pequena diferença (default 0,25; `0` corrige todos). É o que tira a

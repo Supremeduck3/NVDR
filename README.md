@@ -351,6 +351,46 @@ BD-rate against P frames only, luma, 25 frames:
 The regression gate's sequence, which does not zoom, comes out byte for
 byte as it did.
 
+### Looking ahead of the intra frame
+
+An intra frame was coded as if nothing came after it, but the frames that
+follow copy it: a background that stays on screen is paid for once and
+inherited by every frame of the group. Before an intra frame the encoder
+now holds up to `--lookahead` (16) source frames and estimates, as x264's
+macroblock tree and AV1's temporal dependency model do, how much of each
+16x16 block the frames after it reuse. Each block has an intra cost (the
+Hadamard sum of its detail) and an inter cost (the Hadamard sum of its
+error against its best whole-pixel match in the frame before); walking
+back from the last frame, a block passes (intra + inherited) x (1 -
+inter/intra) to the blocks its match overlaps.
+
+What reaches the intra frame becomes a step offset per 32x32 tile:
+`--tpl` (1) sixths of a doubling for each doubling of (intra +
+inherited) / intra, finer only, down to -12. The offsets needed a new
+still flag, 0x10 (TILEQ): each tile's offset is coded at its start in
+layer 0 as the difference from the tile before, so truncation keeps
+working, and every decoder scales the tile's step by the integer table
+1024 x 2^(d/6) for its colours, textures and deblocking thresholds. The
+4:2:0 choice is made without the offsets: with them, the gate's
+saturated drawing came out 4:2:0 and lost 5 dB of RGB.
+
+BD-rate on PSNR-Y against the same encoder without it:
+
+    clip                                           --tpl 1   --tpl 2   --tpl 3
+    pan over a photo, whole pixels, clean            -0.1%    +1.2%    +6.4%
+    subpixel pan, zoom, object, clean                -1.9%    -2.9%    -2.6%
+    the same with sensor noise                       -0.3%    -0.3%    +0.2%
+    still camera, object crossing, clean             -1.8%    +1.7%    +9.0%
+    still camera, object crossing, noisy             -3.4%    -4.6%    -4.4%
+
+Small, because the P and B frames are already coded far coarser than the
+intra frame (up to 3.5 times its step), which does most of what the
+tree would at the level of whole frames; where every bit is in the intra
+frame (a still scene) there is nothing to move. Stronger settings make
+the intra frame finer than the frames after it can use. The remaining
+distance to AV1's intra frame is in coding it, not in how its bits are
+spread.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
