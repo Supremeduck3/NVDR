@@ -56,6 +56,9 @@ NvdrvConfig nvdrv_default_config(void) {
     c.b_q_step = 0.5f;
     c.lookahead = 16;
     c.tpl_strength = 1.0f;
+    c.tf_radius = 3;
+    c.tf_strength = 1.0f;
+    c.tf_levels = 0;
     c.fps = 24;
     return c;
 }
@@ -1334,6 +1337,7 @@ struct NvdrvEncoder {
     NvdrImage   last_src;
     int         anchor;      /* display number of the last anchor, -1 before any */
     NvdrImage   pred, error;
+    NvdrImage   tf;          /* the anchor, filtered */
     /* Searched vectors at block size (s) and half size (h), the chosen
      * field (v), the models' vectors (m) and modes on the half-size grid,
      * and which blocks split. */
@@ -1394,6 +1398,8 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     if (e->cfg.bframes > NVDRV_MAX_B) e->cfg.bframes = NVDRV_MAX_B;
     if (e->cfg.lookahead < 0) e->cfg.lookahead = 0;
     if (e->cfg.lookahead > NVDRV_MAX_LOOKAHEAD) e->cfg.lookahead = NVDRV_MAX_LOOKAHEAD;
+    if (e->cfg.tf_radius < 0 || e->cfg.tf_strength <= 0) e->cfg.tf_radius = 0;
+    if (e->cfg.tf_radius > NVDRV_MAX_TF) e->cfg.tf_radius = NVDRV_MAX_TF;
     e->intra_scale = 1.0f;
     /* B frames need per-block vectors; a GOP shorter than a group bounds
      * the group anyway. */
@@ -1918,12 +1924,16 @@ done:
     return scale;
 }
 
+static int temporal_filter(NvdrvEncoder* e, int idx, NvdrImage* out);
+
 /* The frames strictly between displays lo and hi, halfway first. */
 static int code_between(NvdrvEncoder* e, int lo, int hi, int level) {
     /* pend[i] is display anchor + 1 + i, and the anchor is still lo. */
     if (hi - lo < 2) return 0;
-    int mid = (lo + hi) / 2;
-    if (code_frame(e, &e->pend[mid - e->anchor - 1], mid, 0, level) != 0) return -1;
+    int mid = (lo + hi) / 2, idx = mid - e->anchor - 1;
+    const NvdrImage* src = &e->pend[idx];
+    if (level <= e->cfg.tf_levels && e->cfg.tf_radius > 0 && temporal_filter(e, idx, &e->tf) == 0) src = &e->tf;
+    if (code_frame(e, src, mid, 0, level) != 0) return -1;
     if (code_between(e, lo, mid, level + 1) != 0) return -1;
     return code_between(e, mid, hi, level + 1);
 }
@@ -1961,10 +1971,143 @@ static int group_ready(const NvdrvEncoder* e, int closing) {
     if (closing) return 1;
     int g = group_end(e), last = e->anchor + e->npend;
     int ahead = is_intra_slot(e, g) && e->cfg.tpl_strength > 0 ? e->cfg.lookahead : 0;
+    if (ahead < e->cfg.tf_radius) ahead = e->cfg.tf_radius;
     return last >= g + ahead;
 }
 
 static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile_q);
+
+/*
+ * FILTERING THE ANCHORS
+ * ---------------------
+ * An anchor is what the frames around it are predicted from, and sensor
+ * noise is the one thing in it they cannot use: it is new in every frame.
+ * Coded as it is, the anchor pays for noise, and its neighbours pay again
+ * to replace that noise with their own. So, as libaom does for its
+ * alternate reference frames, the anchor is first averaged along the
+ * motion with the `tf_radius` source frames on either side.
+ *
+ * Each neighbour is matched to the anchor block by block (16x16, whole
+ * pixels around the summed global motion and then quarter pixels, the
+ * searches the sequence already has) and assembled into a picture that
+ * lines up with it. Each pixel then blends the anchor with every aligned
+ * neighbour, weighted by how well they agree: d, the mean of the squared
+ * difference (summed over the channels) over the 3x3 around the pixel
+ * and over its block, against what noise alone makes it,
+ *
+ *     w = exp(-d / (tf_strength * noise))
+ *
+ * so a neighbour that differs by no more than noise counts for about a
+ * third of the anchor, and one that differs by an edge, something moving
+ * or a failed match, not at all. `noise` is measured in time, not space:
+ * the median block's squared difference against the nearest neighbour,
+ * which two independent draws of the noise make 2 sigma^2 a channel. (A
+ * spatial estimate, Immerkaer's, was tried first and could not tell the
+ * noisy clip from a clean one: sensor noise is a little blurred, and the
+ * clean clip's detail looks like noise to it.) A clean clip's median is
+ * the interpolation's small mismatch, so its neighbours count only where
+ * they agree almost exactly, which changes almost nothing.
+ */
+#define TF_B 16
+
+static int cmp_float(const void* a, const void* b) {
+    float x = *(const float*)a, y = *(const float*)b;
+    return x < y ? -1 : x > y;
+}
+
+static int temporal_filter(NvdrvEncoder* e, int idx, NvdrImage* out) {
+    int w = e->width, h = e->height, R = e->cfg.tf_radius;
+    const NvdrImage* cur = &e->pend[idx];
+    size_t npx = (size_t)w * h * 3;
+    int nbx = (w + TF_B - 1) / TF_B, nby = (h + TF_B - 1) / TF_B, nb = nbx * nby;
+    int lim = NVDRV_MV_MAX / 4 - 8, rc = -1, nn = 0;
+    NvdrImage al[2 * NVDRV_MAX_TF];
+    int dist[2 * NVDRV_MAX_TF];
+    float* bmse = (float*)malloc(sizeof(float) * (size_t)nb * 2 * R);
+    float* tmp = (float*)malloc(sizeof(float) * (size_t)nb);
+    int16_t* vx = (int16_t*)malloc(sizeof(int16_t) * (size_t)nb);
+    int16_t* vy = (int16_t*)malloc(sizeof(int16_t) * (size_t)nb);
+    float* acc = (float*)malloc(sizeof(float) * npx);
+    float* wsum = (float*)malloc(sizeof(float) * (size_t)w * h);
+    if (!bmse || !tmp || !vx || !vy || !acc || !wsum) goto done;
+    if (!out->pixels && alloc_image(out, w, h) != 0) goto done;
+    /* Every neighbour aligned to the anchor, with its blocks' error. */
+    for (int k = idx - R; k <= idx + R; k++) {
+        if (k == idx || k < 0 || k >= e->npend) continue;
+        const NvdrImage* src = &e->pend[k];
+        int cx = clampi(e->cumx[idx + 1] - e->cumx[k + 1], -lim, lim);
+        int cy = clampi(e->cumy[idx + 1] - e->cumy[k + 1], -lim, lim);
+        Subpel sp;
+        dist[nn] = k < idx ? idx - k : k - idx;
+        if (alloc_image(&al[nn], w, h) != 0) goto done;
+        nn++;
+        block_search(cur, src, TF_B, dist[nn - 1], cx, cy, vx, vy);
+        if (subpel_build(&sp, src) != 0) goto done;
+        block_refine(cur, &sp, TF_B, NVDRV_MV_MAX, vx, vy);
+        block_predict(&sp, &al[nn - 1], TF_B, vx, vy);
+        subpel_free(&sp);
+        float* bm = bmse + (size_t)(nn - 1) * nb;
+        for (int b = 0; b < nb; b++) {
+            int x0 = (b % nbx) * TF_B, y0 = (b / nbx) * TF_B;
+            int x1 = x0 + TF_B < w ? x0 + TF_B : w, y1 = y0 + TF_B < h ? y0 + TF_B : h;
+            double s = 0.0;
+            for (int y = y0; y < y1; y++) {
+                const unsigned char* a = cur->pixels + ((size_t)y * w + x0) * 3;
+                const unsigned char* c = al[nn - 1].pixels + ((size_t)y * w + x0) * 3;
+                for (int i = 0; i < (x1 - x0) * 3; i++) { int d = a[i] - c[i]; s += d * d; }
+            }
+            bm[b] = (float)(s / ((x1 - x0) * (y1 - y0)));
+        }
+    }
+    if (!nn) goto done;
+    /* What noise alone makes of a block: the nearest neighbours' median. */
+    double noise = 1e30;
+    for (int n = 0; n < nn; n++) {
+        if (dist[n] != 1) continue;
+        memcpy(tmp, bmse + (size_t)n * nb, sizeof(float) * (size_t)nb);
+        qsort(tmp, (size_t)nb, sizeof(float), cmp_float);
+        if (tmp[nb / 2] < noise) noise = tmp[nb / 2];
+    }
+    if (noise > 1e29) goto done;
+    if (noise < 1.0) noise = 1.0;
+    if (getenv("TFDBG")) fprintf(stderr, "tf idx %d noise %.1f\n", idx, noise);
+    double inv = 1.0 / (e->cfg.tf_strength * noise);
+    for (size_t i = 0; i < npx; i++) acc[i] = cur->pixels[i];
+    for (size_t i = 0; i < (size_t)w * h; i++) wsum[i] = 1.0f;
+    for (int n = 0; n < nn; n++) {
+        const unsigned char* A = al[n].pixels;
+        const float* bm = bmse + (size_t)n * nb;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                double s = 0.0;
+                int cnt = 0;
+                for (int j = y - 1; j <= y + 1; j++) {
+                    if (j < 0 || j >= h) continue;
+                    for (int i = x - 1; i <= x + 1; i++) {
+                        if (i < 0 || i >= w) continue;
+                        size_t at = ((size_t)j * w + i) * 3;
+                        for (int ch = 0; ch < 3; ch++) { int d = cur->pixels[at + ch] - A[at + ch]; s += d * d; }
+                        cnt++;
+                    }
+                }
+                double d = 0.5 * s / cnt + 0.5 * bm[(y / TF_B) * nbx + x / TF_B];
+                float wt = (float)exp(-d * inv);
+                size_t at = (size_t)y * w + x;
+                wsum[at] += wt;
+                for (int ch = 0; ch < 3; ch++) acc[at * 3 + ch] += wt * A[at * 3 + ch];
+            }
+    }
+    for (size_t i = 0; i < npx; i++)
+        out->pixels[i] = (unsigned char)clamp255v((int)lrintf(acc[i] / wsum[i / 3]));
+    rc = 0;
+done:
+    for (int n = 0; n < nn; n++) free(al[n].pixels);
+    free(bmse); free(tmp); free(vx); free(vy); free(acc); free(wsum);
+    return rc;
+}
 
 /* Code the next group: its anchor, then the B frames before it. */
 static int flush_group(NvdrvEncoder* e, int closing) {
@@ -1983,7 +2126,11 @@ static int flush_group(NvdrvEncoder* e, int closing) {
     }
     int use_tiles = intra && tiles_on && e->tile_q && e->cfg.tpl_strength > 0;
     e->use_tile_q = use_tiles;
-    if (code_frame(e, &e->pend[idx], g, intra, 0) != 0) return -1;
+    /* The anchor coded is its filtered copy; the frames stay as they
+     * arrived, for the B frames and for filtering the next anchor. */
+    const NvdrImage* anchor_src = &e->pend[idx];
+    if (e->cfg.tf_radius > 0 && temporal_filter(e, idx, &e->tf) == 0) anchor_src = &e->tf;
+    if (code_frame(e, anchor_src, g, intra, 0) != 0) return -1;
     e->use_tile_q = 0;
     e->intra_scale = 1.0f;
     if (a >= 0 && code_between(e, a, g, 1) != 0) return -1;
@@ -2015,7 +2162,7 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame) {
      * only centres the searches against the decoded references, and the
      * look ahead. */
     int sx = 0, sy = 0;
-    if (display > 0 && (e->cfg.bframes > 0 || e->cfg.tpl_strength > 0))
+    if (display > 0 && (e->cfg.bframes > 0 || e->cfg.tpl_strength > 0 || e->cfg.tf_radius > 0))
         find_shift(frame, &e->last_src, e->cfg.search, &sx, &sy);
     if (i == 1) e->cumx[0] = e->cumy[0] = 0;
     e->cumx[i] = e->cumx[i - 1] + sx;
@@ -2046,7 +2193,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     }
     for (int i = 0; i < e->ndpb; i++) nvdr_image_free(&e->dpb[i].img);
     for (int i = 0; i < QCAP; i++) free(e->pend[i].pixels);
-    free(e->pred.pixels); free(e->error.pixels); free(e->last_src.pixels);
+    free(e->pred.pixels); free(e->error.pixels); free(e->last_src.pixels); free(e->tf.pixels);
     free(e->s0x); free(e->s0y); free(e->s1x); free(e->s1y);
     free(e->v0x); free(e->v0y); free(e->v1x); free(e->v1y);
     free(e->m0x); free(e->m0y); free(e->m1x); free(e->m1y);

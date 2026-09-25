@@ -77,6 +77,7 @@
 #define NVDRV_MAX_B    15
 #define NVDRV_MAX_DPB  (NVDRV_MAX_B + 3)
 #define NVDRV_MAX_LOOKAHEAD 32
+#define NVDRV_MAX_TF   7
 
 typedef struct {
     NvdrConfig frame;      /* how each frame's container is built */
@@ -131,6 +132,16 @@ typedef struct {
      * macroblock-tree strength, in sixths of a doubling per doubling of
      * reuse. 0 codes the intra frame at `frame.q` whatever follows it. */
     float tpl_strength;
+    /* The temporal filter (see "Filtering the anchors" in nvdrv.c): source
+     * frames on each side, 0 to NVDRV_MAX_TF, blended into each anchor
+     * before it is coded, and how far a match may differ from it, in units
+     * of the frame's measured noise, before it stops counting. 0 turns
+     * it off. */
+    int   tf_radius;
+    float tf_strength;
+    /* B frames filtered too, by level: 1 the frame halfway between two
+     * anchors, which the frames either side are predicted from. */
+    int   tf_levels;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 
