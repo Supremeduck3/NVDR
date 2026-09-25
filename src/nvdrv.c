@@ -1353,10 +1353,10 @@ static int alloc_image(NvdrImage* img, int w, int h) {
 
 /* Decode a frame's container at full quality, which is what later frames
  * predict from. */
-static int reconstruct(const uint8_t* blob, size_t len, NvdrImage* out) {
+static int reconstruct(const uint8_t* blob, size_t len, const NvdrImage* base, NvdrImage* out) {
     NvdrImage img;
     NvdrHeader hdr;
-    if (nvdr_decode_mem(blob, len, -1, &img, &hdr, NULL) != 0) return -1;
+    if (nvdr_decode_mem_base(blob, len, base, &img, &hdr, NULL) != 0) return -1;
     /* A frame's container has to be the size of the sequence it sits in,
      * or it is not a frame of this sequence. */
     if (hdr.width != out->width || hdr.height != out->height) {
@@ -1642,12 +1642,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         ref = &e->pred;
     }
 
-    const NvdrImage* to_code = src;
     if (kind != NVDRV_INTRA) {
-        for (size_t i = 0; i < npx; i++)
-            e->error.pixels[i] =
-                (unsigned char)clamp255v((int)src->pixels[i] - (int)ref->pixels[i] + 128);
-        to_code = &e->error;
         if (kind == NVDRV_PRED && block) {
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL };
             field = with_models(aff0 ? &model0 : NULL, NULL,
@@ -1665,30 +1660,33 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     fcfg.q = q_for(e, kind, level);
     fcfg.tile_q = kind == NVDRV_INTRA && e->use_tile_q ? e->tile_q : NULL;
     if (kind != NVDRV_INTRA) {
-        fcfg.residual = 1;
-        /* When the intra frame halved its colour, as it does for anything
-         * photographic, the residuals do too: the reference's colour is
-         * already smooth, and a residual coded whole spends its bytes on
-         * colour detail, and colour noise, the viewer does not see. Their
-         * leaf seams are filtered as well, since over a continuous
-         * prediction they land in the picture as they are. The filter is
-         * the still decoder's, driven by the container's own flag, so
-         * decoders need nothing new. Together, at equal luma: 6 to 8%
-         * smaller on the clean test clips, 23% on the noisy one.
+        /*
+         * A predicted frame is the source frame itself, coded as a
+         * picture against its motion-compensated prediction as the
+         * container's base (NVDR_FLAG_INTER): each leaf takes the base
+         * under it (INTER) and corrects it, or, where the motion does not
+         * explain the frame (what an object uncovers, what comes in at
+         * the edge), is predicted from its own decoded neighbours along a
+         * direction, as intra frames are. It replaces coding the
+         * difference as a picture of its own, biased to 128 and clipped
+         * wherever it passed 127, and puts the deblocking filter on the
+         * picture that is shown and predicted from.
          *
-         * A sequence whose intra frame keeps its colour whole (a drawing,
-         * a screen) keeps both off: halving there piles colour error up
-         * along the chain of references, and on the regression gate's
-         * sawtooth texture the filter cost 9% for nothing. */
+         * When the intra frame halved its colour, as it does for anything
+         * photographic, these do too; a sequence whose intra frame keeps
+         * its colour whole (a drawing, a screen) keeps it whole.
+         */
+        fcfg.base = ref;
+        fcfg.directional = 1;
         int photo = e->chroma420 && e->cfg.frame.chroma420 == NVDR_CHROMA_AUTO;
-        fcfg.chroma420 = photo ? NVDR_CHROMA_420 : e->cfg.frame.chroma420;
-        fcfg.deblock = photo && e->cfg.frame.deblock;
+        fcfg.chroma420 = photo ? NVDR_CHROMA_420 : (e->cfg.frame.chroma420 == NVDR_CHROMA_AUTO
+                                                    ? NVDR_CHROMA_444 : e->cfg.frame.chroma420);
     }
 
     uint8_t* blob = NULL;
     size_t len = 0;
     NvdrHeader fh;
-    if (nvdr_encode_mem(&blob, &len, to_code, &fcfg, &fh) != 0) { free(field); return -1; }
+    if (nvdr_encode_mem(&blob, &len, src, &fcfg, &fh) != 0) { free(field); return -1; }
     if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
     int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0);
@@ -1701,13 +1699,9 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
      * so the two sides hold the same bytes from here on. */
     Slot* s = &e->dpb[e->ndpb];
     if (alloc_image(&s->img, e->width, e->height) != 0) { free(blob); return -1; }
-    int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? &s->img : &e->error);
+    int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img);
     free(blob);
     if (rc != 0) { nvdr_image_free(&s->img); return -1; }
-    if (kind != NVDRV_INTRA)
-        for (size_t i = 0; i < npx; i++)
-            s->img.pixels[i] = (unsigned char)clamp255v(
-                (int)e->error.pixels[i] - 128 + (int)ref->pixels[i]);
     s->display = display;
     s->kind = kind;
     e->ndpb++;
@@ -2153,7 +2147,6 @@ static int decode_one(NvdrvDecoder* d) {
     if (kind == NVDRV_BI && after < 0) return -1;
     d->pos += NVDRV_FRAME_HEADER;
 
-    size_t npx = (size_t)d->width * d->height * 3;
     const NvdrImage* ref = kind == NVDRV_INTRA ? NULL : &d->dpb[before].img;
 
     if (block) {
@@ -2219,14 +2212,10 @@ static int decode_one(NvdrvDecoder* d) {
     if (alloc_image(&s->img, d->width, d->height) != 0) return -1;
     /* A frame cut before its colour layer has no picture yet: the stream
      * ends there, it is not damaged. */
-    if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? &s->img : &d->err) != 0) {
+    if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? NULL : ref, &s->img) != 0) {
         nvdr_image_free(&s->img);
         return partial ? 0 : -1;
     }
-    if (kind != NVDRV_INTRA)
-        for (size_t i = 0; i < npx; i++)
-            s->img.pixels[i] = (unsigned char)clamp255v(
-                (int)d->err.pixels[i] - 128 + (int)ref->pixels[i]);
     s->display = display;
     s->kind = kind;
     s->partial = partial;
@@ -2409,7 +2398,7 @@ int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
     if (unpack_field(data + 9, field_len, nbx, nby, tx, ty, MV_ESC_ALBUM, 127, vx, vy) != 0) goto done;
     if (subpel_build(&sp, ref) != 0) goto done;
     block_predict(&sp, &pred, block, vx, vy);
-    if (reconstruct(data + 9 + field_len, len - 9 - field_len, &err) != 0) goto done;
+    if (reconstruct(data + 9 + field_len, len - 9 - field_len, NULL, &err) != 0) goto done;
     for (size_t i = 0; i < npx; i++)
         pred.pixels[i] = (unsigned char)clamp255v((int)err.pixels[i] - 128 + (int)pred.pixels[i]);
     *out = pred;

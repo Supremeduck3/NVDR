@@ -102,6 +102,12 @@ typedef struct {
      * (band is forced to 0). For a sequence's intra frames, which are
      * never shown half-arrived. Flagged in the header. */
     int   directional;
+    /* A picture this one is predicted from, the same size (RGB): a
+     * sequence's motion-compensated prediction. Each leaf is then
+     * predicted from it (mode INTER) or from its own decoded neighbours
+     * along a direction, as `directional` does, which it implies. The
+     * decoder needs the same picture: see nvdr_decode_mem_base(). */
+    const NvdrImage* base;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -177,6 +183,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_GRAIN    0x08         /* grain parameters follow the header */
 #define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
 #define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
+#define NVDR_FLAG_INTER    0x40         /* predicted from a base picture as well */
 
 typedef struct {
     uint16_t width, height;
@@ -237,5 +244,11 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
                         const NvdrConfig* cfg, NvdrHeader* hdr_out, NvdrContext* ctx);
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr, NvdrDecodeInfo* info, NvdrContext* ctx);
+
+/* A container with NVDR_FLAG_INTER, decoded against the picture it was
+ * predicted from (which must be its size). Containers without the flag
+ * decode as nvdr_decode_mem() would. */
+int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
+                         NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 
 #endif /* NVDR_H */

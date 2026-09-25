@@ -3,10 +3,12 @@
  *
  * The still format already says "this level is a delta on the one before
  * it". A sequence says the same thing along time: frame N is a delta on
- * what the decoder is holding after frame N-1. Nothing about the frame
- * codec changes — a predicted frame is an ordinary NVDR container whose
- * image happens to be the prediction error, biased to the middle of the
- * range so it fits in the same unsigned bytes.
+ * what the decoder is holding after frame N-1. Every frame is an ordinary
+ * NVDR container; a predicted frame's has NVDR_FLAG_INTER and is decoded
+ * against its motion-compensated prediction, each leaf taking the
+ * prediction's pixels or predicting itself from its neighbours. (It used
+ * to be the prediction error, biased to the middle of the range; an
+ * album's predicted photo still is.)
  *
  * WHY NOT COPY
  * ------------
@@ -58,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      9
+#define NVDRV_VERSION      10
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20
 

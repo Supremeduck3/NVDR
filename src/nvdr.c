@@ -136,6 +136,8 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b) {
 
 #define NSIZES     4           /* 4, 8, 16, 32 */
 #define POS_CTX    15
+#define NVDR_MODES 15          /* intra modes, see dir_predict() */
+#define MODE_INTER NVDR_MODES  /* with a base: the base picture's block */
 #define SIG_CTX    25          /* 5 position classes x 5 neighbourhoods */
 #define GT1_CTX    10          /* 5 neighbourhoods x (a level over 1 yet or not) */
 #define MAG_UNARY  14
@@ -157,6 +159,7 @@ NvdrConfig nvdr_default_config(void) {
     c.deadzone = 0.1f;
     c.rdoq = 1;
     c.directional = 0;
+    c.base = NULL;
     /* The split decision is flat across 0.06..0.3; this is the middle. */
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
@@ -368,6 +371,7 @@ typedef struct {
     uint16_t dc_mag[3][MAG_UNARY];
     uint16_t tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
     uint16_t mode_flat[NSIZES], mode_tree[16];       /* a leaf's prediction mode */
+    uint16_t mode_inter[NSIZES];                     /* INTER or not, with a base */
 } ColourModels;
 
 typedef struct {
@@ -489,7 +493,11 @@ static void put_tq(Sink* s, ColourModels* m, int v) {
 
 /* A leaf's mode: "flat or not" by size, then 1..14 as four bits down a
  * tree of contexts. */
-static void put_mode(Sink* s, ColourModels* m, int sc, int mode) {
+static void put_mode(Sink* s, ColourModels* m, int sc, int mode, int inter) {
+    if (inter) {
+        put_bit(s, &m->mode_inter[sc], mode != MODE_INTER);
+        if (mode == MODE_INTER) return;
+    }
     put_bit(s, &m->mode_flat[sc], mode != 0);
     if (!mode) return;
     int v = mode - 1, node = 1;
@@ -500,7 +508,8 @@ static void put_mode(Sink* s, ColourModels* m, int sc, int mode) {
     }
 }
 
-static int get_mode(NvdrDecoder* d, ColourModels* m, int sc) {
+static int get_mode(NvdrDecoder* d, ColourModels* m, int sc, int inter) {
+    if (inter && !nvdr_dec_bit(d, &m->mode_inter[sc])) return MODE_INTER;
     if (!nvdr_dec_bit(d, &m->mode_flat[sc])) return 0;
     int v = 0, node = 1;
     for (int k = 0; k < 4; k++) {
@@ -508,7 +517,7 @@ static int get_mode(NvdrDecoder* d, ColourModels* m, int sc) {
         v = 2 * v + b;
         node = 2 * node + b;
     }
-    return v + 1;    /* 15 and 16 are damage; the caller checks */
+    return v < NVDR_MODES - 1 ? v + 1 : -1;    /* the last two are damage */
 }
 
 static int get_tq(NvdrDecoder* d, ColourModels* m) {
@@ -667,6 +676,8 @@ typedef struct {
     int np, comp0;
     int fixed_pred;              /* NVDR_FLAG_RESIDUAL: every colour predicted as 128 */
     int dirpred;                 /* NVDR_FLAG_DIRPRED: predict from `full`, along modes */
+    int inter;                   /* NVDR_FLAG_INTER: and from `base` */
+    uint8_t* base[3];            /* with it, the base picture on this canvas */
     uint8_t* flat[3];
     uint8_t* full[3];
     /* The texture added so far, unclamped (to 16 bits): `full` is
@@ -691,7 +702,54 @@ static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block, int np
 }
 
 static void canvas_free(Canvas* cv) {
-    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); free(cv->acc[c]); }
+    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); free(cv->acc[c]); free(cv->base[c]); }
+}
+
+/*
+ * A base picture on the canvases, in integers identical in every decoder:
+ * Y, Cb and Cr in 16-bit fixed point with JPEG's coefficients, the canvas
+ * padded by repeating the last row and column, and in 4:2:0 the colour
+ * the rounded mean of each 2x2 (repeating at the edge), as the encoder
+ * averages its source.
+ */
+static int canvas_base(Canvas* cv, Canvas* cc, const NvdrImage* img) {
+    size_t n = (size_t)cv->pw * cv->ph;
+    uint8_t* full[3];
+    for (int c = 0; c < 3; c++) if (!(full[c] = (uint8_t*)malloc(n))) { for (int k = 0; k < c; k++) free(full[k]); return -1; }
+    for (int y = 0; y < cv->ph; y++)
+        for (int x = 0; x < cv->pw; x++) {
+            int sx = x < cv->w ? x : cv->w - 1, sy = y < cv->h ? y : cv->h - 1;
+            const unsigned char* p = img->pixels + ((size_t)sy * img->width + sx) * 3;
+            int r = p[0], g = p[1], b = p[2];
+            size_t at = (size_t)y * cv->pw + x;
+            full[0][at] = (uint8_t)clamp_u8((19595 * r + 38470 * g + 7471 * b + 32768) >> 16);
+            full[1][at] = (uint8_t)clamp_u8(((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16) + 128);
+            full[2][at] = (uint8_t)clamp_u8(((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128);
+        }
+    if (!cc) {
+        for (int c = 0; c < 3; c++) cv->base[c] = full[c];
+        return 0;
+    }
+    cv->base[0] = full[0];
+    for (int c = 1; c < 3; c++) {
+        uint8_t* h = (uint8_t*)malloc((size_t)cc->pw * cc->ph);
+        if (!h) { free(full[1]); free(full[2]); return -1; }
+        for (int y = 0; y < cc->ph; y++)
+            for (int x = 0; x < cc->pw; x++) {
+                int sum = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        int fx = 2 * x + i, fy = 2 * y + j;
+                        if (fx >= cv->pw) fx = cv->pw - 1;
+                        if (fy >= cv->ph) fy = cv->ph - 1;
+                        sum += full[c][(size_t)fy * cv->pw + fx];
+                    }
+                h[(size_t)y * cc->pw + x] = (uint8_t)((sum + 2) >> 2);
+            }
+        cc->base[c - 1] = h;
+        free(full[c]);
+    }
+    return 0;
 }
 
 /*
@@ -740,7 +798,6 @@ static int predict(const Canvas* cv, int c, int x, int y, int n) {
  * inverse angles. The DC level then moves the whole prediction by a
  * constant, and the texture is the DCT of what is left. All integer.
  */
-#define NVDR_MODES 15
 static const int MODE_ANGLE[NVDR_MODES] = { 0, 0, -32, -17, -9, 0, 9, 17, 32, -17, -9, 0, 9, 17, 32 };
 static int inv_angle(int a) {
     return a == -32 ? -256 : a == -17 ? -482 : a == -9 ? -910 : 0;
@@ -782,6 +839,11 @@ static int decoded_before(const Canvas* cv, int x, int y, int px, int py) {
 }
 
 static void dir_predict(const Canvas* cv, int c, int x, int y, int n, int mode, int* P) {
+    if (mode == MODE_INTER) {
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) P[j * n + i] = cv->base[c][(size_t)(y + j) * cv->pw + x + i];
+        return;
+    }
     const uint8_t* f = cv->full[c];
     int pw = cv->pw, T[2 * NVDR_MAX_BLOCK + 1] = { 0 }, L[2 * NVDR_MAX_BLOCK + 1] = { 0 };
     int top = y > 0, left = x > 0;
@@ -861,6 +923,13 @@ static void tile_fallback(Canvas* cv, int tx, int ty) {
     int h = ty + cv->tile < cv->ph ? cv->tile : cv->ph - ty;
     for (int c = 0; c < cv->np; c++) {
         paint_flat(cv, c, tx, ty, w, h, 128);
+        /* With a base, a tile that never arrived shows the base. */
+        if (cv->inter)
+            for (int j = ty; j < ty + h; j++)
+                for (int i = tx; i < tx + w; i++) {
+                    size_t at = (size_t)j * cv->pw + i;
+                    cv->flat[c][at] = cv->full[c][at] = cv->base[c][at];
+                }
     }
 }
 
@@ -933,7 +1002,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
     if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN |
-                     NVDR_FLAG_TILEQ | NVDR_FLAG_DIRPRED))
+                     NVDR_FLAG_TILEQ | NVDR_FLAG_DIRPRED | NVDR_FLAG_INTER))
         return -1;   /* a flag this decoder does not know */
     /* Grain parameters sit between the header and the first layer; byte
      * 29 says how many there are. */
@@ -949,6 +1018,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
      * has no second texture layer, and a residual has nothing to predict
      * from. */
     if ((h->flags & NVDR_FLAG_DIRPRED) && (h->band != 0 || (h->flags & NVDR_FLAG_RESIDUAL))) return -1;
+    if ((h->flags & NVDR_FLAG_INTER) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
     return 0;
 }
 
@@ -1042,12 +1112,32 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip, int mode,
         size_t b = (size_t)((y - P->pre_y) / n) * (cv->pw / n) + (size_t)(x / n);
         memset(lv[c], 0, sizeof(int) * count);
         int nonzero = 0;
-        if (mode > 0) {
+        if (mode == MODE_INTER) {
+            /* The base under the leaf, moved by the DC; the texture of
+             * the block minus the base, prepared with the row. */
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            dir_predict(cv, c, x, y, n, MODE_INTER, pr);
+            double dc = P->pre_sum[sc][c][b] / count * n;
+            dl[c] = quantise(dc / step, 0.0);
+            paint_pred(cv, c, x, y, n, pr, div_round(clamp_coef((long)dl[c] * step), n));
+            memcpy(lv[c], P->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
+            nonzero = P->pre_nz[sc][c][b];
+            if (nonzero) {
+                add_residual(cv, c, x, y, n, P->pre_lo[sc][c] + b * count);
+                any = 1;
+            }
+        } else if (mode > 0 || cv->inter) {
             /* The texture of a directional prediction depends on the
              * prediction, so it is transformed here and not beforehand. */
             int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
             double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-            dir_predict(cv, c, x, y, n, mode, pr);
+            if (mode > 0) dir_predict(cv, c, x, y, n, mode, pr);
+            else {
+                /* Flat in a picture with a base: its texture is not
+                 * prepared, since the row's is the block minus the base. */
+                int f = predict(cv, c, x, y, n);
+                for (int i = 0; i < count; i++) pr[i] = f;
+            }
             for (int j = 0; j < n; j++)
                 for (int i = 0; i < n; i++)
                     blk[j * n + i] = P->src[c][(size_t)(y + j) * cv->pw + x + i] - pr[j * n + i];
@@ -1106,7 +1196,7 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n, int mode,
                       const int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK]) {
     int sc = size_class(n), count = n * n, at = e->band_at[sc];
     const Canvas* cv = &e->p->cv;
-    if (cv->dirpred) put_mode(s0, &e->cm, sc, mode);
+    if (cv->dirpred) put_mode(s0, &e->cm, sc, mode, cv->inter);
     for (int c = 0; c < cv->np; c++) {
         int k = cv->comp0 + c;
         double before = s0->bits + s1[0].bits + s1[1].bits;
@@ -1130,6 +1220,9 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n, int mode,
  */
 /* How many directional modes code_leaf() tries in full after screening. */
 #define DIR_TRIED 5
+/* Mean squared error per sample above which a leaf of a picture with a
+ * base tries the other modes besides INTER. */
+#define INTRA_TRY 16.0
 
 /* Sum of absolute 4x4 Hadamard coefficients of source minus prediction. */
 static double satd_leaf(const double* src, int pw, int x, int y, int n, const int* pr) {
@@ -1156,7 +1249,41 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* te
     static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int skip = 0, mode = 0;
     double skip_lambda = e->p->skip_lambda;
-    if (e->p->cv.dirpred) {
+    if (e->p->cv.inter) {
+        /* INTER first; the other modes only where it does badly (a mean
+         * squared error over INTRA_TRY), which is where something is
+         * uncovered or comes in: flat and the best few directions. */
+        const Canvas* cv = &e->p->cv;
+        Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
+        double d = leaf_levels(e, x, y, n, 0, MODE_INTER, dl, lv, NULL);
+        leaf_emit(e, &c0, c1, n, MODE_INTER, dl, lv);
+        double best = d + e->p->lambda * (c0.bits + c1[0].bits + c1[1].bits);
+        mode = MODE_INTER;
+        if (d / (double)(n * n * cv->np) > INTRA_TRY) {
+            int cand[1 + DIR_TRIED] = { 0 }, nc = 1;
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            double sc_best[DIR_TRIED];
+            for (int m = 1; m < NVDR_MODES; m++) {
+                dir_predict(cv, 0, x, y, n, m, pr);
+                double sat = satd_leaf(e->p->src[0], cv->pw, x, y, n, pr);
+                int k = nc - 1;
+                if (k < DIR_TRIED) { cand[nc++] = m; sc_best[k] = sat; }
+                else if (sat < sc_best[DIR_TRIED - 1]) { cand[DIR_TRIED] = m; sc_best[DIR_TRIED - 1] = sat; }
+                else continue;
+                for (int a = (k < DIR_TRIED ? k : DIR_TRIED - 1); a > 0 && sc_best[a] < sc_best[a - 1]; a--) {
+                    double t = sc_best[a]; sc_best[a] = sc_best[a - 1]; sc_best[a - 1] = t;
+                    int tm = cand[a + 1]; cand[a + 1] = cand[a]; cand[a] = tm;
+                }
+            }
+            for (int ci = 0; ci < nc; ci++) {
+                Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
+                double dm = leaf_levels(e, x, y, n, 0, cand[ci], dl, lv, NULL);
+                leaf_emit(e, &k0, k1, n, cand[ci], dl, lv);
+                double j = dm + e->p->lambda * (k0.bits + k1[0].bits + k1[1].bits);
+                if (j < best) { best = j; mode = cand[ci]; }
+            }
+        }
+    } else if (e->p->cv.dirpred) {
         /* The directional modes screened by the Hadamard sum of their
          * error on the first plane, as HEVC's reference encoder does; flat
          * and the best few tried in full, the cheapest by error plus
@@ -1371,8 +1498,15 @@ static void precompute_row(Enc* e, int ty) {
                 if (y + n > cv->ph) continue;
                 int step = e->tq ? tq_step(base, e->tq[(ty / cv->tile) * e->tiles_x + x / cv->tile]) : base;
                 double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                /* With a base, what mode INTER leaves: the block minus the
+                 * base's; otherwise the block, whose flat colour moves only
+                 * the DC. */
+                const uint8_t* bp = cv->inter ? cv->base[c] : NULL;
                 for (int j = 0; j < n; j++)
-                    for (int i = 0; i < n; i++) blk[j * n + i] = src[(size_t)(y + j) * cv->pw + x + i];
+                    for (int i = 0; i < n; i++) {
+                        size_t at = (size_t)(y + j) * cv->pw + x + i;
+                        blk[j * n + i] = src[at] - (bp ? bp[at] : 0);
+                    }
                 double sum = 0.0;
                 for (int j = 0; j < n; j++)
                     for (int i = 0; i < n; i++) sum += blk[j * n + i];
@@ -1385,13 +1519,14 @@ static void precompute_row(Enc* e, int ty) {
                     /* Each band against its own layer's models. */
                     double v[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
                     for (int i = 1; i < count; i++) v[i] = co[scan_pos[s][i]] / step;
-                    double lam = P->lambda_base / ((double)base * base) * (cv->fixed_pred ? RDOQ_RESIDUAL : RDOQ_PICTURE);
+                    double lam = P->lambda_base / ((double)base * base) *
+                                 (cv->fixed_pred || cv->inter ? RDOQ_RESIDUAL : RDOQ_PICTURE);
                     int at = e->band_at[s];
                     /* In a picture the lowest frequencies are left to the
                      * dead zone: they draw ramps, and dropping their level
                      * 1s turned the gate's gradient into bands (-6 dB for
                      * 18% of its bytes). */
-                    int keep = cv->fixed_pred ? 0 : RDOQ_KEEP;
+                    int keep = cv->fixed_pred || cv->inter ? 0 : RDOQ_KEEP;
                     rdoq(&e->tm, s, cv->comp0 + c, v, q, 1, at < count ? at : count, lam, keep);
                     if (at < count) rdoq(&e->tm2, s, cv->comp0 + c, v, q, at, count, lam, keep);
                     for (int i = 1; i < count; i++) nonzero |= q[i];
@@ -1503,7 +1638,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memset(&enc1, 0, sizeof(enc1));
     memset(&enc2, 0, sizeof(enc2));
     int band = cfg.band < 0 ? 0 : (cfg.band > 32 ? 32 : cfg.band);
-    int dirpred = cfg.directional && !cfg.residual;
+    int inter = cfg.base != NULL && !cfg.residual && cfg.base->width == img->width &&
+                cfg.base->height == img->height;
+    int dirpred = (cfg.directional || inter) && !cfg.residual;
     if (dirpred) band = 0;
     NvdrHeader h;
     memset(&h, 0, sizeof(h));
@@ -1520,6 +1657,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         Canvas* pc = &e.part[k].cv;
         pc->fixed_pred = cfg.residual != 0;
         pc->dirpred = dirpred;
+        pc->inter = inter;
         for (int c = 0; c < pc->np; c++) {
             e.part[k].src[c] = (double*)malloc(sizeof(double) * pc->pw * pc->ph);
             if (!e.part[k].src[c]) goto done;
@@ -1563,6 +1701,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         }
     }
 
+    if (inter && canvas_base(&e.part[0].cv, e.nparts == 2 ? &e.part[1].cv : NULL, cfg.base) != 0) goto done;
     int qc = (int)(cfg.q * cfg.chroma_q + 0.5f);
     if (qc < 1) qc = 1;
     if (qc > 4095) qc = 4095;
@@ -1680,7 +1819,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     buf[4] = NVDR_VERSION;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
                        (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0) |
-                       (dirpred ? NVDR_FLAG_DIRPRED : 0));
+                       (dirpred ? NVDR_FLAG_DIRPRED : 0) | (inter ? NVDR_FLAG_INTER : 0));
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -1891,7 +2030,7 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     *out_buf = NULL; *out_len = 0;
     tables_init();
     NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
-    if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || !img->pixels)
+    if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || cfg.base || !img->pixels)
         return encode_chroma(out_buf, out_len, img, &cfg, hdr_out, ctx);
     NvdrImage clean;
     NvdrGrain g;
@@ -2013,8 +2152,8 @@ static int read_node(Layer0* L, int x, int y, int n) {
     int sc = size_class(n);
     int mode = 0;
     if (cv->dirpred) {
-        mode = get_mode(L->d, L->cm, sc);
-        if (mode >= NVDR_MODES) { L->corrupt = 1; return 0; }
+        mode = get_mode(L->d, L->cm, sc, cv->inter);
+        if (mode < 0) { L->corrupt = 1; return 0; }
     }
     for (int c = 0; c < cv->np; c++) {
         int k = cv->comp0 + c;
@@ -2152,8 +2291,9 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
  * only damage makes it do: the decode starts over, saving tiles. */
 #define DECODE_AGAIN (-2)
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
-                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful);
+static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base,
+                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
+                       int careful);
 
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
@@ -2162,13 +2302,21 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
      * to restore it (a tenth of the time); if one stops, the decode starts
      * over the careful way and gives what that gives. The context is only
      * written when a decode finishes, so starting over is safe. */
-    int rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 0);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 1);
+    int rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 0);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 1);
     return rc;
 }
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
-                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful) {
+int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
+                         NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
+    int rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 0);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 1);
+    return rc;
+}
+
+static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base_img,
+                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
+                       int careful) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
@@ -2211,6 +2359,12 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     for (int k = 0; k < np; k++) {
         cvs[k].fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
         cvs[k].dirpred = dirpred;
+        cvs[k].inter = (h.flags & NVDR_FLAG_INTER) != 0;
+    }
+    /* A picture predicted from a base cannot be decoded without it. */
+    if (h.flags & NVDR_FLAG_INTER) {
+        if (!base_img || base_img->width != h.width || base_img->height != h.height ||
+            canvas_base(&cvs[0], np == 2 ? &cvs[1] : NULL, base_img) != 0) goto done;
     }
     int tiles_x = (cv->pw + cv->tile - 1) / cv->tile, tiles_y = (cv->ph + cv->tile - 1) / cv->tile;
     int tiles = tiles_x * tiles_y;

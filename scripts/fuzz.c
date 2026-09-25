@@ -69,6 +69,21 @@ static int decode_still(const uint8_t* d, size_t n) {
         nvdr_image_free(&img);
         ok = 1;
     }
+    /* A container predicted from a base decodes only against one, so it
+     * gets one: a ramp of the size its header claims, while that is sane. */
+    if (n >= 10 && (d[5] & NVDR_FLAG_INTER)) {
+        int w = d[6] | d[7] << 8, h = d[8] | d[9] << 8;
+        if (w > 0 && h > 0 && (long)w * h <= 4096L * 4096) {
+            NvdrImage base, img;
+            base.width = w; base.height = h;
+            base.pixels = (unsigned char*)malloc((size_t)w * h * 3);
+            if (base.pixels) {
+                for (size_t i = 0; i < (size_t)w * h * 3; i++) base.pixels[i] = (unsigned char)(i * 7 / 3);
+                if (nvdr_decode_mem_base(d, n, &base, &img, NULL, NULL) == 0) { nvdr_image_free(&img); ok = 1; }
+                free(base.pixels);
+            }
+        }
+    }
     return ok;
 }
 
@@ -147,10 +162,11 @@ int main(int argc, char** argv) {
         size_t ntiles = (size_t)((img.width + 31) / 32) * ((img.height + 31) / 32);
         int8_t* tq = (int8_t*)malloc(ntiles);
         for (size_t t = 0; tq && t < ntiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
-        for (int variant = 0; variant < 7 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 8 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 5) { if (!tq) continue; c.tile_q = tq; }
             if (variant == 6) { c.directional = 1; c.q = 30; }
+            if (variant == 7) { c.base = &img; c.q = 30; }   /* every leaf could be INTER */
             if (variant == 1) c.q = 1;
             if (variant == 2) c.q = 200;
             if (variant == 3) { c.min_block = 8; c.max_block = 16; c.band = 0; }

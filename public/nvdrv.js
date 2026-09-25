@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 9;
+const VERSION = 10;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -414,12 +414,13 @@ function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip 
 }
 
 /*
- * Decode one frame's container at full quality into `out`. Returns false
+ * Decode one frame's container at full quality into `out`, predicted from
+ * `base` (RGB of the sequence's size) when it is not null. Returns false
  * where reconstruct() in nvdrv.c returns -1: the container did not decode,
  * or is not the size of the sequence.
  */
-function reconstruct(bytes, out, width, height) {
-    const result = decode(bytes);
+function reconstruct(bytes, out, width, height, base = null) {
+    const result = decode(bytes, undefined, false, null, false, base ? { width, height, rgb: base } : null);
     if (!result) return false;
     if (result.header.width !== width || result.header.height !== height) return false;
     out.set(result.rgb);
@@ -478,13 +479,12 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v9 file');
+        if (!this.info) throw new Error('not an NVDRV v10 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
         this.pred = new Uint8Array(n);
         this.pred1 = new Uint8Array(n);
-        this.error = new Uint8Array(n);
         this.dpb = [];
         this.nextOut = 0;
         this.ended = false;
@@ -612,13 +612,11 @@ export class SequenceDecoder {
         const body = bytes.subarray(this.pos, this.pos + len);
         const pixels = new Uint8Array(width * height * 3);
         // A frame cut before its colour layer ends the stream.
-        if (!reconstruct(body, kind === INTRA ? pixels : this.error, width, height)) {
+        // A predicted frame's container is predicted from `ref`, block by
+        // block, and decodes straight to the picture.
+        if (!reconstruct(body, pixels, width, height, kind === INTRA ? null : ref)) {
             if (partial) return false;
             throw new Error('frame does not decode');
-        }
-        if (kind !== INTRA) {
-            const err = this.error;
-            for (let i = 0; i < pixels.length; i++) pixels[i] = clamp255(err[i] - 128 + ref[i]);
         }
         this.dpb.push({ display, kind, partial, pixels });
         this.pos += len;

@@ -419,6 +419,13 @@ fotografia faz), os quadros preditos seguem: o resíduo também vai em
 de luma sai **6 a 8% menor** nos clipes limpos e **23% menor** num clipe
 com ruído de sensor. Desenho e tela (intra em 4:4:4) ficam como antes.
 
+Desde o formato de sequência 10, um quadro P ou B não é mais o erro
+contra a predição: cada bloco escolhe entre copiar a predição por
+movimento (modo INTER) ou se prever dos vizinhos já decodificados, como
+um quadro intra. Isso ajuda onde algo entra em cena ou é descoberto. O
+decodificador precisa da predição para ler o quadro, então arquivos v9
+não abrem mais; recodifique-os.
+
 Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
 
 ```bash

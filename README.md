@@ -539,6 +539,43 @@ rectangle crossing a pan. The regression gate's sequence (8x8 blocks
 splitting into 4x4) comes out 4.9% smaller in the closed loop and 0.8%
 smaller and 0.15 dB better by default.
 
+### Intra prediction inside predicted frames (sequence format 10, flag 0x40)
+
+A predicted frame was the error against its motion-compensated
+prediction, coded as a residual: every leaf's colour predicted as 128,
+nothing else possible. Where the prediction fails, in what an object
+uncovers or a new thing brings in, the residual has to draw the picture
+from nothing, while the frame's own decoded neighbours sit right there.
+
+With NVDR_FLAG_INTER the container codes the frame itself, not its
+error, and is decoded against a base picture the caller supplies: in a
+sequence, the frame's motion-compensated prediction
+(`nvdr_decode_mem_base()`, and `decode(..., base)` in nvdr.js). Every
+leaf gets one more mode, INTER, the base's pixels under it; the 15
+directional modes of the intra frames are still there, so the flag
+implies 0x20. The mode is an "INTER or not" bit by size before the
+others. The base goes onto the canvases in integers every decoder
+computes alike (JPEG's YCbCr in 16-bit fixed point, and in 4:2:0 the
+rounded mean of each 2x2), and a tile that never arrived shows it.
+
+The encoder tries INTER first. Only a leaf whose mean squared error
+under it is over 16 tries flat and the five best directions by Hadamard
+sum as well, which keeps the encode time where it was; trying them at
+4 and over 60 measured within 0.8 points either way. INTER's texture is
+prepared with the row, like flat's used to be, so the common case costs
+no more than the residual did.
+
+BD-rate on PSNR-Y, 25 frames, against P frames only (format 6):
+
+    clip                               format 9       format 10
+    pan over a photo, clean              -19.2%          -22.7%
+    subpixel pan, zoom, clean            -45.2%          -45.1%
+    the same with sensor noise           -44.0%          -44.0%
+
+and 1.7 points more on the clip with three objects (-4.2% against
+format 8). Clips that move with the camera have little uncovered; the
+gain is where things come into view.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -557,6 +594,9 @@ that much more:
     clean, + look-ahead, RDOQ,
       contexts, directional       +102.6%       +37.3%       +0.1%
     noisy, the same               +216.0%       +50.0%       +9.8%
+    clean, + variable blocks,
+      intra in P and B (fmt 10)    +99.4%       +36.7%       -0.3%
+    noisy, the same               +217.1%       +50.6%      +10.4%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame
@@ -2123,6 +2163,8 @@ side, a slider that truncates the container, and plays sequences.
     [layer 2]     the same for the high band; empty when band is 0
 
 Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
+Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
+directional prediction and 0x40 a base picture (see their sections).
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does

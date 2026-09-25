@@ -44,13 +44,18 @@ export async function loadWasmBytes(bytes) {
 /* decode() of nvdr.js, without a fluid context. Each view is a decode of
  * its own (the C decoder shows one layer per call); layer 0 and 1 are
  * the cheap ones. */
-export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false) {
+export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false, base = null) {
     const w = exports_;
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const header = readHeader(bytes);
     if (!header) return null;
     const at = w.nvdr_wasm_input(bytes.length);
     new Uint8Array(w.memory.buffer, at, bytes.length).set(bytes);
+    // A predicted container decodes against its base, at full quality.
+    if (base && (header.flags & 0x40)) {
+        const bp = w.nvdr_wasm_base(base.width, base.height);
+        new Uint8Array(w.memory.buffer, bp, base.rgb.length).set(base.rgb);
+    }
     const view = layer => {
         const r = w.nvdr_wasm_decode(bytes.length, layer);
         if (!r) { w.nvdr_wasm_release(); return null; }
