@@ -56,8 +56,8 @@ NvdrvConfig nvdrv_default_config(void) {
     c.b_q_step = 0.5f;
     c.lookahead = 16;
     c.tpl_strength = 1.0f;
-    c.tf_radius = 3;
-    c.tf_strength = 1.0f;
+    c.tf_radius = 7;
+    c.tf_strength = 4.0f;
     c.tf_levels = 0;
     c.fps = 24;
     return c;
@@ -1997,9 +1997,13 @@ static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile
  *
  *     w = exp(-d / (tf_strength * noise))
  *
- * so a neighbour that differs by no more than noise counts for about a
- * third of the anchor, and one that differs by an edge, something moving
- * or a failed match, not at all. `noise` is measured in time, not space:
+ * so at the default strength of 4 a neighbour that differs by no more
+ * than noise counts for three quarters of the anchor, and one that
+ * differs by an edge, something moving or a failed match, not at all.
+ * (Measured on the noisy clip: strength 0.5, 1, 2, 4 and 8 gave -9.7,
+ * -16.4, -18.5, -19.2 and -19.2%; 2, 3, 5 and 7 frames a side -14.1,
+ * -16.4, -18.6 and -19.6%, together -21.3% for 8% more encoding time.
+ * Filtering the B frames at level 1 or 2 as well was worth nothing.) `noise` is measured in time, not space:
  * the median block's squared difference against the nearest neighbour,
  * which two independent draws of the noise make 2 sigma^2 a channel. (A
  * spatial estimate, Immerkaer's, was tried first and could not tell the
@@ -2070,7 +2074,6 @@ static int temporal_filter(NvdrvEncoder* e, int idx, NvdrImage* out) {
     }
     if (noise > 1e29) goto done;
     if (noise < 1.0) noise = 1.0;
-    if (getenv("TFDBG")) fprintf(stderr, "tf idx %d noise %.1f\n", idx, noise);
     double inv = 1.0 / (e->cfg.tf_strength * noise);
     for (size_t i = 0; i < npx; i++) acc[i] = cur->pixels[i];
     for (size_t i = 0; i < (size_t)w * h; i++) wsum[i] = 1.0f;

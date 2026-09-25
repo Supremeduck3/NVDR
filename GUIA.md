@@ -399,6 +399,15 @@ Parâmetros:
   olha até N quadros à frente (default 16) e dá q mais fino às regiões que
   eles vão reaproveitar, com intensidade F (default 1; `0` desliga). Rende
   de 0 a 3% nos clipes de teste.
+- **`--tf N`**, **`--tf-strength F`** e **`--tf-levels L`** — filtro
+  temporal: antes de codificar cada âncora (quadro I ou P), o encoder a
+  alinha por movimento com os N quadros de cada lado (default 7) e tira a
+  média onde eles concordam, pesando pelo ruído medido no próprio clipe
+  (força F, default 4). O ruído some da referência que o grupo inteiro
+  copia. Num clipe com ruído de sensor o arquivo fica **~21% menor** na
+  mesma qualidade; num clipe limpo não muda nada (o filtro percebe que
+  não há ruído). `--tf-levels 1` filtra também o B do meio do grupo, o
+  que não rendeu nada medível; `--tf 0` desliga.
 - **`--skip-k F`** — quão facilmente um quadro predito deixa um bloco
   **exatamente como estava** no quadro anterior, em vez de recodificar a
   pequena diferença (default 0,25; `0` corrige todos). É o que tira a

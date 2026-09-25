@@ -576,6 +576,41 @@ and 1.7 points more on the clip with three objects (-4.2% against
 format 8). Clips that move with the camera have little uncovered; the
 gain is where things come into view.
 
+### Filtering the anchors in time
+
+Sensor noise is new in every frame, so no prediction can use it: an
+anchor coded with its noise pays for it once, and every frame predicted
+from it pays again to swap that noise for its own. On the noisy clip
+this was the whole gap to x265, far more than on the clean one.
+
+Before an anchor (an I or P frame) is coded, the encoder now averages it
+along the motion with the 7 source frames on either side, as libaom
+does for its alternate references. Each neighbour is matched to the
+anchor in 16x16 blocks (the sequence's own searches, to quarter pixels)
+and every pixel blends the anchor with each aligned neighbour, weighted
+by exp(-d / (4 * noise)): d is the squared difference over the 3x3
+around the pixel and over its block, and `noise` the median block's
+difference against the nearest neighbour, which is what noise alone
+makes it. A neighbour that differs by an edge, a moving object or a bad
+match drops out. Only the encoder changes; the format does not.
+
+Measuring the noise in space first, by Immerkaer's method, failed: the
+noise here is slightly blurred, as a camera's is, and the clean clip's
+detail looked noisier to it than the noisy clip did. In time the two
+are 96 against 8 to 12.
+
+BD-rate on PSNR-Y against the same encoder without the filter, 25 frames:
+
+    subpixel pan, zoom, one object, noisy               -21.3%
+    still camera, noisy                                 -18.9%
+    three objects, light noise                           -9.0%
+    the same pan, clean                                  -0.5%
+    pan over a photo, clean                              -0.5%
+
+Encoding takes 8% longer. The strength and radius were swept (see
+nvdrv.c); filtering the B frame halfway between anchors too measured
+nothing.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -597,6 +632,8 @@ that much more:
     clean, + variable blocks,
       intra in P and B (fmt 10)    +99.4%       +36.7%       -0.3%
     noisy, the same               +217.1%       +50.6%      +10.4%
+    clean, + temporal filter       +99.2%       +36.8%       -0.4%
+    noisy, the same               +118.2%       +18.6%      -13.1%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame

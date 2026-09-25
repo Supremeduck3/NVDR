@@ -71,8 +71,8 @@ static void usage(const char* a0) {
         "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.5)\n"
         "  --lookahead N    frames looked ahead of each intra frame (default 16)\n"
         "  --tpl F          how much their reuse refines the intra frame (default 2; 0 = off)\n"
-        "  --tf N           source frames each side averaged into each anchor (default 3; 0 = off)\n"
-        "  --tf-strength F  how far a match may differ, in units of the noise (default 1)\n"
+        "  --tf N           source frames each side averaged into each anchor (default 7; 0 = off)\n"
+        "  --tf-strength F  how far a match may differ, in units of the noise (default 4)\n"
         "  --limit N        stop after N frames\n", a0);
 }
 
