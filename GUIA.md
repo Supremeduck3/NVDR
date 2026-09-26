@@ -248,6 +248,12 @@ não uma falha.
   textura são lidas juntas e a imagem só aparece inteira. Os quadros intra
   dos vídeos usam isso sempre.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
+- **`--no-restore`** — não manda o filtro de restauração. Por padrão o
+  encoder ajusta um filtro à imagem decodificada (no estilo do ALF do VVC)
+  e o manda em algumas dezenas de bytes; o decodificador o aplica depois do
+  deblocking e, num vídeo, os quadros seguintes são previstos da imagem já
+  restaurada. Nas seis amostras vale −3,6% de bytes na mesma qualidade;
+  nos clipes, −5,2%. Só entra quando paga os próprios bytes.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
   em 420, gráficos e bordas de cor pura em 444).

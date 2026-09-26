@@ -34,6 +34,7 @@ const FLAG_GRAIN = 0x08;      // grain parameters follow the header
 const FLAG_TILEQ = 0x10;      // a step offset per tile, in layer 0
 const FLAG_DIRPRED = 0x20;    // directional prediction, not progressive
 const FLAG_INTER = 0x40;      // and from a base picture the caller holds
+const FLAG_RESTORE = 0x80;    // restoration parameters follow the grain
 
 /* Mirrors TQ_SCALE and tq_step(): a tile's step from the header's and its
  * offset in sixths of a doubling. */
@@ -407,7 +408,8 @@ export function readHeader(buffer) {
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN | FLAG_TILEQ | FLAG_DIRPRED | FLAG_INTER)) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN | FLAG_TILEQ | FLAG_DIRPRED | FLAG_INTER |
+                    FLAG_RESTORE)) return null;
     if ((h.flags & FLAG_CHROMA420) && h.maxBlock < 8) return null;
     // Mirrors nvdr_grain_unpack(): parameters between the header and layer 0.
     if (h.flags & FLAG_GRAIN) {
@@ -420,13 +422,158 @@ export function readHeader(buffer) {
     if (h.storedBytes.some(b => b > 0x7fffffff) || h.band > 32) return null;
     if ((h.flags & FLAG_DIRPRED) && (h.band !== 0 || (h.flags & FLAG_RESIDUAL))) return null;
     if ((h.flags & FLAG_INTER) && !(h.flags & FLAG_DIRPRED)) return null;
+    // Mirrors the end of read_header(): restoration parameters follow the
+    // grain's, bytes 30 and 31 say how many, and a residual has none.
+    h.restoreLen = v.getUint16(30, true);
+    h.restore = null;
+    if (h.flags & FLAG_RESTORE) {
+        if (!h.restoreLen || (h.flags & FLAG_RESIDUAL) || buffer.byteLength < HEADER_SIZE + h.grainLen + h.restoreLen)
+            return null;
+        const u8 = ArrayBuffer.isView(buffer) ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+                                              : new Uint8Array(buffer);
+        h.restore = restoreParse(u8, HEADER_SIZE + h.grainLen, h.restoreLen, restorePlanes(h));
+        if (!h.restore) return null;
+    } else if (h.restoreLen) return null;
     return h;
 }
 
 /** Bytes needed before each layer is complete. */
 export function layerThresholds(header) {
-    const a = HEADER_SIZE + header.grainLen + header.storedBytes[0], b = a + header.storedBytes[1];
+    const a = HEADER_SIZE + header.grainLen + header.restoreLen + header.storedBytes[0], b = a + header.storedBytes[1];
     return [a, b, b + header.storedBytes[2]];
+}
+
+/* --- in-loop restoration, mirroring src/restore.c ---------------------- */
+
+const RESTORE_ALF = 1, RESTORE_KINDS = 2, ALF_CLASSES = 25, RESTORE_UNIT = 64;
+const ALF_CLIP = [255, 32, 12, 4];
+const ALF_ACT_AT = [3, 8, 16, 32];
+const ALF_TAPS = [
+    [[0, -3], [-1, -2], [0, -2], [1, -2], [-2, -1], [-1, -1], [0, -1], [1, -1], [2, -1], [-3, 0], [-2, 0], [-1, 0]],
+    [[0, -2], [-1, -1], [0, -1], [1, -1], [-2, 0], [-1, 0]]
+];
+const RPAD = 3;
+
+/* Mirrors restore_planes(): each component's canvas and unit. */
+function restorePlanes(h) {
+    const mb = h.minBlock, pw = Math.ceil(h.width / mb) * mb, ph = Math.ceil(h.height / mb) * mb;
+    const y = { pw, ph, unit: RESTORE_UNIT };
+    if (!(h.flags & FLAG_CHROMA420)) return [y, y, y];
+    const c = { pw: Math.ceil(((h.width + 1) >> 1) / MIN_BLOCK) * MIN_BLOCK,
+                ph: Math.ceil(((h.height + 1) >> 1) / MIN_BLOCK) * MIN_BLOCK, unit: RESTORE_UNIT >> 1 };
+    return [y, c, c];
+}
+
+/* Mirrors nvdr_restore_parse(): per component its kind and parameters,
+ * or null where the C decoder refuses them. */
+function restoreParse(bytes, off, len, planes) {
+    const total = len * 8;
+    let pos = 0, bad = false;
+    const bits = n => {
+        let v = 0;
+        for (let i = 0; i < n; i++) {
+            if (pos >= total) { bad = true; return 0; }
+            v = (v << 1) | ((bytes[off + (pos >> 3)] >> (7 - (pos & 7))) & 1);
+            pos++;
+        }
+        return v;
+    };
+    const eg = k => {
+        let z = 0;
+        while (!bits(1)) if (bad || ++z > 16) { bad = true; return 0; }
+        return (((1 << z) - 1) << k) + bits(z + k);
+    };
+    const signed = k => { const m = eg(k); return m && bits(1) ? -m : m; };
+    const out = [];
+    for (let c = 0; c < 3; c++) {
+        const kind = bits(3);
+        if (bad || kind >= RESTORE_KINDS) return null;
+        if (kind === 0) { out.push({ kind }); continue; }
+        const clip = bits(2), k = bits(2), taps = ALF_TAPS[c ? 1 : 0].length;
+        let nfilters = 1;
+        const classmap = new Uint8Array(ALF_CLASSES);
+        if (c === 0) {
+            nfilters = bits(5) + 1;
+            if (nfilters > ALF_CLASSES) return null;
+            const b = Math.ceil(Math.log2(nfilters));
+            for (let i = 0; i < ALF_CLASSES; i++) {
+                classmap[i] = bits(b);
+                if (classmap[i] >= nfilters) return null;
+            }
+        }
+        const coef = [];
+        for (let f = 0; f < nfilters; f++) {
+            const row = new Int32Array(taps);
+            for (let t = 0; t < taps; t++) {
+                row[t] = signed(k);
+                if (row[t] < -127 || row[t] > 127) return null;
+            }
+            coef.push(row);
+        }
+        const unitsX = Math.ceil(planes[c].pw / planes[c].unit), unitsY = Math.ceil(planes[c].ph / planes[c].unit);
+        const allUnits = bits(1);
+        let units = null;
+        if (!allUnits) {
+            if (unitsX * unitsY > total - pos) return null;
+            units = new Uint8Array(unitsX * unitsY);
+            for (let u = 0; u < units.length; u++) units[u] = bits(1);
+        }
+        if (bad) return null;
+        out.push({ kind, clip, classmap, coef, unitsX, units });
+    }
+    return out;
+}
+
+/* Mirrors nvdr_restore_apply(): the plane, padded by repeating its edge,
+ * filtered 4x4 block by block where its unit is on. */
+function restoreApply(r, comp, plane, pw, ph, unit) {
+    if (!r || r.kind !== RESTORE_ALF) return;
+    const s = pw + 2 * RPAD, q = new Uint8Array(s * (ph + 2 * RPAD));
+    for (let y = -RPAD; y < ph + RPAD; y++) {
+        const sy = y < 0 ? 0 : y >= ph ? ph - 1 : y, row = (y + RPAD) * s, from = sy * pw;
+        q.set(plane.subarray(from, from + pw), row + RPAD);
+        for (let x = 0; x < RPAD; x++) { q[row + x] = plane[from]; q[row + RPAD + pw + x] = plane[from + pw - 1]; }
+    }
+    const b = ALF_CLIP[r.clip], taps = ALF_TAPS[comp ? 1 : 0], n = taps.length;
+    const off = taps.map(([dx, dy]) => dy * s + dx);
+    const clip = v => v < -b ? -b : v > b ? b : v;
+    for (let y = 0; y < ph; y += 4)
+        for (let x = 0; x < pw; x += 4) {
+            if (r.units && !r.units[Math.floor(y / unit) * r.unitsX + Math.floor(x / unit)]) continue;
+            let cf = r.coef[0];
+            if (comp === 0) {
+                // Mirrors block_class().
+                let gv = 0, gh = 0, g1 = 0, g2 = 0;
+                for (let j = 0; j < 4; j++) {
+                    const at = (y + j + RPAD) * s + x + RPAD;
+                    for (let i = at; i < at + 4; i++) {
+                        const c2 = 2 * q[i];
+                        gh += Math.abs(c2 - q[i - 1] - q[i + 1]);
+                        gv += Math.abs(c2 - q[i - s] - q[i + s]);
+                        g1 += Math.abs(c2 - q[i - s - 1] - q[i + s + 1]);
+                        g2 += Math.abs(c2 - q[i - s + 1] - q[i + s - 1]);
+                    }
+                }
+                const avg = (gv + gh) >> 4;
+                let act = 0;
+                while (act < 4 && avg >= ALF_ACT_AT[act]) act++;
+                const hvmax = Math.max(gh, gv), hvmin = Math.min(gh, gv), dmax = Math.max(g1, g2), dmin = Math.min(g1, g2);
+                let dir = 0;
+                if (hvmax * dmin >= dmax * hvmin) { if (hvmax > 2 * hvmin) dir = gh > gv ? 1 : 2; }
+                else if (dmax > 2 * dmin) dir = g1 > g2 ? 3 : 4;
+                cf = r.coef[r.classmap[dir * 5 + act]];
+            }
+            for (let j = 0; j < 4; j++) {
+                const at = (y + j + RPAD) * s + x + RPAD, o = (y + j) * pw + x;
+                for (let i = 0; i < 4; i++) {
+                    const a = at + i, c0 = q[a];
+                    let sum = 0;
+                    for (let t = 0; t < n; t++) sum += cf[t] * (clip(q[a + off[t]] - c0) + clip(q[a - off[t]] - c0));
+                    const v = c0 + ((sum + 64) >> 7);
+                    plane[o + i] = v < 0 ? 0 : v > 255 ? 255 : v;
+                }
+            }
+        }
 }
 
 /* --- decoder ----------------------------------------------------------- */
@@ -730,7 +877,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     if (!h) return null;
     const size = bytes.length;
 
-    const base = HEADER_SIZE + h.grainLen;
+    const base = HEADER_SIZE + h.grainLen + h.restoreLen;
     let avail0 = Math.min(size - base, h.storedBytes[0]);
     if (avail0 < 5) return null;
     const off1 = base + h.storedBytes[0];
@@ -1068,21 +1215,28 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         return out;
     };
 
+    // Everything arrived and is shown: only then is the picture restored,
+    // and only then are the models where the encoder left them.
+    const whole = complete[0] === tiles && complete[1] === tiles &&
+        (h.band === 0 || complete[2] === tiles) && (maxLayer < 0 || maxLayer >= LAYERS - 1);
     if (ctx) {
-        // Only a container decoded whole leaves the models where the
-        // encoder left them (mirrors nvdr_decode_mem_ctx).
-        const whole = complete[0] === tiles && complete[1] === tiles &&
-            (h.band === 0 || complete[2] === tiles) && (maxLayer < 0 || maxLayer >= LAYERS - 1);
+        // Mirrors nvdr_decode_mem_ctx.
         if (whole) { ctx.cm = cm; ctx.tm = tms[0]; ctx.tm2 = tms[1]; ctx.valid = true; }
         else ctx.valid = false;
     }
 
     // The filter works in place, and a second view of the same planes has
     // to start from the unfiltered ones, so filter a copy when asked for both.
-    const shown = (views, texs) => {
-        if (!(h.flags & FLAG_DEBLOCK)) return toRgb(views);
+    // Restoration (restoreApply) runs after deblocking, on the whole picture only.
+    const shown = (views, texs, restore = false) => {
+        const deb = (h.flags & FLAG_DEBLOCK) !== 0, rs = restore && h.restore;
+        if (!deb && !rs) return toRgb(views);
         const copy = wantFlat ? views.map(v => v.map(p => p.slice())) : views;
-        parts.forEach((P, k) => deblock(P, copy[k], texs && texs[k]));
+        if (deb) parts.forEach((P, k) => deblock(P, copy[k], texs && texs[k]));
+        if (rs) parts.forEach((P, k) => {
+            for (let c = 0; c < P.np; c++)
+                restoreApply(h.restore[P.comp0 + c], P.comp0 + c, copy[k][c], P.pw, P.ph, k ? RESTORE_UNIT >> 1 : RESTORE_UNIT);
+        });
         return toRgb(copy);
     };
 
@@ -1097,7 +1251,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
                      : complete0 === tiles && avail1 >= 5 ? 2 : 1,
         tiles,
         tilesComplete: complete,
-        rgb: maxLayer === 0 ? shown(flats, null) : shown(fulls, texs),
+        rgb: maxLayer === 0 ? shown(flats, null) : shown(fulls, texs, whole),
         flatRgb: wantFlat ? shown(flats, null) : null,
         lowRgb
     };

@@ -122,6 +122,12 @@ typedef struct {
     /* Filter the seams between leaves after decoding (see deblock() in
      * nvdr.c). Carried in the header's flags. */
     int   deblock;
+    /* Fit a restoration filter to the decoded picture and send it (see
+     * restore.c): the decoder applies it after deblocking, so in a
+     * sequence later frames predict from the restored picture. Kept per
+     * component only where it pays for its bytes. Carried in the header's
+     * flags; never on a residual. */
+    int   restore;
     /* In a residual, how readily a leaf is left uncorrected, as a multiple
      * of lambda: its bits are weighed at skip_k * lambda against the error
      * it would remove. 0 codes every leaf. */
@@ -184,6 +190,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
 #define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
 #define NVDR_FLAG_INTER    0x40         /* predicted from a base picture as well */
+#define NVDR_FLAG_RESTORE  0x80         /* restoration parameters follow the grain */
 
 typedef struct {
     uint16_t width, height;
@@ -193,6 +200,7 @@ typedef struct {
     uint8_t  band;
     uint8_t  grain_len;                 /* bytes of grain parameters after the header */
     NvdrGrain grain;
+    uint16_t restore_len;               /* bytes of restoration parameters after those */
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */

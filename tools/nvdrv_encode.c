@@ -73,6 +73,7 @@ static void usage(const char* a0) {
         "  --tpl F          how much their reuse refines the intra frame (default 2; 0 = off)\n"
         "  --tf N           source frames each side averaged into each anchor (default 7; 0 = off)\n"
         "  --tf-strength F  how far a match may differ, in units of the noise (default 4)\n"
+        "  --no-restore     send no restoration filter with any frame\n"
         "  --limit N        stop after N frames\n", a0);
 }
 
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tf-strength") && i+1 < argc) cfg.tf_strength = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--tf-levels") && i+1 < argc) cfg.tf_levels = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-restore")) cfg.frame.restore = 0;
     }
 
     int n = 0;
