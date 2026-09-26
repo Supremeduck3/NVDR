@@ -60,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      10
+#define NVDRV_VERSION      11
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20
 

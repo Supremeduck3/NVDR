@@ -435,6 +435,11 @@ um quadro intra. Isso ajuda onde algo entra em cena ou é descoberto. O
 decodificador precisa da predição para ler o quadro, então arquivos v9
 não abrem mais; recodifique-os.
 
+O formato 11 suaviza as emendas entre blocos com movimentos diferentes
+(OBMC): perto da borda, cada bloco mistura a própria predição com a que
+o movimento do vizinho faria dos mesmos pixels. Rende ~2% nos clipes com
+movimento. Arquivos v10 também precisam ser recodificados.
+
 Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
 
 ```bash

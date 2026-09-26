@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 10;
+const VERSION = 11;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -131,7 +131,7 @@ function unpackField(bytes, offset, len, nbx, nby, mx, my, vx, vy, esc, lim) {
 
 /* model_get(): an affine model's six int16s. */
 const MODEL_BYTES = 12;
-const FRAME_MODEL0 = 1, FRAME_MODEL1 = 2;
+const FRAME_MODEL0 = 1, FRAME_MODEL1 = 2, FRAME_OBMC = 4;
 function modelGet(bytes, at) {
     const v = new DataView(bytes.buffer, bytes.byteOffset + at, MODEL_BYTES);
     return [0, 2, 4, 6, 8, 10].map(o => v.getInt16(o, true));
@@ -296,6 +296,67 @@ const SG = new Int32Array((MAXB + 6) * (MAXB + 6) * 3);
 
 const clip8 = v => (v < 0 ? 0 : v > 255 ? 255 : v);
 
+/*
+ * Mirrors obmc_apply() in nvdrv.c: each cell blended near its edges with
+ * the prediction its neighbours' motion makes of the same pixels, rows
+ * toward the cells above and below first, then columns toward the cells
+ * left and right, with AV1's masks, skipping neighbours that move the
+ * same way.
+ */
+const OBMC_MASKS = {
+    1: [64], 2: [45, 64], 4: [39, 50, 59, 64], 8: [36, 42, 48, 53, 57, 61, 64, 64],
+    16: [34, 37, 40, 43, 46, 49, 52, 54, 56, 58, 60, 61, 64, 64, 64, 64],
+    32: [33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55,
+         56, 57, 58, 59, 60, 60, 61, 62, 64, 64, 64, 64, 64, 64, 64, 64]
+};
+const OT0 = new Uint8Array(MAXB * MAXB * 3), OT1 = new Uint8Array(MAXB * MAXB * 3);
+function obmcApply(G, dst, width, height, r0, r1, v0x, v0y, v1x, v1y, mode) {
+    const g = G.g, L = g >> 1 > 0 ? g >> 1 : 1;
+    const mask = OBMC_MASKS[L >= 32 ? 32 : L >= 16 ? 16 : L >= 8 ? 8 : L >= 4 ? 4 : L >= 2 ? 2 : 1];
+    const md = b => (mode ? mode[b] : MODE_FWD);
+    const same = (a, b) => {
+        const ma = md(a);
+        if (ma !== md(b)) return false;
+        if (ma !== MODE_BWD && (v0x[a] !== v0x[b] || v0y[a] !== v0y[b])) return false;
+        if (ma !== MODE_FWD && (v1x[a] !== v1x[b] || v1y[a] !== v1y[b])) return false;
+        return true;
+    };
+    const stride = width * 3;
+    for (let fy = 0; fy < G.nfy; fy++)
+        for (let fx = 0; fx < G.nfx; fx++) {
+            const b = fy * G.nfx + fx, x0 = fx * g, y0 = fy * g;
+            const bw = Math.min(g, width - x0), bh = Math.min(g, height - y0);
+            for (let side = 0; side < 4; side++) {
+                let n;
+                if (side === 0) { if (fy === 0) continue; n = b - G.nfx; }
+                else if (side === 1) { if (fy + 1 >= G.nfy) continue; n = b + G.nfx; }
+                else if (side === 2) { if (fx === 0) continue; n = b - 1; }
+                else { if (fx + 1 >= G.nfx) continue; n = b + 1; }
+                if (same(b, n)) continue;
+                // The neighbour's prediction of the whole cell, then the
+                // strip along the shared edge blended into it.
+                const m = md(n), ls = bw * 3;
+                if (m !== MODE_BWD) predictRegion(r0, width, height, x0, y0, bw, bh, v0x[n], v0y[n], OT0, 0, ls);
+                if (m !== MODE_FWD) predictRegion(r1, width, height, x0, y0, bw, bh, v1x[n], v1y[n], m === MODE_BWD ? OT0 : OT1, 0, ls);
+                if (m !== MODE_FWD && m !== MODE_BWD)
+                    for (let k = 0; k < bh * ls; k++) OT0[k] = (OT0[k] + OT1[k] + 1) >> 1;
+                const vertical = side < 2, len = Math.min(L, vertical ? bh : bw);
+                for (let d = 0; d < len; d++) {
+                    const w = mask[d];
+                    if (w === 64) continue;
+                    const line = side === 0 ? d : side === 1 ? bh - 1 - d : side === 2 ? d : bw - 1 - d;
+                    const count = vertical ? bw : bh;
+                    for (let k = 0; k < count; k++) {
+                        const i = vertical ? k : line, j = vertical ? line : k;
+                        const o = (y0 + j) * stride + (x0 + i) * 3, t = j * ls + i * 3;
+                        for (let c = 0; c < 3; c++)
+                            dst[o + c] = (w * dst[o + c] + (64 - w) * OT0[t + c] + 32) >> 6;
+                    }
+                }
+            }
+        }
+}
+
 /* Blocks whose `mode` is `skip` are left alone (a B frame's blocks that do
  * not read this reference). */
 function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip = -1) {
@@ -305,8 +366,19 @@ function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip 
         const y0 = by * block, bh = Math.min(block, height - y0);
         for (let bx = 0; bx < nbx; bx++) {
             const x0 = bx * block, bw = Math.min(block, width - x0);
-            const b = by * nbx + bx, fx = vx[b], fy = vy[b];
+            const b = by * nbx + bx;
             if (mode && mode[b] === skip) continue;
+            predictRegion(src, width, height, x0, y0, bw, bh, vx[b], vy[b], dst, y0 * stride + x0 * 3, stride);
+        }
+    }
+}
+
+/* The bw x bh region at (x0, y0) as the vector (fx, fy) predicts it, into
+ * dst from index `obase` with rows `os` apart. */
+function predictRegion(src, width, height, x0, y0, bw, bh, fx, fy, dst, obase, os) {
+    const stride = width * 3;
+    {
+        {
             const X0 = x0 + (fx >> 2), Y0 = y0 + (fy >> 2);
             const phase = ((fy & 3) << 2) | (fx & 3);
             // Clamped source columns X0-2 .. X0+bw+3 and rows Y0-2 .. Y0+bh+3.
@@ -322,13 +394,13 @@ function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip 
             if (phase === 0) {
                 for (let j = 0; j < bh; j++) {
                     const row = YS[j + 2];
-                    let o = (y0 + j) * stride + x0 * 3;
+                    let o = obase + j * os;
                     for (let i = 0; i < bw; i++, o += 3) {
                         const s0 = row + XS[i + 2];
                         dst[o] = src[s0]; dst[o + 1] = src[s0 + 1]; dst[o + 2] = src[s0 + 2];
                     }
                 }
-                continue;
+                return;
             }
             // The source region the filters reach, gathered once, edges
             // held: rows Y0-2 .. Y0+bh+3, columns X0-2 .. X0+bw+3.
@@ -404,7 +476,7 @@ function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip 
             default: A = PH; oa = R; Bp = PB; ob = D;
             }
             for (let j = 0; j < bh; j++) {
-                const o = (y0 + j) * stride + x0 * 3, l = j * ls * 3;
+                const o = obase + j * os, l = j * ls * 3;
                 const n = bw * 3;
                 if (Bp) for (let k = 0; k < n; k++) dst[o + k] = (A[l + k + oa] + Bp[l + k + ob] + 1) >> 1;
                 else for (let k = 0; k < n; k++) dst[o + k] = A[l + k + oa];
@@ -479,7 +551,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v10 file');
+        if (!this.info) throw new Error('not an NVDRV v11 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -532,7 +604,7 @@ export class SequenceDecoder {
         const flags = view.getUint8(18);
         if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
         if (kind === INTRA && block) throw new Error('intra frame with a motion field');
-        if ((flags & ~(FRAME_MODEL0 | FRAME_MODEL1)) || view.getUint8(19)) throw new Error('bad frame flags');
+        if ((flags & ~(FRAME_MODEL0 | FRAME_MODEL1 | FRAME_OBMC)) || view.getUint8(19)) throw new Error('bad frame flags');
         if (flags && (!block || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
         if (block && (block < 8 || block > 128 || (block & 1))) throw new Error('bad block size');
         if (kind === BI && !block) throw new Error('B frame without a motion field');
@@ -572,6 +644,7 @@ export class SequenceDecoder {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
                     throw new Error('motion field is damaged');
                 blockPredict(ref, this.pred, width, height, G.g, v0x, v0y);
+                if (flags & FRAME_OBMC) obmcApply(G, this.pred, width, height, ref, null, v0x, v0y, null, null, null);
             } else {
                 const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
                 const l1 = { G, M: model1, vx: v1x, vy: v1y, dx: new Int16Array(nb), dy: new Int16Array(nb) };
@@ -593,6 +666,7 @@ export class SequenceDecoder {
                         else for (let k = o; k < o + n; k++) P0[k] = (P0[k] + P1[k] + 1) >> 1;
                     }
                 }
+                if (flags & FRAME_OBMC) obmcApply(G, P0, width, height, ref, this.dpb[after].pixels, v0x, v0y, v1x, v1y, mode);
             }
             ref = this.pred;
             this.pos += 4 + fieldLen;

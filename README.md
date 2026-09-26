@@ -611,6 +611,42 @@ Encoding takes 8% longer. The strength and radius were swept (see
 nvdrv.c); filtering the B frame halfway between anchors too measured
 nothing.
 
+### Overlapped blocks (sequence format 11)
+
+A block's vector is right for its middle and less so at its edges,
+where the next block's motion begins: the prediction steps at every
+edge between two vectors, and the frame has to code the step. As in
+H.263 and AV1, each cell of the field (half a block) is now blended near
+its edges with what its neighbours' motion predicts for the same pixels:
+first the rows toward the cells above and below, then the columns toward
+the cells left and right, each over half the cell, with AV1's masks (the
+cell's own weight in 64ths, 39 50 59 64 from the edge in for a cell of
+8). In a B frame a neighbour's motion is its mode and the vectors that
+mode uses. A neighbour moving exactly as the cell does is skipped, so
+nothing inside an unsplit block changes. All integer, identical in the
+C, JavaScript and WebAssembly decoders; the album's predicted photos do
+not use it. A flag in each frame's header says
+whether its blocks overlap, and the encoder keeps whichever prediction
+is nearer the source: on the regression gate's 128x128 clip, whose 4x4
+cells put nearly half the pixels next to an edge around an object with
+sharp edges, overlapping every frame cost 27% more bytes, and there the
+encoder now turns it off. On the clips below it stays on.
+
+BD-rate on PSNR-Y against format 10, 25 frames:
+
+    subpixel pan, zoom, one object, noisy                -2.2%
+    the same, clean                                      -2.1%
+    three objects, light noise                           -2.1%
+    still camera, noisy                                  -0.7%
+    whole-pixel pan over a photo, clean                  +0.2%
+
+A quarter-cell overlap gave less (-0.8% and -1.5% where half gives
+-2.1), a whole-cell one blurred too much (+2.9% on the photo pan), and
+skipping neighbours whose vectors differ by one or two quarter pixels
+lost most of the gain. The encoder still chooses vectors as if the
+blocks did not overlap; choosing them knowing the blend is what AV1
+does next.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -634,6 +670,9 @@ that much more:
     noisy, the same               +217.1%       +50.6%      +10.4%
     clean, + temporal filter       +99.2%       +36.8%       -0.4%
     noisy, the same               +118.2%       +18.6%      -13.1%
+    clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
+      (fmt 11)
+    noisy, the same               +111.5%       +14.9%      -15.7%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame

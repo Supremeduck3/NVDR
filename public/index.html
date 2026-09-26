@@ -653,7 +653,7 @@ function indexFrames(bytes) {
 
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v10.', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV v11.', true); return; }
     const frames = indexFrames(new Uint8Array(buffer));
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;

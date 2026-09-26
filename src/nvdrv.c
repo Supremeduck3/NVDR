@@ -718,6 +718,7 @@ static void field_rd(const NvdrImage* cur, const Subpel* ref, int block, int lim
 /* Frame header byte 18: which lists carry an affine model. */
 #define FRAME_MODEL0 1
 #define FRAME_MODEL1 2
+#define FRAME_OBMC   4   /* the prediction's blocks overlap (format 11) */
 
 typedef struct { int a0, a1, a2, b0, b1, b2; } Model;
 
@@ -931,6 +932,108 @@ static void grid_init(Grid* G, int w, int h, int block) {
     G->block = block; G->g = block / 2; G->w = w; G->h = h;
     G->nfx = (w + G->g - 1) / G->g; G->nfy = (h + G->g - 1) / G->g;
     G->nbx = (w + block - 1) / block; G->nby = (h + block - 1) / block;
+}
+
+/*
+ * OVERLAPPED BLOCKS (sequence format 11)
+ * --------------------------------------
+ * A block's vector is right for the middle of the block and less so at
+ * its edges, where the next block's motion starts: the prediction steps
+ * at every edge between two vectors, and the step is texture the frame
+ * has to code. So, as H.263 and AV1 do, each cell of the field is then
+ * blended near its edges with the prediction its neighbours' motion
+ * makes of the same pixels: first the rows toward the cells above and
+ * below, then the columns toward the cells left and right, each over half
+ * the cell, with AV1's masks (the cell's own weight, in 64ths, from the
+ * edge in). A neighbour moving exactly as the cell does changes nothing
+ * and is skipped, so only the seams between different motions are
+ * touched; there are none inside an unsplit block. All integer, the same
+ * in nvdrv.js. A frame header flag (FRAME_OBMC) says whether a frame's
+ * blocks overlap: the encoder keeps whichever prediction is nearer the
+ * source, because on the regression gate's 128x128 clip, whose 4x4 cells
+ * put nearly half the pixels next to an edge and whose object has sharp
+ * edges, overlapping every frame cost 27% more bytes.
+ *
+ * Measured against format 10, BD-rate on PSNR-Y over 25 frames: -2.1 to
+ * -2.2% on the two pans and the clip with three objects, -0.7% with the
+ * camera still, +0.2% on the whole-pixel pan over a photo. Overlapping a
+ * quarter of the cell or all of it did worse (-0.8/-1.5% and +2.9% on
+ * the photo pan), and so did leaving out neighbours whose vectors differ
+ * by a quarter pixel or two: small differences are where the blend
+ * smooths the most.
+ */
+static const uint8_t OBMC_M1[1] = { 64 };
+static const uint8_t OBMC_M2[2] = { 45, 64 };
+static const uint8_t OBMC_M4[4] = { 39, 50, 59, 64 };
+static const uint8_t OBMC_M8[8] = { 36, 42, 48, 53, 57, 61, 64, 64 };
+static const uint8_t OBMC_M16[16] = { 34, 37, 40, 43, 46, 49, 52, 54, 56, 58, 60, 61, 64, 64, 64, 64 };
+static const uint8_t OBMC_M32[32] = { 33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55,
+                                      56, 57, 58, 59, 60, 60, 61, 62, 64, 64, 64, 64, 64, 64, 64, 64 };
+
+static const uint8_t* obmc_mask(int len) {
+    return len >= 32 ? OBMC_M32 : len >= 16 ? OBMC_M16 : len >= 8 ? OBMC_M8
+         : len >= 4 ? OBMC_M4 : len >= 2 ? OBMC_M2 : OBMC_M1;
+}
+
+typedef struct {
+    const Subpel *r0, *r1;
+    const int16_t *v0x, *v0y, *v1x, *v1y;
+    const uint8_t* mode;         /* NULL in a P frame */
+} Motion;
+
+/* One channel of the prediction cell b's motion makes at (x, y). */
+static inline int motion_sample(const Motion* M, int b, int x, int y, int c) {
+    int md = M->mode ? M->mode[b] : MODE_FWD;
+    if (md == MODE_FWD) return qsample(M->r0, x, y, M->v0x[b], M->v0y[b], c);
+    if (md == MODE_BWD) return qsample(M->r1, x, y, M->v1x[b], M->v1y[b], c);
+    return (qsample(M->r0, x, y, M->v0x[b], M->v0y[b], c) +
+            qsample(M->r1, x, y, M->v1x[b], M->v1y[b], c) + 1) >> 1;
+}
+
+static int motion_same(const Motion* M, int a, int b) {
+    int ma = M->mode ? M->mode[a] : MODE_FWD, mb = M->mode ? M->mode[b] : MODE_FWD;
+    if (ma != mb) return 0;
+    if (ma != MODE_BWD && (M->v0x[a] != M->v0x[b] || M->v0y[a] != M->v0y[b])) return 0;
+    if (ma != MODE_FWD && (M->v1x[a] != M->v1x[b] || M->v1y[a] != M->v1y[b])) return 0;
+    return 1;
+}
+
+static void obmc_apply(const Grid* G, const Motion* M, NvdrImage* dst) {
+    int g = G->g, L = g / 2 > 0 ? g / 2 : 1, w = dst->width, h = dst->height;
+    const uint8_t* mask = obmc_mask(L);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int fy = 0; fy < G->nfy; fy++)
+        for (int fx = 0; fx < G->nfx; fx++) {
+            int b = fy * G->nfx + fx, x0 = fx * g, y0 = fy * g;
+            int bw = w - x0 < g ? w - x0 : g, bh = h - y0 < g ? h - y0 : g;
+            /* Rows toward the cells above and below, then columns toward
+             * the cells left and right. */
+            for (int side = 0; side < 4; side++) {
+                int n;
+                if (side == 0) { if (fy == 0) continue; n = b - G->nfx; }
+                else if (side == 1) { if (fy + 1 >= G->nfy) continue; n = b + G->nfx; }
+                else if (side == 2) { if (fx == 0) continue; n = b - 1; }
+                else { if (fx + 1 >= G->nfx) continue; n = b + 1; }
+                if (motion_same(M, b, n)) continue;
+                int vertical = side < 2, extent = vertical ? bh : bw;
+                int len = L < extent ? L : extent;
+                for (int d = 0; d < len; d++) {
+                    int m = mask[d];
+                    if (m == 64) continue;
+                    /* d pixels in from the shared edge. */
+                    int line = side == 0 ? d : side == 1 ? bh - 1 - d : side == 2 ? d : bw - 1 - d;
+                    int count = vertical ? bw : bh;
+                    for (int k = 0; k < count; k++) {
+                        int x = vertical ? x0 + k : x0 + line, y = vertical ? y0 + line : y0 + k;
+                        unsigned char* o = dst->pixels + ((size_t)y * w + x) * 3;
+                        for (int c = 0; c < 3; c++)
+                            o[c] = (unsigned char)((m * o[c] + (64 - m) * motion_sample(M, n, x, y, c) + 32) >> 6);
+                    }
+                }
+            }
+        }
 }
 
 static int16_t model_point(const Model* m, int px, int py, int x_or_y) {
@@ -1572,6 +1675,22 @@ static int q_for(const NvdrvEncoder* e, int kind, int level) {
     return (int)(pq * (1.0f + e->cfg.b_q_step * (float)level) + 0.5f);
 }
 
+/* The prediction in e->pred with its blocks overlapped or not, whichever
+ * is nearer the source in squared error; 1 when overlapped. */
+static int obmc_choose(NvdrvEncoder* e, const Grid* G, const Motion* M, const NvdrImage* src) {
+    size_t npx = (size_t)e->width * e->height * 3;
+    memcpy(e->error.pixels, e->pred.pixels, npx);
+    obmc_apply(G, M, &e->error);
+    double plain = 0.0, over = 0.0;
+    for (size_t i = 0; i < npx; i++) {
+        int a = src->pixels[i] - e->pred.pixels[i], b = src->pixels[i] - e->error.pixels[i];
+        plain += a * a; over += b * b;
+    }
+    if (over >= plain) return 0;
+    unsigned char* t = e->pred.pixels; e->pred.pixels = e->error.pixels; e->error.pixels = t;
+    return 1;
+}
+
 /* Code the source frame `src`, shown at `display`, and keep what the
  * decoder will hold. */
 static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int force_intra, int level) {
@@ -1582,7 +1701,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
              : (after >= 0 && e->cfg.block > 0 ? NVDRV_BI : NVDRV_PRED);
     if (e->ndpb >= NVDRV_MAX_DPB) return -1;
 
-    int block = 0, dx = 0, dy = 0, dx1 = 0, dy1 = 0;
+    int block = 0, dx = 0, dy = 0, dx1 = 0, dy1 = 0, obmc = 0;
     uint8_t* field = NULL;
     size_t field_len = 0;
     Grid G;
@@ -1608,6 +1727,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
             VfDecide D = { src, &sp, NULL, &G, &l0, NULL, NULL, lambda };
             vf_decide(&D, e->s0x, e->s0y, NULL, NULL, e->h0x, e->h0y, NULL, NULL, e->split, VF_SPLIT_BITS);
             block_predict(&sp, &e->pred, G.g, e->v0x, e->v0y);
+            Motion M = { &sp, NULL, e->v0x, e->v0y, NULL, NULL, NULL };
+            obmc = obmc_choose(e, &G, &M, src);
             subpel_free(&sp);
             ref = &e->pred;
         } else {
@@ -1644,6 +1765,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         VfDecide D = { src, &sp0, &sp1, &G, &l0, &l1, e->mode, lambda };
         vf_decide(&D, e->s0x, e->s0y, e->s1x, e->s1y, e->h0x, e->h0y, e->h1x, e->h1y, e->split, VF_SPLIT_BITS);
         block_predict_bi(&sp0, &sp1, &e->pred, G.g, e->v0x, e->v0y, e->v1x, e->v1y, e->mode);
+        Motion M = { &sp0, &sp1, e->v0x, e->v0y, e->v1x, e->v1y, e->mode };
+        obmc = obmc_choose(e, &G, &M, src);
         subpel_free(&sp0); subpel_free(&sp1);
         ref = &e->pred;
     }
@@ -1695,7 +1818,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     if (nvdr_encode_mem(&blob, &len, src, &fcfg, &fh) != 0) { free(field); return -1; }
     if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
-    int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0);
+    int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0) |
+                (block && obmc ? FRAME_OBMC : 0);
     if (write_frame(e, kind, display, block, flags, dx, dy, dx1, dy1, field, field_len, blob, len) != 0) {
         free(blob); free(field); return -1;
     }
@@ -2280,7 +2404,7 @@ static int decode_one(NvdrvDecoder* d) {
     uint32_t display32 = get_u32v(h + 14);
     if (kind != NVDRV_INTRA && kind != NVDRV_PRED && kind != NVDRV_BI) return -1;
     if (kind == NVDRV_INTRA && block) return -1;
-    if (flags & ~(FRAME_MODEL0 | FRAME_MODEL1) || h[19]) return -1;
+    if (flags & ~(FRAME_MODEL0 | FRAME_MODEL1 | FRAME_OBMC) || h[19]) return -1;
     if (flags && (!block || (kind != NVDRV_BI && (flags & FRAME_MODEL1)))) return -1;
     /* A field's blocks split into halves: 8 to 128, even. */
     if (kind == NVDRV_BI && (block < 8 || block > 128 || (block & 1))) return -1;
@@ -2330,12 +2454,16 @@ static int decode_one(NvdrvDecoder* d) {
                 if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0 &&
                     subpel_build(&sp0, ref) == 0) {
                     block_predict(&sp0, &d->pred, G.g, v, v + nb);
+                    Motion M = { &sp0, NULL, v, v + nb, NULL, NULL, NULL };
+                    if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
                     rc = 0;
                 }
             } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1) == 0 &&
                        subpel_build(&sp0, ref) == 0 &&
                        subpel_build(&sp1, &d->dpb[after].img) == 0) {
                 block_predict_bi(&sp0, &sp1, &d->pred, G.g, v, v + nb, v + 2 * nb, v + 3 * nb, mode);
+                Motion M = { &sp0, &sp1, v, v + nb, v + 2 * nb, v + 3 * nb, mode };
+                if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
                 rc = 0;
             }
         }
