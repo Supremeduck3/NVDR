@@ -684,19 +684,25 @@ the build before, six photographs, q 12 to 48:
     7 types, tried with every mode (default)           -2.3%  (-2.6%)
     9 types (adding DST-VII with the identity)         -2.2%  (-2.5%)
 
-Per photograph, the default: {PERIMAGE}. The type follows the mode
+Per photograph, the default: -7.7% on the graphic (OIP-1304511485),
+-2.6% on macarrão, -2.1% on montanha_pessoas, -0.9% on OIP-4140498144
+and -0.2% on the two dense photographs. The type follows the mode
 closely: with the best DCT mode alone the gain mostly disappears, and
 trying the other types only for the best one, two or three modes by
 their DCT cost gives -1.0, -1.6 and -2.0% for 1.14, 1.34 and 1.51 times
-the encoding time. Trying them with every mode costs {TIME}. On 4x4
-leaves of a photograph the DST-VII both ways is chosen more often than
-the DCT, as HEVC found when it made it the only 4x4 intra transform; the
-identity is chosen mostly on the graphic (OIP-1304511485, -7.7%).
+the encoding time. Trying them with every mode costs 2.1 times the
+encoding time of an intra frame. On 4x4 leaves of a photograph the DST-
+VII both ways is chosen more often than the DCT, as HEVC found when it
+made it the only 4x4 intra transform; the identity is chosen mostly on
+the graphic.
 
 On the sequences, where it applies to every intra frame and to the intra
-leaves of predicted ones: {SEQ}. Choosing the type for INTER leaves too,
-whose texture the encoder now transforms before the search, is the next
-step, at the cost of doing that per leaf.
+leaves of predicted ones: -2.2% on a pan over montanha_pessoas, -1.9% on
+the mixed clip with noise, -1.7% on a zoom (24 synthetic frames from
+`scripts/analysis/frames.c`, q 16 to 48, on PSNR-RGB), nearly all of it
+from the intra frame. Choosing the type for INTER leaves too, whose
+texture the encoder now transforms before the search, is the next step,
+at the cost of doing that per leaf.
 
 ### Against the state of the art
 

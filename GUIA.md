@@ -246,7 +246,9 @@ não uma falha.
   decodificados, ao longo de uma de 15 direções (os ângulos do HEVC).
   Deixa a imagem ~5% menor, mas ela deixa de ser progressiva: cor e
   textura são lidas juntas e a imagem só aparece inteira. Os quadros intra
-  dos vídeos usam isso sempre.
+  dos vídeos usam isso sempre. Junto vem a escolha da transformada por
+  bloco (DCT, DST-VII ou identidade, 7 combinações), mais ~2,3% menor pelo
+  mesmo PSNR e ~2x o tempo de codificação; `--no-adaptive-tx` desliga.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
