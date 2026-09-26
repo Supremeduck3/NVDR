@@ -1071,7 +1071,8 @@ quality comes back almost exact: the browser's JPEG jumped from 35.6 to
 is montanha_pessoas with high-ISO sensor noise added
 (`scripts/analysis/addnoise.mjs`: spread growing with the light, mostly
 luma, a little over a pixel wide), since a photo straight from a camera
-is not a JPEG thumbnail. No AVIF: there is no encoder for it here.
+is not a JPEG thumbnail. AVIF, JPEG XL and HEIC are in the next
+section.
 
 ### Colour at half resolution (4:2:0)
 
@@ -1217,6 +1218,60 @@ PSNR-RGB, where the thumbnails averaged -3.3%, +3.9% and -7.7%: the
 quadtree's 32x32 leaves and the colour tree pay most where there are
 large smooth areas to cover, and a photograph at full size has more of
 them. `node scripts/bench_codecs.mjs <images>` runs any picture.
+
+## Against AVIF, JPEG XL and HEIC (v11)
+
+`make bench` also runs the reference encoders of the newer formats when
+they are installed (Ubuntu: `libavif-bin libjxl-tools libheif-examples
+libheif-plugin-x265`), each over its quality knob, decoded by its own
+decoder and scored by the same code as the rest:
+
+    AVIF     avifenc 1.0.4 (aom 3.8.2), 4:2:0, speed 4, -q 10..82
+    JPEG XL  cjxl 0.7.0, effort 7, distance 0.4..9
+    HEIC     heif-enc 1.17.6 (x265 3.5), HEVC intra, 4:2:0, -q 10..74
+
+`make bench-photos` runs everything on five camera photographs instead of
+the thumbnails, 2.5 to 21 megapixels, fetched and developed by
+`scripts/fetch_photos.py`: four raw files from rawpy's tests, developed
+with LibRaw (no noise reduction, so they carry the sensor's own noise;
+three are night shots) and libjxl's flower photograph. None has been
+through a lossy codec.
+
+BD-rate of NVDR (default options) against each, PSNR-Y / SSIM-Y /
+PSNR-RGB, + = NVDR needs more bytes:
+
+    7 thumbnails (make bench)    PSNR-Y  SSIM-Y  PSNR-RGB
+    vs JPEG (browser)            -34.7%  -27.3%  -36.9%
+    vs WebP (browser)             -3.3%   +3.9%   -7.7%
+    vs AVIF                      +33.2%  +41.9%  +25.2%
+    vs JPEG XL                   -12.1%   -3.0%  -23.7%
+    vs HEIC                      +21.6%  +30.4%   +6.8%
+
+    image            size       vs AVIF                  vs JPEG XL              vs HEIC
+    canon_40d_sraw   1944x1296  +46.2% +62.7% +39.0%     +9.1% +26.7% -46.7%     +22.7% +31.4%  +8.7%
+    canon_5d2        5634x3752  +29.2% +24.8% +25.4%     -9.2%  +0.7% -23.8%      +7.9% +13.0%  -8.0%
+    flower           2268x1512  +48.3% +52.4% +49.5%     +7.6% +18.6% -10.8%     +27.7% +37.1% +16.3%
+    iss030e122639    4284x2844  +27.2% +21.7% +12.0%     -4.5%  -1.2% -29.6%      +5.8%  +4.8% -21.1%
+    iss042e297200    4940x3292  +43.0% +43.7% +39.6%     -2.0%  +1.9%  -7.0%     +34.8% +33.5% +10.7%
+    mean of 5                   +38.8% +41.1% +33.1%     +0.2%  +9.3% -23.6%     +19.8% +24.0%  +1.3%
+
+    (the same photos against the browser's JPEG: -37.0% -30.8% -53.6%;
+     against its WebP: -19.6% -18.5% -18.4%)
+
+Where NVDR stands, in order: well ahead of JPEG and WebP (further ahead
+on camera photos than on thumbnails), ahead of JPEG XL on thumbnails
+and level with it on photos by luma (ahead by colour), 20% behind HEIC
+and 35-40% behind AVIF. AVIF is the one to beat.
+
+Caveats. PSNR and SSIM are what NVDR's rate-distortion optimises for,
+and JPEG XL is tuned for butteraugli instead, so these metrics
+undersell it; its PSNR-RGB loss is its XYB colour space spending less
+on what the eye sees least. cjxl 0.7 is from 2022 (current libjxl
+encodes better), and even at distance 9 it stays above about 34 dB, so
+against it only the upper half of the range is compared. AVIF at speed
+4 is not aom's best (speed 0-2 gains a few percent more). The dark
+photos have large nearly-black areas, which every codec codes almost
+for free.
 
 ### The decoder as WebAssembly
 

@@ -53,10 +53,17 @@ output/convert: scripts/analysis/convert.c $(CODEC) $(HEADERS)
 	mkdir -p output
 	$(CC) $(CFLAGS) -o $@ scripts/analysis/convert.c $(CODEC) $(LDLIBS)
 
-# NVDR against the browser's JPEG and WebP at equal quality (see
+# NVDR against the browser's JPEG and WebP, and AVIF, JPEG XL and HEIC
+# when avifenc, cjxl and heif-enc are installed, at equal quality (see
 # scripts/bench_codecs.mjs); writes output/bench/.
 bench: nvdr_encode nvdr_decode output/convert
 	node scripts/bench_codecs.mjs
+
+# The same on five large camera photos (2.5 to 21 MP), fetched and
+# developed from raw by scripts/fetch_photos.py (needs rawpy).
+bench-photos: nvdr_encode nvdr_decode output/convert
+	python3 scripts/fetch_photos.py
+	node scripts/bench_codecs.mjs samples/photos/*.png
 
 # The decoder for the browser, as WebAssembly: clang and wasm-ld only.
 wasm: public/nvdr.wasm
@@ -78,4 +85,4 @@ demo: nvdr_encode nvdr_album
 clean:
 	rm -f $(TOOLS) fuzz_nvdr
 
-.PHONY: all check clean fuzz demo
+.PHONY: all check clean fuzz demo bench bench-photos
