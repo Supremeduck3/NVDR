@@ -108,6 +108,11 @@ typedef struct {
      * along a direction, as `directional` does, which it implies. The
      * decoder needs the same picture: see nvdr_decode_mem_base(). */
     const NvdrImage* base;
+    /* With directional prediction (or a base), let each leaf of 16 pixels
+     * or less choose its transform: the DCT, a DST-VII along either axis
+     * or both, or none (see TRANSFORM TYPES in nvdr.c). Flagged in the
+     * header; it has no effect on progressive pictures. */
+    int   adaptive_tx;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -184,6 +189,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
 #define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
 #define NVDR_FLAG_INTER    0x40         /* predicted from a base picture as well */
+#define NVDR_FLAG_TXSEL    0x80         /* a transform type per leaf, with DIRPRED */
 
 typedef struct {
     uint16_t width, height;
