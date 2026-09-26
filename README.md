@@ -717,6 +717,9 @@ that much more:
     clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
       (fmt 11)
     noisy, the same               +111.5%       +14.9%      -15.7%
+    clean, + transform types,
+      OBMC-aware vectors (v13)     +91.4%       +31.9%       -4.0%
+    noisy, the same               +109.3%       +14.6%      -16.1%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame
