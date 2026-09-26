@@ -8,12 +8,12 @@
     "psnr": 0.0
   },
   "<sequence default>": {
-    "bytes": 6943,
-    "psnr": 32.09
+    "bytes": 6949,
+    "psnr": 31.98
   },
   "<sequence>": {
-    "bytes": 5345,
-    "psnr": 30.39
+    "bytes": 5412,
+    "psnr": 30.35
   },
   "OIP-1304511485.jpg": {
     "bytes": 13023,

@@ -862,22 +862,6 @@ static int model_fit(const int16_t* vx, const int16_t* vy, int w, int h, int blo
 #define MODE_FWD 1
 #define MODE_BWD 2
 
-static int block_sad_bi(const NvdrImage* cur, const Subpel* r0, const Subpel* r1,
-                        int x0, int y0, int bw, int bh, int f0x, int f0y, int f1x, int f1y,
-                        int limit) {
-    int acc = 0;
-    for (int y = y0; y < y0 + bh; y++) {
-        const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
-        for (int x = x0; x < x0 + bw; x++, a += 3)
-            for (int c = 0; c < 3; c++) {
-                int p = (qsample(r0, x, y, f0x, f0y, c) + qsample(r1, x, y, f1x, f1y, c) + 1) >> 1;
-                int d = a[c] - p;
-                acc += d < 0 ? -d : d;
-            }
-        if (acc >= limit) return acc;
-    }
-    return acc;
-}
 
 static void block_predict_bi(const Subpel* r0, const Subpel* r1, NvdrImage* dst, int block,
                              const int16_t* v0x, const int16_t* v0y,
@@ -1273,6 +1257,68 @@ typedef struct {
     int lambda;
 } VfDecide;
 
+/*
+ * A candidate's error as the decoder will see it with overlapped blocks:
+ * the unit's own prediction, blended toward the cells above and to the
+ * left, whose motion is decided already, as obmc_apply() will blend it.
+ * The cells below and to the right are not decided yet and are left out,
+ * as AV1's encoder leaves them out. Stops once past `limit`.
+ */
+static inline int cand_sample(const VfDecide* D, int md, int v0x, int v0y, int v1x, int v1y,
+                              int x, int y, int c) {
+    if (md == MODE_FWD) return qsample(D->r0, x, y, v0x, v0y, c);
+    if (md == MODE_BWD) return qsample(D->r1, x, y, v1x, v1y, c);
+    return (qsample(D->r0, x, y, v0x, v0y, c) + qsample(D->r1, x, y, v1x, v1y, c) + 1) >> 1;
+}
+
+static int cell_sample(const VfDecide* D, int b, int x, int y, int c) {
+    int md = D->mode ? D->mode[b] : MODE_FWD;
+    return cand_sample(D, md, D->l0->vx[b], D->l0->vy[b], D->l1 ? D->l1->vx[b] : 0, D->l1 ? D->l1->vy[b] : 0,
+                       x, y, c);
+}
+
+static int cell_same(const VfDecide* D, int b, int md, int v0x, int v0y, int v1x, int v1y) {
+    int mb = D->mode ? D->mode[b] : MODE_FWD;
+    if (mb != md) return 0;
+    if (md != MODE_BWD && (D->l0->vx[b] != v0x || D->l0->vy[b] != v0y)) return 0;
+    if (md != MODE_FWD && (D->l1->vx[b] != v1x || D->l1->vy[b] != v1y)) return 0;
+    return 1;
+}
+
+static int unit_sad(const VfDecide* D, int fx, int fy, int x0, int y0, int bw, int bh,
+                    int md, int v0x, int v0y, int v1x, int v1y, int limit) {
+    const Grid* G = D->G;
+    int g = G->g, L = g / 2 > 0 ? g / 2 : 1, acc = 0;
+    const uint8_t* mask = obmc_mask(L);
+    for (int j = 0; j < bh; j++) {
+        int y = y0 + j, cy = fy + j / g, jj = j % g;
+        const unsigned char* a = D->cur->pixels + ((size_t)y * D->cur->width + x0) * 3;
+        for (int i = 0; i < bw; i++, a += 3) {
+            int x = x0 + i, cx = fx + i / g, ii = i % g;
+            /* The neighbours this pixel blends with: above if it is in the
+             * unit's top cells, left if in its left cells. */
+            int up = -1, lf = -1;
+            if (j < g && jj < L && fy > 0 && mask[jj] < 64) {
+                int b = (fy - 1) * G->nfx + cx;
+                if (!cell_same(D, b, md, v0x, v0y, v1x, v1y)) up = b;
+            }
+            if (i < g && ii < L && fx > 0 && mask[ii] < 64) {
+                int b = cy * G->nfx + fx - 1;
+                if (!cell_same(D, b, md, v0x, v0y, v1x, v1y)) lf = b;
+            }
+            for (int c = 0; c < 3; c++) {
+                int p = cand_sample(D, md, v0x, v0y, v1x, v1y, x, y, c);
+                if (up >= 0) p = (mask[jj] * p + (64 - mask[jj]) * cell_sample(D, up, x, y, c) + 32) >> 6;
+                if (lf >= 0) p = (mask[ii] * p + (64 - mask[ii]) * cell_sample(D, lf, x, y, c) + 32) >> 6;
+                int d = a[c] - p;
+                acc += d < 0 ? -d : d;
+            }
+        }
+        if (acc >= limit) return acc;
+    }
+    return acc;
+}
+
 /* The best candidate for one unit, written into its cells; returns its
  * cost. `o0`, `o1` are the unit's searched vectors. */
 static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x, int o1y, int alt0x, int alt0y,
@@ -1299,7 +1345,7 @@ static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x
             if (dup || vx < -lim || vx > lim || vy < -lim || vy > lim) continue;
             int rate = D->lambda * mv_bits(vx - p0x, vy - p0y);
             if (rate >= best) continue;
-            int cost = block_sad_q(D->cur, D->r0, x0, y0, bw, bh, vx, vy, best - rate) + rate;
+            int cost = unit_sad(D, fx, fy, x0, y0, bw, bh, MODE_FWD, vx, vy, 0, 0, best - rate) + rate;
             if (cost < best) { best = cost; bx = vx; by = vy; }
         }
         vf_set(D->l0, fx, fy, w, bx, by);
@@ -1329,12 +1375,8 @@ static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x
         if (md != MODE_FWD) bits += mv_bits(cand[k][3] - p1x, cand[k][4] - p1y);
         int rate = D->lambda * bits;
         if (rate >= best) continue;
-        int cost = rate + (md == MODE_FWD
-            ? block_sad_q(D->cur, D->r0, x0, y0, bw, bh, cand[k][1], cand[k][2], best - rate)
-            : md == MODE_BWD
-            ? block_sad_q(D->cur, D->r1, x0, y0, bw, bh, cand[k][3], cand[k][4], best - rate)
-            : block_sad_bi(D->cur, D->r0, D->r1, x0, y0, bw, bh, cand[k][1], cand[k][2],
-                           cand[k][3], cand[k][4], best - rate));
+        int cost = rate + unit_sad(D, fx, fy, x0, y0, bw, bh, md, cand[k][1], cand[k][2],
+                                   cand[k][3], cand[k][4], best - rate);
         if (cost < best) { best = cost; bi = k; }
     }
     int md = cand[bi][0];
