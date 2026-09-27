@@ -12,7 +12,7 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
-import { decode, showRGB, ArithDecoder, PROB_INIT } from './nvdr.js';
+import { decode, showRGB, ArithDecoder, newProbs } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
 const VERSION = 11;
@@ -73,11 +73,11 @@ function mvComponent(dec, m, c, canBeZero, esc) {
 
 function mvModels() {
     return {
-        same: new Uint16Array(3).fill(PROB_INIT),
-        zero: new Uint16Array(2).fill(PROB_INIT),
-        sign: new Uint16Array(2).fill(PROB_INIT),
-        mag: [new Uint16Array(MV_MAG_CTX).fill(PROB_INIT),
-              new Uint16Array(MV_MAG_CTX).fill(PROB_INIT)]
+        same: newProbs(3),
+        zero: newProbs(2),
+        sign: newProbs(2),
+        mag: [newProbs(MV_MAG_CTX),
+              newProbs(MV_MAG_CTX)]
     };
 }
 
@@ -213,8 +213,8 @@ function unpackVfield(bytes, offset, len, G, split, mode, l0, l1) {
     const nf = G.nfx * G.nfy;
     l0.same = new Uint8Array(nf); l0.mm = mvModels();
     if (l1) { l1.same = new Uint8Array(nf); l1.mm = mvModels(); }
-    const splitM = new Uint16Array(3).fill(PROB_INIT), notBi = new Uint16Array(3).fill(PROB_INIT);
-    const bwd = new Uint16Array(3).fill(PROB_INIT);
+    const splitM = newProbs(3), notBi = newProbs(3);
+    const bwd = newProbs(3);
     if (mode) mode.fill(0);
     const dec = new ArithDecoder(bytes, offset, len);
     const modeCtxF = (fx, fy, which) => {

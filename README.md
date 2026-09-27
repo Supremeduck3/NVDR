@@ -793,6 +793,27 @@ that: a cross-component filter (VVC's CC-ALF, colour refined from luma),
 given how much the colour alone gained here, and giving the 4:2:0
 upsampling a filter of its own.
 
+### Adapting faster at first
+
+Every context starts at even odds and learns only from the bits it
+codes, so the start of every picture is coded with raw probabilities.
+LZMA moves a probability 1/32 of the way toward each bit: slow to
+learn, and a little jittery once learned. Each context now also counts
+the bits it has coded and moves by 1/4 over its first 12, 1/8 up to 40,
+1/16 up to 96 and 1/64 after, as AV1's per-context counter does; the
+probability is kept at 15 bits so the slow steps still move it, and
+coded at 11 as before. Both sides count the same bits, so nothing is
+sent. Mixing a fast and a slow estimate at fixed rates (VVC's way) was
+tried first and gave about a third as much.
+
+    intra, five photos, BD-rate       vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    before                                    +7.0%                  -5.7%
+    counting                                  +6.5%                  -6.2%
+
+The small pictures gain most, having the fewest bits to learn from:
+the regression gate's synthetic blocks and gradient 25 and 27% smaller,
+its 128x128 sequence 7.7% smaller at 0.08 dB more, a burst album 5.6%.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

@@ -426,27 +426,27 @@ static int tq_step(int step, int d) {
 /* =============================================================== models */
 
 typedef struct {
-    uint16_t split[NSIZES];
-    uint16_t split_c[NSIZES];    /* the colour tree's, in 4:2:0 */
-    uint16_t dc_zero[NSIZES][3];
-    uint16_t dc_sign[3];
-    uint16_t dc_mag[3][MAG_UNARY];
-    uint16_t tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
-    uint16_t mode_flat[NSIZES], mode_tree[16];       /* a leaf's prediction mode */
-    uint16_t mode_inter[NSIZES];                     /* INTER or not, with a base */
-    uint16_t tx_dct[3][3];                           /* DCT or not, by size and direction */
-    uint16_t tx_tree[3][8];                          /* which of the other four */
+    NvdrProb split[NSIZES];
+    NvdrProb split_c[NSIZES];    /* the colour tree's, in 4:2:0 */
+    NvdrProb dc_zero[NSIZES][3];
+    NvdrProb dc_sign[3];
+    NvdrProb dc_mag[3][MAG_UNARY];
+    NvdrProb tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
+    NvdrProb mode_flat[NSIZES], mode_tree[16];       /* a leaf's prediction mode */
+    NvdrProb mode_inter[NSIZES];                     /* INTER or not, with a base */
+    NvdrProb tx_dct[3][3];                           /* DCT or not, by size and direction */
+    NvdrProb tx_tree[3][8];                          /* which of the other four */
 } ColourModels;
 
 typedef struct {
-    uint16_t cbf[NSIZES][3];
-    uint16_t sig[NSIZES][3][SIG_CTX];
-    uint16_t last[NSIZES][3][POS_CTX];
-    uint16_t gt1[3][GT1_CTX];
-    uint16_t mag[3][MAG_UNARY];
+    NvdrProb cbf[NSIZES][3];
+    NvdrProb sig[NSIZES][3][SIG_CTX];
+    NvdrProb last[NSIZES][3][POS_CTX];
+    NvdrProb gt1[3][GT1_CTX];
+    NvdrProb mag[3][MAG_UNARY];
 } TextureModels;
 
-static void models_fill(uint16_t* p, size_t count) {
+static void models_fill(NvdrProb* p, size_t count) {
     for (size_t i = 0; i < count; i++) p[i] = NVDR_PROB_INIT;
 }
 
@@ -491,8 +491,8 @@ typedef struct {
 
 /* A sink with a coder writes the symbol, and either way counts what it
  * costs at the model's odds before they adapt. */
-static void put_bit(Sink* s, uint16_t* p, int bit) {
-    s->bits += bitcost[bit][*p];
+static void put_bit(Sink* s, NvdrProb* p, int bit) {
+    s->bits += bitcost[bit][nvdr_prob(*p)];
     if (s->enc) nvdr_enc_bit(s->enc, p, bit);
 }
 
@@ -1147,7 +1147,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     return 0;
 }
 
-static uint16_t* split_model(ColourModels* m, const Canvas* cv, int n) {
+static NvdrProb* split_model(ColourModels* m, const Canvas* cv, int n) {
     return cv->comp0 ? &m->split_c[size_class(n)] : &m->split[size_class(n)];
 }
 
@@ -1551,7 +1551,7 @@ static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
  * first RDOQ_KEEP scan positions of a picture are left to the dead zone
  * (see the caller). */
 
-static double rd_bit(const uint16_t* p, int b) { return bitcost[b][*p]; }
+static double rd_bit(const NvdrProb* p, int b) { return bitcost[b][nvdr_prob(*p)]; }
 
 static double rd_mag_bits(const TextureModels* m, int c, int g, int a) {
     double bits = rd_bit(&m->gt1[c][g], a > 1);
@@ -1928,9 +1928,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (ctx && ctx->valid) {
         e.cm = ctx->cm; e.tm = ctx->tm; e.tm2 = ctx->tm2;
     } else {
-        models_fill((uint16_t*)&e.cm, sizeof(e.cm) / sizeof(uint16_t));
-        models_fill((uint16_t*)&e.tm, sizeof(e.tm) / sizeof(uint16_t));
-        models_fill((uint16_t*)&e.tm2, sizeof(e.tm2) / sizeof(uint16_t));
+        models_fill((NvdrProb*)&e.cm, sizeof(e.cm) / sizeof(NvdrProb));
+        models_fill((NvdrProb*)&e.tm, sizeof(e.tm) / sizeof(NvdrProb));
+        models_fill((NvdrProb*)&e.tm2, sizeof(e.tm2) / sizeof(NvdrProb));
     }
     if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0 ||
         nvdr_enc_init(&enc2, 1 << 16) != 0) goto done;
@@ -2622,8 +2622,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     if (ctx && ctx->valid) {
         cm = ctx->cm; tms[0] = ctx->tm; tms[1] = ctx->tm2;
     } else {
-        models_fill((uint16_t*)&cm, sizeof(cm) / sizeof(uint16_t));
-        for (int k = 0; k < 2; k++) models_fill((uint16_t*)&tms[k], sizeof(TextureModels) / sizeof(uint16_t));
+        models_fill((NvdrProb*)&cm, sizeof(cm) / sizeof(NvdrProb));
+        for (int k = 0; k < 2; k++) models_fill((NvdrProb*)&tms[k], sizeof(TextureModels) / sizeof(NvdrProb));
     }
     NvdrDecoder d0;
     nvdr_dec_init(&d0, data + base, avail0);
