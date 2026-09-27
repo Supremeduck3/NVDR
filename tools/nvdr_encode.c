@@ -23,6 +23,7 @@ static void usage(const char* argv0) {
         "  --max-block N    largest leaf, 4..32 (default 32)\n"
         "  --min-block N    smallest leaf, 4..max (default 4)\n"
         "  --no-deblock     leave the seams between leaves unfiltered\n"
+        "  --no-restore     send no restoration filter\n"
         "  --band N         0..32, where texture splits between its low and high\n"
         "                   layers (default 8; 0 keeps it in one layer)\n"
         "  --chroma M       auto (default), 420 or 444: colour at half resolution\n"
@@ -36,6 +37,8 @@ static void usage(const char* argv0) {
         "  --directional    predict each leaf along a direction from its decoded\n"
         "                   neighbours; smaller, but not progressive (one texture\n"
         "                   layer, decoded together with the colours)\n"
+        "  --no-adaptive-tx with --directional, keep every leaf on the DCT\n"
+        "                   instead of choosing its transform per leaf\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
         "                   choosing them by rate-distortion\n"
         "  --tile-q-test    give every tile a step offset from a fixed pattern,\n"
@@ -60,11 +63,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--max-block") && i + 1 < argc) cfg.max_block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--min-block") && i + 1 < argc) cfg.min_block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-deblock")) cfg.deblock = 0;
+        else if (!strcmp(argv[i], "--no-restore")) cfg.restore = 0;
         else if (!strcmp(argv[i], "--band") && i + 1 < argc) cfg.band = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
+        else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];
             if (!strcmp(v, "off")) cfg.grain = NVDR_GRAIN_OFF;
@@ -143,7 +148,7 @@ int main(int argc, char** argv) {
         nvdr_image_free(&source);
         return 1;
     }
-    size_t cumulative = NVDR_HEADER_SIZE + hdr.grain_len;
+    size_t cumulative = NVDR_HEADER_SIZE + hdr.grain_len + hdr.restore_len;
     for (int k = 0; k < NVDR_LAYERS; k++) {
         cumulative += hdr.stored_bytes[k];
         printf("  %-8s %10u  %10zu   %6.2f dB\n", layer_name(k), hdr.stored_bytes[k],

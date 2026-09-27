@@ -647,36 +647,62 @@ lost most of the gain. The encoder still chooses vectors as if the
 blocks did not overlap; choosing them knowing the blend is what AV1
 does next.
 
-### Transform types (format v13)
+### Adaptive transforms (flag 0x80)
 
-Every texture was a DCT. What directional prediction leaves is small
-next to the pixels a leaf is predicted from and grows away from them,
-and the DST-VII fits that shape better; HEVC uses it for 4x4 intra luma
-and AV1 as one of its transform types. In a picture with directional
-prediction (every sequence frame, and stills with `--directional`) a
-luma leaf of 4, 8 or 16 now picks one of four: DCT both ways, DST both
-ways, or DST one way and DCT the other. The type follows the "has
-texture" bit, as up to three bits on contexts by size. The DST's rows
-are the DCT's scale, so the two share their shifts (the 4-point one is
-HEVC's exactly), and they are the same integers in C and JavaScript.
+A directional prediction misses least next to the pixels it copies and
+more the further a pixel is from them, and the DCT, whose first basis
+function is flat, is the wrong shape for that. With NVDR_FLAG_TXSEL (on
+wherever directional prediction is, `--no-adaptive-tx` turns it off)
+each leaf of 4, 8 or 16 pixels predicted along a direction, or flat in a
+picture with a base, chooses one of seven separable transforms, as VVC
+and AV1 do: the DCT both ways; the DST-VII (AV1's ADST) down, across or
+both, whose first basis function starts near zero at the reference and
+rises away from it; the identity both ways, which codes pixels as they
+are, for edges and text where a DCT rings; and the identity down with
+the DCT across, or the other way round, for stripes along one axis.
+Leaves of 32 and INTER leaves stay on the DCT.
 
-The DST has no flat basis vector, so a residual whose mean the leaf's
-colour correction has taken out costs it several coefficients to say
-nothing. Under a DST the encoder therefore leaves the colour at the
-prediction and lets the transform carry the level too. With the mean
-taken out first, the DST won 2 to 5% of the leaves and nothing
-measurable; once it carried the level, 25 to 50%. The encoder tries the
-other types only for the mode it chose with the DCT, and only where
-the DCT leaves luma texture (a flat level is what the DCT says exactly),
-which keeps the added encoding time to 9% instead of 24%. Separate
-coefficient contexts for DST blocks were tried and did worse: they
-dilute the statistics.
+The DST-VII's integer matrices are 64 sqrt(N) times the orthonormal one,
+like the DCT's, so every type shares its shifts: each entry is one of N
+magnitudes (for 4, VVC's 29 55 74 84) with the sign the sine gives it,
+and the identity is 128, 181 and 256 on the diagonal. A leaf with any
+type but the DCT has no DC level, since no other basis has a constant
+function, so its texture is coded from scan position 0 against the same
+models as the DCT's. The type is a "DCT or not" bit by size and by the
+mode's direction (flat or planar, from above, from the left), then three
+bits down a tree by direction, after the mode. The encoder tries every
+type for each of the modes it tries in full and keeps the cheapest by
+error plus lambda times bits.
 
-    intra, five photos, BD-rate       vs AV1 (libaom, still)   vs HEVC (x265 intra)
-    directional (v12)                        +11.2%                  -2.2%
-    + transform types (v13)                  +10.9%                  -2.5%
+Intra frames (`--directional`), BD-rate on PSNR-Y (and PSNR-RGB) against
+the build before, six photographs, q 12 to 48:
 
-On the sequences, against format 11 as it was: -0.0 to -0.7%.
+    5 types, for the best DCT mode only, own models    -0.2%  (-0.8%)
+    the same, the DCT's models                         -0.4%  (-0.9%)
+    5 types, tried with every mode                     -1.6%  (-2.1%)
+    the same, keeping the DC level for the others      +0.6%  (-0.1%)
+    7 types, tried with every mode (default)           -2.3%  (-2.6%)
+    9 types (adding DST-VII with the identity)         -2.2%  (-2.5%)
+
+Per photograph, the default: -7.7% on the graphic (OIP-1304511485),
+-2.6% on macarrão, -2.1% on montanha_pessoas, -0.9% on OIP-4140498144
+and -0.2% on the two dense photographs. The type follows the mode
+closely: with the best DCT mode alone the gain mostly disappears, and
+trying the other types only for the best one, two or three modes by
+their DCT cost gives -1.0, -1.6 and -2.0% for 1.14, 1.34 and 1.51 times
+the encoding time. Trying them with every mode costs 2.1 times the
+encoding time of an intra frame. On 4x4 leaves of a photograph the DST-
+VII both ways is chosen more often than the DCT, as HEVC found when it
+made it the only 4x4 intra transform; the identity is chosen mostly on
+the graphic.
+
+On the sequences, where it applies to every intra frame and to the intra
+leaves of predicted ones: -2.2% on a pan over montanha_pessoas, -1.9% on
+the mixed clip with noise, -1.7% on a zoom (24 synthetic frames from
+`scripts/analysis/frames.c`, q 16 to 48, on PSNR-RGB), nearly all of it
+from the intra frame. Choosing the type for INTER leaves too, whose
+texture the encoder now transforms before the search, is the next step,
+at the cost of doing that per leaf.
 
 ### Choosing vectors for overlapped blocks
 
@@ -690,6 +716,82 @@ against the same encoder without it: -0.2 to -0.8% on the five clips.
 On the regression gate's small clip, whose frames turn overlapping off,
 it costs 1.3% in the closed loop: the vectors were chosen for a blend
 that then does not happen.
+
+### In-loop restoration
+
+Deblocking fixes one artefact, the step at a leaf's edge, by a rule
+fixed in advance. What quantisation leaves inside a leaf (ringing along
+an edge, texture flattened, a ramp turned into steps) is left, and it
+differs from one picture to the next. So the encoder, which holds the
+source, now fits a filter to the picture it has just decoded and sends
+it: the least-squares filter that takes the decoded picture closest to
+the source. The decoder applies it after deblocking. In a sequence the
+restored picture is the one later frames predict from, so the filter is
+in the loop, and a frame's gain is also every later frame's.
+
+The filter is VVC's adaptive loop filter, simplified (`src/restore.c`):
+a 7x7 diamond for luma and a 5x5 one for colour, each neighbour entering
+as its difference from the centre clipped to one of four bounds, so a
+neighbour across a strong edge counts no more than one across a weak
+one. Luma's 4x4 blocks fall into 25 classes by the direction and
+strength of their gradient, which the encoder merges greedily into as
+many filters as pay for themselves at the picture's lambda. Each 64x64
+unit is filtered or not, and each component carries a filter only where
+that removes more error than its bits cost. Coefficients are in 128ths,
+Exp-Golomb coded after the grain parameters; bytes 30 and 31 of the
+header give their length, 0 when there are none (the flag byte is
+full: 0x80 is the transform types'). Everything is integer, and C, JavaScript and
+WebAssembly decode identically. Only a picture decoded whole is
+restored: the filter was fitted to that picture, not to a prefix of it.
+
+Colour at half size has to be judged where it is seen. Fitted against
+the 2x2 means it was coded from, the filter brought each half-size plane
+closer to them and made the full-size colour worse on all six samples,
+by up to 8%. The encoder now measures colour after the decoder's
+upsampling, against the full-size source, and solves for the filter in
+that domain (the upsampling is linear, so each tap's contribution is
+too). There the filter undoes much of what halving and bilinear
+upsampling blur: on OIP-1304511485 the squared error of Cb falls from
+8.4 to 5.5 and of Cr from 14.6 to 6.1, and the picture gains 1.7 dB for
+51 bytes.
+
+BD-rate on RGB PSNR against the same build without the filter, q 12 to
+56 (stills) and 10 to 56 (sequences):
+
+    image                 BD-rate     at q 24
+    OIP-1304511485        -11.2%      13023 B 33.11 dB -> 13074 B 34.78 dB
+    OIP-3451121336         -1.9%      36346 B 31.12 dB -> 36380 B 31.35 dB
+    OIP-3786546191         -2.8%      28988 B 31.68 dB -> 29029 B 32.02 dB
+    OIP-4140498144         -1.3%      19262 B 33.21 dB -> 19308 B 33.30 dB
+    macarrão               -2.2%       4942 B 38.68 dB ->  4996 B 38.91 dB
+    montanha_pessoas       -2.1%      45508 B 32.74 dB -> 45638 B 32.92 dB
+
+    25 frames, from scripts/analysis/frames.c          BD-rate
+    pan and a moving object over montanha, clean         -3.8%
+    the same, noise 6                                    -3.0%
+    whole-pixel pan over OIP-3786546191                  -9.5%
+    still camera over OIP-3451121336, noise 6            -8.6%
+    zoom into OIP-4140498144                             -1.0%
+
+Swept and left at the first choice: the clip bounds (255 32 12 4 against
+255 64 16 6 and 255 24 8 3) and the activity levels (3 8 16 32 against
+2 5 10 20 and 4 12 24 48) all measured within 0.1 point. Encoding a still
+takes about twice as long (0.11 s to 0.27 s for montanha_pessoas), a
+sequence about 10% longer; the statistics come from a sixteenth of the
+pixels for the clip bound and half of them for the filter.
+
+**A learned filter goes in beside it, not instead.** Each component's
+parameters start with a kind: 0 none, 1 this filter, 2 reserved for a
+network whose weights both sides hold, named by an id, with its
+per-picture parameters (a strength, a class map) in its payload. A new
+kind is a parse and an apply in the decoders and a fit in
+`nvdr_restore_fit()`, which already keeps the cheapest candidate per
+component, so a network that only wins on some pictures costs nothing
+on the others. The fit receives the decoded plane and the source, the
+same inputs a learned filter's encoder side needs. Two next steps before
+that: a cross-component filter (VVC's CC-ALF, colour refined from luma),
+given how much the colour alone gained here, and giving the 4:2:0
+upsampling a filter of its own.
 
 ### Against the state of the art
 
@@ -717,9 +819,6 @@ that much more:
     clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
       (fmt 11)
     noisy, the same               +111.5%       +14.9%      -15.7%
-    clean, + transform types,
-      OBMC-aware vectors (v13)     +91.4%       +31.9%       -4.0%
-    noisy, the same               +109.3%       +14.6%      -16.1%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame
@@ -2301,7 +2400,8 @@ B frames came later: see "B frames (sequence format 7)".
 
 ## Layout
 
-    src/        the codec: nvdr.c (v10) and entropy.c, plus nvdrv.c for sequences
+    src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
+                nvdrv.c for sequences
     tools/      five CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
@@ -2342,7 +2442,12 @@ side, a slider that truncates the container, and plays sequences.
 
 Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
-directional prediction and 0x40 a base picture (see their sections).
+directional prediction, 0x40 a base picture and 0x80 a transform type
+per leaf (see their sections).
+
+directional prediction, 0x40 a base picture and 0x80 restoration, whose
+parameters follow the grain's and whose length is bytes 30 and 31 (see
+their sections).
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does

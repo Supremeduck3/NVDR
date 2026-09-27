@@ -246,8 +246,16 @@ não uma falha.
   decodificados, ao longo de uma de 15 direções (os ângulos do HEVC).
   Deixa a imagem ~5% menor, mas ela deixa de ser progressiva: cor e
   textura são lidas juntas e a imagem só aparece inteira. Os quadros intra
-  dos vídeos usam isso sempre.
+  dos vídeos usam isso sempre. Junto vem a escolha da transformada por
+  bloco (DCT, DST-VII ou identidade, 7 combinações), mais ~2,3% menor pelo
+  mesmo PSNR e ~2x o tempo de codificação; `--no-adaptive-tx` desliga.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
+- **`--no-restore`** — não manda o filtro de restauração. Por padrão o
+  encoder ajusta um filtro à imagem decodificada (no estilo do ALF do VVC)
+  e o manda em algumas dezenas de bytes; o decodificador o aplica depois do
+  deblocking e, num vídeo, os quadros seguintes são previstos da imagem já
+  restaurada. Nas seis amostras vale −3,6% de bytes na mesma qualidade;
+  nos clipes, −5,2%. Só entra quando paga os próprios bytes.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
   em 420, gráficos e bordas de cor pura em 444).
@@ -439,10 +447,6 @@ O formato 11 suaviza as emendas entre blocos com movimentos diferentes
 (OBMC): perto da borda, cada bloco mistura a própria predição com a que
 o movimento do vizinho faria dos mesmos pixels. Rende ~2% nos clipes com
 movimento. Arquivos v10 também precisam ser recodificados.
-
-O contêiner v13 (fotos com `--directional` e todo quadro de vídeo)
-escolhe, por bloco de luma de até 16×16, entre a DCT e a DST-VII em cada
-direção. Arquivos v12 não abrem mais.
 
 Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
 

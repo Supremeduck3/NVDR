@@ -108,6 +108,11 @@ typedef struct {
      * along a direction, as `directional` does, which it implies. The
      * decoder needs the same picture: see nvdr_decode_mem_base(). */
     const NvdrImage* base;
+    /* With directional prediction (or a base), let each leaf of 16 pixels
+     * or less choose its transform: the DCT, a DST-VII along either axis
+     * or both, or none (see TRANSFORM TYPES in nvdr.c). Flagged in the
+     * header; it has no effect on progressive pictures. */
+    int   adaptive_tx;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -122,6 +127,12 @@ typedef struct {
     /* Filter the seams between leaves after decoding (see deblock() in
      * nvdr.c). Carried in the header's flags. */
     int   deblock;
+    /* Fit a restoration filter to the decoded picture and send it (see
+     * restore.c): the decoder applies it after deblocking, so in a
+     * sequence later frames predict from the restored picture. Kept per
+     * component only where it pays for its bytes. Carried in the header's
+     * flags; never on a residual. */
+    int   restore;
     /* In a residual, how readily a leaf is left uncorrected, as a multiple
      * of lambda: its bits are weighed at skip_k * lambda against the error
      * it would remove. 0 codes every leaf. */
@@ -175,7 +186,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     13
+#define NVDR_VERSION     12
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -184,6 +195,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
 #define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
 #define NVDR_FLAG_INTER    0x40         /* predicted from a base picture as well */
+#define NVDR_FLAG_TXSEL    0x80         /* a transform type per leaf, with DIRPRED */
 
 typedef struct {
     uint16_t width, height;
@@ -193,6 +205,7 @@ typedef struct {
     uint8_t  band;
     uint8_t  grain_len;                 /* bytes of grain parameters after the header */
     NvdrGrain grain;
+    uint16_t restore_len;               /* bytes of restoration parameters after those */
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */
