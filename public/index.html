@@ -659,7 +659,7 @@ function indexFrames(bytes) {
 
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v12 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV v13 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
     const frames = indexFrames(new Uint8Array(buffer));
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;
@@ -695,6 +695,7 @@ function setKept(bytes) {
 }
 
 function rewind() {
+    if (player.dec) player.dec.close();
     player.dec = new SequenceDecoder(seq.buffer.slice(0, player.kept));
     player.queue = [];
     player.ended = false;

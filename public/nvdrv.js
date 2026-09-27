@@ -12,10 +12,10 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
-import { decode, showRGB, ArithDecoder, newProbs } from './nvdr.js';
+import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 12;
+const VERSION = 13;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -491,8 +491,8 @@ function predictRegion(src, width, height, x0, y0, bw, bh, fx, fy, dst, obase, o
  * where reconstruct() in nvdrv.c returns -1: the container did not decode,
  * or is not the size of the sequence.
  */
-function reconstruct(bytes, out, width, height, base = null) {
-    const result = decode(bytes, undefined, false, null, false, base ? { width, height, rgb: base } : null);
+function reconstruct(bytes, out, width, height, base = null, ctx = null) {
+    const result = decode(bytes, undefined, false, ctx, false, base ? { width, height, rgb: base } : null);
     if (!result) return false;
     if (result.header.width !== width || result.header.height !== height) return false;
     out.set(result.rgb);
@@ -524,6 +524,17 @@ export function predictDecode(ref, width, height, data) {
     return pred;
 }
 
+const contextRegistry = new FinalizationRegistry(ctxs => ctxs.forEach(freeContext));
+
+/* Mirrors frame_class(): -1 intra, 0 P, 1..3 a B frame by the gap
+ * between its references. */
+function frameClass(kind, before, after) {
+    if (kind === INTRA) return -1;
+    if (kind === PRED) return 0;
+    const gap = after - before;
+    return gap >= 8 ? 1 : gap >= 4 ? 2 : 3;
+}
+
 /*
  * find_refs(): among the held frames, the nearest before `display` and
  * the nearest after it, as indices, -1 where there is none.
@@ -551,15 +562,27 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v12 file');
+        if (!this.info) throw new Error('not an NVDRV v13 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
         this.pred = new Uint8Array(n);
         this.pred1 = new Uint8Array(n);
         this.dpb = [];
+        // The models frames leave, per class (frameClass()).
+        this.ctxs = [newDecodeContext(), newDecodeContext(), newDecodeContext(), newDecodeContext()];
+        // With the WebAssembly decoder they are slots in its pool; they go
+        // back when this decoder is collected, or at close().
+        const held = this.ctxs.slice();
+        contextRegistry.register(this, held, this);
         this.nextOut = 0;
         this.ended = false;
+    }
+
+    /* Gives the decoder's contexts back to the WebAssembly pool. */
+    close() {
+        this.ctxs.forEach(freeContext);
+        contextRegistry.unregister(this);
     }
 
     async next() {
@@ -688,7 +711,12 @@ export class SequenceDecoder {
         // A frame cut before its colour layer ends the stream.
         // A predicted frame's container is predicted from `ref`, block by
         // block, and decodes straight to the picture.
-        if (!reconstruct(body, pixels, width, height, kind === INTRA ? null : ref)) {
+        // Mirrors code_frame() and decode_one(): the models carry on from
+        // the last frame of the same class, fresh again at an intra frame.
+        const fc = frameClass(kind, before >= 0 ? this.dpb[before].display : 0,
+                              after >= 0 ? this.dpb[after].display : 0);
+        if (kind === INTRA) for (const c of this.ctxs) resetContext(c);
+        if (!reconstruct(body, pixels, width, height, kind === INTRA ? null : ref, fc >= 0 ? this.ctxs[fc] : null)) {
             if (partial) return false;
             throw new Error('frame does not decode');
         }

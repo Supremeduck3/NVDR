@@ -1589,6 +1589,10 @@ struct NvdrvEncoder {
     int         anchor;      /* display number of the last anchor, -1 before any */
     NvdrImage   pred, error;
     NvdrImage   tf;          /* the anchor, filtered */
+    /* The models the frames leave, carried from one to the next in coding
+     * order (see code_frame()): the encoder's, and the decoder's as
+     * reconstruct() rebuilds them. */
+    NvdrContext *ctx[4], *dctx[4];
     /* Searched vectors at block size (s) and half size (h), the chosen
      * field (v), the models' vectors (m) and modes on the half-size grid,
      * and which blocks split. */
@@ -1606,12 +1610,24 @@ static int alloc_image(NvdrImage* img, int w, int h) {
     return img->pixels ? 0 : -1;
 }
 
+/* Which models a frame carries on (see code_frame()): -1 for an intra
+ * frame, which starts fresh; 0 for a P frame; for a B frame 1 to 3 by the
+ * gap between its references, which is its level in the group. */
+static int frame_class(int kind, int before, int after) {
+    if (kind == NVDRV_INTRA) return -1;
+    if (kind == NVDRV_PRED) return 0;
+    int gap = after - before;
+    return gap >= 8 ? 1 : gap >= 4 ? 2 : 3;
+}
+
 /* Decode a frame's container at full quality, which is what later frames
- * predict from. */
-static int reconstruct(const uint8_t* blob, size_t len, const NvdrImage* base, NvdrImage* out) {
+ * predict from, starting from the models `ctx` holds and leaving it with
+ * the frame's (NULL: fresh models). */
+static int reconstruct(const uint8_t* blob, size_t len, const NvdrImage* base, NvdrImage* out,
+                       NvdrContext* ctx) {
     NvdrImage img;
     NvdrHeader hdr;
-    if (nvdr_decode_mem_base(blob, len, base, &img, &hdr, NULL) != 0) return -1;
+    if (nvdr_decode_mem_base(blob, len, base, &img, &hdr, NULL, ctx) != 0) return -1;
     /* A frame's container has to be the size of the sequence it sits in,
      * or it is not a frame of this sequence. */
     if (hdr.width != out->width || hdr.height != out->height) {
@@ -1657,7 +1673,11 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     if (e->cfg.block == 0) e->cfg.bframes = 0;
     if (alloc_image(&e->pred, width, height) != 0 ||
         alloc_image(&e->error, width, height) != 0 ||
-        alloc_image(&e->last_src, width, height) != 0) {
+        alloc_image(&e->last_src, width, height) != 0 ||
+        !(e->ctx[0] = nvdr_context_new()) || !(e->ctx[1] = nvdr_context_new()) ||
+        !(e->ctx[2] = nvdr_context_new()) || !(e->ctx[3] = nvdr_context_new()) ||
+        !(e->dctx[0] = nvdr_context_new()) || !(e->dctx[1] = nvdr_context_new()) ||
+        !(e->dctx[2] = nvdr_context_new()) || !(e->dctx[3] = nvdr_context_new())) {
         nvdrv_encode_close(e); return -1;
     }
     if (e->cfg.block > 0) {
@@ -1987,7 +2007,20 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     uint8_t* blob = NULL;
     size_t len = 0;
     NvdrHeader fh;
-    if (nvdr_encode_mem(&blob, &len, src, &fcfg, &fh) != 0) { free(field); return -1; }
+    /*
+     * The models carry over from frame to frame in coding order, as an
+     * album's do, and start fresh at every intra frame so the stream can
+     * still be joined there. Every frame used to start from even odds, and
+     * a 960x540 frame codes too few bits for its thousand-odd contexts to
+     * learn much before it ends. A frame inherits from the last frame of
+     * its own class (frame_class()): carried across every frame, the B
+     * frames gained 10 to 30% and the P frames lost 15%, taking over the
+     * statistics of the intra frame or of the finest B frames.
+     */
+    int fc = frame_class(kind, before >= 0 ? e->dpb[before].display : 0, after >= 0 ? e->dpb[after].display : 0);
+    if (kind == NVDRV_INTRA)
+        for (int i = 0; i < 4; i++) { nvdr_context_reset(e->ctx[i]); nvdr_context_reset(e->dctx[i]); }
+    if (nvdr_encode_mem_ctx(&blob, &len, src, &fcfg, &fh, fc >= 0 ? e->ctx[fc] : NULL) != 0) { free(field); return -1; }
     if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
     int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0) |
@@ -2001,7 +2034,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
      * so the two sides hold the same bytes from here on. */
     Slot* s = &e->dpb[e->ndpb];
     if (alloc_image(&s->img, e->width, e->height) != 0) { free(blob); return -1; }
-    int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img);
+    int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? e->dctx[fc] : NULL);
     free(blob);
     if (rc != 0) { nvdr_image_free(&s->img); return -1; }
     s->display = display;
@@ -2499,6 +2532,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     free(e->h0x); free(e->h0y); free(e->h1x); free(e->h1y);
     free(e->mode); free(e->split);
     free(e->tile_q);
+    for (int i = 0; i < 4; i++) { nvdr_context_free(e->ctx[i]); nvdr_context_free(e->dctx[i]); }
     free(e);
     return rc;
 }
@@ -2515,6 +2549,7 @@ struct NvdrvDecoder {
     int       shown;         /* display number of the frame last shown */
     int       ended;
     NvdrImage pred, err;
+    NvdrContext* ctx[4];     /* the models frames left, per class: see code_frame() */
 };
 
 int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
@@ -2546,7 +2581,9 @@ int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
     if (d->width <= 0 || d->height <= 0 ||
         (size_t)d->width * d->height > NVDR_MAX_PIXELS ||
         alloc_image(&d->pred, d->width, d->height) != 0 ||
-        alloc_image(&d->err, d->width, d->height) != 0) {
+        alloc_image(&d->err, d->width, d->height) != 0 ||
+        !(d->ctx[0] = nvdr_context_new()) || !(d->ctx[1] = nvdr_context_new()) ||
+        !(d->ctx[2] = nvdr_context_new()) || !(d->ctx[3] = nvdr_context_new())) {
         nvdrv_decode_close(d); return -1;
     }
     if (info) {
@@ -2662,7 +2699,10 @@ static int decode_one(NvdrvDecoder* d) {
     if (alloc_image(&s->img, d->width, d->height) != 0) return -1;
     /* A frame cut before its colour layer has no picture yet: the stream
      * ends there, it is not damaged. */
-    if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? NULL : ref, &s->img) != 0) {
+    int fc = frame_class(kind, before >= 0 ? d->dpb[before].display : 0, after >= 0 ? d->dpb[after].display : 0);
+    if (kind == NVDRV_INTRA) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
+    if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? NULL : ref, &s->img,
+                    fc >= 0 ? d->ctx[fc] : NULL) != 0) {
         nvdr_image_free(&s->img);
         return partial ? 0 : -1;
     }
@@ -2718,6 +2758,7 @@ void nvdrv_decode_close(NvdrvDecoder* d) {
     for (int i = 0; i < d->ndpb; i++) nvdr_image_free(&d->dpb[i].img);
     free(d->pred.pixels);
     free(d->err.pixels);
+    for (int i = 0; i < 4; i++) nvdr_context_free(d->ctx[i]);
     free(d);
 }
 
@@ -2848,7 +2889,7 @@ int nvdrv_predict_decode(const NvdrImage* ref, const uint8_t* data, size_t len,
     if (unpack_field(data + 9, field_len, nbx, nby, tx, ty, MV_ESC_ALBUM, 127, vx, vy) != 0) goto done;
     if (subpel_build(&sp, ref) != 0) goto done;
     block_predict(&sp, &pred, block, vx, vy);
-    if (reconstruct(data + 9 + field_len, len - 9 - field_len, NULL, &err) != 0) goto done;
+    if (reconstruct(data + 9 + field_len, len - 9 - field_len, NULL, &err, NULL) != 0) goto done;
     for (size_t i = 0; i < npx; i++)
         pred.pixels[i] = (unsigned char)clamp255v((int)err.pixels[i] - 128 + (int)pred.pixels[i]);
     *out = pred;

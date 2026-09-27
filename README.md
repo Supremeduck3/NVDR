@@ -821,6 +821,26 @@ The small pictures gain most, having the fewest bits to learn from:
 the regression gate's synthetic blocks and gradient 25 and 27% smaller,
 its 128x128 sequence 7.7% smaller at 0.08 dB more, a burst album 5.6%.
 
+### Models carried from frame to frame (sequence v13)
+
+A sequence coded every frame against fresh models, while an album
+already carried them from one photo to the next. A predicted frame of
+960x540 is a few hundred bytes; its contexts learn little before it
+ends. The models now carry over in coding order and start fresh at each
+intra frame, so a stream can still be joined there. Carried across all
+frames, the B frames came out 10 to 30% smaller but the P frames 15%
+larger: they took over the statistics of the intra frame or of the
+finest B frames. So each frame carries on from the last frame of its
+own class: the P frames from the P frames, the B frames of each level
+(1 to 3, by the gap between their references) from their own level.
+BD-rate on PSNR-Y, 25 frames: -0.1 to -0.7% on the five clips, small
+because the intra frame, which starts fresh, is most of their bytes.
+
+The WebAssembly decoder keeps a pool of 64 contexts outside the heap it
+rewinds between decodes, so a sequence decoded through it keeps its
+speed (`newDecodeContext()` in nvdr.js; `SequenceDecoder.close()`
+gives them back).
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

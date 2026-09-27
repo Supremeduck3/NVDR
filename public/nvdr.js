@@ -649,13 +649,35 @@ export function newContext() { return { valid: false, cm: null, tm: null, tm2: n
 const RETRY = Symbol('retry');
 
 // A faster decode() with the same results, when one is loaded: the C
-// decoder as WebAssembly (nvdr-wasm.js). Not for a fluid context, whose
-// models only this decoder carries between containers.
-let fastDecoder = null;
-export function setFastDecoder(fn) { fastDecoder = fn; }
+// decoder as WebAssembly (nvdr-wasm.js). A fluid context goes to it only
+// when it lives there (newDecodeContext()); an album's, made with
+// newContext(), stays with this decoder.
+let fastDecoder = null, fastContexts = null;
+/* `contexts`, when given, keeps contexts on the fast decoder's side:
+ * { alloc() -> slot or -1, reset(slot), free(slot) }. */
+export function setFastDecoder(fn, contexts = null) { fastDecoder = fn; fastContexts = contexts; }
+
+/*
+ * A context for a run of containers decoded in order (a sequence's frames
+ * of one class). With the WebAssembly decoder loaded it lives there, so
+ * those frames keep its speed; otherwise it is this file's own. Give it
+ * back with freeContext() when done.
+ */
+export function newDecodeContext() {
+    const slot = fastDecoder && fastContexts ? fastContexts.alloc() : -1;
+    return slot >= 0 ? { valid: false, cm: null, tm: null, tm2: null, slot } : newContext();
+}
+export function resetContext(ctx) {
+    if (ctx.slot !== undefined) fastContexts.reset(ctx.slot);
+    else ctx.valid = false;
+}
+export function freeContext(ctx) {
+    if (ctx.slot !== undefined) { fastContexts.free(ctx.slot); ctx.slot = undefined; ctx.valid = false; }
+}
 
 export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null) {
-    if (fastDecoder && !ctx) return fastDecoder(buffer, maxLayer, wantFlat, wantLow, base);
+    if (fastDecoder && (!ctx || ctx.slot !== undefined))
+        return fastDecoder(buffer, maxLayer, wantFlat, wantLow, base, ctx ? ctx.slot : -1);
     return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow, base);
 }
 

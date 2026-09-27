@@ -79,7 +79,7 @@ static int decode_still(const uint8_t* d, size_t n) {
             base.pixels = (unsigned char*)malloc((size_t)w * h * 3);
             if (base.pixels) {
                 for (size_t i = 0; i < (size_t)w * h * 3; i++) base.pixels[i] = (unsigned char)(i * 7 / 3);
-                if (nvdr_decode_mem_base(d, n, &base, &img, NULL, NULL) == 0) { nvdr_image_free(&img); ok = 1; }
+                if (nvdr_decode_mem_base(d, n, &base, &img, NULL, NULL, NULL) == 0) { nvdr_image_free(&img); ok = 1; }
                 free(base.pixels);
             }
         }
