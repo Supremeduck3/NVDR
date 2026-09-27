@@ -354,6 +354,10 @@ function handleAlbum(req, res) {
 function handleVideo(req, res) {
     const seconds = intHeader(req, 'x-seconds', 5, 1, 30);
     const maxWidth = intHeader(req, 'x-max-width', 1280, 64, 3840);
+    // The intra frames' step; predicted frames take 1.2 times it. 17 is
+    // the page's "Alta": the encoder's own default of 24 left grass and
+    // skin visibly soft on a 720p clip.
+    const q = intHeader(req, 'x-q', 17, 4, 200);
 
     receiveUpload(req, res, (inputPath, fileId) => {
         const outPath = path.join(outDir, `temp_${fileId}.nvdrv`);
@@ -392,7 +396,7 @@ function handleVideo(req, res) {
                 if (!frames) return fail(422, 'ffmpeg não extraiu nenhum quadro.');
                 console.log(`Video: ${frames} frames, encoding...`);
 
-                execFile(encoder, [framesDir, outPath, '--fps', String(fps)],
+                execFile(encoder, [framesDir, outPath, '--fps', String(fps), '--q', String(q)],
                          { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, (err2, stdout, stderr2) => {
                     if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
                     fs.readFile(outPath, (err3, data) => {

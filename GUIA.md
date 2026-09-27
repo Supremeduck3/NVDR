@@ -109,6 +109,11 @@ esse toca direto, sem passar pelo servidor.
 - **Duração** (3 a 20 s) e **largura máxima** limitam o trabalho: codificar
   é a direção lenta, e os quadros ficam em PNG no disco enquanto isso.
   Com os padrões (5 s, 1280 px), um clipe de 960×540 levou 14 s ida e volta.
+- **Qualidade** escolhe o `--q` dos quadros intra (os preditos usam 1,2×):
+  Máxima 12, **Alta 17 (padrão)**, Média 24, Leve 34. O padrão era 24, o
+  do próprio encoder, e deixava grama e pele visivelmente moles em 720p.
+  Num clipe de teste de 960×540 com panorâmica, zoom e um objeto se
+  movendo, Alta dá 36,7 dB a ~1,1 Mbit/s e Média 34,6 dB a ~0,6 Mbit/s.
 
 O player mostra, por quadro, quanto custou **decodificar** e **exibir**
 contra o orçamento do fps do vídeo, e quantas vezes travou. A faixa embaixo
@@ -237,6 +242,11 @@ não uma falha.
 - **`--band N`** — onde a textura se divide entre as camadas baixa e alta
   (default 8; `0` deixa tudo numa camada só). Com 8, metade do arquivo dá
   em média +2,4 dB contra `0`, e o arquivo sai ~1% menor.
+- **`--directional`** — cada bloco é previsto a partir dos vizinhos já
+  decodificados, ao longo de uma de 15 direções (os ângulos do HEVC).
+  Deixa a imagem ~5% menor, mas ela deixa de ser progressiva: cor e
+  textura são lidas juntas e a imagem só aparece inteira. Os quadros intra
+  dos vídeos usam isso sempre.
 - **`--no-deblock`** — desliga o filtro que suaviza as emendas entre blocos.
 - **`--chroma auto|420|444`** — guardar a cor em meia resolução (420),
   inteira (444) ou deixar o encoder escolher (auto, o padrão: fotos saem
@@ -371,12 +381,33 @@ Parâmetros:
   intra mesmo fora do GOP (default 24). É assim que corte de cena é
   detectado, não declarado.
 - **`--q N`** — o passo de quantização dos quadros intra (default 24), e
-  **`--pred-q N`** o dos quadros preditos (default 1,2× o `--q`).
+  **`--pred-q N`** o dos quadros P (default 1,4× o `--q` com quadros B,
+  1,2× sem).
 - **`--block N`** — movimento por bloco de NxN, com vetores em **quarto de
   pixel** (default: 16 a partir de 0,2 Mpx, 8 abaixo; `0` usa um vetor só
   para o quadro todo).
 - **`--mv-lambda N`** — quanto um bit de vetor pesa contra o erro do bloco
   (default 16).
+- **`--bframes N`** — quadros B entre duas âncoras (default 7; `0` volta a
+  só quadros P). Cada B é previsto do quadro decodificado mais próximo antes
+  e do mais próximo depois, por bloco de um, do outro ou da média dos dois.
+  Nos clipes de teste isso deixou o arquivo **11 a 31% menor** na mesma
+  qualidade.
+- **`--b-q-step F`** — quanto cada nível de B é mais grosso que os P
+  (default 0,5: níveis 1, 2 e 3 a 1,5×, 2× e 2,5× o passo dos P).
+- **`--lookahead N`** e **`--tpl F`** — antes de um quadro intra o encoder
+  olha até N quadros à frente (default 16) e dá q mais fino às regiões que
+  eles vão reaproveitar, com intensidade F (default 1; `0` desliga). Rende
+  de 0 a 3% nos clipes de teste.
+- **`--tf N`**, **`--tf-strength F`** e **`--tf-levels L`** — filtro
+  temporal: antes de codificar cada âncora (quadro I ou P), o encoder a
+  alinha por movimento com os N quadros de cada lado (default 7) e tira a
+  média onde eles concordam, pesando pelo ruído medido no próprio clipe
+  (força F, default 4). O ruído some da referência que o grupo inteiro
+  copia. Num clipe com ruído de sensor o arquivo fica **~21% menor** na
+  mesma qualidade; num clipe limpo não muda nada (o filtro percebe que
+  não há ruído). `--tf-levels 1` filtra também o B do meio do grupo, o
+  que não rendeu nada medível; `--tf 0` desliga.
 - **`--skip-k F`** — quão facilmente um quadro predito deixa um bloco
   **exatamente como estava** no quadro anterior, em vez de recodificar a
   pequena diferença (default 0,25; `0` corrige todos). É o que tira a
@@ -390,6 +421,43 @@ No clipe de referência de 960×540, `--q 20` dá **622 kbit/s a 36,8 dB**.
 O VP8 faz 605 kbit/s a 37,2 dB. A interpolação de quarto de pixel usa o
 filtro de 6 taps do H.264, que no laço fechado vale ~1 dB sobre a
 bilinear.
+
+Quando o quadro intra sai com a cor em meia resolução (4:2:0, o que toda
+fotografia faz), os quadros preditos seguem: o resíduo também vai em
+4:2:0 e passa pelo filtro de desblocagem. Em BD-rate, a mesma qualidade
+de luma sai **6 a 8% menor** nos clipes limpos e **23% menor** num clipe
+com ruído de sensor. Desenho e tela (intra em 4:4:4) ficam como antes.
+
+Desde o formato de sequência 10, um quadro P ou B não é mais o erro
+contra a predição: cada bloco escolhe entre copiar a predição por
+movimento (modo INTER) ou se prever dos vizinhos já decodificados, como
+um quadro intra. Isso ajuda onde algo entra em cena ou é descoberto. O
+decodificador precisa da predição para ler o quadro, então arquivos v9
+não abrem mais; recodifique-os.
+
+O formato 11 suaviza as emendas entre blocos com movimentos diferentes
+(OBMC): perto da borda, cada bloco mistura a própria predição com a que
+o movimento do vizinho faria dos mesmos pixels. Rende ~2% nos clipes com
+movimento. Arquivos v10 também precisam ser recodificados.
+
+O contêiner v13 (fotos com `--directional` e todo quadro de vídeo)
+escolhe, por bloco de luma de até 16×16, entre a DCT e a DST-VII em cada
+direção. Arquivos v12 não abrem mais.
+
+Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
+
+```bash
+node scripts/bench_video.mjs pasta_de_quadros/
+```
+
+E com os melhores encoders que existem, offline e nos presets lentos
+(libaom AV1, x265, x264 e libvpx VP9, pelo ffmpeg). Esse é o comparativo
+que importa: os encoders do navegador são de tempo real e bem mais fracos.
+O ffmpeg com esses encoders vem com `pip install imageio-ffmpeg`:
+
+```bash
+node scripts/bench_video_offline.mjs pasta_de_quadros/ [--only av1,hevc]
+```
 
 Contra codificar cada quadro sozinho, nas sequências sintéticas: **−66,6%
 a −75,1% com qualidade igual ou melhor**.

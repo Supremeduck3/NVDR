@@ -3,10 +3,12 @@
  *
  * The still format already says "this level is a delta on the one before
  * it". A sequence says the same thing along time: frame N is a delta on
- * what the decoder is holding after frame N-1. Nothing about the frame
- * codec changes — a predicted frame is an ordinary NVDR container whose
- * image happens to be the prediction error, biased to the middle of the
- * range so it fits in the same unsigned bytes.
+ * what the decoder is holding after frame N-1. Every frame is an ordinary
+ * NVDR container; a predicted frame's has NVDR_FLAG_INTER and is decoded
+ * against its motion-compensated prediction, each leaf taking the
+ * prediction's pixels or predicting itself from its neighbours. (It used
+ * to be the prediction error, biased to the middle of the range; an
+ * album's predicted photo still is.)
  *
  * WHY NOT COPY
  * ------------
@@ -37,10 +39,20 @@
  *
  * TRUNCATION, ON BOTH AXES
  * ------------------------
- * Frames are self-delimiting and carry no index, so a prefix of the file
- * is a prefix of the movie. The last frame in a cut file is handed to the
- * still decoder as-is, which decodes as far as its bytes reach. Cutting
- * anywhere gives whole frames, then one partial one, then nothing.
+ * Frames are self-delimiting and carry no index. The last frame in a cut
+ * file is handed to the still decoder as-is, which decodes as far as its
+ * bytes reach. Frames are stored in coding order, each group's anchor
+ * before the B frames shown ahead of it, so a prefix of the file is the
+ * movie up to the last whole group, then the next anchor (possibly
+ * partial) and whichever of that group's B frames arrived; the player
+ * skips over the ones that did not.
+ *
+ * B FRAMES
+ * --------
+ * Every eighth frame by default is an anchor (an I or P frame); the seven
+ * between are B frames, coded after it, halfway first, and predicted per
+ * block from the nearest decoded frame before, the nearest after, or the
+ * mean of both. See "B frames" in the README.
  */
 #ifndef NVDRV_H
 #define NVDRV_H
@@ -48,12 +60,24 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      6
+#define NVDRV_VERSION      11
 #define NVDRV_HEADER_SIZE  24
-#define NVDRV_FRAME_HEADER 12
+#define NVDRV_FRAME_HEADER 20
 
 #define NVDRV_INTRA 0   /* the frame on its own */
-#define NVDRV_PRED  1   /* the error against the previous reconstruction */
+#define NVDRV_PRED  1   /* the error against the frame before it */
+#define NVDRV_BI    2   /* the error against the frames before and after it */
+
+/* The longest vector a sequence's field holds, in quarter pixels (96 px):
+ * an anchor eight frames from its reference under a brisk pan. */
+#define NVDRV_MV_MAX   384
+/* Most B frames between two anchors, and so the most decoded frames a
+ * decoder holds at once (both anchors, the frames between, and the one
+ * last shown). */
+#define NVDRV_MAX_B    15
+#define NVDRV_MAX_DPB  (NVDRV_MAX_B + 3)
+#define NVDRV_MAX_LOOKAHEAD 32
+#define NVDRV_MAX_TF   7
 
 typedef struct {
     NvdrConfig frame;      /* how each frame's container is built */
@@ -90,6 +114,34 @@ typedef struct {
      * over a block, when the encoder chooses between a block's own vector
      * and the one its neighbours predict. 0 keeps the search's choice. */
     int   mv_lambda;
+    /* B frames between two anchors (I or P frames), 0 to NVDRV_MAX_B. The
+     * anchor is coded first, then the frame halfway between the two
+     * anchors, then the halves of each half: every B frame is predicted
+     * from the nearest decoded frames on either side, per block from the
+     * one before, the one after, or the mean of both. 0 codes every frame
+     * as a P frame. */
+    int   bframes;
+    /* How much coarser each level of B frames is than the P frames: level
+     * l (1 halfway, 2 the quarters, ...) takes pred_q * (1 + b_q_step * l). */
+    float b_q_step;
+    /* Frames the encoder looks ahead of each intra frame, 0 to
+     * NVDRV_MAX_LOOKAHEAD, to measure how much of it the frames after will
+     * reuse (see "Looking ahead" in nvdrv.c). */
+    int   lookahead;
+    /* How strongly that reuse refines the intra frame's step: x264's
+     * macroblock-tree strength, in sixths of a doubling per doubling of
+     * reuse. 0 codes the intra frame at `frame.q` whatever follows it. */
+    float tpl_strength;
+    /* The temporal filter (see "Filtering the anchors" in nvdrv.c): source
+     * frames on each side, 0 to NVDRV_MAX_TF, blended into each anchor
+     * before it is coded, and how far a match may differ from it, in units
+     * of the frame's measured noise, before it stops counting. 0 turns
+     * it off. */
+    int   tf_radius;
+    float tf_strength;
+    /* B frames filtered too, by level: 1 the frame halfway between two
+     * anchors, which the frames either side are predicted from. */
+    int   tf_levels;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 
@@ -99,17 +151,31 @@ NvdrvConfig nvdrv_default_config(void);
 
 /*
  * Streaming, because a movie does not fit in memory. Frames go in one at
- * a time and the container is written as they arrive.
+ * a time in display order; the encoder holds up to `bframes` of them
+ * until the next anchor arrives, and writes frames in the order they are
+ * coded.
  */
 typedef struct NvdrvEncoder NvdrvEncoder;
 
+/* What one coded frame cost, reported as it is written. */
+typedef struct {
+    int    display;        /* the frame's position in the movie */
+    int    kind;           /* NVDRV_INTRA, _PRED or _BI */
+    int    level;          /* 0 for an anchor, 1.. for B frames */
+    int    q;              /* the container's quantiser step */
+    size_t bytes;          /* frame header included */
+    size_t field_bytes;    /* of which the motion field */
+    int    dx, dy;         /* global vector toward the frame before */
+} NvdrvFrameReport;
+typedef void (*NvdrvReportFn)(void* user, const NvdrvFrameReport* r);
+
 int  nvdrv_encode_open(NvdrvEncoder** out, const char* path,
                        int width, int height, const NvdrvConfig* cfg);
-/* Returns 0 on success. `kind_out` and `bytes_out` may be NULL; when
- * given they report how the frame was coded and what it cost. */
-int  nvdrv_encode_frame(NvdrvEncoder* enc, const NvdrImage* frame,
-                        int* kind_out, size_t* bytes_out,
-                        int* dx_out, int* dy_out);
+void nvdrv_encode_set_report(NvdrvEncoder* enc, NvdrvReportFn fn, void* user);
+/* Returns 0 on success. The frame is copied; it may be coded now or when a
+ * later frame, or the close, completes its group. */
+int  nvdrv_encode_frame(NvdrvEncoder* enc, const NvdrImage* frame);
+/* Codes whatever is still held, and finishes the file. */
 int  nvdrv_encode_close(NvdrvEncoder* enc);
 
 /* ------------------------------------------------------------- decoder */
@@ -125,15 +191,18 @@ typedef struct NvdrvDecoder NvdrvDecoder;
 int  nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info);
 
 /*
- * Render the next frame into `out`, which the caller allocates at
- * width*height*3. Returns 1 when a frame was produced, 0 at the end of the
- * stream, -1 on a container that does not make sense.
+ * Render the next frame, in display order, into `out`, which the caller
+ * allocates at width*height*3. Returns 1 when a frame was produced, 0 at
+ * the end of the stream, -1 on a container that does not make sense.
  *
  * A partial frame at the end of a cut file still produces a picture, at
- * whatever quality its bytes paid for.
+ * whatever quality its bytes paid for. Frames a cut file never delivered
+ * are skipped: the movie jumps over them rather than ending there.
  */
 int  nvdrv_decode_next(NvdrvDecoder* dec, NvdrImage* out,
                        int* kind_out, int* partial_out);
+/* The display number of the frame nvdrv_decode_next() last produced. */
+int  nvdrv_decode_display(const NvdrvDecoder* dec);
 void nvdrv_decode_close(NvdrvDecoder* dec);
 
 /* ------------------------------------------------- one image from another */

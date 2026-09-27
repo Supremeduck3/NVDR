@@ -136,6 +136,10 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b) {
 
 #define NSIZES     4           /* 4, 8, 16, 32 */
 #define POS_CTX    15
+#define NVDR_MODES 15          /* intra modes, see dir_predict() */
+#define MODE_INTER NVDR_MODES  /* with a base: the base picture's block */
+#define SIG_CTX    25          /* 5 position classes x 5 neighbourhoods */
+#define GT1_CTX    10          /* 5 neighbourhoods x (a level over 1 yet or not) */
 #define MAG_UNARY  14
 #define EG_LIMIT   24          /* longest Exp-Golomb prefix a decoder accepts */
 #define COEF_MAX   32767
@@ -153,6 +157,9 @@ NvdrConfig nvdr_default_config(void) {
     /* Measured on the samples: chroma at luma's step beat 1.5x and 2.5x. */
     c.chroma_q = 1.0f;
     c.deadzone = 0.1f;
+    c.rdoq = 1;
+    c.directional = 0;
+    c.base = NULL;
     /* The split decision is flat across 0.06..0.3; this is the middle. */
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
@@ -170,6 +177,7 @@ NvdrConfig nvdr_default_config(void) {
     c.band = 8;
     c.chroma420 = NVDR_CHROMA_AUTO;
     c.grain = NVDR_GRAIN_OFF;
+    c.tile_q = NULL;
     return c;
 }
 
@@ -188,9 +196,68 @@ static const int cos_table[33] = {
 };
 
 static int tmat[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* [k * n + x] */
+
+/*
+ * TRANSFORM TYPES (format v13)
+ * ----------------------------
+ * The DCT suits a residual that is as likely at one end of the block as
+ * the other. What a leaf predicted from its neighbours leaves is small
+ * next to the pixels it was predicted from and grows away from them, and
+ * DST-VII, HEVC's 4x4 intra transform and one of AV1's, fits that shape.
+ * So in a picture with directional prediction a luma leaf of 4 to 16
+ * chooses, per direction, between the two: DCT both ways (type 0), DST
+ * both ways (1), DST down the columns and DCT along the rows (2), or the
+ * reverse (3). The DST's rows are 128 * sqrt(N / (2N + 1)) *
+ * sin(pi * (2k + 1)(n + 1) / (2N + 1)), rounded, the scale of the DCT's,
+ * so the transforms share their shifts; the 4-point one is HEVC's. Under
+ * a DST the lowest coefficient is not the mean, so it is coded with the
+ * texture, after the leaf's DC has moved the prediction as before.
+ */
+#define TX_TYPES 4
+#define TX_MAX_N 16
+static const int dst4[16] = {
+      29,   55,   74,   84,
+      74,   74,    0,  -74,
+      84,  -29,  -74,   55,
+      55,  -84,   74,  -29,
+};
+static const int dst8[64] = {
+      16,   32,   46,   59,   70,   79,   84,   87,
+      46,   79,   87,   70,   32,  -16,  -59,  -84,
+      70,   84,   32,  -46,  -87,  -59,   16,   79,
+      84,   46,  -59,  -79,   16,   87,   32,  -70,
+      87,  -16,  -84,   32,   79,  -46,  -70,   59,
+      79,  -70,  -16,   84,  -59,  -32,   87,  -46,
+      59,  -87,   70,  -16,  -46,   84,  -79,   32,
+      32,  -59,   79,  -87,   84,  -70,   46,  -16,
+};
+static const int dst16[256] = {
+       8,   17,   25,   33,   41,   48,   55,   62,   67,   73,   77,   81,   84,   87,   88,   89,
+      25,   48,   67,   81,   88,   88,   81,   67,   48,   25,    0,  -25,  -48,  -67,  -81,  -88,
+      41,   73,   88,   84,   62,   25,  -17,  -55,  -81,  -89,  -77,  -48,   -8,   33,   67,   87,
+      55,   87,   81,   41,  -17,  -67,  -89,  -73,  -25,   33,   77,   88,   62,    8,  -48,  -84,
+      67,   88,   48,  -25,  -81,  -81,  -25,   48,   88,   67,    0,  -67,  -88,  -48,   25,   81,
+      77,   77,    0,  -77,  -77,    0,   77,   77,    0,  -77,  -77,    0,   77,   77,    0,  -77,
+      84,   55,  -48,  -87,   -8,   81,   62,  -41,  -88,  -17,   77,   67,  -33,  -89,  -25,   73,
+      88,   25,  -81,  -48,   67,   67,  -48,  -81,   25,   88,    0,  -88,  -25,   81,   48,  -67,
+      89,   -8,  -88,   17,   87,  -25,  -84,   33,   81,  -41,  -77,   48,   73,  -55,  -67,   62,
+      87,  -41,  -67,   73,   33,  -88,    8,   84,  -48,  -62,   77,   25,  -89,   17,   81,  -55,
+      81,  -67,  -25,   88,  -48,  -48,   88,  -25,  -67,   81,    0,  -81,   67,   25,  -88,   48,
+      73,  -84,   25,   55,  -89,   48,   33,  -87,   67,    8,  -77,   81,  -17,  -62,   88,  -41,
+      62,  -89,   67,   -8,  -55,   88,  -73,   17,   48,  -87,   77,  -25,  -41,   84,  -81,   33,
+      48,  -81,   88,  -67,   25,   25,  -67,   88,  -81,   48,    0,  -48,   81,  -88,   67,  -25,
+      33,  -62,   81,  -89,   84,  -67,   41,   -8,  -25,   55,  -77,   88,  -87,   73,  -48,   17,
+      17,  -33,   48,  -62,   73,  -81,   87,  -89,   88,  -84,   77,  -67,   55,  -41,   25,   -8,
+};
+static const int* const dst_mat[3] = { dst4, dst8, dst16 };
+
+/* The matrices down the columns and along the rows of a transform type. */
+static const int* tx_vert(int s, int tx) { return tx == 1 || tx == 2 ? dst_mat[s] : tmat[s]; }
+static const int* tx_horz(int s, int tx) { return tx == 1 || tx == 3 ? dst_mat[s] : tmat[s]; }
 static int scan_pos[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_ctx[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_diag[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* u + v */
+static int16_t scan_idx[NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* raster -> scan */
 static double bitcost[2][1 << NVDR_PROB_BITS];
 
 static int cos_entry(int j) {
@@ -220,6 +287,7 @@ static void tables_init(void) {
                 int u = d - v;
                 if (u < 0 || u >= n) continue;
                 scan_pos[s][at] = v * n + u;
+                scan_idx[s][v * n + u] = (int16_t)at;
                 scan_ctx[s][at] = (uint8_t)(d < 8 ? d : 8 + ((d - 8) / 4 < 6 ? (d - 8) / 4 : 6));
                 scan_diag[s][at] = (uint8_t)d;
                 at++;
@@ -237,16 +305,19 @@ static void tables_init(void) {
 }
 
 /* Encoder only: orthonormal coefficients of an n x n block. */
-static void forward_dct(int s, const double* in, double* out) {
+static void forward_tx(int s, int tx, const double* in, double* out);
+static void forward_dct(int s, const double* in, double* out) { forward_tx(s, 0, in, out); }
+static void forward_tx(int s, int tx, const double* in, double* out) {
     /* Every sum runs over its terms in the same order as a plain row-times-
      * column product; the loops are only nested so the innermost one walks
      * contiguous memory, which the compiler vectorises. */
     int n = NVDR_MIN_BLOCK << s;
-    const int* t = tmat[s];
+    const int* t = tx_vert(s, tx);
+    const int* th = tx_horz(s, tx);
     double tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], tt[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     double scale = 1.0 / (4096.0 * n);
     for (int u = 0; u < n; u++)
-        for (int x = 0; x < n; x++) tt[x * n + u] = t[u * n + x];
+        for (int x = 0; x < n; x++) tt[x * n + u] = th[u * n + x];
     for (int y = 0; y < n; y++) {
         double* row = tmp + y * n;
         for (int u = 0; u < n; u++) row[u] = 0.0;
@@ -275,13 +346,14 @@ static void forward_dct(int s, const double* in, double* out) {
  * bites on damaged input, and it is what keeps every product inside 32
  * bits: 32767 * 90 * 32 is under 2^27.
  */
-static void inverse_dct(int s, const int* in, int* out, int mu, int mv) {
+static void inverse_dct(int s, int tx, const int* in, int* out, int mu, int mv) {
     /* mu and mv bound the nonzero coefficients; every term past them is a
      * zero, so the bounds change the time and nothing else. Integer sums,
      * so the loop order, chosen for contiguous inner loops, changes
      * nothing either. */
     int n = NVDR_MIN_BLOCK << s;
-    const int* t = tmat[s];
+    const int* t = tx_vert(s, tx);
+    const int* th = tx_horz(s, tx);
     int tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int shift2 = 6 + log2_int(n);
     for (int y = 0; y < n; y++) {
@@ -299,7 +371,7 @@ static void inverse_dct(int s, const int* in, int* out, int mu, int mv) {
         for (int x = 0; x < n; x++) a[x] = 0;
         for (int u = 0; u <= mu; u++) {
             int k = tmp[y * n + u];
-            const int* row = t + u * n;
+            const int* row = th + u * n;
             for (int x = 0; x < n; x++) a[x] += k * row[x];
         }
         for (int x = 0; x < n; x++) out[y * n + x] = (a[x] + (1 << (shift2 - 1))) >> shift2;
@@ -331,6 +403,26 @@ static void ycc_to_rgb(int y, int cb, int cr, unsigned char* p) {
     p[2] = (unsigned char)clamp_u8(y + ((116130 * cb + 32768) >> 16));
 }
 
+/*
+ * TILE STEP OFFSETS
+ * -----------------
+ * With NVDR_FLAG_TILEQ each tile carries, at its start in layer 0, how
+ * far its step sits from the header's, in sixths of a doubling (H.264's
+ * QP scale), -TQ_MAX to TQ_MAX, coded as the difference from the tile
+ * before. A sequence's encoder uses it to give the parts of an intra frame
+ * that the frames after it reuse a finer step (see nvdrv.c). The scale is
+ * integer, identical in every decoder: 1024 * 2^(d / 6), rounded.
+ */
+#define TQ_MAX 12
+static const int TQ_SCALE[2 * TQ_MAX + 1] = {
+    256, 287, 323, 362, 406, 456, 512, 575, 645, 724, 813, 912,
+    1024, 1149, 1290, 1448, 1625, 1825, 2048, 2299, 2580, 2896, 3251, 3649, 4096
+};
+static int tq_step(int step, int d) {
+    int s = (step * TQ_SCALE[d + TQ_MAX] + 512) >> 10;
+    return s < 1 ? 1 : (s > 65535 ? 65535 : s);
+}
+
 /* =============================================================== models */
 
 typedef struct {
@@ -339,14 +431,18 @@ typedef struct {
     uint16_t dc_zero[NSIZES][3];
     uint16_t dc_sign[3];
     uint16_t dc_mag[3][MAG_UNARY];
+    uint16_t tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
+    uint16_t mode_flat[NSIZES], mode_tree[16];       /* a leaf's prediction mode */
+    uint16_t mode_inter[NSIZES];                     /* INTER or not, with a base */
 } ColourModels;
 
 typedef struct {
     uint16_t cbf[NSIZES][3];
-    uint16_t sig[NSIZES][3][POS_CTX];
+    uint16_t sig[NSIZES][3][SIG_CTX];
     uint16_t last[NSIZES][3][POS_CTX];
-    uint16_t gt1[3][4];
+    uint16_t gt1[3][GT1_CTX];
     uint16_t mag[3][MAG_UNARY];
+    uint16_t tx[NSIZES][3];      /* a luma leaf's transform type, down a tree */
 } TextureModels;
 
 static void models_fill(uint16_t* p, size_t count) {
@@ -447,6 +543,96 @@ static int get_dc(NvdrDecoder* d, ColourModels* m, int sc, int c, int* corrupt) 
     return neg ? -(r + 1) : r + 1;
 }
 
+static void put_tq(Sink* s, ColourModels* m, int v) {
+    put_bit(s, &m->tq_zero, v != 0);
+    if (!v) return;
+    put_bit(s, &m->tq_sign, v < 0);
+    int r = (v < 0 ? -v : v) - 1;
+    for (int i = 0; i < 2 * TQ_MAX - 1; i++) {
+        put_bit(s, &m->tq_mag[i], r > i);
+        if (r <= i) return;
+    }
+}
+
+/* A leaf's mode: "flat or not" by size, then 1..14 as four bits down a
+ * tree of contexts. */
+static void put_mode(Sink* s, ColourModels* m, int sc, int mode, int inter) {
+    if (inter) {
+        put_bit(s, &m->mode_inter[sc], mode != MODE_INTER);
+        if (mode == MODE_INTER) return;
+    }
+    put_bit(s, &m->mode_flat[sc], mode != 0);
+    if (!mode) return;
+    int v = mode - 1, node = 1;
+    for (int k = 3; k >= 0; k--) {
+        int b = (v >> k) & 1;
+        put_bit(s, &m->mode_tree[node], b);
+        node = 2 * node + b;
+    }
+}
+
+static int get_mode(NvdrDecoder* d, ColourModels* m, int sc, int inter) {
+    if (inter && !nvdr_dec_bit(d, &m->mode_inter[sc])) return MODE_INTER;
+    if (!nvdr_dec_bit(d, &m->mode_flat[sc])) return 0;
+    int v = 0, node = 1;
+    for (int k = 0; k < 4; k++) {
+        int b = nvdr_dec_bit(d, &m->mode_tree[node]);
+        v = 2 * v + b;
+        node = 2 * node + b;
+    }
+    return v < NVDR_MODES - 1 ? v + 1 : -1;    /* the last two are damage */
+}
+
+static int get_tq(NvdrDecoder* d, ColourModels* m) {
+    if (!nvdr_dec_bit(d, &m->tq_zero)) return 0;
+    int neg = nvdr_dec_bit(d, &m->tq_sign);
+    int r = 0;
+    for (int i = 0; i < 2 * TQ_MAX - 1; i++) {
+        if (!nvdr_dec_bit(d, &m->tq_mag[i])) break;
+        r = i + 1;
+    }
+    return neg ? -(r + 1) : r + 1;
+}
+
+/*
+ * TEXTURE CONTEXTS
+ * ----------------
+ * A coefficient is likelier to be significant, and large, when the ones
+ * next to it in frequency are: the energy of a block runs in ridges and
+ * falls off together. So significance is conditioned on the position's
+ * class (its diagonal: 1, 2, 3-4, 5-7, 8 on) and on how much is already
+ * coded around it, the levels at (u-1, v), (u, v-1), (u-1, v-1), (u-2, v)
+ * and (u, v-2), each counted up to 3, the template AV1 and VVC use. All
+ * five lie on earlier diagonals, so the diagonal scan has coded them. A
+ * neighbour in the other band (the other layer) counts as zero, which
+ * keeps the layers decodable on their own. The "more than 1" flag of a
+ * magnitude is conditioned on the same sum and on whether a level over 1
+ * has been seen in the band yet.
+ */
+static int nb_mag(const int* lv, int s, int i, int start) {
+    static const int du[5] = { 1, 0, 1, 2, 0 }, dv[5] = { 0, 1, 1, 0, 2 };
+    int n = NVDR_MIN_BLOCK << s, p = scan_pos[s][i];
+    int u = p & (n - 1), v = p / n, t = 0;
+    for (int k = 0; k < 5; k++) {
+        int uu = u - du[k], vv = v - dv[k];
+        if (uu < 0 || vv < 0) continue;
+        int j = scan_idx[s][vv * n + uu];
+        if (j < start || j >= i) continue;
+        int a = lv[j] < 0 ? -lv[j] : lv[j];
+        t += a < 3 ? a : 3;
+    }
+    return t;
+}
+
+static int sig_ctx(int s, int i, int t) {
+    int d = scan_diag[s][i];
+    int pc = d <= 1 ? 0 : d == 2 ? 1 : d <= 4 ? 2 : d <= 7 ? 3 : 4;
+    int nb = (t + 1) >> 1;
+    return pc * 5 + (nb < 4 ? nb : 4);
+}
+
+static int gt1_ctx(int t, int g) { return (t < 4 ? t : 4) + (g ? 5 : 0); }
+
 static void put_mag(Sink* s, TextureModels* m, int c, int g, int a) {
     put_bit(s, &m->gt1[c][g], a > 1);
     if (a == 1) return;
@@ -465,38 +651,65 @@ static void put_mag(Sink* s, TextureModels* m, int c, int g, int a) {
  * The last position of the range needs neither flag: reaching it means it
  * is the one left.
  */
+/* A transform type as up to three bits: DCT or not, DST both ways or
+ * not, then which way the DST runs. */
+static void put_tx(Sink* s, TextureModels* m, int sc, int tx) {
+    put_bit(s, &m->tx[sc][0], tx != 0);
+    if (!tx) return;
+    put_bit(s, &m->tx[sc][1], tx != 1);
+    if (tx != 1) put_bit(s, &m->tx[sc][2], tx == 3);
+}
+
+static int get_tx(NvdrDecoder* d, TextureModels* m, int sc) {
+    if (!nvdr_dec_bit(d, &m->tx[sc][0])) return 0;
+    if (!nvdr_dec_bit(d, &m->tx[sc][1])) return 1;
+    return nvdr_dec_bit(d, &m->tx[sc][2]) ? 3 : 2;
+}
+
+/* `tx` is the leaf's transform type where it may choose one (a luma leaf
+ * of a picture with directional prediction, 16 or smaller), -1 where it
+ * is the DCT without saying so. Under a DST the range starts at 0. */
 static void put_texture(Sink* s, TextureModels* m, int sc, int c, const int* lv,
-                        int start, int end) {
-    int last = 0;
+                        int start, int end, int tx) {
+    if (tx > 0) start = 0;
+    int last = -1;
     for (int i = start; i < end; i++) if (lv[i]) last = i;
-    put_bit(s, &m->cbf[sc][c], last > 0);
-    if (!last) return;
+    put_bit(s, &m->cbf[sc][c], last >= 0);
+    if (last < 0) return;
+    if (tx >= 0) put_tx(s, m, sc, tx);
     int g = 0;
     for (int i = start; i <= last; i++) {
         int a = lv[i] < 0 ? -lv[i] : lv[i];
-        int pc = scan_ctx[sc][i];
-        if (i < end - 1) put_bit(s, &m->sig[sc][c][pc], a != 0);
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        if (i < end - 1) put_bit(s, &m->sig[sc][c][sig_ctx(sc, i, t)], a != 0);
         if (!a) continue;
         if (i < end - 1) put_bit(s, &m->last[sc][c][pc], i == last);
-        put_mag(s, m, c, g < 3 ? g : 3, a);
+        put_mag(s, m, c, gt1_ctx(t, g), a);
         put_direct(s, lv[i] < 0, 1);
         if (a > 1) g++;
     }
 }
 
 /* Fills lv[start, end); returns 0 when the range carries nothing. */
+/* With `tx` set the leaf may choose its transform type: it is read into
+ * *tx, and 0 when the range carries nothing. */
 static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
-                       int start, int end, int* corrupt) {
+                       int start, int end, int* corrupt, int* tx) {
+    if (tx) { *tx = 0; start = 0; }
     memset(lv + start, 0, sizeof(int) * (size_t)(end - start));
     if (!nvdr_dec_bit(d, &m->cbf[sc][c])) return 0;
+    if (tx) {
+        *tx = get_tx(d, m, sc);
+        if (!*tx) start = 1;
+    }
     int g = 0;
     for (int i = start; i < end; i++) {
-        int pc = scan_ctx[sc][i];
-        int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][pc]) : 1;
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[sc][c][sig_ctx(sc, i, t)]) : 1;
         if (!sig) continue;
         int last = i < end - 1 ? nvdr_dec_bit(d, &m->last[sc][c][pc]) : 1;
         int a;
-        if (!nvdr_dec_bit(d, &m->gt1[c][g < 3 ? g : 3])) a = 1;
+        if (!nvdr_dec_bit(d, &m->gt1[c][gt1_ctx(t, g)])) a = 1;
         else {
             int r = 0, k = 0;
             for (; k < MAG_UNARY; k++) {
@@ -552,6 +765,9 @@ typedef struct {
      * the models and the steps. */
     int np, comp0;
     int fixed_pred;              /* NVDR_FLAG_RESIDUAL: every colour predicted as 128 */
+    int dirpred;                 /* NVDR_FLAG_DIRPRED: predict from `full`, along modes */
+    int inter;                   /* NVDR_FLAG_INTER: and from `base` */
+    uint8_t* base[3];            /* with it, the base picture on this canvas */
     uint8_t* flat[3];
     uint8_t* full[3];
     /* The texture added so far, unclamped (to 16 bits): `full` is
@@ -576,7 +792,54 @@ static int canvas_init(Canvas* cv, int w, int h, int tile, int min_block, int np
 }
 
 static void canvas_free(Canvas* cv) {
-    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); free(cv->acc[c]); }
+    for (int c = 0; c < 3; c++) { free(cv->flat[c]); free(cv->full[c]); free(cv->acc[c]); free(cv->base[c]); }
+}
+
+/*
+ * A base picture on the canvases, in integers identical in every decoder:
+ * Y, Cb and Cr in 16-bit fixed point with JPEG's coefficients, the canvas
+ * padded by repeating the last row and column, and in 4:2:0 the colour
+ * the rounded mean of each 2x2 (repeating at the edge), as the encoder
+ * averages its source.
+ */
+static int canvas_base(Canvas* cv, Canvas* cc, const NvdrImage* img) {
+    size_t n = (size_t)cv->pw * cv->ph;
+    uint8_t* full[3];
+    for (int c = 0; c < 3; c++) if (!(full[c] = (uint8_t*)malloc(n))) { for (int k = 0; k < c; k++) free(full[k]); return -1; }
+    for (int y = 0; y < cv->ph; y++)
+        for (int x = 0; x < cv->pw; x++) {
+            int sx = x < cv->w ? x : cv->w - 1, sy = y < cv->h ? y : cv->h - 1;
+            const unsigned char* p = img->pixels + ((size_t)sy * img->width + sx) * 3;
+            int r = p[0], g = p[1], b = p[2];
+            size_t at = (size_t)y * cv->pw + x;
+            full[0][at] = (uint8_t)clamp_u8((19595 * r + 38470 * g + 7471 * b + 32768) >> 16);
+            full[1][at] = (uint8_t)clamp_u8(((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16) + 128);
+            full[2][at] = (uint8_t)clamp_u8(((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128);
+        }
+    if (!cc) {
+        for (int c = 0; c < 3; c++) cv->base[c] = full[c];
+        return 0;
+    }
+    cv->base[0] = full[0];
+    for (int c = 1; c < 3; c++) {
+        uint8_t* h = (uint8_t*)malloc((size_t)cc->pw * cc->ph);
+        if (!h) { free(full[1]); free(full[2]); return -1; }
+        for (int y = 0; y < cc->ph; y++)
+            for (int x = 0; x < cc->pw; x++) {
+                int sum = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        int fx = 2 * x + i, fy = 2 * y + j;
+                        if (fx >= cv->pw) fx = cv->pw - 1;
+                        if (fy >= cv->ph) fy = cv->ph - 1;
+                        sum += full[c][(size_t)fy * cv->pw + fx];
+                    }
+                h[(size_t)y * cc->pw + x] = (uint8_t)((sum + 2) >> 2);
+            }
+        cc->base[c - 1] = h;
+        free(full[c]);
+    }
+    return 0;
 }
 
 /*
@@ -587,7 +850,7 @@ static void canvas_free(Canvas* cv) {
  */
 static int predict(const Canvas* cv, int c, int x, int y, int n) {
     if (cv->fixed_pred) return 128;
-    const uint8_t* p = cv->flat[c];
+    const uint8_t* p = cv->dirpred ? cv->full[c] : cv->flat[c];
     int sum = 0, k = 0;
     if (y > 0) {
         int x1 = x + n < cv->pw ? x + n : cv->pw;
@@ -600,6 +863,130 @@ static int predict(const Canvas* cv, int c, int x, int y, int n) {
         k += y1 - y;
     }
     return k ? (sum + k / 2) / k : 128;
+}
+
+/*
+ * DIRECTIONAL PREDICTION
+ * ----------------------
+ * With NVDR_FLAG_DIRPRED a leaf is predicted from the reconstruction
+ * around it: the row above, extended right to twice the leaf by repeating
+ * its last pixel, the column to the left, extended down the same way, and
+ * the corner. A side the canvas does not have takes the first pixel of
+ * the other; with neither everything is 128. The modes:
+ *
+ *   0       flat: the mean of that row and column, as without the flag
+ *   1       planar, HEVC's
+ *   2..8    from above, at HEVC's angles -32 -17 -9 0 9 17 32 (in 32nds
+ *           of a pixel per row; 0 is vertical, -32 comes from the corner,
+ *           32 from above-right)
+ *   9..14   from the left, at -17 -9 0 9 17 32 (0 is horizontal, 32 from
+ *           below-left)
+ *
+ * The angular modes are HEVC's exactly: each row steps along the
+ * reference by the angle, interpolated in 32nds, and a negative angle
+ * reaches round the corner by projecting the other side with HEVC's
+ * inverse angles. The DC level then moves the whole prediction by a
+ * constant, and the texture is the DCT of what is left. All integer.
+ */
+static const int MODE_ANGLE[NVDR_MODES] = { 0, 0, -32, -17, -9, 0, 9, 17, 32, -17, -9, 0, 9, 17, 32 };
+static int inv_angle(int a) {
+    return a == -32 ? -256 : a == -17 ? -482 : a == -9 ? -910 : 0;
+}
+
+/* One angular prediction along `main`, with `side` round the corner:
+ * main[0] and side[0] are the corner, then 2n samples each. Writes
+ * P[r * n + k] for r the step along the angle, k across it. */
+static void angular(const int* main, const int* side, int n, int angle, int* P) {
+    int buf[4 * NVDR_MAX_BLOCK + 2], *ref = buf + 2 * NVDR_MAX_BLOCK;
+    for (int k = 0; k <= 2 * n; k++) ref[k] = main[k];
+    if (angle < 0) {
+        int last = (n * angle) >> 5, inv = inv_angle(angle);
+        for (int k = -1; k >= last; k--) ref[k] = side[(k * inv + 128) >> 8];
+    }
+    for (int r = 0; r < n; r++) {
+        int pos = (r + 1) * angle, idx = pos >> 5, fact = pos & 31;
+        for (int k = 0; k < n; k++) {
+            int a0 = ref[k + idx + 1], a1 = ref[k + idx + 2 <= 2 * n ? k + idx + 2 : 2 * n];
+            P[r * n + k] = fact ? ((32 - fact) * a0 + fact * a1 + 16) >> 5 : a0;
+        }
+    }
+}
+
+/* The position of a 4x4 cell in the order a tile's quadtree is decoded. */
+static int zorder(int cx, int cy) {
+    int z = 0;
+    for (int b = 0; b < 4; b++) z |= ((cx >> b) & 1) << (2 * b) | ((cy >> b) & 1) << (2 * b + 1);
+    return z;
+}
+
+/* Whether pixel (px, py) was decoded before the leaf at (x, y): in an
+ * earlier tile, or earlier in this tile's quadtree. */
+static int decoded_before(const Canvas* cv, int x, int y, int px, int py) {
+    if (px < 0 || py < 0 || px >= cv->pw || py >= cv->ph) return 0;
+    int t = cv->tile, lt = (y / t) * 65536 + x / t, pt = (py / t) * 65536 + px / t;
+    if (pt != lt) return pt < lt;
+    return zorder((px % t) / 4, (py % t) / 4) < zorder((x % t) / 4, (y % t) / 4);
+}
+
+static void dir_predict(const Canvas* cv, int c, int x, int y, int n, int mode, int* P) {
+    if (mode == MODE_INTER) {
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) P[j * n + i] = cv->base[c][(size_t)(y + j) * cv->pw + x + i];
+        return;
+    }
+    const uint8_t* f = cv->full[c];
+    int pw = cv->pw, T[2 * NVDR_MAX_BLOCK + 1] = { 0 }, L[2 * NVDR_MAX_BLOCK + 1] = { 0 };
+    int top = y > 0, left = x > 0;
+    /* T[0] and L[0] are the corner, then 2n samples: the row above and on
+     * past the leaf while it has been decoded, then its last repeated;
+     * the column to the left likewise down. */
+    int tr = top, bl = left;
+    for (int i = 0; i < 2 * n; i++) {
+        if (i >= n && tr && !(i % 4) && !decoded_before(cv, x, y, x + i, y - 1)) tr = 0;
+        if (i >= n && bl && !(i % 4) && !decoded_before(cv, x, y, x - 1, y + i)) bl = 0;
+        T[i + 1] = !top ? 0 : (i < n || tr) ? f[(size_t)(y - 1) * pw + x + i] : T[i];
+        L[i + 1] = !left ? 0 : (i < n || bl) ? f[(size_t)(y + i) * pw + x - 1] : L[i];
+    }
+    if (!top && !left) { for (int i = 0; i <= 2 * n; i++) T[i] = L[i] = 128; }
+    else if (!top) { for (int i = 0; i <= 2 * n; i++) T[i] = L[1]; L[0] = L[1]; }
+    else if (!left) { for (int i = 0; i <= 2 * n; i++) L[i] = T[1]; T[0] = T[1]; }
+    else T[0] = L[0] = f[(size_t)(y - 1) * pw + x - 1];
+    if (n >= 8 && mode != 0) {
+        /* HEVC's [1 2 1] over the references, corner shared. */
+        int t2[2 * NVDR_MAX_BLOCK + 1], l2[2 * NVDR_MAX_BLOCK + 1];
+        t2[0] = l2[0] = (T[1] + 2 * T[0] + L[1] + 2) >> 2;
+        for (int i = 1; i < 2 * n; i++) {
+            t2[i] = (T[i - 1] + 2 * T[i] + T[i + 1] + 2) >> 2;
+            l2[i] = (L[i - 1] + 2 * L[i] + L[i + 1] + 2) >> 2;
+        }
+        t2[2 * n] = T[2 * n]; l2[2 * n] = L[2 * n];
+        memcpy(T, t2, sizeof(int) * (2 * n + 1)); memcpy(L, l2, sizeof(int) * (2 * n + 1));
+    }
+    int sh = log2_int(n);
+    if (mode == 1) {
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++)
+                P[j * n + i] = ((n - 1 - i) * L[j + 1] + (i + 1) * T[n + 1] +
+                                (n - 1 - j) * T[i + 1] + (j + 1) * L[n + 1] + n) >> (sh + 1);
+        return;
+    }
+    int tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    if (mode <= 8) { angular(T, L, n, MODE_ANGLE[mode], P); return; }
+    /* From the left: the same along the column, then transposed. */
+    angular(L, T, n, MODE_ANGLE[mode], tmp);
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) P[j * n + i] = tmp[i * n + j];
+}
+
+/* A leaf painted with a prediction moved by `offset`, and no texture. */
+static void paint_pred(Canvas* cv, int c, int x, int y, int n, const int* P, int offset) {
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) {
+            size_t at = (size_t)(y + j) * cv->pw + x + i;
+            uint8_t v = (uint8_t)clamp_u8(P[j * n + i] + offset);
+            cv->flat[c][at] = cv->full[c][at] = v;
+            cv->acc[c][at] = 0;
+        }
 }
 
 static void fill(uint8_t* p, int stride, int x, int y, int w, int h, int v) {
@@ -626,11 +1013,18 @@ static void tile_fallback(Canvas* cv, int tx, int ty) {
     int h = ty + cv->tile < cv->ph ? cv->tile : cv->ph - ty;
     for (int c = 0; c < cv->np; c++) {
         paint_flat(cv, c, tx, ty, w, h, 128);
+        /* With a base, a tile that never arrived shows the base. */
+        if (cv->inter)
+            for (int j = ty; j < ty + h; j++)
+                for (int i = tx; i < tx + w; i++) {
+                    size_t at = (size_t)j * cv->pw + i;
+                    cv->flat[c][at] = cv->full[c][at] = cv->base[c][at];
+                }
     }
 }
 
 /* The pixels the texture in scan positions [start, end) adds to a leaf. */
-static void texture_residual(int s, const int* lv, int start, int end, int step, int* res) {
+static void texture_residual(int s, int tx, const int* lv, int start, int end, int step, int* res) {
     int n = NVDR_MIN_BLOCK << s, count = n * n;
     int coef[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     memset(coef, 0, sizeof(int) * count);
@@ -642,7 +1036,7 @@ static void texture_residual(int s, const int* lv, int start, int end, int step,
         if (u > mu) mu = u;
         if (v > mv) mv = v;
     }
-    inverse_dct(s, coef, res, mu, mv);
+    inverse_dct(s, tx, coef, res, mu, mv);
 }
 
 /* Adds them to the leaf's accumulated texture, and shows flat + texture
@@ -658,10 +1052,10 @@ static void add_residual(Canvas* cv, int c, int x, int y, int n, const int* res)
         }
 }
 
-static void apply_texture(Canvas* cv, int c, int x, int y, int n, const int* lv,
+static void apply_texture(Canvas* cv, int c, int x, int y, int n, int tx, const int* lv,
                           int start, int end, int step) {
     int res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-    texture_residual(size_class(n), lv, start, end, step, res);
+    texture_residual(size_class(n), tx, lv, start, end, step, res);
     add_residual(cv, c, x, y, n, res);
 }
 
@@ -697,7 +1091,8 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
     if (!h->q_luma || !h->q_chroma) return -1;
-    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN))
+    if (h->flags & ~(NVDR_FLAG_RESIDUAL | NVDR_FLAG_DEBLOCK | NVDR_FLAG_CHROMA420 | NVDR_FLAG_GRAIN |
+                     NVDR_FLAG_TILEQ | NVDR_FLAG_DIRPRED | NVDR_FLAG_INTER))
         return -1;   /* a flag this decoder does not know */
     /* Grain parameters sit between the header and the first layer; byte
      * 29 says how many there are. */
@@ -709,6 +1104,11 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if ((h->flags & NVDR_FLAG_CHROMA420) && h->max_block < 8) return -1;
     for (int k = 0; k < NVDR_LAYERS; k++) if (h->stored_bytes[k] > 0x7fffffffu) return -1;
     if (h->band > 32) return -1;
+    /* Directional prediction decodes colour and texture together, so it
+     * has no second texture layer, and a residual has nothing to predict
+     * from. */
+    if ((h->flags & NVDR_FLAG_DIRPRED) && (h->band != 0 || (h->flags & NVDR_FLAG_RESIDUAL))) return -1;
+    if ((h->flags & NVDR_FLAG_INTER) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
     return 0;
 }
 
@@ -724,6 +1124,7 @@ typedef struct {
     Canvas         cv;
     double*        src[3];      /* the planes' source, padded by replication */
     double         lambda, skip_lambda;   /* see code_leaf() */
+    double         lambda_base; /* lambda at the header's step, for rdoq() */
     int*           split;       /* one decision per node, per size */
     size_t         grid_base[NSIZES];
     int            grid_w[NSIZES];
@@ -744,14 +1145,24 @@ typedef struct {
     Part           part[2];
     int            nparts;
     Part*          p;           /* the tree being searched or coded */
-    int            step[3];     /* per component */
+    int            step[3];     /* per component, for the tile being coded */
+    int            base_step[3];   /* the header's */
+    const int8_t*  tq;          /* tile step offsets, or NULL */
+    int            tiles_x;
     double         deadzone;
+    int            rdoq;
     ColourModels   cm;
     TextureModels  tm;           /* the low band */
     TextureModels  tm2;          /* the high band */
     int            band_at[NSIZES];   /* first high-band scan position per size */
     double         plane_bits[3];   /* what the coded leaves cost, per component */
+    int            tx;          /* the luma transform type being tried or coded */
 } Enc;
+
+/* Whether plane c's leaves of size n choose a transform type. */
+static int tx_ok(const Canvas* cv, int c, int n) {
+    return cv->dirpred && cv->comp0 + c == 0 && n <= TX_MAX_N;
+}
 
 static size_t node_id(const Enc* e, int x, int y, int n) {
     int s = size_class(n);
@@ -779,7 +1190,13 @@ static int quantise(double v, double dz) {
  * colour is the prediction and there is no texture. Returns the squared
  * error over the pixels inside the image.
  */
-static double leaf_levels(Enc* e, int x, int y, int n, int skip,
+#define RDOQ_PICTURE  0.6
+#define RDOQ_RESIDUAL 0.6
+#define RDOQ_KEEP     4
+static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv,
+                 int start, int end, double lam, int keep);
+
+static double leaf_levels(Enc* e, int x, int y, int n, int skip, int mode,
                           int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], int* textured) {
     Part* P = e->p;
     Canvas* cv = &P->cv;
@@ -788,28 +1205,89 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
     int any = 0;
     for (int c = 0; c < cv->np; c++) {
         int step = e->step[cv->comp0 + c];
-        int pred = predict(cv, c, x, y, n);
-        dl[c] = 0;
         size_t b = (size_t)((y - P->pre_y) / n) * (cv->pw / n) + (size_t)(x / n);
-        if (!skip) {
-            double sum = P->pre_sum[sc][c][b];
-            /* The orthonormal DC of (block - prediction) is n * its mean. */
-            double dc = (sum / count - pred) * n;
-            dl[c] = quantise(dc / step, 0.0);
-        }
-        int colour = clamp_u8(pred + div_round(clamp_coef((long)dl[c] * step), n));
-        paint_flat(cv, c, x, y, n, n, colour);
-
         memset(lv[c], 0, sizeof(int) * count);
-        int nonzero = 0;
-        if (!skip) {
+        int nonzero = 0, txc = tx_ok(cv, c, n) ? e->tx : 0;
+        if (mode == MODE_INTER && !txc) {
+            /* The base under the leaf, moved by the DC; the texture of
+             * the block minus the base, prepared with the row. */
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            dir_predict(cv, c, x, y, n, MODE_INTER, pr);
+            double dc = P->pre_sum[sc][c][b] / count * n;
+            dl[c] = quantise(dc / step, 0.0);
+            paint_pred(cv, c, x, y, n, pr, div_round(clamp_coef((long)dl[c] * step), n));
             memcpy(lv[c], P->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
             nonzero = P->pre_nz[sc][c][b];
-        }
-        if (nonzero) {
-            add_residual(cv, c, x, y, n, P->pre_lo[sc][c] + b * count);
-            if (e->band_at[sc] < count) add_residual(cv, c, x, y, n, P->pre_hi[sc][c] + b * count);
-            any = 1;
+            if (nonzero) {
+                add_residual(cv, c, x, y, n, P->pre_lo[sc][c] + b * count);
+                any = 1;
+            }
+        } else if (mode > 0 || cv->inter || txc) {
+            /* The texture of a directional prediction depends on the
+             * prediction, so it is transformed here and not beforehand. */
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            if (mode > 0) dir_predict(cv, c, x, y, n, mode, pr);
+            else {
+                /* Flat in a picture with a base: its texture is not
+                 * prepared, since the row's is the block minus the base. */
+                int f = predict(cv, c, x, y, n);
+                for (int i = 0; i < count; i++) pr[i] = f;
+            }
+            for (int j = 0; j < n; j++)
+                for (int i = 0; i < n; i++)
+                    blk[j * n + i] = P->src[c][(size_t)(y + j) * cv->pw + x + i] - pr[j * n + i];
+            forward_dct(sc, blk, co);
+            /* Under a DST the texture carries the level too: its basis
+             * has no flat vector, so a residual with its mean taken out
+             * would cost it several coefficients to say nothing. */
+            dl[c] = txc ? 0 : quantise(co[0] / step, 0.0);
+            paint_pred(cv, c, x, y, n, pr, div_round(clamp_coef((long)dl[c] * step), n));
+            int t0 = txc ? 0 : 1;
+            if (txc) {
+                for (int j = 0; j < n; j++)
+                    for (int i = 0; i < n; i++) {
+                        size_t at = (size_t)(y + j) * cv->pw + x + i;
+                        blk[j * n + i] = P->src[c][at] - cv->flat[c][at];
+                    }
+                forward_tx(sc, txc, blk, co);
+            }
+            double v[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            for (int i = t0; i < count; i++) v[i] = co[scan_pos[sc][i]] / step;
+            if (e->rdoq) {
+                double lam = P->lambda_base / ((double)e->base_step[cv->comp0 + c] * e->base_step[cv->comp0 + c]) *
+                             (cv->inter ? RDOQ_RESIDUAL : RDOQ_PICTURE);
+                int keep = mode == MODE_INTER ? 0 : RDOQ_KEEP;
+                rdoq(&e->tm, sc, cv->comp0 + c, v, lv[c], t0, count, lam, keep);
+            } else
+                for (int i = t0; i < count; i++) lv[c][i] = quantise(v[i], e->deadzone);
+            for (int i = t0; i < count; i++) nonzero |= lv[c][i];
+            if (nonzero) {
+                int res[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                texture_residual(sc, txc, lv[c], t0, count, step, res);
+                add_residual(cv, c, x, y, n, res);
+                any = 1;
+            }
+        } else {
+            int pred = predict(cv, c, x, y, n);
+            dl[c] = 0;
+            if (!skip) {
+                double sum = P->pre_sum[sc][c][b];
+                /* The orthonormal DC of (block - prediction) is n * its mean. */
+                double dc = (sum / count - pred) * n;
+                dl[c] = quantise(dc / step, 0.0);
+            }
+            int colour = clamp_u8(pred + div_round(clamp_coef((long)dl[c] * step), n));
+            paint_flat(cv, c, x, y, n, n, colour);
+            if (!skip) {
+                memcpy(lv[c], P->pre[sc][c] + b * count, sizeof(int) * (size_t)count);
+                nonzero = P->pre_nz[sc][c][b];
+            }
+            if (nonzero) {
+                add_residual(cv, c, x, y, n, P->pre_lo[sc][c] + b * count);
+                if (e->band_at[sc] < count) add_residual(cv, c, x, y, n, P->pre_hi[sc][c] + b * count);
+                any = 1;
+            }
         }
 
         for (int j = 0; j < n && y + j < cv->h; j++)
@@ -824,16 +1302,17 @@ static double leaf_levels(Enc* e, int x, int y, int n, int skip,
 }
 
 /* s1 is the two texture layers' sinks, low band then high. */
-static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
+static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n, int mode,
                       const int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK]) {
     int sc = size_class(n), count = n * n, at = e->band_at[sc];
     const Canvas* cv = &e->p->cv;
+    if (cv->dirpred) put_mode(s0, &e->cm, sc, mode, cv->inter);
     for (int c = 0; c < cv->np; c++) {
         int k = cv->comp0 + c;
         double before = s0->bits + s1[0].bits + s1[1].bits;
         put_dc(s0, &e->cm, sc, k, dl[c]);
-        put_texture(&s1[0], &e->tm, sc, k, lv[c], 1, at);
-        if (at < count) put_texture(&s1[1], &e->tm2, sc, k, lv[c], at, count);
+        put_texture(&s1[0], &e->tm, sc, k, lv[c], 1, at, tx_ok(cv, c, n) ? e->tx : -1);
+        if (at < count) put_texture(&s1[1], &e->tm2, sc, k, lv[c], at, count, -1);
         if (s0->enc) e->plane_bits[k] += s0->bits + s1[0].bits + s1[1].bits - before;
     }
 }
@@ -849,31 +1328,147 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n,
  * whatever small error the reference carries, a little differently each
  * frame, and a background that does not move shimmers.
  */
+/* How many directional modes code_leaf() tries in full after screening. */
+#define DIR_TRIED 5
+/* Mean squared error per sample above which a leaf of a picture with a
+ * base tries the other modes besides INTER. */
+#define INTRA_TRY 16.0
+
+/* Sum of absolute 4x4 Hadamard coefficients of source minus prediction. */
+static double satd_leaf(const double* src, int pw, int x, int y, int n, const int* pr) {
+    double acc = 0.0;
+    for (int by = 0; by < n; by += 4)
+        for (int bx = 0; bx < n; bx += 4) {
+            double d[16];
+            for (int j = 0; j < 4; j++)
+                for (int i = 0; i < 4; i++)
+                    d[4 * j + i] = src[(size_t)(y + by + j) * pw + x + bx + i] - pr[(by + j) * n + bx + i];
+            for (int j = 0; j < 4; j++) {
+                double* r = d + 4 * j, a = r[0] + r[1], b = r[0] - r[1], c = r[2] + r[3], e = r[2] - r[3];
+                r[0] = a + c; r[1] = b + e; r[2] = a - c; r[3] = b - e;
+            }
+            for (int i = 0; i < 4; i++) {
+                double a = d[i] + d[4 + i], b = d[i] - d[4 + i], c = d[8 + i] + d[12 + i], e = d[8 + i] - d[12 + i];
+                acc += fabs(a + c) + fabs(b + e) + fabs(a - c) + fabs(b - e);
+            }
+        }
+    return acc;
+}
+
 static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, int* textured) {
     static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-    int skip = 0;
-    double skip_lambda = e->p->skip_lambda;
-    if (skip_lambda > 0.0) {
+    int skip = 0, mode = 0;
+    double skip_lambda = e->p->skip_lambda, best_j = 1e300;
+    e->tx = 0;
+    if (e->p->cv.inter) {
+        /* INTER first; the other modes only where it does badly (a mean
+         * squared error over INTRA_TRY), which is where something is
+         * uncovered or comes in: flat and the best few directions. */
+        const Canvas* cv = &e->p->cv;
         Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
-        double d_skip = leaf_levels(e, x, y, n, 1, dl, lv, NULL);
-        leaf_emit(e, &c0, c1, n, dl, lv);
+        double d = leaf_levels(e, x, y, n, 0, MODE_INTER, dl, lv, NULL);
+        leaf_emit(e, &c0, c1, n, MODE_INTER, dl, lv);
+        double best = d + e->p->lambda * (c0.bits + c1[0].bits + c1[1].bits);
+        best_j = best;
+        mode = MODE_INTER;
+        if (d / (double)(n * n * cv->np) > INTRA_TRY) {
+            int cand[1 + DIR_TRIED] = { 0 }, nc = 1;
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            double sc_best[DIR_TRIED];
+            for (int m = 1; m < NVDR_MODES; m++) {
+                dir_predict(cv, 0, x, y, n, m, pr);
+                double sat = satd_leaf(e->p->src[0], cv->pw, x, y, n, pr);
+                int k = nc - 1;
+                if (k < DIR_TRIED) { cand[nc++] = m; sc_best[k] = sat; }
+                else if (sat < sc_best[DIR_TRIED - 1]) { cand[DIR_TRIED] = m; sc_best[DIR_TRIED - 1] = sat; }
+                else continue;
+                for (int a = (k < DIR_TRIED ? k : DIR_TRIED - 1); a > 0 && sc_best[a] < sc_best[a - 1]; a--) {
+                    double t = sc_best[a]; sc_best[a] = sc_best[a - 1]; sc_best[a - 1] = t;
+                    int tm = cand[a + 1]; cand[a + 1] = cand[a]; cand[a] = tm;
+                }
+            }
+            for (int ci = 0; ci < nc; ci++) {
+                Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
+                double dm = leaf_levels(e, x, y, n, 0, cand[ci], dl, lv, NULL);
+                leaf_emit(e, &k0, k1, n, cand[ci], dl, lv);
+                double j = dm + e->p->lambda * (k0.bits + k1[0].bits + k1[1].bits);
+                if (j < best) { best = j; mode = cand[ci]; }
+            }
+        }
+        best_j = best;
+    } else if (e->p->cv.dirpred) {
+        /* The directional modes screened by the Hadamard sum of their
+         * error on the first plane, as HEVC's reference encoder does; flat
+         * and the best few tried in full, the cheapest by error plus
+         * lambda times bits coded. The canvas ends up holding the last
+         * tried, so the winner is reconstructed again. */
+        int cand[1 + DIR_TRIED] = { 0 }, nc = 1;
+        {
+            const Canvas* cv = &e->p->cv;
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            double sc_best[DIR_TRIED];
+            for (int m = 1; m < NVDR_MODES; m++) {
+                dir_predict(cv, 0, x, y, n, m, pr);
+                double sat = satd_leaf(e->p->src[0], cv->pw, x, y, n, pr);
+                int k = nc - 1;
+                if (k < DIR_TRIED) { cand[nc++] = m; sc_best[k] = sat; }
+                else if (sat < sc_best[DIR_TRIED - 1]) { cand[DIR_TRIED] = m; sc_best[DIR_TRIED - 1] = sat; }
+                else continue;
+                /* keep the tried list sorted by score */
+                for (int a = (k < DIR_TRIED ? k : DIR_TRIED - 1); a > 0 && sc_best[a] < sc_best[a - 1]; a--) {
+                    double t = sc_best[a]; sc_best[a] = sc_best[a - 1]; sc_best[a - 1] = t;
+                    int tm = cand[a + 1]; cand[a + 1] = cand[a]; cand[a] = tm;
+                }
+            }
+        }
+        double best = 1e300;
+        for (int ci = 0; ci < nc; ci++) {
+            int m = cand[ci];
+            Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
+            double d = leaf_levels(e, x, y, n, 0, m, dl, lv, NULL);
+            leaf_emit(e, &c0, c1, n, m, dl, lv);
+            double j = d + e->p->lambda * (c0.bits + c1[0].bits + c1[1].bits);
+            if (j < best) { best = j; mode = m; }
+        }
+        best_j = best;
+    } else if (skip_lambda > 0.0) {
+        Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
+        double d_skip = leaf_levels(e, x, y, n, 1, 0, dl, lv, NULL);
+        leaf_emit(e, &c0, c1, n, 0, dl, lv);
         double j_skip = d_skip + skip_lambda * (c0.bits + c1[0].bits + c1[1].bits);
         Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
         int tex = 0;
-        double d_code = leaf_levels(e, x, y, n, 0, dl, lv, &tex);
-        leaf_emit(e, &k0, k1, n, dl, lv);
+        double d_code = leaf_levels(e, x, y, n, 0, 0, dl, lv, &tex);
+        leaf_emit(e, &k0, k1, n, 0, dl, lv);
         double j_code = d_code + skip_lambda * (k0.bits + k1[0].bits + k1[1].bits);
         skip = j_skip <= j_code;
         /* Coded wins: the canvas, dl and lv already hold it, and redoing
          * it would give the same (costing only bits is not coding). */
         if (!skip) {
             if (textured) *textured = tex;
-            leaf_emit(e, s0, s1, n, dl, lv);
+            leaf_emit(e, s0, s1, n, 0, dl, lv);
             return d_code;
         }
     }
-    double err = leaf_levels(e, x, y, n, skip, dl, lv, textured);
-    leaf_emit(e, s0, s1, n, dl, lv);
+    /* The luma transform type, for the mode chosen with the DCT. */
+    if (tx_ok(&e->p->cv, 0, n)) {
+        /* Where the DCT leaves the luma no texture a DST cannot do
+         * better: a flat level is what the DCT's DC says exactly. */
+        int btx = 0, any = 0;
+        leaf_levels(e, x, y, n, 0, mode, dl, lv, NULL);
+        for (int i = 1; i < n * n && !any; i++) any = lv[0][i] != 0;
+        for (int t = 1; t < TX_TYPES && any; t++) {
+            Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
+            e->tx = t;
+            double dm = leaf_levels(e, x, y, n, 0, mode, dl, lv, NULL);
+            leaf_emit(e, &k0, k1, n, mode, dl, lv);
+            double j = dm + e->p->lambda * (k0.bits + k1[0].bits + k1[1].bits);
+            if (j < best_j) { best_j = j; btx = t; }
+        }
+        e->tx = btx;
+    }
+    double err = leaf_levels(e, x, y, n, skip, mode, dl, lv, textured);
+    leaf_emit(e, s0, s1, n, mode, dl, lv);
     return err;
 }
 
@@ -896,6 +1491,109 @@ static void load_block(Canvas* cv, int x, int y, int n, const uint8_t* buf) {
             memcpy(cv->full[c] + at, buf, (size_t)n); buf += n;
             memcpy(cv->acc[c] + at, buf, sizeof(int16_t) * (size_t)n); buf += 2 * n;
         }
+}
+
+/*
+ * RATE-DISTORTION QUANTISATION
+ * ----------------------------
+ * Rounding each coefficient to its nearest level with a fixed dead zone
+ * spends bits wherever a level is barely over a half: a 1 that costs
+ * eight bits to say buys less error than eight bits are worth. rdoq()
+ * decides the levels of one band of one block the way HEVC's reference
+ * encoder does, against the texture models as they stand when the row is
+ * prepared:
+ *
+ *   1. front to back, each coefficient takes whichever of its rounded
+ *      level and one less (down to zero) costs less error plus lambda
+ *      times the bits the models charge for it: significance, the
+ *      "not last" flag, magnitude and sign;
+ *   2. then the block's last level is chosen: every nonzero position is
+ *      tried as the last, everything after it dropped, against dropping
+ *      the whole band.
+ *
+ * Errors are in units of the step squared, so lambda there is the tree's
+ * lambda over the step squared, the same at every step.
+ */
+/* The tree's lambda scaled for levels, swept from 0.4 to 1.5 on five
+ * photographs (BD-rate against AV1's and x265's intra frames) and three
+ * clips: 0.6 for pictures; residuals do as well at 0.6 as at 1, and 1
+ * lets the regression gate's closed loop drift past its limit. The
+ * first RDOQ_KEEP scan positions of a picture are left to the dead zone
+ * (see the caller). */
+
+static double rd_bit(const uint16_t* p, int b) { return bitcost[b][*p]; }
+
+static double rd_mag_bits(const TextureModels* m, int c, int g, int a) {
+    double bits = rd_bit(&m->gt1[c][g], a > 1);
+    if (a == 1) return bits;
+    int r = a - 2;
+    for (int i = 0; i < MAG_UNARY; i++) {
+        bits += rd_bit(&m->mag[c][i], r > i);
+        if (r <= i) return bits;
+    }
+    unsigned v = (unsigned)(r - MAG_UNARY) + 1;
+    int n = 0;
+    while ((v >> n) > 1) n++;
+    return bits + 2 * n + 1;
+}
+
+static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv,
+                 int start, int end, double lam, int keep) {
+    double cost[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* coded cost of each position */
+    double drop[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* its error if dropped */
+    int g = 0;
+    for (int i = start; i < end; i++) {
+        double a = fabs(v[i]);
+        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start), sp = sig_ctx(sc, i, t);
+        int l = (int)(a + 0.5);
+        if (l > COEF_MAX) l = COEF_MAX;
+        drop[i] = a * a;
+        double zero_bits = i < end - 1 ? rd_bit(&m->sig[sc][c][sp], 0) : 0.0;
+        double best = drop[i] + lam * zero_bits;
+        int bl = 0;
+        if (i < keep) {
+            /* Kept as rounded with the dead zone: see the caller. */
+            bl = (int)(a + 0.4);
+            if (bl > COEF_MAX) bl = COEF_MAX;
+            lv[i] = v[i] < 0 ? -bl : bl;
+            double bits = bl ? rd_mag_bits(m, c, gt1_ctx(t, g), bl) + 1.0 +
+                               (i < end - 1 ? rd_bit(&m->sig[sc][c][sp], 1) + rd_bit(&m->last[sc][c][pc], 0) : 0.0)
+                             : zero_bits;
+            cost[i] = (a - bl) * (a - bl) + lam * bits;
+            if (bl > 1) g++;
+            continue;
+        }
+        for (int lvl = l; lvl >= 1 && lvl >= l - 1; lvl--) {
+            double bits = rd_mag_bits(m, c, gt1_ctx(t, g), lvl) + 1.0;
+            if (i < end - 1) bits += rd_bit(&m->sig[sc][c][sp], 1) + rd_bit(&m->last[sc][c][pc], 0);
+            double j = (a - lvl) * (a - lvl) + lam * bits;
+            if (j < best) { best = j; bl = lvl; }
+        }
+        lv[i] = v[i] < 0 ? -bl : bl;
+        cost[i] = best;
+        if (bl > 1) g++;
+    }
+    /* The last level: coding up to k costs what positions start..k cost,
+     * the flag that says k is last instead of not, and the error of
+     * everything after k. */
+    double tail = 0.0;
+    for (int i = start; i < end; i++) tail += drop[i];
+    double best = tail + lam * rd_bit(&m->cbf[sc][c], 0);
+    int best_last = -1;
+    double prefix = 0.0;
+    int first_last = start;     /* no cut drops a kept level */
+    for (int i = start; i < end && i < keep; i++) if (lv[i]) first_last = i;
+    if (first_last > start || (keep > start && lv[start])) best = 1e300;
+    for (int k = start; k < end; k++) {
+        prefix += cost[k];
+        tail -= drop[k];
+        if (!lv[k] || k < first_last) continue;
+        int pc = scan_ctx[sc][k];
+        double flag = k < end - 1 ? rd_bit(&m->last[sc][c][pc], 1) - rd_bit(&m->last[sc][c][pc], 0) : 0.0;
+        double j = prefix + tail + lam * (rd_bit(&m->cbf[sc][c], 1) + flag);
+        if (j < best) { best = j; best_last = k; }
+    }
+    for (int i = best_last < start ? start : best_last + 1; i < end; i++) lv[i] = 0;
 }
 
 /*
@@ -923,15 +1621,23 @@ static void precompute_row(Enc* e, int ty) {
         for (int c = 0; c < cv->np; c++) {
             int* dst = P->pre[s][c];
             const double* src = P->src[c];
-            int step = e->step[cv->comp0 + c];
+            int base = e->base_step[cv->comp0 + c];
             double dz = e->deadzone;
             #pragma omp parallel for schedule(static)
             for (int b = 0; b < blocks; b++) {
                 int x = (b % gw) * n, y = ty + (b / gw) * n;
                 if (y + n > cv->ph) continue;
+                int step = e->tq ? tq_step(base, e->tq[(ty / cv->tile) * e->tiles_x + x / cv->tile]) : base;
                 double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                /* With a base, what mode INTER leaves: the block minus the
+                 * base's; otherwise the block, whose flat colour moves only
+                 * the DC. */
+                const uint8_t* bp = cv->inter ? cv->base[c] : NULL;
                 for (int j = 0; j < n; j++)
-                    for (int i = 0; i < n; i++) blk[j * n + i] = src[(size_t)(y + j) * cv->pw + x + i];
+                    for (int i = 0; i < n; i++) {
+                        size_t at = (size_t)(y + j) * cv->pw + x + i;
+                        blk[j * n + i] = src[at] - (bp ? bp[at] : 0);
+                    }
                 double sum = 0.0;
                 for (int j = 0; j < n; j++)
                     for (int i = 0; i < n; i++) sum += blk[j * n + i];
@@ -940,15 +1646,31 @@ static void precompute_row(Enc* e, int ty) {
                 int* q = dst + (size_t)b * count;
                 int nonzero = 0;
                 q[0] = 0;
-                for (int i = 1; i < count; i++) {
-                    q[i] = quantise(co[scan_pos[s][i]] / step, dz);
-                    nonzero |= q[i];
-                }
+                if (e->rdoq) {
+                    /* Each band against its own layer's models. */
+                    double v[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+                    for (int i = 1; i < count; i++) v[i] = co[scan_pos[s][i]] / step;
+                    double lam = P->lambda_base / ((double)base * base) *
+                                 (cv->fixed_pred || cv->inter ? RDOQ_RESIDUAL : RDOQ_PICTURE);
+                    int at = e->band_at[s];
+                    /* In a picture the lowest frequencies are left to the
+                     * dead zone: they draw ramps, and dropping their level
+                     * 1s turned the gate's gradient into bands (-6 dB for
+                     * 18% of its bytes). */
+                    int keep = cv->fixed_pred || cv->inter ? 0 : RDOQ_KEEP;
+                    rdoq(&e->tm, s, cv->comp0 + c, v, q, 1, at < count ? at : count, lam, keep);
+                    if (at < count) rdoq(&e->tm2, s, cv->comp0 + c, v, q, at, count, lam, keep);
+                    for (int i = 1; i < count; i++) nonzero |= q[i];
+                } else
+                    for (int i = 1; i < count; i++) {
+                        q[i] = quantise(co[scan_pos[s][i]] / step, dz);
+                        nonzero |= q[i];
+                    }
                 P->pre_nz[s][c][b] = (uint8_t)(nonzero != 0);
                 if (nonzero) {
                     int at = e->band_at[s];
-                    texture_residual(s, q, 1, at, step, P->pre_lo[s][c] + (size_t)b * count);
-                    if (at < count) texture_residual(s, q, at, count, step, P->pre_hi[s][c] + (size_t)b * count);
+                    texture_residual(s, 0, q, 1, at, step, P->pre_lo[s][c] + (size_t)b * count);
+                    if (at < count) texture_residual(s, 0, q, at, count, step, P->pre_hi[s][c] + (size_t)b * count);
                 }
             }
         }
@@ -1041,11 +1763,16 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     Enc e;
     memset(&e, 0, sizeof(e));
     int rc = -1;
+    int8_t* tq = NULL;
     NvdrEncoder enc0, enc1, enc2;
     memset(&enc0, 0, sizeof(enc0));
     memset(&enc1, 0, sizeof(enc1));
     memset(&enc2, 0, sizeof(enc2));
     int band = cfg.band < 0 ? 0 : (cfg.band > 32 ? 32 : cfg.band);
+    int inter = cfg.base != NULL && !cfg.residual && cfg.base->width == img->width &&
+                cfg.base->height == img->height;
+    int dirpred = (cfg.directional || inter) && !cfg.residual;
+    if (dirpred) band = 0;
     NvdrHeader h;
     memset(&h, 0, sizeof(h));
 
@@ -1060,6 +1787,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     for (int k = 0; k < e.nparts; k++) {
         Canvas* pc = &e.part[k].cv;
         pc->fixed_pred = cfg.residual != 0;
+        pc->dirpred = dirpred;
+        pc->inter = inter;
         for (int c = 0; c < pc->np; c++) {
             e.part[k].src[c] = (double*)malloc(sizeof(double) * pc->pw * pc->ph);
             if (!e.part[k].src[c]) goto done;
@@ -1103,17 +1832,21 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         }
     }
 
+    if (inter && canvas_base(&e.part[0].cv, e.nparts == 2 ? &e.part[1].cv : NULL, cfg.base) != 0) goto done;
     int qc = (int)(cfg.q * cfg.chroma_q + 0.5f);
     if (qc < 1) qc = 1;
     if (qc > 4095) qc = 4095;
     e.step[0] = cfg.q; e.step[1] = e.step[2] = qc;
+    for (int c = 0; c < 3; c++) e.base_step[c] = e.step[c];
     e.deadzone = cfg.deadzone;
+    e.rdoq = cfg.rdoq;
     double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     for (int k = 0; k < e.nparts; k++) {
         /* A colour sample at half size stands for four pixels: its error
          * weighs four times, which is lambda a quarter. */
         double scale = e.part[k].cv.comp0 && use420 ? 0.25 : 1.0;
         e.part[k].lambda = lambda * scale;
+        e.part[k].lambda_base = lambda * scale;
         e.part[k].skip_lambda = cfg.residual ? cfg.skip_k * lambda * scale : 0.0;
     }
     for (int s = 0; s < NSIZES; s++) e.band_at[s] = band_split(s, band);
@@ -1162,12 +1895,37 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
      * for real, which is what adapts them for the next. In 4:2:0 a tile is
      * luma's tree, then colour's over the same area at half size. */
     Canvas* cv = &e.part[0].cv;
+    e.tiles_x = (cv->pw + cv->tile - 1) / cv->tile;
+    if (cfg.tile_q) {
+        size_t tiles = (size_t)e.tiles_x * ((cv->ph + cv->tile - 1) / cv->tile);
+        tq = (int8_t*)malloc(tiles);
+        if (!tq) goto done;
+        for (size_t t = 0; t < tiles; t++)
+            tq[t] = (int8_t)(cfg.tile_q[t] < -TQ_MAX ? -TQ_MAX : cfg.tile_q[t] > TQ_MAX ? TQ_MAX : cfg.tile_q[t]);
+        e.tq = tq;
+    }
+    double lambda0[2], skip0[2];
+    for (int k = 0; k < e.nparts; k++) { lambda0[k] = e.part[k].lambda; skip0[k] = e.part[k].skip_lambda; }
+    int tq_prev = 0;
     for (int ty = 0; ty < cv->ph; ty += cv->tile) {
         for (int k = 0; k < e.nparts; k++) {
             e.p = &e.part[k];
             if (ty / (k + 1) < e.p->cv.ph) precompute_row(&e, ty / (k + 1));
         }
-        for (int tx = 0; tx < cv->pw; tx += cv->tile)
+        for (int tx = 0; tx < cv->pw; tx += cv->tile) {
+            if (e.tq) {
+                /* The tile's offset, then its trees at its step; lambda
+                 * follows the step squared, as it does across q. */
+                int d = e.tq[(ty / cv->tile) * e.tiles_x + tx / cv->tile];
+                put_tq(&s0, &e.cm, d - tq_prev);
+                tq_prev = d;
+                for (int c = 0; c < 3; c++) e.step[c] = tq_step(e.base_step[c], d);
+                double r = TQ_SCALE[d + TQ_MAX] / 1024.0;
+                for (int k = 0; k < e.nparts; k++) {
+                    e.part[k].lambda = lambda0[k] * r * r;
+                    e.part[k].skip_lambda = skip0[k] * r * r;
+                }
+            }
             for (int k = 0; k < e.nparts; k++) {
                 e.p = &e.part[k];
                 int x = tx / (k + 1), y = ty / (k + 1);
@@ -1175,7 +1933,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                 search(&e, x, y, e.p->cv.tile);
                 emit(&e, &s0, s1, x, y, e.p->cv.tile, &h);
             }
+        }
     }
+    for (int c = 0; c < 3; c++) e.step[c] = e.base_step[c];
     if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
         nvdr_enc_finish(&enc2) != 0) goto done;
     /* With no high band the stream holds no symbols, only the coder's
@@ -1189,7 +1949,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = NVDR_VERSION;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
-                       (use420 ? NVDR_FLAG_CHROMA420 : 0));
+                       (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0) |
+                       (dirpred ? NVDR_FLAG_DIRPRED : 0) | (inter ? NVDR_FLAG_INTER : 0));
     put_u16(buf + 6, (uint32_t)img->width);
     put_u16(buf + 8, (uint32_t)img->height);
     buf[10] = (uint8_t)cfg.max_block;
@@ -1220,6 +1981,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     rc = 0;
 
 done:
+    free(tq);
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
     nvdr_enc_free(&enc2);
@@ -1332,6 +2094,22 @@ static int encode_chroma(uint8_t** out_buf, size_t* out_len, const NvdrImage* im
         cfg.chroma420 = 0;
         return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
     }
+    /* Tile step offsets move the two modes' costs apart in ways that have
+     * nothing to do with colour (a sequence's intra frame, refined where
+     * it is reused, came out 4:2:0 on the gate's saturated drawing and
+     * lost 5 dB of RGB), so the mode is chosen without them and then
+     * coded with them. */
+    if (cfg.tile_q && !ctx) {
+        NvdrConfig plain = cfg;
+        plain.tile_q = NULL;
+        uint8_t* trial = NULL;
+        size_t trial_len = 0;
+        NvdrHeader th;
+        if (encode_chroma(&trial, &trial_len, img, &plain, &th, NULL) != 0) return -1;
+        free(trial);
+        cfg.chroma420 = (th.flags & NVDR_FLAG_CHROMA420) ? 1 : 0;
+        return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    }
     cfg.chroma420 = 1;
     if (chroma_halving_mse(img) < CHROMA_AUTO_FREE)
         return encode_mode(out_buf, out_len, img, &cfg, hdr_out, ctx);
@@ -1383,7 +2161,7 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
     *out_buf = NULL; *out_len = 0;
     tables_init();
     NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
-    if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || !img->pixels)
+    if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || cfg.base || !img->pixels)
         return encode_chroma(out_buf, out_len, img, &cfg, hdr_out, ctx);
     NvdrImage clean;
     NvdrGrain g;
@@ -1456,13 +2234,17 @@ static void upsample_plane(const uint8_t* src, const Canvas* cc, uint8_t* dst, i
 
 
 
-typedef struct { uint16_t x, y; uint8_t n; } Leaf;
+typedef struct { uint16_t x, y; uint8_t n, tex; } Leaf;
 
 typedef struct {
     Canvas*        cv;
     NvdrDecoder*   d;
     ColourModels*  cm;
     const int*     step;
+    /* With directional prediction, each leaf's texture comes from the
+     * first texture layer as soon as its colour does. */
+    NvdrDecoder*   d1;
+    TextureModels* tm;
     Leaf*          leaves;
     size_t         count, cap;
     int            corrupt;
@@ -1478,6 +2260,7 @@ static int push_leaf(Layer0* L, int x, int y, int n) {
     L->leaves[L->count].x = (uint16_t)x;
     L->leaves[L->count].y = (uint16_t)y;
     L->leaves[L->count].n = (uint8_t)n;
+    L->leaves[L->count].tex = 0;
     L->count++;
     return 0;
 }
@@ -1498,14 +2281,39 @@ static int read_node(Layer0* L, int x, int y, int n) {
         return 0;
     }
     int sc = size_class(n);
+    int mode = 0;
+    if (cv->dirpred) {
+        mode = get_mode(L->d, L->cm, sc, cv->inter);
+        if (mode < 0) { L->corrupt = 1; return 0; }
+    }
     for (int c = 0; c < cv->np; c++) {
         int k = cv->comp0 + c;
-        int pred = predict(cv, c, x, y, n);
         int dl = get_dc(L->d, L->cm, sc, k, &L->corrupt);
-        int colour = clamp_u8(pred + div_round(clamp_coef((long)dl * L->step[k]), n));
-        paint_flat(cv, c, x, y, n, n, colour);
+        int offset = div_round(clamp_coef((long)dl * L->step[k]), n);
+        if (mode > 0) {
+            int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+            dir_predict(cv, c, x, y, n, mode, pr);
+            paint_pred(cv, c, x, y, n, pr, offset);
+        } else
+            paint_flat(cv, c, x, y, n, n, clamp_u8(predict(cv, c, x, y, n) + offset));
     }
-    return push_leaf(L, x, y, n);
+    if (push_leaf(L, x, y, n) != 0) return -1;
+    if (cv->dirpred) {
+        /* The texture now, since the next leaf predicts from it. */
+        int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], count = n * n;
+        for (int c = 0; c < cv->np && !L->corrupt && !L->d1->overrun; c++) {
+            int tx = 0, txok = cv->comp0 + c == 0 && n <= TX_MAX_N;
+            if (get_texture(L->d1, L->tm, sc, cv->comp0 + c, lv, 1, count, &L->corrupt, txok ? &tx : NULL) &&
+                !L->corrupt && !L->d1->overrun) {
+                apply_texture(cv, c, x, y, n, tx, lv, tx ? 0 : 1, count, L->step[cv->comp0 + c]);
+                L->leaves[L->count - 1].tex = 1;
+            }
+        }
+        /* A texture layer that runs out is damage here: the leaves after
+         * would predict from a picture the encoder never saw. */
+        if (L->d1->overrun) L->corrupt = 1;
+    }
+    return 0;
 }
 
 /*
@@ -1546,8 +2354,10 @@ static int db_param(int step, int k16) { return (step * k16 + 8) >> 4; }
  */
 static int edge_filtered(int ca, int cb) { return ((ca | cb) & 0x80) != 0; }
 
+/* The step at an edge is that of the tile its second side lies in. */
 static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
-                          const uint8_t* vedge, const uint8_t* hedge, int step) {
+                          const uint8_t* vedge, const uint8_t* hedge, int base,
+                          const int8_t* tq, int tile, int tiles_x) {
     int gw = pw / 4, gh = ph / 4;
     for (int pass = 0; pass < 2; pass++)
         for (int gy = pass; gy < gh; gy++)
@@ -1556,6 +2366,7 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
                 if (!edge[gy * gw + gx]) continue;
                 int other = pass ? (gy - 1) * gw + gx : gy * gw + gx - 1;
                 if (!edge_filtered(cell[gy * gw + gx], cell[other])) continue;
+                int step = tq ? tq_step(base, tq[(gy * 4 / tile) * tiles_x + gx * 4 / tile]) : base;
                 int alpha = db_param(step, DB_ALPHA), beta = db_param(step, DB_BETA);
                 int tc = db_param(step, DB_TC);
                 int along = pass ? 1 : pw, across = pass ? pw : 1;
@@ -1576,7 +2387,8 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
  * leaf's size in cells and 0x80 when the leaf shows texture; `textured` is
  * NULL when only colours are shown. */
 static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const uint8_t* textured,
-                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step) {
+                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step,
+                   const int8_t* tq) {
     int gw = cv->pw / 4, gh = cv->ph / 4;
     uint8_t* vedge = (uint8_t*)calloc((size_t)gw * gh, 1);
     uint8_t* hedge = (uint8_t*)calloc((size_t)gw * gh, 1);
@@ -1598,7 +2410,7 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
         if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
     }
     for (int c = 0; c < cv->np; c++)
-        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c]);
+        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c], tq, cv->tile, tiles_x);
     free(vedge); free(hedge); free(cell);
     return 0;
 }
@@ -1612,8 +2424,9 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
  * only damage makes it do: the decode starts over, saving tiles. */
 #define DECODE_AGAIN (-2)
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
-                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful);
+static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base,
+                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
+                       int careful);
 
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
@@ -1622,13 +2435,21 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
      * to restore it (a tenth of the time); if one stops, the decode starts
      * over the careful way and gives what that gives. The context is only
      * written when a decode finishes, so starting over is safe. */
-    int rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 0);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, out, hdr_out, info, ctx, 1);
+    int rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 0);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 1);
     return rc;
 }
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
-                       NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx, int careful) {
+int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
+                         NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
+    int rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 0);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 1);
+    return rc;
+}
+
+static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base_img,
+                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
+                       int careful) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
@@ -1662,11 +2483,22 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     memset(L, 0, sizeof(L));
     uint8_t* up[2] = { NULL, NULL };
     uint8_t* saved = NULL;
+    int8_t* tq = NULL;
     if (canvas_init(&cvs[0], h.width, h.height, h.max_block, h.min_block, np == 2 ? 1 : 3, 0) != 0) goto done;
     if (np == 2 && canvas_init(&cvs[1], (h.width + 1) / 2, (h.height + 1) / 2, h.max_block / 2,
                                NVDR_MIN_BLOCK, 2, 1) != 0) goto done;
     Canvas* cv = &cvs[0];
-    for (int k = 0; k < np; k++) cvs[k].fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
+    int dirpred = (h.flags & NVDR_FLAG_DIRPRED) != 0;
+    for (int k = 0; k < np; k++) {
+        cvs[k].fixed_pred = (h.flags & NVDR_FLAG_RESIDUAL) != 0;
+        cvs[k].dirpred = dirpred;
+        cvs[k].inter = (h.flags & NVDR_FLAG_INTER) != 0;
+    }
+    /* A picture predicted from a base cannot be decoded without it. */
+    if (h.flags & NVDR_FLAG_INTER) {
+        if (!base_img || base_img->width != h.width || base_img->height != h.height ||
+            canvas_base(&cvs[0], np == 2 ? &cvs[1] : NULL, base_img) != 0) goto done;
+    }
     int tiles_x = (cv->pw + cv->tile - 1) / cv->tile, tiles_y = (cv->ph + cv->tile - 1) / cv->tile;
     int tiles = tiles_x * tiles_y;
     for (int k = 0; k < np; k++) {
@@ -1674,6 +2506,10 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
         if (!tile_start[k]) goto done;
     }
     int step[3] = { h.q_luma, h.q_chroma, h.q_chroma };
+    int tstep[3] = { step[0], step[1], step[2] };
+    /* The tiles' step offsets, as layer 0 delivers them; zero where it
+     * never did. */
+    if ((h.flags & NVDR_FLAG_TILEQ) && !(tq = (int8_t*)calloc((size_t)tiles, 1))) goto done;
 
     /* Layer 0: every tile that arrives whole; the rest predicted. */
     ColourModels cm;
@@ -1686,11 +2522,24 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     }
     NvdrDecoder d0;
     nvdr_dec_init(&d0, data + base, avail0);
-    for (int k = 0; k < np; k++) { L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = step; }
-    int complete0 = 0, stopped = 0;
+    NvdrDecoder d1;
+    nvdr_dec_init(&d1, data + off1, avail1);
+    for (int k = 0; k < np; k++) {
+        L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = tstep;
+        L[k].d1 = &d1; L[k].tm = &tms[0];
+    }
+    int complete0 = 0, stopped = 0, tq_prev = 0;
     for (int t = 0; t < tiles; t++) {
         int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
         for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
+        if (tq && !stopped) {
+            int d = tq_prev + get_tq(&d0, &cm);
+            if (d0.overrun || d < -TQ_MAX || d > TQ_MAX) stopped = 1;
+            else {
+                tq[t] = (int8_t)d; tq_prev = d;
+                for (int c = 0; c < 3; c++) tstep[c] = tq_step(step[c], d);
+            }
+        }
         for (int k = 0; k < np && !stopped; k++) {
             int x = tx / (k + 1), y = ty / (k + 1);
             if (!node_exists(&cvs[k], x, y)) continue;
@@ -1714,13 +2563,16 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
     for (int k = 0; k < np; k++) {
         textured[k] = (uint8_t*)calloc(L[k].count ? L[k].count : 1, 1);
         if (!textured[k]) goto done;
+        if (dirpred) for (size_t i = 0; i < L[k].count; i++) textured[k][i] = L[k].leaves[i].tex;
     }
+    /* With directional prediction the texture came with the colours. */
+    if (dirpred) { complete[1] = complete0; max_layer = -1; }
     saved = (uint8_t*)malloc((size_t)cv->tile * cv->tile * 9);   /* full and acc, 3 planes */
     if (!saved) goto done;
     for (int layer = 1; layer < NVDR_LAYERS; layer++) {
         const uint8_t* stream = data + (layer == 1 ? off1 : off2);
         size_t avail = layer == 1 ? avail1 : avail2;
-        if ((max_layer >= 0 && max_layer < layer) || avail < 5 || complete[layer - 1] == 0) break;
+        if (dirpred || (max_layer >= 0 && max_layer < layer) || avail < 5 || complete[layer - 1] == 0) break;
         if (layer == 2 && h.band == 0) break;
         TextureModels* tm = &tms[layer - 1];
         NvdrDecoder d;
@@ -1750,6 +2602,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
             }
             for (int k = 0; k < np && !d.overrun && !corrupt; k++) {
                 Canvas* pc = &cvs[k];
+                int tile_step[3] = { step[0], step[1], step[2] };
+                if (tq) for (int c = 0; c < 3; c++) tile_step[c] = tq_step(step[c], tq[t]);
                 for (size_t i = tile_start[k][t]; i < tile_start[k][t + 1] && !d.overrun && !corrupt; i++) {
                     const Leaf* f = &L[k].leaves[i];
                     int sc = size_class(f->n), count = f->n * f->n;
@@ -1757,8 +2611,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
                     if (start >= end) continue;
                     for (int c = 0; c < pc->np && !d.overrun && !corrupt; c++) {
                         int comp = pc->comp0 + c;
-                        if (get_texture(&d, tm, sc, comp, lv, start, end, &corrupt) && !d.overrun && !corrupt) {
-                            apply_texture(pc, c, f->x, f->y, f->n, lv, start, end, step[comp]);
+                        if (get_texture(&d, tm, sc, comp, lv, start, end, &corrupt, NULL) && !d.overrun && !corrupt) {
+                            apply_texture(pc, c, f->x, f->y, f->n, 0, lv, start, end, tile_step[comp]);
                             textured[k][i] = 1;
                         }
                     }
@@ -1796,7 +2650,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
         uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
         if ((h.flags & NVDR_FLAG_DEBLOCK) &&
             deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][complete0],
-                    complete0, tiles_x, tiles, step) != 0) {
+                    complete0, tiles_x, tiles, step, tq) != 0) {
             free(out->pixels); out->pixels = NULL; goto done;
         }
         for (int c = 0; c < cvs[k].np; c++) planes[cvs[k].comp0 + c] = pl[c];
@@ -1843,6 +2697,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, NvdrImag
 
 done:
     free(saved);
+    free(tq);
     for (int k = 0; k < 2; k++) {
         free(L[k].leaves);
         free(tile_start[k]);

@@ -90,13 +90,16 @@ int main(int argc, char** argv) {
     int i = 0, kind = 0, partial = 0, rc;
     double psnr_sum = 0.0; int psnr_n = 0;
     while ((rc = nvdrv_decode_next(dec, &f, &kind, &partial)) == 1) {
-        if (cmpdir && i < nsrc) {
+        /* Compared against the source frame it shows, which a cut file
+         * that skipped frames no longer lines up with by count. */
+        int shown = nvdrv_decode_display(dec);
+        if (cmpdir && shown < nsrc) {
             NvdrImage src;
-            if (nvdr_image_load(&src, srcs[i]) == 0) {
+            if (nvdr_image_load(&src, srcs[shown]) == 0) {
                 double p = nvdr_psnr(&src, &f);
                 psnr_sum += p; psnr_n++;
-                printf("  %5d  %-6s %6.2f dB%s\n", i,
-                       kind == NVDRV_INTRA ? "INTRA" : "pred", p,
+                printf("  %5d  %-6s %6.2f dB%s\n", shown,
+                       kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : "bi", p,
                        partial ? "   (quadro parcial)" : "");
                 nvdr_image_free(&src);
             }

@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-const VERSION = 11;
+const VERSION = 13;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -31,10 +31,24 @@ const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
 const FLAG_CHROMA420 = 0x04;  // colour in its own half-resolution tree
 const FLAG_GRAIN = 0x08;      // grain parameters follow the header
+const FLAG_TILEQ = 0x10;      // a step offset per tile, in layer 0
+const FLAG_DIRPRED = 0x20;    // directional prediction, not progressive
+const FLAG_INTER = 0x40;      // and from a base picture the caller holds
+
+/* Mirrors TQ_SCALE and tq_step(): a tile's step from the header's and its
+ * offset in sixths of a doubling. */
+const TQ_MAX = 12;
+const TQ_SCALE = [256, 287, 323, 362, 406, 456, 512, 575, 645, 724, 813, 912,
+                  1024, 1149, 1290, 1448, 1625, 1825, 2048, 2299, 2580, 2896, 3251, 3649, 4096];
+function tqStep(step, d) {
+    const s = (step * TQ_SCALE[d + TQ_MAX] + 512) >> 10;
+    return s < 1 ? 1 : s > 65535 ? 65535 : s;
+}
 const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
+const SIG_CTX = 25, GT1_CTX = 10;
 
 /* --- entropy layer, mirroring src/entropy.c -------------------------- */
 
@@ -126,6 +140,9 @@ function cosEntry(j) {
 }
 
 const TMAT = [], SCAN_POS = [], SCAN_CTX = [], SCAN_DIAG = [];
+// Per scan position, the scan positions of the five neighbours nb_mag()
+// reads, -1 off the block.
+const SCAN_NB = [];
 
 /* Mirrors band_split(): the first scan position of the high band. */
 function bandSplit(sc, band) {
@@ -152,8 +169,40 @@ for (let s = 0; s < NSIZES; s++) {
             diag[at] = d;
             at++;
         }
-    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag);
+    const idx = new Int32Array(n * n);
+    for (let i = 0; i < n * n; i++) idx[pos[i]] = i;
+    const nb = new Int32Array(n * n * 5).fill(-1);
+    const du = [1, 0, 1, 2, 0], dv = [0, 1, 1, 0, 2];
+    for (let i = 0; i < n * n; i++) {
+        const u = pos[i] & (n - 1), v = (pos[i] - u) / n;
+        for (let k = 0; k < 5; k++) {
+            const uu = u - du[k], vv = v - dv[k];
+            if (uu >= 0 && vv >= 0) nb[i * 5 + k] = idx[vv * n + uu];
+        }
+    }
+    TMAT.push(t); SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag); SCAN_NB.push(nb);
 }
+
+/* Mirrors nb_mag(), sig_ctx() and gt1_ctx(): what is coded around a
+ * position, neighbours outside the band counting as zero. */
+function nbMag(lv, sc, i, start) {
+    const nb = SCAN_NB[sc];
+    let t = 0;
+    for (let k = i * 5; k < i * 5 + 5; k++) {
+        const j = nb[k];
+        if (j < start || j >= i) continue;
+        const a = lv[j] < 0 ? -lv[j] : lv[j];
+        t += a < 3 ? a : 3;
+    }
+    return t;
+}
+function sigCtx(sc, i, t) {
+    const d = SCAN_DIAG[sc][i];
+    const pc = d <= 1 ? 0 : d === 2 ? 1 : d <= 4 ? 2 : d <= 7 ? 3 : 4;
+    const nb = (t + 1) >> 1;
+    return pc * 5 + (nb < 4 ? nb : 4);
+}
+const gt1Ctx = (t, g) => (t < 4 ? t : 4) + (g ? 5 : 0);
 
 const sizeClass = n => (n === 4 ? 0 : n === 8 ? 1 : n === 16 ? 2 : 3);
 const log2 = n => 31 - Math.clz32(n);
@@ -173,10 +222,19 @@ function divRound(a, n) {
  */
 const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
 const ROW = new Int32Array(MAX_BLOCK);
-function inverseDct(s, input, out, mu, mv) {
+/* Mirrors the transform types in nvdr.c: DST-VII for 4, 8 and 16, down
+ * the columns for types 1 and 2, along the rows for 1 and 3. */
+const TX_MAX_N = 16;
+const DST = [
+    Int32Array.from([29,55,74,84,74,74,0,-74,84,-29,-74,55,55,-84,74,-29]),
+    Int32Array.from([16,32,46,59,70,79,84,87,46,79,87,70,32,-16,-59,-84,70,84,32,-46,-87,-59,16,79,84,46,-59,-79,16,87,32,-70,87,-16,-84,32,79,-46,-70,59,79,-70,-16,84,-59,-32,87,-46,59,-87,70,-16,-46,84,-79,32,32,-59,79,-87,84,-70,46,-16]),
+    Int32Array.from([8,17,25,33,41,48,55,62,67,73,77,81,84,87,88,89,25,48,67,81,88,88,81,67,48,25,0,-25,-48,-67,-81,-88,41,73,88,84,62,25,-17,-55,-81,-89,-77,-48,-8,33,67,87,55,87,81,41,-17,-67,-89,-73,-25,33,77,88,62,8,-48,-84,67,88,48,-25,-81,-81,-25,48,88,67,0,-67,-88,-48,25,81,77,77,0,-77,-77,0,77,77,0,-77,-77,0,77,77,0,-77,84,55,-48,-87,-8,81,62,-41,-88,-17,77,67,-33,-89,-25,73,88,25,-81,-48,67,67,-48,-81,25,88,0,-88,-25,81,48,-67,89,-8,-88,17,87,-25,-84,33,81,-41,-77,48,73,-55,-67,62,87,-41,-67,73,33,-88,8,84,-48,-62,77,25,-89,17,81,-55,81,-67,-25,88,-48,-48,88,-25,-67,81,0,-81,67,25,-88,48,73,-84,25,55,-89,48,33,-87,67,8,-77,81,-17,-62,88,-41,62,-89,67,-8,-55,88,-73,17,48,-87,77,-25,-41,84,-81,33,48,-81,88,-67,25,25,-67,88,-81,48,0,-48,81,-88,67,-25,33,-62,81,-89,84,-67,41,-8,-25,55,-77,88,-87,73,-48,17,17,-33,48,-62,73,-81,87,-89,88,-84,77,-67,55,-41,25,-8])
+];
+function inverseDct(s, input, out, mu, mv, tx = 0) {
     // Integer sums, so the order, chosen for contiguous inner loops and to
     // skip zero terms, changes nothing.
-    const n = MIN_BLOCK << s, t = TMAT[s], shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
+    const n = MIN_BLOCK << s, shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
+    const t = tx === 1 || tx === 2 ? DST[s] : TMAT[s], th = tx === 1 || tx === 3 ? DST[s] : TMAT[s];
     for (let y = 0; y < n; y++) {
         ROW.fill(0, 0, mu + 1);
         for (let v = 0; v <= mv; v++) {
@@ -192,7 +250,7 @@ function inverseDct(s, input, out, mu, mv) {
             const k = TMP[row + u];
             if (k === 0) continue;
             const r = u * n;
-            for (let x = 0; x < n; x++) ROW[x] += k * t[r + x];
+            for (let x = 0; x < n; x++) ROW[x] += k * th[r + x];
         }
         for (let x = 0; x < n; x++) out[row + x] = (ROW[x] + half) >> shift2;
     }
@@ -209,17 +267,73 @@ function colourModels() {
         splitC: probs(NSIZES),   // the colour tree's, in 4:2:0
         dcZero: grid(NSIZES, 3),
         dcSign: probs(3),
-        dcMag: grid(3, MAG_UNARY)
+        dcMag: grid(3, MAG_UNARY),
+        tqZero: probs(1), tqSign: probs(1), tqMag: probs(2 * TQ_MAX),
+        modeFlat: probs(NSIZES), modeTree: probs(16), modeInter: probs(NSIZES)
     };
+}
+
+/* Mirrors get_mode(): INTER or not by size with a base, flat or not by
+ * size, then four bits down a tree. */
+function getMode(d, m, sc, inter) {
+    if (inter && !d.bit(m.modeInter, sc)) return MODE_INTER;
+    if (!d.bit(m.modeFlat, sc)) return 0;
+    let v = 0, node = 1;
+    for (let k = 0; k < 4; k++) {
+        const b = d.bit(m.modeTree, node);
+        v = 2 * v + b;
+        node = 2 * node + b;
+    }
+    return v < MODES - 1 ? v + 1 : -1;    // the last two are damage
+}
+
+/* Mirrors the directional prediction in nvdr.c: MODE_ANGLE, angular(),
+ * zorder(), decoded_before() and dir_predict(). */
+const MODES = 15;
+const MODE_INTER = MODES;
+const MODE_ANGLE = [0, 0, -32, -17, -9, 0, 9, 17, 32, -17, -9, 0, 9, 17, 32];
+const invAngle = a => (a === -32 ? -256 : a === -17 ? -482 : a === -9 ? -910 : 0);
+const REF = new Int32Array(4 * MAX_BLOCK + 2), REF0 = 2 * MAX_BLOCK;
+function angular(main, side, n, angle, P) {
+    for (let k = 0; k <= 2 * n; k++) REF[REF0 + k] = main[k];
+    if (angle < 0) {
+        const last = (n * angle) >> 5, inv = invAngle(angle);
+        for (let k = -1; k >= last; k--) REF[REF0 + k] = side[(k * inv + 128) >> 8];
+    }
+    for (let r = 0; r < n; r++) {
+        const pos = (r + 1) * angle, idx = pos >> 5, fact = pos & 31;
+        for (let k = 0; k < n; k++) {
+            const a0 = REF[REF0 + k + idx + 1], a1 = REF[REF0 + (k + idx + 2 <= 2 * n ? k + idx + 2 : 2 * n)];
+            P[r * n + k] = fact ? ((32 - fact) * a0 + fact * a1 + 16) >> 5 : a0;
+        }
+    }
+}
+function zorder(cx, cy) {
+    let z = 0;
+    for (let b = 0; b < 4; b++) z |= (((cx >> b) & 1) << (2 * b)) | (((cy >> b) & 1) << (2 * b + 1));
+    return z;
+}
+
+/* Mirrors get_tq(). */
+function getTq(d, m) {
+    if (!d.bit(m.tqZero, 0)) return 0;
+    const neg = d.bit(m.tqSign, 0);
+    let r = 0;
+    for (let i = 0; i < 2 * TQ_MAX - 1; i++) {
+        if (!d.bit(m.tqMag, i)) break;
+        r = i + 1;
+    }
+    return neg ? -(r + 1) : r + 1;
 }
 
 function textureModels() {
     return {
         cbf: grid(NSIZES, 3),
-        sig: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
+        sig: Array.from({ length: NSIZES }, () => grid(3, SIG_CTX)),
         last: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
-        gt1: grid(3, 4),
-        mag: grid(3, MAG_UNARY)
+        gt1: grid(3, GT1_CTX),
+        mag: grid(3, MAG_UNARY),
+        tx: grid(NSIZES, 3)
     };
 }
 
@@ -247,17 +361,26 @@ function getDc(d, m, sc, c, state) {
 }
 
 /* Mirrors get_texture(): fills lv[start, end). */
-function getTexture(d, m, sc, c, lv, start, end, state) {
+/* With `txOut` the leaf may choose its transform type (get_tx()): it is
+ * read into txOut.tx, 0 when the range carries nothing, and under a DST
+ * the range starts at 0. */
+function getTexture(d, m, sc, c, lv, start, end, state, txOut = null) {
+    if (txOut) { txOut.tx = 0; start = 0; }
     lv.fill(0, start, end);
     if (!d.bit(m.cbf[sc], c)) return false;
+    if (txOut) {
+        const t = m.tx[sc];
+        txOut.tx = !d.bit(t, 0) ? 0 : !d.bit(t, 1) ? 1 : d.bit(t, 2) ? 3 : 2;
+        if (!txOut.tx) start = 1;
+    }
     let g = 0;
     for (let i = start; i < end; i++) {
-        const pc = SCAN_CTX[sc][i];
-        const sig = i < end - 1 ? d.bit(m.sig[sc][c], pc) : 1;
+        const pc = SCAN_CTX[sc][i], t = nbMag(lv, sc, i, start);
+        const sig = i < end - 1 ? d.bit(m.sig[sc][c], sigCtx(sc, i, t)) : 1;
         if (!sig) continue;
         const last = i < end - 1 ? d.bit(m.last[sc][c], pc) : 1;
         let a;
-        if (!d.bit(m.gt1[c], g < 3 ? g : 3)) a = 1;
+        if (!d.bit(m.gt1[c], gt1Ctx(t, g))) a = 1;
         else {
             let r = 0, k = 0;
             for (; k < MAG_UNARY; k++) {
@@ -303,7 +426,7 @@ export function readHeader(buffer) {
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
-    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN)) return null;
+    if (h.flags & ~(FLAG_RESIDUAL | FLAG_DEBLOCK | FLAG_CHROMA420 | FLAG_GRAIN | FLAG_TILEQ | FLAG_DIRPRED | FLAG_INTER)) return null;
     if ((h.flags & FLAG_CHROMA420) && h.maxBlock < 8) return null;
     // Mirrors nvdr_grain_unpack(): parameters between the header and layer 0.
     if (h.flags & FLAG_GRAIN) {
@@ -314,6 +437,8 @@ export function readHeader(buffer) {
                     sigma: Array.from({ length: GRAIN_POINTS }, (_, k) => g(6 + k)) };
     } else if (h.grainLen) return null;
     if (h.storedBytes.some(b => b > 0x7fffffff) || h.band > 32) return null;
+    if ((h.flags & FLAG_DIRPRED) && (h.band !== 0 || (h.flags & FLAG_RESIDUAL))) return null;
+    if ((h.flags & FLAG_INTER) && !(h.flags & FLAG_DIRPRED)) return null;
     return h;
 }
 
@@ -349,23 +474,26 @@ const RETRY = Symbol('retry');
 let fastDecoder = null;
 export function setFastDecoder(fn) { fastDecoder = fn; }
 
-export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false) {
-    if (fastDecoder && !ctx) return fastDecoder(buffer, maxLayer, wantFlat, wantLow);
-    return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow);
+export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null) {
+    if (fastDecoder && !ctx) return fastDecoder(buffer, maxLayer, wantFlat, wantLow, base);
+    return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow, base);
 }
 
 /* The JavaScript decoder itself, whichever decode() uses. */
-export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false) {
+/* A container with FLAG_INTER needs `base`, the picture it was predicted
+ * from, as RGB of its size ({ width, height, rgb }); without it, it does
+ * not decode. */
+export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null) {
     // A texture layer that arrived whole cannot stop inside a tile unless
     // the file is damaged, so the first attempt does not save each tile to
     // restore it, a fifth of the time on a large image. If it does stop,
     // the decode starts over the careful way and gives what that gives. A
     // warm context is changed in place and cannot be started over.
     if (!(ctx && ctx.valid)) {
-        const r = decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, false);
+        const r = decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, false, base);
         if (r !== RETRY) return r;
     }
-    return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true);
+    return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true, base);
 }
 
 /*
@@ -374,7 +502,7 @@ export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = 
  * then Cb and Cr at half size. Planes index the arrays; components
  * (comp0 + plane) index the models and steps.
  */
-function makePart(w, h, tile, minBlock, np, comp0, fixedPred) {
+function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
     const pw = Math.ceil(w / minBlock) * minBlock, ph = Math.ceil(h / minBlock) * minBlock;
     const P = {
         w, h, pw, ph, tile, minBlock, np, comp0,
@@ -408,9 +536,10 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred) {
         for (let j = y; j < y + hh; j++)
             for (let at = j * pw + x, end = at + ww; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
     };
+    P.dirpred = dirpred;
     P.predict = (c, x, y, n) => {
         if (fixedPred) return 128;
-        const p = P.flat[c];
+        const p = dirpred ? P.full[c] : P.flat[c];
         let sum = 0, k = 0;
         if (y > 0) {
             const x1 = Math.min(x + n, pw);
@@ -424,13 +553,115 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred) {
         }
         return k ? Math.floor((sum + (k >> 1)) / k) : 128;
     };
+    const decodedBefore = (x, y, px, py) => {
+        if (px < 0 || py < 0 || px >= pw || py >= ph) return false;
+        const lt = Math.floor(y / tile) * 65536 + Math.floor(x / tile);
+        const pt = Math.floor(py / tile) * 65536 + Math.floor(px / tile);
+        if (pt !== lt) return pt < lt;
+        return zorder(((px % tile) >> 2), ((py % tile) >> 2)) < zorder(((x % tile) >> 2), ((y % tile) >> 2));
+    };
+    const T = new Int32Array(2 * MAX_BLOCK + 1), L = new Int32Array(2 * MAX_BLOCK + 1);
+    const T2 = new Int32Array(2 * MAX_BLOCK + 1), L2 = new Int32Array(2 * MAX_BLOCK + 1);
+    const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    P.dirPredict = (c, x, y, n, mode, out) => {
+        if (mode === MODE_INTER) {
+            const b = P.base[c];
+            for (let j = 0; j < n; j++)
+                for (let i = 0; i < n; i++) out[j * n + i] = b[(y + j) * pw + x + i];
+            return;
+        }
+        const f = P.full[c], top = y > 0, left = x > 0;
+        T.fill(0); L.fill(0);
+        let tr = top, bl = left;
+        for (let i = 0; i < 2 * n; i++) {
+            if (i >= n && tr && !(i % 4) && !decodedBefore(x, y, x + i, y - 1)) tr = false;
+            if (i >= n && bl && !(i % 4) && !decodedBefore(x, y, x - 1, y + i)) bl = false;
+            T[i + 1] = !top ? 0 : (i < n || tr) ? f[(y - 1) * pw + x + i] : T[i];
+            L[i + 1] = !left ? 0 : (i < n || bl) ? f[(y + i) * pw + x - 1] : L[i];
+        }
+        if (!top && !left) { for (let i = 0; i <= 2 * n; i++) T[i] = L[i] = 128; }
+        else if (!top) { for (let i = 0; i <= 2 * n; i++) T[i] = L[1]; L[0] = L[1]; }
+        else if (!left) { for (let i = 0; i <= 2 * n; i++) L[i] = T[1]; T[0] = T[1]; }
+        else T[0] = L[0] = f[(y - 1) * pw + x - 1];
+        if (n >= 8 && mode !== 0) {
+            T2[0] = L2[0] = (T[1] + 2 * T[0] + L[1] + 2) >> 2;
+            for (let i = 1; i < 2 * n; i++) {
+                T2[i] = (T[i - 1] + 2 * T[i] + T[i + 1] + 2) >> 2;
+                L2[i] = (L[i - 1] + 2 * L[i] + L[i + 1] + 2) >> 2;
+            }
+            T2[2 * n] = T[2 * n]; L2[2 * n] = L[2 * n];
+            T.set(T2.subarray(0, 2 * n + 1)); L.set(L2.subarray(0, 2 * n + 1));
+        }
+        const sh = log2(n);
+        if (mode === 1) {
+            for (let j = 0; j < n; j++)
+                for (let i = 0; i < n; i++)
+                    out[j * n + i] = ((n - 1 - i) * L[j + 1] + (i + 1) * T[n + 1] +
+                                      (n - 1 - j) * T[i + 1] + (j + 1) * L[n + 1] + n) >> (sh + 1);
+            return;
+        }
+        if (mode <= 8) { angular(T, L, n, MODE_ANGLE[mode], out); return; }
+        angular(L, T, n, MODE_ANGLE[mode], TMP);
+        for (let j = 0; j < n; j++)
+            for (let i = 0; i < n; i++) out[j * n + i] = TMP[i * n + j];
+    };
+    // Mirrors paint_pred().
+    P.paintPred = (c, x, y, n, pr, offset) => {
+        const f = P.flat[c], o = P.full[c], a = P.acc[c];
+        for (let j = 0; j < n; j++)
+            for (let i = 0; i < n; i++) {
+                const at = (y + j) * pw + x + i, v = clampU8(pr[j * n + i] + offset);
+                f[at] = v; o[at] = v; a[at] = 0;
+            }
+    };
     // Neutral grey, as tile_fallback() explains.
     P.tileFallback = (tx, ty) => {
         if (tx >= pw || ty >= ph) return;
         const ww = tx + tile < pw ? tile : pw - tx, hh = ty + tile < ph ? tile : ph - ty;
-        for (let c = 0; c < np; c++) P.paintFlat(c, tx, ty, ww, hh, 128);
+        for (let c = 0; c < np; c++) {
+            P.paintFlat(c, tx, ty, ww, hh, 128);
+            // With a base, a tile that never arrived shows the base.
+            if (P.base)
+                for (let j = ty; j < ty + hh; j++)
+                    for (let at = j * pw + tx, end = at + ww; at < end; at++)
+                        P.flat[c][at] = P.full[c][at] = P.base[c][at];
+        }
     };
     return P;
+}
+
+/* Mirrors canvas_base(): the base picture on the canvases, in the same
+ * integers as the C side. */
+function canvasBase(P, C, rgb) {
+    const n = P.pw * P.ph, full = [new Uint8Array(n), new Uint8Array(n), new Uint8Array(n)];
+    for (let y = 0; y < P.ph; y++)
+        for (let x = 0; x < P.pw; x++) {
+            const sx = x < P.w ? x : P.w - 1, sy = y < P.h ? y : P.h - 1;
+            const s = (sy * P.w + sx) * 3, r = rgb[s], g = rgb[s + 1], b = rgb[s + 2];
+            const at = y * P.pw + x;
+            full[0][at] = clampU8((19595 * r + 38470 * g + 7471 * b + 32768) >> 16);
+            full[1][at] = clampU8(((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16) + 128);
+            full[2][at] = clampU8(((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128);
+        }
+    if (!C) { P.base = full; return; }
+    P.base = [full[0]];
+    C.base = [];
+    for (let c = 1; c < 3; c++) {
+        const hp = new Uint8Array(C.pw * C.ph);
+        for (let y = 0; y < C.ph; y++)
+            for (let x = 0; x < C.pw; x++) {
+                let sum = 0;
+                for (let j = 0; j < 2; j++)
+                    for (let i = 0; i < 2; i++) {
+                        let fx = 2 * x + i, fy = 2 * y + j;
+                        if (fx >= P.pw) fx = P.pw - 1;
+                        if (fy >= P.ph) fy = P.ph - 1;
+                        sum += full[c][fy * P.pw + fx];
+                    }
+                hp[y * C.pw + x] = (sum + 2) >> 2;
+            }
+        C.base.push(hp);
+    }
 }
 
 /* Mirrors upsample_plane(): colour back to full size, 9 3 3 1 in
@@ -512,7 +743,7 @@ function grainTemplates(g) {
     return out;
 }
 
-function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
+function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
     if (!h) return null;
@@ -531,8 +762,14 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     // tile by tile in the same streams. A tile is whole when both are.
     const fixedPred = (h.flags & FLAG_RESIDUAL) !== 0;
     const is420 = (h.flags & FLAG_CHROMA420) !== 0;
-    const parts = [makePart(h.width, h.height, h.maxBlock, h.minBlock, is420 ? 1 : 3, 0, fixedPred)];
-    if (is420) parts.push(makePart((h.width + 1) >> 1, (h.height + 1) >> 1, h.maxBlock >> 1, MIN_BLOCK, 2, 1, fixedPred));
+    const dirpred = (h.flags & FLAG_DIRPRED) !== 0;
+    const parts = [makePart(h.width, h.height, h.maxBlock, h.minBlock, is420 ? 1 : 3, 0, fixedPred, dirpred)];
+    if (is420) parts.push(makePart((h.width + 1) >> 1, (h.height + 1) >> 1, h.maxBlock >> 1, MIN_BLOCK, 2, 1, fixedPred, dirpred));
+    const inter = (h.flags & FLAG_INTER) !== 0;
+    if (inter) {
+        if (!baseImg || baseImg.width !== h.width || baseImg.height !== h.height) return null;
+        canvasBase(parts[0], parts[1] || null, baseImg.rgb);
+    }
     const main = parts[0], tile = main.tile, pw = main.pw;
     const step = [h.qLuma, h.qChroma, h.qChroma];
     const tilesX = Math.ceil(main.pw / tile), tilesY = Math.ceil(main.ph / tile), tiles = tilesX * tilesY;
@@ -542,9 +779,49 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     const warm = ctx && ctx.valid;
     const cm = warm ? ctx.cm : colourModels();
     if (!cm.splitC) cm.splitC = probs(NSIZES);
+    if (!cm.tqZero) { cm.tqZero = probs(1); cm.tqSign = probs(1); cm.tqMag = probs(2 * TQ_MAX); }
+    if (!cm.modeFlat) { cm.modeFlat = probs(NSIZES); cm.modeTree = probs(16); }
+    if (!cm.modeInter) cm.modeInter = probs(NSIZES);
+    // The tiles' step offsets as layer 0 delivers them, zero where it
+    // never did, and the step of the tile being read.
+    const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
+    const tstep = step.slice();
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
+    for (const m of tms) if (!m.tx) m.tx = grid(NSIZES, 3);
+    const TXO = { tx: 0 };
     const d0 = new ArithDecoder(bytes, base, avail0);
     const s0 = { corrupt: false };
+
+    // Mirrors texture_residual() + add_residual(): texture levels in
+    // [start, end) added to a leaf.
+    const tcoef = new Int32Array(MAX_BLOCK * MAX_BLOCK), tres = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    function applyTex(P, c, x, y, n, lv, start, end, stepv, tx = 0) {
+        const sc = sizeClass(n), count = n * n, pos = SCAN_POS[sc], sh = log2(n), ppw = P.pw;
+        tcoef.fill(0, 0, count);
+        let mu = 0, mv = 0;
+        for (let q = start; q < end; q++) {
+            if (!lv[q]) continue;
+            const p = pos[q], u = p & (n - 1), v = p >> sh;
+            tcoef[p] = clampCoef(lv[q] * stepv);
+            if (u > mu) mu = u;
+            if (v > mv) mv = v;
+        }
+        inverseDct(sc, tcoef, tres, mu, mv, tx);
+        const o = P.full[c], f = P.flat[c], a = P.acc[c];
+        for (let j = 0; j < n; j++)
+            for (let ii = 0; ii < n; ii++) {
+                const at = (y + j) * ppw + x + ii;
+                let v = a[at] + tres[j * n + ii];
+                v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+                a[at] = v;
+                o[at] = clampU8(f[at] + v);
+            }
+    }
+    // With directional prediction a leaf's texture comes from the first
+    // texture layer as soon as its colour does.
+    const d1 = dirpred ? new ArithDecoder(bytes, off1, avail1) : null;
+    const lvd = new Int32Array(MAX_BLOCK * MAX_BLOCK), prd = new Int32Array(MAX_BLOCK * MAX_BLOCK);
+    for (const P of parts) P.ltex = [];
 
     function readNode(P, x, y, n) {
         let split = 0;
@@ -560,20 +837,49 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
             return;
         }
         const sc = sizeClass(n);
+        let mode = 0;
+        if (dirpred) {
+            mode = getMode(d0, cm, sc, inter);
+            if (mode < 0) { s0.corrupt = true; return; }
+        }
         for (let c = 0; c < P.np; c++) {
             const k = P.comp0 + c;
-            const pred = P.predict(c, x, y, n);
             const dl = getDc(d0, cm, sc, k, s0);
-            const colour = clampU8(pred + divRound(clampCoef(dl * step[k]), n));
-            P.paintFlat(c, x, y, n, n, colour);
+            const offset = divRound(clampCoef(dl * tstep[k]), n);
+            if (mode > 0) {
+                P.dirPredict(c, x, y, n, mode, prd);
+                P.paintPred(c, x, y, n, prd, offset);
+            } else P.paintFlat(c, x, y, n, n, clampU8(P.predict(c, x, y, n) + offset));
         }
         P.lx.push(x); P.ly.push(y); P.ln.push(n);
+        let tex = 0;
+        if (dirpred) {
+            const count = n * n;
+            for (let c = 0; c < P.np && !s0.corrupt && !d1.overrun; c++) {
+                const txo = P.comp0 + c === 0 && n <= TX_MAX_N ? TXO : null;
+                if (getTexture(d1, tms[0], sc, P.comp0 + c, lvd, 1, count, s0, txo) && !s0.corrupt && !d1.overrun) {
+                    const tx = txo ? txo.tx : 0;
+                    applyTex(P, c, x, y, n, lvd, tx ? 0 : 1, count, tstep[P.comp0 + c], tx);
+                    tex = 1;
+                }
+            }
+            if (d1.overrun) s0.corrupt = true;
+        }
+        P.ltex.push(tex);
     }
 
-    let complete0 = 0, stopped = false;
+    let complete0 = 0, stopped = false, tqPrev = 0;
     for (let t = 0; t < tiles; t++) {
         const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
         for (const P of parts) P.tileStart[t] = P.lx.length;
+        if (tq && !stopped) {
+            const dq = tqPrev + getTq(d0, cm);
+            if (d0.overrun || dq < -TQ_MAX || dq > TQ_MAX) stopped = true;
+            else {
+                tq[t] = dq; tqPrev = dq;
+                for (let c = 0; c < 3; c++) tstep[c] = tqStep(step[c], dq);
+            }
+        }
         for (let k = 0; k < parts.length && !stopped; k++) {
             const P = parts[k], x = tx / (k + 1), y = ty / (k + 1);
             if (!P.exists(x, y)) continue;
@@ -582,7 +888,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         }
         if (stopped) {
             parts.forEach((P, k) => {
-                P.lx.length = P.ly.length = P.ln.length = P.tileStart[t];
+                P.lx.length = P.ly.length = P.ln.length = P.ltex.length = P.tileStart[t];
                 P.tileFallback(tx / (k + 1), ty / (k + 1));
             });
         } else complete0++;
@@ -593,8 +899,9 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     // loop: each band as far as its bytes reach and no further than the
     // layer before it; a tile cut short is restored to what it showed.
     const complete = [complete0, 0, 0];
+    if (dirpred) { complete[1] = complete0; maxLayer = LAYERS - 1; wantLow = false; }
     for (const P of parts) {
-        P.textured = new Uint8Array(P.lx.length);
+        P.textured = dirpred ? Uint8Array.from(P.ltex) : new Uint8Array(P.lx.length);
         P.saved = Array.from({ length: P.np }, () => new Uint8Array(P.tile * P.tile));
         P.savedAcc = Array.from({ length: P.np }, () => new Int16Array(P.tile * P.tile));
     }
@@ -609,7 +916,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
     };
     for (let layer = 1; layer < LAYERS; layer++) {
         const avail = layer === 1 ? avail1 : avail2, off = layer === 1 ? off1 : off2;
-        if ((maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
+        if (dirpred || (maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
         if (layer === 2 && h.band === 0) break;
         const tm = tms[layer - 1];
         const d = new ArithDecoder(bytes, off, avail);
@@ -630,6 +937,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                 }
                 P.was = P.textured.slice(P.tileStart[t], P.tileStart[t + 1]);
             }
+            const tileStep = tq ? step.map(q => tqStep(q, tq[t])) : step;
             for (let k = 0; k < parts.length && !d.overrun && !st.corrupt; k++) {
                 const P = parts[k], ppw = P.pw;
                 for (let i = P.tileStart[t]; i < P.tileStart[t + 1] && !d.overrun && !st.corrupt; i++) {
@@ -645,7 +953,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                             for (let q = start; q < end; q++) {
                                 if (!lv[q]) continue;
                                 const p = pos[q], u = p & (n - 1), v = p >> sh;
-                                coef[p] = clampCoef(lv[q] * step[comp]);
+                                coef[p] = clampCoef(lv[q] * tileStep[comp]);
                                 if (u > mu) mu = u;
                                 if (v > mv) mv = v;
                             }
@@ -701,13 +1009,19 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
         for (let t = complete0; t < tiles; t++)
             mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, 0);
         for (let c = 0; c < P.np; c++) {
-            const p = planes[c], sp = step[P.comp0 + c];
-            const alpha = (sp * DB_ALPHA + 8) >> 4, beta = (sp * DB_BETA + 8) >> 4;
-            const tc = (sp * DB_TC + 8) >> 4;
+            const p = planes[c], base = step[P.comp0 + c];
+            // The step at an edge is its second side's tile's.
+            let alpha = 0, beta = 0, tc = 0;
+            const at = (gx, gy) => {
+                const sp = tq ? tqStep(base, tq[Math.floor(gy * 4 / ptile) * tilesX + Math.floor(gx * 4 / ptile)]) : base;
+                alpha = (sp * DB_ALPHA + 8) >> 4; beta = (sp * DB_BETA + 8) >> 4; tc = (sp * DB_TC + 8) >> 4;
+            };
+            at(0, 0);
             for (let gy = 0; gy < gh; gy++)
                 for (let gx = 1; gx < gw; gx++) {
                     if (!vedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[gy * gw + gx - 1]) continue;
+                    if (tq) at(gx, gy);
                     for (let y = gy * 4; y < gy * 4 + 4; y++) {
                         const r = y * ppw + gx * 4;
                         const p1 = p[r - 2], p0 = p[r - 1], q0 = p[r], q1 = p[r + 1];
@@ -723,6 +1037,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful) {
                 for (let gx = 0; gx < gw; gx++) {
                     if (!hedge[gy * gw + gx]) continue;
                     if (!textured[gy * gw + gx] && !textured[(gy - 1) * gw + gx]) continue;
+                    if (tq) at(gx, gy);
                     for (let x = gx * 4; x < gx * 4 + 4; x++) {
                         const r = gy * 4 * ppw + x;
                         const p1 = p[r - 2 * ppw], p0 = p[r - ppw], q0 = p[r], q1 = p[r + ppw];

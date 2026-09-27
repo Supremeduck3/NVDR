@@ -92,6 +92,22 @@ typedef struct {
      * 0 rounds to nearest; larger values trade small coefficients for
      * bytes. */
     float deadzone;
+    /* Choose every texture level by rate-distortion against the models
+     * (see rdoq() in nvdr.c) instead of rounding with `deadzone`. */
+    int   rdoq;
+    /* Predict each leaf from its neighbours' full reconstruction, along
+     * one of NVDR_MODES modes chosen per leaf (see dir_predict() in
+     * nvdr.c). The picture is then no longer progressive: colour and
+     * texture are decoded together, leaf by leaf, in one texture layer
+     * (band is forced to 0). For a sequence's intra frames, which are
+     * never shown half-arrived. Flagged in the header. */
+    int   directional;
+    /* A picture this one is predicted from, the same size (RGB): a
+     * sequence's motion-compensated prediction. Each leaf is then
+     * predicted from it (mode INTER) or from its own decoded neighbours
+     * along a direction, as `directional` does, which it implies. The
+     * decoder needs the same picture: see nvdr_decode_mem_base(). */
+    const NvdrImage* base;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -126,6 +142,10 @@ typedef struct {
      * _AUTO (only when the picture is measurably noisy) or _ON. Carried in
      * the header's flags. */
     int   grain;
+    /* A step offset per tile (max_block square, raster order), in sixths
+     * of a doubling, -12 to 12; NULL for none. Carried in layer 0 at the
+     * start of each tile, flagged in the header. */
+    const int8_t* tile_q;
 } NvdrConfig;
 
 #define NVDR_GRAIN_OFF   0
@@ -155,12 +175,15 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     11
+#define NVDR_VERSION     13
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
 #define NVDR_FLAG_CHROMA420 0x04        /* colour in its own half-resolution tree */
 #define NVDR_FLAG_GRAIN    0x08         /* grain parameters follow the header */
+#define NVDR_FLAG_TILEQ    0x10         /* a step offset per tile, in layer 0 */
+#define NVDR_FLAG_DIRPRED  0x20         /* directional prediction, not progressive */
+#define NVDR_FLAG_INTER    0x40         /* predicted from a base picture as well */
 
 typedef struct {
     uint16_t width, height;
@@ -221,5 +244,11 @@ int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img
                         const NvdrConfig* cfg, NvdrHeader* hdr_out, NvdrContext* ctx);
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr, NvdrDecodeInfo* info, NvdrContext* ctx);
+
+/* A container with NVDR_FLAG_INTER, decoded against the picture it was
+ * predicted from (which must be its size). Containers without the flag
+ * decode as nvdr_decode_mem() would. */
+int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
+                         NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 
 #endif /* NVDR_H */
