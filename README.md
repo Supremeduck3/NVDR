@@ -810,6 +810,11 @@ tried first and gave about a third as much.
     before                                    +7.0%                  -5.7%
     counting                                  +6.5%                  -6.2%
 
+On the five 25-frame clips, BD-rate on PSNR-Y: -4.4% (noisy pan),
+-4.1% (clean pan), -4.3% (photo pan), -5.1% (still camera, noisy) and
+-2.7% (three objects). A sequence's frames are coded against fresh
+models each, so every frame pays for the slow start.
+
 The small pictures gain most, having the fewest bits to learn from:
 the regression gate's synthetic blocks and gradient 25 and 27% smaller,
 its 128x128 sequence 7.7% smaller at 0.08 dB more, a burst album 5.6%.
