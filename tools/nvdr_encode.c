@@ -36,6 +36,8 @@ static void usage(const char* argv0) {
         "  --directional    predict each leaf along a direction from its decoded\n"
         "                   neighbours; smaller, but not progressive (one texture\n"
         "                   layer, decoded together with the colours)\n"
+        "  --no-adaptive-tx with --directional, keep every leaf on the DCT\n"
+        "                   instead of choosing its transform per leaf\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
         "                   choosing them by rate-distortion\n"
         "  --tile-q-test    give every tile a step offset from a fixed pattern,\n"
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
+        else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];
             if (!strcmp(v, "off")) cfg.grain = NVDR_GRAIN_OFF;

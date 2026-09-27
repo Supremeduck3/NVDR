@@ -647,6 +647,63 @@ lost most of the gain. The encoder still chooses vectors as if the
 blocks did not overlap; choosing them knowing the blend is what AV1
 does next.
 
+### Adaptive transforms (flag 0x80)
+
+A directional prediction misses least next to the pixels it copies and
+more the further a pixel is from them, and the DCT, whose first basis
+function is flat, is the wrong shape for that. With NVDR_FLAG_TXSEL (on
+wherever directional prediction is, `--no-adaptive-tx` turns it off)
+each leaf of 4, 8 or 16 pixels predicted along a direction, or flat in a
+picture with a base, chooses one of seven separable transforms, as VVC
+and AV1 do: the DCT both ways; the DST-VII (AV1's ADST) down, across or
+both, whose first basis function starts near zero at the reference and
+rises away from it; the identity both ways, which codes pixels as they
+are, for edges and text where a DCT rings; and the identity down with
+the DCT across, or the other way round, for stripes along one axis.
+Leaves of 32 and INTER leaves stay on the DCT.
+
+The DST-VII's integer matrices are 64 sqrt(N) times the orthonormal one,
+like the DCT's, so every type shares its shifts: each entry is one of N
+magnitudes (for 4, VVC's 29 55 74 84) with the sign the sine gives it,
+and the identity is 128, 181 and 256 on the diagonal. A leaf with any
+type but the DCT has no DC level, since no other basis has a constant
+function, so its texture is coded from scan position 0 against the same
+models as the DCT's. The type is a "DCT or not" bit by size and by the
+mode's direction (flat or planar, from above, from the left), then three
+bits down a tree by direction, after the mode. The encoder tries every
+type for each of the modes it tries in full and keeps the cheapest by
+error plus lambda times bits.
+
+Intra frames (`--directional`), BD-rate on PSNR-Y (and PSNR-RGB) against
+the build before, six photographs, q 12 to 48:
+
+    5 types, for the best DCT mode only, own models    -0.2%  (-0.8%)
+    the same, the DCT's models                         -0.4%  (-0.9%)
+    5 types, tried with every mode                     -1.6%  (-2.1%)
+    the same, keeping the DC level for the others      +0.6%  (-0.1%)
+    7 types, tried with every mode (default)           -2.3%  (-2.6%)
+    9 types (adding DST-VII with the identity)         -2.2%  (-2.5%)
+
+Per photograph, the default: -7.7% on the graphic (OIP-1304511485),
+-2.6% on macarrão, -2.1% on montanha_pessoas, -0.9% on OIP-4140498144
+and -0.2% on the two dense photographs. The type follows the mode
+closely: with the best DCT mode alone the gain mostly disappears, and
+trying the other types only for the best one, two or three modes by
+their DCT cost gives -1.0, -1.6 and -2.0% for 1.14, 1.34 and 1.51 times
+the encoding time. Trying them with every mode costs 2.1 times the
+encoding time of an intra frame. On 4x4 leaves of a photograph the DST-
+VII both ways is chosen more often than the DCT, as HEVC found when it
+made it the only 4x4 intra transform; the identity is chosen mostly on
+the graphic.
+
+On the sequences, where it applies to every intra frame and to the intra
+leaves of predicted ones: -2.2% on a pan over montanha_pessoas, -1.9% on
+the mixed clip with noise, -1.7% on a zoom (24 synthetic frames from
+`scripts/analysis/frames.c`, q 16 to 48, on PSNR-RGB), nearly all of it
+from the intra frame. Choosing the type for INTER leaves too, whose
+texture the encoder now transforms before the search, is the next step,
+at the cost of doing that per leaf.
+
 ### Choosing vectors for overlapped blocks
 
 The encoder chose each unit's vector by the error of its own
@@ -2253,7 +2310,8 @@ side, a slider that truncates the container, and plays sequences.
 
 Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
-directional prediction and 0x40 a base picture (see their sections).
+directional prediction, 0x40 a base picture and 0x80 a transform type
+per leaf (see their sections).
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does
