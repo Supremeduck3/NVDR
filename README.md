@@ -647,37 +647,6 @@ lost most of the gain. The encoder still chooses vectors as if the
 blocks did not overlap; choosing them knowing the blend is what AV1
 does next.
 
-### Transform types (format v13)
-
-Every texture was a DCT. What directional prediction leaves is small
-next to the pixels a leaf is predicted from and grows away from them,
-and the DST-VII fits that shape better; HEVC uses it for 4x4 intra luma
-and AV1 as one of its transform types. In a picture with directional
-prediction (every sequence frame, and stills with `--directional`) a
-luma leaf of 4, 8 or 16 now picks one of four: DCT both ways, DST both
-ways, or DST one way and DCT the other. The type follows the "has
-texture" bit, as up to three bits on contexts by size. The DST's rows
-are the DCT's scale, so the two share their shifts (the 4-point one is
-HEVC's exactly), and they are the same integers in C and JavaScript.
-
-The DST has no flat basis vector, so a residual whose mean the leaf's
-colour correction has taken out costs it several coefficients to say
-nothing. Under a DST the encoder therefore leaves the colour at the
-prediction and lets the transform carry the level too. With the mean
-taken out first, the DST won 2 to 5% of the leaves and nothing
-measurable; once it carried the level, 25 to 50%. The encoder tries the
-other types only for the mode it chose with the DCT, and only where
-the DCT leaves luma texture (a flat level is what the DCT says exactly),
-which keeps the added encoding time to 9% instead of 24%. Separate
-coefficient contexts for DST blocks were tried and did worse: they
-dilute the statistics.
-
-    intra, five photos, BD-rate       vs AV1 (libaom, still)   vs HEVC (x265 intra)
-    directional (v12)                        +11.2%                  -2.2%
-    + transform types (v13)                  +10.9%                  -2.5%
-
-On the sequences, against format 11 as it was: -0.0 to -0.7%.
-
 ### Choosing vectors for overlapped blocks
 
 The encoder chose each unit's vector by the error of its own
@@ -717,9 +686,6 @@ that much more:
     clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
       (fmt 11)
     noisy, the same               +111.5%       +14.9%      -15.7%
-    clean, + transform types,
-      OBMC-aware vectors (v13)     +91.4%       +31.9%       -4.0%
-    noisy, the same               +109.3%       +14.6%      -16.1%
 
 That is the honest position: past the browser's encoders, near x264 at
 its slowest, and AV1 needs well under half the bytes. The intra frame

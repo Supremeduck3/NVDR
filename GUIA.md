@@ -440,10 +440,6 @@ O formato 11 suaviza as emendas entre blocos com movimentos diferentes
 o movimento do vizinho faria dos mesmos pixels. Rende ~2% nos clipes com
 movimento. Arquivos v10 também precisam ser recodificados.
 
-O contêiner v13 (fotos com `--directional` e todo quadro de vídeo)
-escolhe, por bloco de luma de até 16×16, entre a DCT e a DST-VII em cada
-direção. Arquivos v12 não abrem mais.
-
 Para comparar com os codecs do navegador (VP8, VP9 e AV1 via WebCodecs):
 
 ```bash

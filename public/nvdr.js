@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-const VERSION = 13;
+const VERSION = 12;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -222,19 +222,10 @@ function divRound(a, n) {
  */
 const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
 const ROW = new Int32Array(MAX_BLOCK);
-/* Mirrors the transform types in nvdr.c: DST-VII for 4, 8 and 16, down
- * the columns for types 1 and 2, along the rows for 1 and 3. */
-const TX_MAX_N = 16;
-const DST = [
-    Int32Array.from([29,55,74,84,74,74,0,-74,84,-29,-74,55,55,-84,74,-29]),
-    Int32Array.from([16,32,46,59,70,79,84,87,46,79,87,70,32,-16,-59,-84,70,84,32,-46,-87,-59,16,79,84,46,-59,-79,16,87,32,-70,87,-16,-84,32,79,-46,-70,59,79,-70,-16,84,-59,-32,87,-46,59,-87,70,-16,-46,84,-79,32,32,-59,79,-87,84,-70,46,-16]),
-    Int32Array.from([8,17,25,33,41,48,55,62,67,73,77,81,84,87,88,89,25,48,67,81,88,88,81,67,48,25,0,-25,-48,-67,-81,-88,41,73,88,84,62,25,-17,-55,-81,-89,-77,-48,-8,33,67,87,55,87,81,41,-17,-67,-89,-73,-25,33,77,88,62,8,-48,-84,67,88,48,-25,-81,-81,-25,48,88,67,0,-67,-88,-48,25,81,77,77,0,-77,-77,0,77,77,0,-77,-77,0,77,77,0,-77,84,55,-48,-87,-8,81,62,-41,-88,-17,77,67,-33,-89,-25,73,88,25,-81,-48,67,67,-48,-81,25,88,0,-88,-25,81,48,-67,89,-8,-88,17,87,-25,-84,33,81,-41,-77,48,73,-55,-67,62,87,-41,-67,73,33,-88,8,84,-48,-62,77,25,-89,17,81,-55,81,-67,-25,88,-48,-48,88,-25,-67,81,0,-81,67,25,-88,48,73,-84,25,55,-89,48,33,-87,67,8,-77,81,-17,-62,88,-41,62,-89,67,-8,-55,88,-73,17,48,-87,77,-25,-41,84,-81,33,48,-81,88,-67,25,25,-67,88,-81,48,0,-48,81,-88,67,-25,33,-62,81,-89,84,-67,41,-8,-25,55,-77,88,-87,73,-48,17,17,-33,48,-62,73,-81,87,-89,88,-84,77,-67,55,-41,25,-8])
-];
-function inverseDct(s, input, out, mu, mv, tx = 0) {
+function inverseDct(s, input, out, mu, mv) {
     // Integer sums, so the order, chosen for contiguous inner loops and to
     // skip zero terms, changes nothing.
-    const n = MIN_BLOCK << s, shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
-    const t = tx === 1 || tx === 2 ? DST[s] : TMAT[s], th = tx === 1 || tx === 3 ? DST[s] : TMAT[s];
+    const n = MIN_BLOCK << s, t = TMAT[s], shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
     for (let y = 0; y < n; y++) {
         ROW.fill(0, 0, mu + 1);
         for (let v = 0; v <= mv; v++) {
@@ -250,7 +241,7 @@ function inverseDct(s, input, out, mu, mv, tx = 0) {
             const k = TMP[row + u];
             if (k === 0) continue;
             const r = u * n;
-            for (let x = 0; x < n; x++) ROW[x] += k * th[r + x];
+            for (let x = 0; x < n; x++) ROW[x] += k * t[r + x];
         }
         for (let x = 0; x < n; x++) out[row + x] = (ROW[x] + half) >> shift2;
     }
@@ -332,8 +323,7 @@ function textureModels() {
         sig: Array.from({ length: NSIZES }, () => grid(3, SIG_CTX)),
         last: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
         gt1: grid(3, GT1_CTX),
-        mag: grid(3, MAG_UNARY),
-        tx: grid(NSIZES, 3)
+        mag: grid(3, MAG_UNARY)
     };
 }
 
@@ -361,18 +351,9 @@ function getDc(d, m, sc, c, state) {
 }
 
 /* Mirrors get_texture(): fills lv[start, end). */
-/* With `txOut` the leaf may choose its transform type (get_tx()): it is
- * read into txOut.tx, 0 when the range carries nothing, and under a DST
- * the range starts at 0. */
-function getTexture(d, m, sc, c, lv, start, end, state, txOut = null) {
-    if (txOut) { txOut.tx = 0; start = 0; }
+function getTexture(d, m, sc, c, lv, start, end, state) {
     lv.fill(0, start, end);
     if (!d.bit(m.cbf[sc], c)) return false;
-    if (txOut) {
-        const t = m.tx[sc];
-        txOut.tx = !d.bit(t, 0) ? 0 : !d.bit(t, 1) ? 1 : d.bit(t, 2) ? 3 : 2;
-        if (!txOut.tx) start = 1;
-    }
     let g = 0;
     for (let i = start; i < end; i++) {
         const pc = SCAN_CTX[sc][i], t = nbMag(lv, sc, i, start);
@@ -787,15 +768,13 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
     const tstep = step.slice();
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
-    for (const m of tms) if (!m.tx) m.tx = grid(NSIZES, 3);
-    const TXO = { tx: 0 };
     const d0 = new ArithDecoder(bytes, base, avail0);
     const s0 = { corrupt: false };
 
     // Mirrors texture_residual() + add_residual(): texture levels in
     // [start, end) added to a leaf.
     const tcoef = new Int32Array(MAX_BLOCK * MAX_BLOCK), tres = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-    function applyTex(P, c, x, y, n, lv, start, end, stepv, tx = 0) {
+    function applyTex(P, c, x, y, n, lv, start, end, stepv) {
         const sc = sizeClass(n), count = n * n, pos = SCAN_POS[sc], sh = log2(n), ppw = P.pw;
         tcoef.fill(0, 0, count);
         let mu = 0, mv = 0;
@@ -806,7 +785,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
             if (u > mu) mu = u;
             if (v > mv) mv = v;
         }
-        inverseDct(sc, tcoef, tres, mu, mv, tx);
+        inverseDct(sc, tcoef, tres, mu, mv);
         const o = P.full[c], f = P.flat[c], a = P.acc[c];
         for (let j = 0; j < n; j++)
             for (let ii = 0; ii < n; ii++) {
@@ -855,14 +834,11 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         let tex = 0;
         if (dirpred) {
             const count = n * n;
-            for (let c = 0; c < P.np && !s0.corrupt && !d1.overrun; c++) {
-                const txo = P.comp0 + c === 0 && n <= TX_MAX_N ? TXO : null;
-                if (getTexture(d1, tms[0], sc, P.comp0 + c, lvd, 1, count, s0, txo) && !s0.corrupt && !d1.overrun) {
-                    const tx = txo ? txo.tx : 0;
-                    applyTex(P, c, x, y, n, lvd, tx ? 0 : 1, count, tstep[P.comp0 + c], tx);
+            for (let c = 0; c < P.np && !s0.corrupt && !d1.overrun; c++)
+                if (getTexture(d1, tms[0], sc, P.comp0 + c, lvd, 1, count, s0) && !s0.corrupt && !d1.overrun) {
+                    applyTex(P, c, x, y, n, lvd, 1, count, tstep[P.comp0 + c]);
                     tex = 1;
                 }
-            }
             if (d1.overrun) s0.corrupt = true;
         }
         P.ltex.push(tex);

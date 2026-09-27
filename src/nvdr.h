@@ -175,7 +175,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     13
+#define NVDR_VERSION     12
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
