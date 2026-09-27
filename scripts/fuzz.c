@@ -230,7 +230,12 @@ int main(int argc, char** argv) {
         uint8_t* buf = (uint8_t*)malloc(n);
         memcpy(buf, src, n);
         size_t len = n;
-        mutate(buf, &len, do_seq ? NVDRV_HEADER_SIZE + NVDRV_FRAME_HEADER : NVDR_HEADER_SIZE);
+        /* A still's header region takes in the grain and restoration
+         * parameters after it, whose lengths it gives. */
+        size_t head = NVDR_HEADER_SIZE;
+        if (!do_seq && n >= NVDR_HEADER_SIZE) head += (size_t)src[29] + ((size_t)src[30] | ((size_t)src[31] << 8));
+        if (head > n) head = n;
+        mutate(buf, &len, do_seq ? NVDRV_HEADER_SIZE + NVDRV_FRAME_HEADER : head);
 
         /* The input is on disk before it is decoded, so whatever crashes
          * leaves its cause behind. */

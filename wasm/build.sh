@@ -8,7 +8,7 @@ TMP=$(mktemp -d)
 FLAGS="--target=wasm32 -O3 -msimd128 -mbulk-memory -ffreestanding -nostdlib -DNVDR_WASM
        -Iwasm/include -Isrc -Wall -Wno-unused-parameter -Wno-unknown-pragmas
        -ffunction-sections -fdata-sections"
-for f in src/nvdr.c src/entropy.c src/grain.c wasm/libc.c wasm/api.c; do
+for f in src/nvdr.c src/entropy.c src/grain.c src/restore.c wasm/libc.c wasm/api.c; do
     ${CLANG:-clang} $FLAGS -c "$f" -o "$TMP/$(basename "$f" .c).o"
 done
 # Only the API is exported; the linker drops the encoder and everything

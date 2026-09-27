@@ -11,6 +11,7 @@
 
 #include "nvdr.h"
 #include "grain.h"
+#include "restore.h"
 #include "entropy.h"
 
 #include <math.h>
@@ -167,6 +168,7 @@ NvdrConfig nvdr_default_config(void) {
     c.min_block = NVDR_MIN_BLOCK;
     c.residual = 0;
     c.deblock = 1;
+    c.restore = 1;
     /* Measured on a 40-frame clip with a still background and a moving
      * subject: background pixels that change from one decoded frame to
      * the next fell from 5.5% to 1.3% (8.7% to 2.0% with sensor noise),
@@ -1075,6 +1077,22 @@ static uint32_t get_u32(const uint8_t* p) {
 
 static int valid_block(int n) { return n == 4 || n == 8 || n == 16 || n == 32; }
 
+/* Each component's plane, as the canvases lay them out: in 4:2:0 colour
+ * sits on a half-size canvas padded to the smallest leaf, 4. */
+static void restore_planes(const NvdrHeader* h, NvdrRestorePlane* g) {
+    int pw = (h->width + h->min_block - 1) / h->min_block * h->min_block;
+    int ph = (h->height + h->min_block - 1) / h->min_block * h->min_block;
+    g[0].pw = pw; g[0].ph = ph; g[0].unit = NVDR_RESTORE_UNIT;
+    for (int c = 1; c < 3; c++) {
+        if (h->flags & NVDR_FLAG_CHROMA420) {
+            int cw = (h->width + 1) / 2, ch = (h->height + 1) / 2;
+            g[c].pw = (cw + NVDR_MIN_BLOCK - 1) / NVDR_MIN_BLOCK * NVDR_MIN_BLOCK;
+            g[c].ph = (ch + NVDR_MIN_BLOCK - 1) / NVDR_MIN_BLOCK * NVDR_MIN_BLOCK;
+            g[c].unit = NVDR_RESTORE_UNIT / 2;
+        } else g[c] = g[0];
+    }
+}
+
 static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (size < NVDR_HEADER_SIZE || memcmp(data, NVDR_MAGIC, 4) != 0 || data[4] != NVDR_VERSION)
         return -1;
@@ -1113,6 +1131,19 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if ((h->flags & NVDR_FLAG_DIRPRED) && (h->band != 0 || (h->flags & NVDR_FLAG_RESIDUAL))) return -1;
     if ((h->flags & NVDR_FLAG_INTER) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
     if ((h->flags & NVDR_FLAG_TXSEL) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
+    /* Restoration parameters follow the grain's; bytes 30 and 31 say how
+     * many, and none means none. (There was no flag left for them: 0x80
+     * is the transform types'.) A residual is not a picture and is never
+     * restored. */
+    h->restore_len = (uint16_t)get_u16(data + 30);
+    if (h->restore_len) {
+        NvdrRestore r;
+        NvdrRestorePlane g[3];
+        restore_planes(h, g);
+        if ((h->flags & NVDR_FLAG_RESIDUAL) ||
+            size < NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len ||
+            nvdr_restore_parse(data + NVDR_HEADER_SIZE + h->grain_len, h->restore_len, g, &r) != 0) return -1;
+    }
     return 0;
 }
 
@@ -1747,6 +1778,12 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     return nvdr_encode_mem_ctx(out_buf, out_len, img, cfg_in, hdr_out, NULL);
 }
 
+static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base,
+                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
+                       int careful, NvdrRestoreFit* fit);
+static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc* e, const NvdrImage* img,
+                           const NvdrImage* base, NvdrContext* start);
+
 /* One encode in the mode cfg->chroma420 names (420 when nonzero). */
 static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                        const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
@@ -1774,6 +1811,14 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (dirpred) band = 0;
     NvdrHeader h;
     memset(&h, 0, sizeof(h));
+    /* Restoration is fitted by decoding what was coded, from the context
+     * the container starts from. */
+    int restore = cfg.restore && !cfg.residual;
+    NvdrContext* start = NULL;
+    if (restore && ctx) {
+        if (!(start = nvdr_context_new())) return -1;
+        nvdr_context_copy(start, ctx);
+    }
 
     /* 4:2:0 needs a colour tile of at least the smallest leaf. */
     int use420 = cfg.chroma420 && cfg.max_block >= 8 && cfg.max_block <= NVDR_MAX_BLOCK &&
@@ -1975,6 +2020,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     h.stored_bytes[2] = (uint32_t)n2;
     h.band = (uint8_t)band;
     for (int c = 0; c < 3; c++) h.plane_bits[c] = e.plane_bits[c];
+    if (restore && add_restoration(&buf, &total, &h, &e, img, inter ? cfg.base : NULL, start) != 0) {
+        free(buf); goto done;
+    }
     if (hdr_out) *hdr_out = h;
     *out_buf = buf;
     *out_len = total;
@@ -1982,6 +2030,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     rc = 0;
 
 done:
+    nvdr_context_free(start);
     free(tq);
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
@@ -1998,6 +2047,63 @@ done:
         canvas_free(&P->cv);
     }
     return rc;
+}
+
+/*
+ * Fits restoration to the container just coded (see restore.c): decodes
+ * it, handing the decoded planes and the source to the fit, and puts the
+ * parameters it chose after the header, flagged, when any component
+ * chose one. The container is left as it was when none did.
+ */
+static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc* e, const NvdrImage* img,
+                           const NvdrImage* base, NvdrContext* start) {
+    NvdrRestoreFit fit;
+    memset(&fit, 0, sizeof(fit));
+    for (int k = 0; k < e->nparts; k++)
+        for (int c = 0; c < e->part[k].cv.np; c++) {
+            int comp = e->part[k].cv.comp0 + c;
+            fit.src[comp] = e->part[k].src[c];
+            fit.lambda[comp] = e->part[k].lambda_base;
+        }
+    /* Colour at half size is judged at full size, where it is seen, at
+     * luma's lambda. */
+    double* full[3] = { NULL, NULL, NULL };
+    const Canvas* cv = &e->part[0].cv;
+    if (e->nparts == 2) {
+        for (int c = 1; c < 3; c++) {
+            if (!(full[c] = (double*)malloc(sizeof(double) * cv->pw * cv->ph))) { free(full[1]); return -1; }
+            fit.full_src[c] = full[c];
+            fit.lambda[c] = e->part[0].lambda_base;
+        }
+        for (int y = 0; y < cv->h; y++)
+            for (int x = 0; x < cv->w; x++) {
+                double o[3];
+                rgb_to_ycc(img->pixels + ((size_t)y * cv->w + x) * 3, o);
+                full[1][(size_t)y * cv->pw + x] = o[1];
+                full[2][(size_t)y * cv->pw + x] = o[2];
+            }
+        fit.full_pw = cv->pw; fit.full_w = cv->w; fit.full_h = cv->h;
+    }
+    NvdrImage shown;
+    int rc = decode_once(*buf, *len, -1, base, &shown, NULL, NULL, start, 1, &fit);
+    free(shown.pixels);
+    free(full[1]); free(full[2]);
+    if (rc != 0 || fit.failed) { nvdr_bits_free(&fit.out); return -1; }
+    int used = 0;
+    for (int c = 0; c < 3; c++) if (fit.bits[c] > 3) used = 1;
+    if (!used || fit.out.count > 0xffff) { nvdr_bits_free(&fit.out); return 0; }
+    size_t n = fit.out.count, total = *len + n;
+    uint8_t* out = (uint8_t*)malloc(total);
+    if (!out) { nvdr_bits_free(&fit.out); return -1; }
+    memcpy(out, *buf, NVDR_HEADER_SIZE);
+    memcpy(out + NVDR_HEADER_SIZE, fit.out.bytes, n);
+    memcpy(out + NVDR_HEADER_SIZE + n, *buf + NVDR_HEADER_SIZE, *len - NVDR_HEADER_SIZE);
+    put_u16(out + 30, (uint32_t)n);
+    nvdr_bits_free(&fit.out);
+    free(*buf);
+    *buf = out; *len = total;
+    h->restore_len = (uint16_t)n;
+    return 0;
 }
 
 /*
@@ -2426,10 +2532,6 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
  * only damage makes it do: the decode starts over, saving tiles. */
 #define DECODE_AGAIN (-2)
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base,
-                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
-                       int careful);
-
 int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrImage* out,
                         NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
     /* A texture layer that arrived whole cannot stop inside a tile unless
@@ -2437,28 +2539,28 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
      * to restore it (a tenth of the time); if one stops, the decode starts
      * over the careful way and gives what that gives. The context is only
      * written when a decode finishes, so starting over is safe. */
-    int rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 0);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 1);
+    int rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 1, NULL);
     return rc;
 }
 
 int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
                          NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
-    int rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 0);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 1);
+    int rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 1, NULL);
     return rc;
 }
 
 static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base_img,
                        NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
-                       int careful) {
+                       int careful, NvdrRestoreFit* fit) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
     if (read_header(data, size, &h) != 0) return -1;
     if (hdr_out) *hdr_out = h;
 
-    size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len;
+    size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len + h.restore_len;
     size_t avail0 = size - base;
     if (avail0 > h.stored_bytes[0]) avail0 = h.stored_bytes[0];
     /* The range decoder primes itself with five bytes; fewer than that
@@ -2649,6 +2751,17 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     if (!out->pixels) goto done;
     out->width = h.width; out->height = h.height;
     uint8_t* planes[3];
+    /* Restoration was fitted to the whole picture, and only a whole
+     * picture gets it; so does the encoder's own decode, which fits it. */
+    int whole_picture = complete[0] == tiles && (dirpred || (complete[1] == tiles && (h.band == 0 || complete[2] == tiles))) &&
+                        (max_layer < 0 || max_layer >= NVDR_LAYERS - 1);
+    NvdrRestore rs;
+    NvdrRestorePlane rg[3];
+    int restoring = h.restore_len && whole_picture;
+    if (restoring) {
+        restore_planes(&h, rg);
+        if (nvdr_restore_parse(data + NVDR_HEADER_SIZE + h.grain_len, h.restore_len, rg, &rs) != 0) restoring = 0;
+    }
     for (int k = 0; k < np; k++) {
         uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
         if ((h.flags & NVDR_FLAG_DEBLOCK) &&
@@ -2656,7 +2769,19 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
                     complete0, tiles_x, tiles, step, tq) != 0) {
             free(out->pixels); out->pixels = NULL; goto done;
         }
-        for (int c = 0; c < cvs[k].np; c++) planes[cvs[k].comp0 + c] = pl[c];
+        for (int c = 0; c < cvs[k].np; c++) {
+            int comp = cvs[k].comp0 + c;
+#ifndef NVDR_WASM   /* only the encoder fits; keeps the fit out of the browser's decoder */
+            NvdrRestorePlane pg = { cvs[k].pw, cvs[k].ph, k ? NVDR_RESTORE_UNIT / 2 : NVDR_RESTORE_UNIT };
+            if (fit && nvdr_restore_fit(fit, comp, pl[c], &pg, cvs[k].w, cvs[k].h) != 0) {
+                free(out->pixels); out->pixels = NULL; goto done;
+            }
+#endif
+            if (restoring && nvdr_restore_apply(&rs.comp[comp], comp, pl[c], &rg[comp]) != 0) {
+                free(out->pixels); out->pixels = NULL; goto done;
+            }
+            planes[comp] = pl[c];
+        }
     }
     if (np == 2) {
         /* Colour back to full size (see upsample_plane()). */

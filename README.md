@@ -717,6 +717,82 @@ On the regression gate's small clip, whose frames turn overlapping off,
 it costs 1.3% in the closed loop: the vectors were chosen for a blend
 that then does not happen.
 
+### In-loop restoration
+
+Deblocking fixes one artefact, the step at a leaf's edge, by a rule
+fixed in advance. What quantisation leaves inside a leaf (ringing along
+an edge, texture flattened, a ramp turned into steps) is left, and it
+differs from one picture to the next. So the encoder, which holds the
+source, now fits a filter to the picture it has just decoded and sends
+it: the least-squares filter that takes the decoded picture closest to
+the source. The decoder applies it after deblocking. In a sequence the
+restored picture is the one later frames predict from, so the filter is
+in the loop, and a frame's gain is also every later frame's.
+
+The filter is VVC's adaptive loop filter, simplified (`src/restore.c`):
+a 7x7 diamond for luma and a 5x5 one for colour, each neighbour entering
+as its difference from the centre clipped to one of four bounds, so a
+neighbour across a strong edge counts no more than one across a weak
+one. Luma's 4x4 blocks fall into 25 classes by the direction and
+strength of their gradient, which the encoder merges greedily into as
+many filters as pay for themselves at the picture's lambda. Each 64x64
+unit is filtered or not, and each component carries a filter only where
+that removes more error than its bits cost. Coefficients are in 128ths,
+Exp-Golomb coded after the grain parameters; bytes 30 and 31 of the
+header give their length, 0 when there are none (the flag byte is
+full: 0x80 is the transform types'). Everything is integer, and C, JavaScript and
+WebAssembly decode identically. Only a picture decoded whole is
+restored: the filter was fitted to that picture, not to a prefix of it.
+
+Colour at half size has to be judged where it is seen. Fitted against
+the 2x2 means it was coded from, the filter brought each half-size plane
+closer to them and made the full-size colour worse on all six samples,
+by up to 8%. The encoder now measures colour after the decoder's
+upsampling, against the full-size source, and solves for the filter in
+that domain (the upsampling is linear, so each tap's contribution is
+too). There the filter undoes much of what halving and bilinear
+upsampling blur: on OIP-1304511485 the squared error of Cb falls from
+8.4 to 5.5 and of Cr from 14.6 to 6.1, and the picture gains 1.7 dB for
+51 bytes.
+
+BD-rate on RGB PSNR against the same build without the filter, q 12 to
+56 (stills) and 10 to 56 (sequences):
+
+    image                 BD-rate     at q 24
+    OIP-1304511485        -11.2%      13023 B 33.11 dB -> 13074 B 34.78 dB
+    OIP-3451121336         -1.9%      36346 B 31.12 dB -> 36380 B 31.35 dB
+    OIP-3786546191         -2.8%      28988 B 31.68 dB -> 29029 B 32.02 dB
+    OIP-4140498144         -1.3%      19262 B 33.21 dB -> 19308 B 33.30 dB
+    macarrão               -2.2%       4942 B 38.68 dB ->  4996 B 38.91 dB
+    montanha_pessoas       -2.1%      45508 B 32.74 dB -> 45638 B 32.92 dB
+
+    25 frames, from scripts/analysis/frames.c          BD-rate
+    pan and a moving object over montanha, clean         -3.8%
+    the same, noise 6                                    -3.0%
+    whole-pixel pan over OIP-3786546191                  -9.5%
+    still camera over OIP-3451121336, noise 6            -8.6%
+    zoom into OIP-4140498144                             -1.0%
+
+Swept and left at the first choice: the clip bounds (255 32 12 4 against
+255 64 16 6 and 255 24 8 3) and the activity levels (3 8 16 32 against
+2 5 10 20 and 4 12 24 48) all measured within 0.1 point. Encoding a still
+takes about twice as long (0.11 s to 0.27 s for montanha_pessoas), a
+sequence about 10% longer; the statistics come from a sixteenth of the
+pixels for the clip bound and half of them for the filter.
+
+**A learned filter goes in beside it, not instead.** Each component's
+parameters start with a kind: 0 none, 1 this filter, 2 reserved for a
+network whose weights both sides hold, named by an id, with its
+per-picture parameters (a strength, a class map) in its payload. A new
+kind is a parse and an apply in the decoders and a fit in
+`nvdr_restore_fit()`, which already keeps the cheapest candidate per
+component, so a network that only wins on some pictures costs nothing
+on the others. The fit receives the decoded plane and the source, the
+same inputs a learned filter's encoder side needs. Two next steps before
+that: a cross-component filter (VVC's CC-ALF, colour refined from luma),
+given how much the colour alone gained here, and giving the 4:2:0
+upsampling a filter of its own.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -2269,7 +2345,8 @@ B frames came later: see "B frames (sequence format 7)".
 
 ## Layout
 
-    src/        the codec: nvdr.c (v10) and entropy.c, plus nvdrv.c for sequences
+    src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
+                nvdrv.c for sequences
     tools/      five CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
@@ -2312,6 +2389,10 @@ Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
 directional prediction, 0x40 a base picture and 0x80 a transform type
 per leaf (see their sections).
+
+directional prediction, 0x40 a base picture and 0x80 restoration, whose
+parameters follow the grain's and whose length is bytes 30 and 31 (see
+their sections).
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does
