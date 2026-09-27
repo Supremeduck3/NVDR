@@ -511,6 +511,13 @@ Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
 
 ## Coisas que confundem
 
+- **A página mostra a imagem em cores erradas, com a parte de baixo
+  cinza, ou diz "Contêiner da versão X".** O encoder que o servidor usa e
+  o decodificador da página são de versões diferentes. Depois de um
+  `git pull`, rode `make` (o encoder é C) e recarregue a página sem cache
+  (Ctrl+Shift+R), porque o navegador pode continuar com o `nvdr.js` ou o
+  `nvdr.wasm` antigos.
+
 **Arquivos antigos (`.nvdr` v9 e v10, `.nvdrv` antes da versão 6) não abrem mais.** O formato mudou de
 retângulos chapados para quadtree + DCT; recodifique a imagem. O codec
 antigo está em `reference/nvdr_v9`, só para reproduzir medições antigas.

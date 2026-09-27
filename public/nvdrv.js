@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, newProbs } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 11;
+const VERSION = 12;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -551,7 +551,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v11 file');
+        if (!this.info) throw new Error('not an NVDRV v12 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
