@@ -1020,6 +1020,42 @@ static void obmc_apply(const Grid* G, const Motion* M, NvdrImage* dst) {
         }
 }
 
+/* One channel of obmc_apply's result at (x, y), alone: a pixel is only
+ * blended by its own cell's passes, in the same order. */
+static int obmc_sample(const Grid* G, const Motion* M, const uint8_t* mask, int L, int x, int y, int c) {
+    int g = G->g, fx = x / g, fy = y / g, b = fy * G->nfx + fx, x0 = fx * g, y0 = fy * g;
+    int bw = G->w - x0 < g ? G->w - x0 : g, bh = G->h - y0 < g ? G->h - y0 : g;
+    int p = motion_sample(M, b, x, y, c);
+    for (int side = 0; side < 4; side++) {
+        int n, d, extent;
+        if (side == 0) { if (fy == 0) continue; n = b - G->nfx; d = y - y0; extent = bh; }
+        else if (side == 1) { if (fy + 1 >= G->nfy) continue; n = b + G->nfx; d = y0 + bh - 1 - y; extent = bh; }
+        else if (side == 2) { if (fx == 0) continue; n = b - 1; d = x - x0; extent = bw; }
+        else { if (fx + 1 >= G->nfx) continue; n = b + 1; d = x0 + bw - 1 - x; extent = bw; }
+        if (d >= (L < extent ? L : extent) || mask[d] == 64 || motion_same(M, b, n)) continue;
+        p = (mask[d] * p + (64 - mask[d]) * motion_sample(M, n, x, y, c) + 32) >> 6;
+    }
+    return p;
+}
+
+/* Absolute error of the overlapped prediction against `cur` over a
+ * rectangle, stopping once past `limit`. */
+static int obmc_sad(const Grid* G, const Motion* M, const NvdrImage* cur,
+                    int x0, int y0, int x1, int y1, int limit) {
+    int L = G->g / 2 > 0 ? G->g / 2 : 1, acc = 0;
+    const uint8_t* mask = obmc_mask(L);
+    for (int y = y0; y < y1; y++) {
+        const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
+        for (int x = x0; x < x1; x++, a += 3)
+            for (int c = 0; c < 3; c++) {
+                int d = a[c] - obmc_sample(G, M, mask, L, x, y, c);
+                acc += d < 0 ? -d : d;
+            }
+        if (acc >= limit) return acc;
+    }
+    return acc;
+}
+
 static int16_t model_point(const Model* m, int px, int py, int x_or_y) {
     int64_t s = x_or_y ? ((int64_t)m->b1 * px + (int64_t)m->b2 * py + 32768) >> 16
                        : ((int64_t)m->a1 * px + (int64_t)m->a2 * py + 32768) >> 16;
@@ -1432,6 +1468,76 @@ static void vf_decide(VfDecide* D, const int16_t* s0x, const int16_t* s0y, const
         }
 }
 
+/*
+ * Choosing vectors knowing the blend. vf_decide scores each unit's
+ * vectors on its own block, as if blocks did not overlap; the decoder
+ * then blends every cell's edges with its neighbours' motion, so the
+ * vector that was best alone is not the one that is best blended. This
+ * pass revisits the units in coding order with every other vector fixed
+ * and scores a unit's candidates on what the decoder will show: the
+ * overlapped prediction over the unit and the half cell around it that
+ * its motion reaches into, plus lambda times the vector's bits. The
+ * candidates are the unit's vector, its four neighbours at a quarter
+ * pixel (walked while they keep winning), its prediction and the vectors
+ * of the cells either side; in a B frame each list the unit's mode uses,
+ * one after the other. Splits and modes stay as vf_decide chose them.
+ */
+#define OBMC_REFINE_STEPS 4
+
+static void obmc_refine_list(VfDecide* D, const Motion* M, VfList* L, int fx, int fy, int w) {
+    const Grid* G = D->G;
+    int c = fy * G->nfx + fx, lim = NVDRV_MV_MAX, h = G->g / 2 > 0 ? G->g / 2 : 1;
+    int x0 = fx * G->g - h, y0 = fy * G->g - h;
+    int x1 = (fx + w) * G->g + h, y1 = (fy + w) * G->g + h;
+    x0 = x0 < 0 ? 0 : x0; y0 = y0 < 0 ? 0 : y0;
+    x1 = x1 > G->w ? G->w : x1; y1 = y1 > G->h ? G->h : y1;
+    int px, py;
+    vf_pred(G, L->M, L->dx, L->dy, fx, fy, w, &px, &py);
+    int bx = L->vx[c], by = L->vy[c];
+    int best = obmc_sad(G, M, D->cur, x0, y0, x1, y1, INT_MAX) + D->lambda * mv_bits(bx - px, by - py);
+    int cand[8][2], nc = 0;
+    cand[nc][0] = px; cand[nc][1] = py; nc++;
+    if (fx > 0) { cand[nc][0] = L->vx[c - 1]; cand[nc][1] = L->vy[c - 1]; nc++; }
+    if (fy > 0) { cand[nc][0] = L->vx[c - G->nfx]; cand[nc][1] = L->vy[c - G->nfx]; nc++; }
+    if (fx + w < G->nfx) { cand[nc][0] = L->vx[c + w]; cand[nc][1] = L->vy[c + w]; nc++; }
+    if (fy + w < G->nfy) { cand[nc][0] = L->vx[c + w * G->nfx]; cand[nc][1] = L->vy[c + w * G->nfx]; nc++; }
+    for (int step = 0; step <= OBMC_REFINE_STEPS; step++) {
+        int ox = bx, oy = by, moved = 0;
+        if (step > 0) {
+            nc = 0;
+            cand[nc][0] = ox - 1; cand[nc][1] = oy; nc++;
+            cand[nc][0] = ox + 1; cand[nc][1] = oy; nc++;
+            cand[nc][0] = ox; cand[nc][1] = oy - 1; nc++;
+            cand[nc][0] = ox; cand[nc][1] = oy + 1; nc++;
+        }
+        for (int k = 0; k < nc; k++) {
+            int vx = cand[k][0], vy = cand[k][1];
+            if ((vx == bx && vy == by) || vx < -lim || vx > lim || vy < -lim || vy > lim) continue;
+            int rate = D->lambda * mv_bits(vx - px, vy - py);
+            if (rate >= best) continue;
+            vf_set(L, fx, fy, w, vx, vy);
+            int cost = obmc_sad(G, M, D->cur, x0, y0, x1, y1, best - rate) + rate;
+            if (cost < best) { best = cost; bx = vx; by = vy; moved = 1; }
+        }
+        vf_set(L, fx, fy, w, bx, by);
+        if (step > 0 && !moved) break;
+    }
+}
+
+static void obmc_refine(VfDecide* D, const Motion* M, const uint8_t* split) {
+    const Grid* G = D->G;
+    for (int by = 0; by < G->nby; by++)
+        for (int bx = 0; bx < G->nbx; bx++) {
+            int u[4][3], nu = vf_units(G, bx, by, split[by * G->nbx + bx], u);
+            for (int k = 0; k < nu; k++) {
+                int fx = u[k][0], fy = u[k][1], w = u[k][2];
+                int md = D->mode ? D->mode[fy * G->nfx + fx] : MODE_FWD;
+                if (md != MODE_BWD) obmc_refine_list(D, M, D->l0, fx, fy, w);
+                if (md != MODE_FWD) obmc_refine_list(D, M, D->l1, fx, fy, w);
+            }
+        }
+}
+
 /* ------------------------------------------------------------ encoder */
 
 /*
@@ -1718,19 +1824,43 @@ static int q_for(const NvdrvEncoder* e, int kind, int level) {
 }
 
 /* The prediction in e->pred with its blocks overlapped or not, whichever
- * is nearer the source in squared error; 1 when overlapped. */
-static int obmc_choose(NvdrvEncoder* e, const Grid* G, const Motion* M, const NvdrImage* src) {
-    size_t npx = (size_t)e->width * e->height * 3;
-    memcpy(e->error.pixels, e->pred.pixels, npx);
+ * is nearer the source in squared error; 1 when overlapped. Overlapped,
+ * the field is the one obmc_refine chose knowing the blend; not, the
+ * field vf_decide chose, which e->pred was built from. */
+static int obmc_choose(NvdrvEncoder* e, VfDecide* D, const Motion* M, const NvdrImage* src) {
+    const Grid* G = D->G;
+    size_t npx = (size_t)e->width * e->height * 3, nf = (size_t)G->nfx * G->nfy;
+    int lists = D->l1 ? 2 : 1;
+    int16_t* save = (int16_t*)malloc(nf * 4 * lists * sizeof(int16_t));
+    if (!save) return 0;
+    for (int l = 0; l < lists; l++) {
+        VfList* L = l ? D->l1 : D->l0;
+        int16_t* s = save + nf * 4 * l;
+        memcpy(s, L->vx, nf * 2); memcpy(s + nf, L->vy, nf * 2);
+        memcpy(s + 2 * nf, L->dx, nf * 2); memcpy(s + 3 * nf, L->dy, nf * 2);
+    }
+    obmc_refine(D, M, e->split);
+    if (D->l1) block_predict_bi(M->r0, M->r1, &e->error, G->g, M->v0x, M->v0y, M->v1x, M->v1y, M->mode);
+    else block_predict(M->r0, &e->error, G->g, M->v0x, M->v0y);
     obmc_apply(G, M, &e->error);
     double plain = 0.0, over = 0.0;
     for (size_t i = 0; i < npx; i++) {
         int a = src->pixels[i] - e->pred.pixels[i], b = src->pixels[i] - e->error.pixels[i];
         plain += a * a; over += b * b;
     }
-    if (over >= plain) return 0;
-    unsigned char* t = e->pred.pixels; e->pred.pixels = e->error.pixels; e->error.pixels = t;
-    return 1;
+    int use = over < plain;
+    if (use) {
+        unsigned char* t = e->pred.pixels; e->pred.pixels = e->error.pixels; e->error.pixels = t;
+    } else {
+        for (int l = 0; l < lists; l++) {
+            VfList* L = l ? D->l1 : D->l0;
+            const int16_t* s = save + nf * 4 * l;
+            memcpy(L->vx, s, nf * 2); memcpy(L->vy, s + nf, nf * 2);
+            memcpy(L->dx, s + 2 * nf, nf * 2); memcpy(L->dy, s + 3 * nf, nf * 2);
+        }
+    }
+    free(save);
+    return use;
 }
 
 /* Code the source frame `src`, shown at `display`, and keep what the
@@ -1770,7 +1900,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
             vf_decide(&D, e->s0x, e->s0y, NULL, NULL, e->h0x, e->h0y, NULL, NULL, e->split, VF_SPLIT_BITS);
             block_predict(&sp, &e->pred, G.g, e->v0x, e->v0y);
             Motion M = { &sp, NULL, e->v0x, e->v0y, NULL, NULL, NULL };
-            obmc = obmc_choose(e, &G, &M, src);
+            obmc = obmc_choose(e, &D, &M, src);
             subpel_free(&sp);
             ref = &e->pred;
         } else {
@@ -1808,7 +1938,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         vf_decide(&D, e->s0x, e->s0y, e->s1x, e->s1y, e->h0x, e->h0y, e->h1x, e->h1y, e->split, VF_SPLIT_BITS);
         block_predict_bi(&sp0, &sp1, &e->pred, G.g, e->v0x, e->v0y, e->v1x, e->v1y, e->mode);
         Motion M = { &sp0, &sp1, e->v0x, e->v0y, e->v1x, e->v1y, e->mode };
-        obmc = obmc_choose(e, &G, &M, src);
+        obmc = obmc_choose(e, &D, &M, src);
         subpel_free(&sp0); subpel_free(&sp1);
         ref = &e->pred;
     }
