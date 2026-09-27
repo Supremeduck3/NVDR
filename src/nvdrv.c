@@ -487,15 +487,15 @@ static void block_predict(const Subpel* src, NvdrImage* dst, int block,
 #define MV_MAG_CTX 6
 
 typedef struct {
-    uint16_t same[3];
-    uint16_t zero[2];
-    uint16_t sign[2];
-    uint16_t mag[2][MV_MAG_CTX];
+    NvdrProb same[3];
+    NvdrProb zero[2];
+    NvdrProb sign[2];
+    NvdrProb mag[2][MV_MAG_CTX];
 } MvModels;
 
 static void mv_models_init(MvModels* m) {
-    uint16_t* p = (uint16_t*)m;
-    for (size_t i = 0; i < sizeof(*m) / sizeof(uint16_t); i++) p[i] = NVDR_PROB_INIT;
+    NvdrProb* p = (NvdrProb*)m;
+    for (size_t i = 0; i < sizeof(*m) / sizeof(NvdrProb); i++) p[i] = NVDR_PROB_INIT;
 }
 
 static int median3(int a, int b, int c) {
@@ -1203,7 +1203,7 @@ static uint8_t* pack_vfield(const Grid* G, const uint8_t* split, const uint8_t* 
     if (!same) return NULL;
     MvModels m0, m1;
     mv_models_init(&m0); mv_models_init(&m1);
-    uint16_t split_m[3], not_bi[3], bwd[3];
+    NvdrProb split_m[3], not_bi[3], bwd[3];
     for (int i = 0; i < 3; i++) split_m[i] = not_bi[i] = bwd[i] = NVDR_PROB_INIT;
     l0->same = same; l0->mm = &m0;
     if (l1) { l1->same = same + nf; l1->mm = &m1; }
@@ -1241,7 +1241,7 @@ static int unpack_vfield(const uint8_t* packed, size_t len, const Grid* G, uint8
     if (!same) return -1;
     MvModels m0, m1;
     mv_models_init(&m0); mv_models_init(&m1);
-    uint16_t split_m[3], not_bi[3], bwd[3];
+    NvdrProb split_m[3], not_bi[3], bwd[3];
     for (int i = 0; i < 3; i++) split_m[i] = not_bi[i] = bwd[i] = NVDR_PROB_INIT;
     l0->same = same; l0->mm = &m0;
     if (l1) { l1->same = same + nf; l1->mm = &m1; }

@@ -48,11 +48,36 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Probabilities are 11-bit, adapted by a shift of 5 — the LZMA tuning,
- * which is well tested and cheap enough to run per bit. */
+/*
+ * ADAPTATION
+ * ----------
+ * A context's probability moves toward each bit it codes, by a share of
+ * the distance that shrinks as the context sees more bits: 1/4 over its
+ * first 12, then 1/8 up to 40, 1/16 up to 96, and 1/64 from then on. A
+ * fresh context so learns in a few bits what the fixed 1/32 of LZMA took
+ * dozens for, and an established one is steadier than 1/32 allowed; it
+ * is the counter AV1 keeps per context. The probability is 15 bits in the
+ * low half of a NvdrProb and the count in the high half, and the coder
+ * uses the probability at 11 bits, clamped away from 0.
+ */
+typedef uint32_t NvdrProb;
 #define NVDR_PROB_BITS  11
-#define NVDR_PROB_INIT  (1 << (NVDR_PROB_BITS - 1))
-#define NVDR_MOVE_BITS  5
+#define NVDR_STATE_BITS 15
+#define NVDR_PROB_INIT  ((NvdrProb)(1u << (NVDR_STATE_BITS - 1)))
+
+/* The 11-bit probability of a 0 a context codes with. */
+static inline uint32_t nvdr_prob(NvdrProb s) {
+    uint32_t p = (s & 0xffffu) >> (NVDR_STATE_BITS - NVDR_PROB_BITS);
+    return p < 1 ? 1 : p > (1u << NVDR_PROB_BITS) - 1 ? (1u << NVDR_PROB_BITS) - 1 : p;
+}
+
+static inline void nvdr_prob_update(NvdrProb* s, int bit) {
+    uint32_t p = *s & 0xffffu, n = *s >> 16;
+    int sh = n < 12 ? 2 : n < 40 ? 3 : n < 96 ? 4 : 6;
+    if (bit) p -= p >> sh; else p += ((1u << NVDR_STATE_BITS) - p) >> sh;
+    if (n < 96) n++;
+    *s = p | (n << 16);
+}
 
 /* Split-flag contexts are bucketed by rectangle area: a large region is
  * far more likely to subdivide than a small one, and both sides know the
@@ -70,19 +95,19 @@
 #define NVDR_PREV_CTX   7
 
 typedef struct {
-    uint16_t split[NVDR_AREA_CTX];
+    NvdrProb split[NVDR_AREA_CTX];
     /* Whether a rectangle carries a ramp, and along which axis. Both are
      * conditioned on area: a big rectangle spans more of a gradient, so it
      * is far likelier to want one. */
-    uint16_t grad[NVDR_AREA_CTX];
-    uint16_t grad_axis[NVDR_AREA_CTX];
-    uint16_t slope_sig[NVDR_CHANNELS];
-    uint16_t slope_sign[NVDR_CHANNELS];
-    uint16_t slope_mag[NVDR_CHANNELS][NVDR_MAG_CTX];
-    uint16_t token[256];                 /* binary tree over anchor_bits */
-    uint16_t sig[NVDR_SPLIT_CTX][NVDR_CHANNELS][NVDR_PREV_CTX];
-    uint16_t sign[NVDR_SPLIT_CTX][NVDR_CHANNELS];
-    uint16_t mag[NVDR_SPLIT_CTX][NVDR_CHANNELS][NVDR_PREV_CTX][NVDR_MAG_CTX];
+    NvdrProb grad[NVDR_AREA_CTX];
+    NvdrProb grad_axis[NVDR_AREA_CTX];
+    NvdrProb slope_sig[NVDR_CHANNELS];
+    NvdrProb slope_sign[NVDR_CHANNELS];
+    NvdrProb slope_mag[NVDR_CHANNELS][NVDR_MAG_CTX];
+    NvdrProb token[256];                 /* binary tree over anchor_bits */
+    NvdrProb sig[NVDR_SPLIT_CTX][NVDR_CHANNELS][NVDR_PREV_CTX];
+    NvdrProb sign[NVDR_SPLIT_CTX][NVDR_CHANNELS];
+    NvdrProb mag[NVDR_SPLIT_CTX][NVDR_CHANNELS][NVDR_PREV_CTX][NVDR_MAG_CTX];
 } NvdrModels;
 
 void nvdr_models_init(NvdrModels* m);
@@ -107,9 +132,9 @@ typedef struct {
 } NvdrEncoder;
 
 int  nvdr_enc_init(NvdrEncoder* enc, size_t expected_bytes);
-void nvdr_enc_bit(NvdrEncoder* enc, uint16_t* prob, int bit);
+void nvdr_enc_bit(NvdrEncoder* enc, NvdrProb* prob, int bit);
 void nvdr_enc_direct(NvdrEncoder* enc, uint32_t value, int bit_count);
-void nvdr_enc_tree(NvdrEncoder* enc, uint16_t* probs, uint32_t value, int bit_count);
+void nvdr_enc_tree(NvdrEncoder* enc, NvdrProb* probs, uint32_t value, int bit_count);
 void nvdr_enc_residual(NvdrEncoder* enc, NvdrModels* m, int value,
                        int split_ctx, int channel, int prev_ctx);
 int  nvdr_enc_finish(NvdrEncoder* enc);   /* flushes; 0 on success */
@@ -127,9 +152,9 @@ typedef struct {
 } NvdrDecoder;
 
 void     nvdr_dec_init(NvdrDecoder* dec, const uint8_t* bytes, size_t size);
-int      nvdr_dec_bit(NvdrDecoder* dec, uint16_t* prob);
+int      nvdr_dec_bit(NvdrDecoder* dec, NvdrProb* prob);
 uint32_t nvdr_dec_direct(NvdrDecoder* dec, int bit_count);
-uint32_t nvdr_dec_tree(NvdrDecoder* dec, uint16_t* probs, int bit_count);
+uint32_t nvdr_dec_tree(NvdrDecoder* dec, NvdrProb* probs, int bit_count);
 int      nvdr_dec_residual(NvdrDecoder* dec, NvdrModels* m,
                            int split_ctx, int channel, int prev_ctx);
 

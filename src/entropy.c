@@ -1,10 +1,10 @@
 /*
  * NVDR entropy layer. See entropy.h for what the contexts are and why.
  *
- * The arithmetic coder itself is the LZMA range coder: 11-bit adaptive
+ * The arithmetic coder itself is the LZMA range coder: 11-bit
  * probabilities, 32-bit range, carry handled by the cache/cache_size pair
- * in shift_low. It is used unmodified because it is well understood and
- * the interesting work here is the model, not the coder.
+ * in shift_low. Only the adaptation differs from LZMA's (see ADAPTATION
+ * in entropy.h).
  */
 #include "entropy.h"
 
@@ -14,8 +14,8 @@
 #define TOP_VALUE (1u << 24)
 
 void nvdr_models_init(NvdrModels* m) {
-    uint16_t* p = (uint16_t*)m;
-    size_t n = sizeof(NvdrModels) / sizeof(uint16_t);
+    NvdrProb* p = (NvdrProb*)m;
+    size_t n = sizeof(NvdrModels) / sizeof(NvdrProb);
     for (size_t i = 0; i < n; i++) p[i] = NVDR_PROB_INIT;
 }
 
@@ -76,16 +76,14 @@ static void enc_shift_low(NvdrEncoder* enc) {
     enc->low = (uint32_t)enc->low << 8;
 }
 
-void nvdr_enc_bit(NvdrEncoder* enc, uint16_t* prob, int bit) {
-    uint32_t bound = (enc->range >> NVDR_PROB_BITS) * (*prob);
-    if (!bit) {
-        enc->range = bound;
-        *prob = (uint16_t)(*prob + (((1 << NVDR_PROB_BITS) - *prob) >> NVDR_MOVE_BITS));
-    } else {
+void nvdr_enc_bit(NvdrEncoder* enc, NvdrProb* prob, int bit) {
+    uint32_t bound = (enc->range >> NVDR_PROB_BITS) * nvdr_prob(*prob);
+    if (!bit) enc->range = bound;
+    else {
         enc->low += bound;
         enc->range -= bound;
-        *prob = (uint16_t)(*prob - (*prob >> NVDR_MOVE_BITS));
     }
+    nvdr_prob_update(prob, bit);
     while (enc->range < TOP_VALUE) {
         enc->range <<= 8;
         enc_shift_low(enc);
@@ -104,7 +102,7 @@ void nvdr_enc_direct(NvdrEncoder* enc, uint32_t value, int bit_count) {
     }
 }
 
-void nvdr_enc_tree(NvdrEncoder* enc, uint16_t* probs, uint32_t value, int bit_count) {
+void nvdr_enc_tree(NvdrEncoder* enc, NvdrProb* probs, uint32_t value, int bit_count) {
     /* Walk a binary tree of contexts from the most significant bit, the
      * way a literal coder does: each node is conditioned on the prefix. */
     uint32_t node = 1;
@@ -197,19 +195,18 @@ static void dec_normalize(NvdrDecoder* dec) {
     }
 }
 
-int nvdr_dec_bit(NvdrDecoder* dec, uint16_t* prob) {
-    uint32_t bound = (dec->range >> NVDR_PROB_BITS) * (*prob);
+int nvdr_dec_bit(NvdrDecoder* dec, NvdrProb* prob) {
+    uint32_t bound = (dec->range >> NVDR_PROB_BITS) * nvdr_prob(*prob);
     int bit;
     if (dec->code < bound) {
         dec->range = bound;
-        *prob = (uint16_t)(*prob + (((1 << NVDR_PROB_BITS) - *prob) >> NVDR_MOVE_BITS));
         bit = 0;
     } else {
         dec->code -= bound;
         dec->range -= bound;
-        *prob = (uint16_t)(*prob - (*prob >> NVDR_MOVE_BITS));
         bit = 1;
     }
+    nvdr_prob_update(prob, bit);
     dec_normalize(dec);
     return bit;
 }
@@ -227,7 +224,7 @@ uint32_t nvdr_dec_direct(NvdrDecoder* dec, int bit_count) {
     return result;
 }
 
-uint32_t nvdr_dec_tree(NvdrDecoder* dec, uint16_t* probs, int bit_count) {
+uint32_t nvdr_dec_tree(NvdrDecoder* dec, NvdrProb* probs, int bit_count) {
     uint32_t node = 1;
     for (int i = 0; i < bit_count; i++)
         node = (node << 1) | (uint32_t)nvdr_dec_bit(dec, &probs[node]);

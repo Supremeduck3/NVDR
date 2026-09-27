@@ -1,54 +1,54 @@
 {
   "<album fotos>": {
-    "bytes": 148642,
+    "bytes": 147899,
     "psnr": 0.0
   },
   "<album rajada>": {
-    "bytes": 6686,
+    "bytes": 6313,
     "psnr": 0.0
   },
   "<sequence default>": {
-    "bytes": 7039,
-    "psnr": 33.3
+    "bytes": 6587,
+    "psnr": 33.45
   },
   "<sequence>": {
-    "bytes": 5601,
-    "psnr": 31.88
+    "bytes": 5172,
+    "psnr": 31.96
   },
   "OIP-1304511485.jpg": {
-    "bytes": 13074,
-    "psnr": 34.78
+    "bytes": 13023,
+    "psnr": 34.8
   },
   "OIP-3451121336.jpg": {
-    "bytes": 36380,
-    "psnr": 31.35
+    "bytes": 36178,
+    "psnr": 31.36
   },
   "OIP-3786546191.jpg": {
-    "bytes": 29029,
+    "bytes": 28867,
     "psnr": 32.02
   },
   "OIP-4140498144.jpg": {
-    "bytes": 19308,
-    "psnr": 33.3
+    "bytes": 19237,
+    "psnr": 33.28
   },
   "blocos.ppm": {
-    "bytes": 329,
+    "bytes": 247,
     "psnr": 56.34
   },
   "circulos.ppm": {
-    "bytes": 3523,
-    "psnr": 41.5
+    "bytes": 3468,
+    "psnr": 41.59
   },
   "degrade.ppm": {
-    "bytes": 430,
+    "bytes": 314,
     "psnr": 46.19
   },
   "macarr\u00e3o.jpg": {
-    "bytes": 4996,
-    "psnr": 38.91
+    "bytes": 4925,
+    "psnr": 38.88
   },
   "montanha_pessoas.jpg": {
-    "bytes": 45638,
-    "psnr": 32.92
+    "bytes": 45452,
+    "psnr": 32.93
   }
 }

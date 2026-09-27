@@ -53,9 +53,12 @@ const SIG_CTX = 25, GT1_CTX = 10;
 
 /* --- entropy layer, mirroring src/entropy.c -------------------------- */
 
-const PROB_BITS = 11;
-export const PROB_INIT = 1 << (PROB_BITS - 1);
-const MOVE_BITS = 5;
+// Mirrors ADAPTATION in entropy.h: a 15-bit probability in the low half
+// of each state and the count of bits it has coded in the high half.
+const PROB_BITS = 11, STATE_BITS = 15;
+export const PROB_INIT = 1 << (STATE_BITS - 1);
+/* A context array of n states, as the models hold them. */
+export const newProbs = n => new Uint32Array(n).fill(PROB_INIT);
 const TOP_VALUE = 1 << 24;
 
 /*
@@ -89,18 +92,25 @@ export class ArithDecoder {
     }
 
     bit(probs, index) {
-        const bound = ((this.range >>> PROB_BITS) * probs[index]) >>> 0;
+        const s = probs[index];
+        let p = s & 0xffff, n = s >>> 16;
+        let q = p >>> (STATE_BITS - PROB_BITS);
+        q = q < 1 ? 1 : q > 2047 ? 2047 : q;
+        const bound = ((this.range >>> PROB_BITS) * q) >>> 0;
         let result;
+        const sh = n < 12 ? 2 : n < 40 ? 3 : n < 96 ? 4 : 6;
         if ((this.code >>> 0) < bound) {
             this.range = bound;
-            probs[index] += ((1 << PROB_BITS) - probs[index]) >>> MOVE_BITS;
+            p += ((1 << STATE_BITS) - p) >>> sh;
             result = 0;
         } else {
             this.code = (this.code - bound) >>> 0;
             this.range = (this.range - bound) >>> 0;
-            probs[index] -= probs[index] >>> MOVE_BITS;
+            p -= p >>> sh;
             result = 1;
         }
+        if (n < 96) n++;
+        probs[index] = (p | (n << 16)) >>> 0;
         this.normalize();
         return result;
     }
@@ -276,7 +286,7 @@ function inverseTx(s, tx, input, out, mu, mv) {
 
 /* --- models ------------------------------------------------------------ */
 
-const probs = n => new Uint16Array(n).fill(PROB_INIT);
+const probs = newProbs;
 const grid = (outer, inner) => Array.from({ length: outer }, () => probs(inner));
 
 function colourModels() {
