@@ -793,7 +793,7 @@ that: a cross-component filter (VVC's CC-ALF, colour refined from luma),
 given how much the colour alone gained here, and giving the 4:2:0
 upsampling a filter of its own.
 
-### Adapting faster at first
+### Adapting faster at first (container v13, sequence v12)
 
 Every context starts at even odds and learns only from the bits it
 codes, so the start of every picture is coded with raw probabilities.
@@ -803,7 +803,9 @@ the bits it has coded and moves by 1/4 over its first 12, 1/8 up to 40,
 1/16 up to 96 and 1/64 after, as AV1's per-context counter does; the
 probability is kept at 15 bits so the slow steps still move it, and
 coded at 11 as before. Both sides count the same bits, so nothing is
-sent. Mixing a fast and a slow estimate at fixed rates (VVC's way) was
+sent. It changes what every bit means, so the container version went
+to 13 (and the sequence's to 12): a decoder of the other kind refuses
+the file instead of reading noise from it. Mixing a fast and a slow estimate at fixed rates (VVC's way) was
 tried first and gave about a third as much.
 
     intra, five photos, BD-rate       vs AV1 (libaom, still)   vs HEVC (x265 intra)

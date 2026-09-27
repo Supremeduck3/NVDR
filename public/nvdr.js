@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-const VERSION = 12;
+export const VERSION = 13;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
