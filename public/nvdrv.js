@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 13;
+const VERSION = 14;
 const HEADER_SIZE = 24;
 const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
@@ -77,8 +77,48 @@ function mvModels() {
         zero: newProbs(2),
         sign: newProbs(2),
         mag: [newProbs(MV_MAG_CTX),
-              newProbs(MV_MAG_CTX)]
+              newProbs(MV_MAG_CTX)],
+        temporal: newProbs(1)
     };
+}
+
+/* Mirrors TEMPORAL PREDICTION in nvdrv.c: scale_round(), temporal_source(),
+ * temporal_pred() and slot_store_field(). */
+function scaleRound(v, num, den) {
+    let a = v * num, b = den;
+    const neg = (a < 0) !== (b < 0);
+    a = Math.abs(a); b = Math.abs(b);
+    const r = Math.floor((2 * a + b) / (2 * b));
+    return neg ? -r : r;
+}
+function temporalSource(dpb, before, after) {
+    if (after >= 0 && dpb[after].fd) return dpb[after];
+    if (before >= 0 && dpb[before].fd) return dpb[before];
+    return null;
+}
+function temporalPred(G, src, dist, tx, ty, tok) {
+    if (!src || !src.fd || src.fnfx !== G.nfx || src.fnfy !== G.nfy || !dist) return false;
+    const nf = G.nfx * G.nfy, lim = MV_MAX;
+    for (let c = 0; c < nf; c++) {
+        const d = src.fd[c];
+        tok[c] = d !== 0 ? 1 : 0;
+        if (!d) { tx[c] = ty[c] = 0; continue; }
+        const x = scaleRound(src.fvx[c], dist, d), y = scaleRound(src.fvy[c], dist, d);
+        tx[c] = x < -lim ? -lim : x > lim ? lim : x;
+        ty[c] = y < -lim ? -lim : y > lim ? lim : y;
+    }
+    return true;
+}
+function storeField(G, mode, v0x, v0y, d0, v1x, v1y, d1) {
+    const nf = G.nfx * G.nfy;
+    const f = { fvx: new Int16Array(nf), fvy: new Int16Array(nf), fd: new Int8Array(nf), fnfx: G.nfx, fnfy: G.nfy };
+    for (let c = 0; c < nf; c++) {
+        const b = mode && mode[c] === MODE_BWD;
+        f.fvx[c] = b ? v1x[c] : v0x[c];
+        f.fvy[c] = b ? v1y[c] : v0y[c];
+        f.fd[c] = b ? d1 : d0;
+    }
+    return f;
 }
 
 /* mv_predict(): the model's vector at the block plus the median of how
@@ -193,7 +233,10 @@ function vfDecVector(dec, L, fx, fy, w) {
     const ctx = (fx > 0 && L.same[c - 1] ? 1 : 0) + (fy > 0 && L.same[c - G.nfx] ? 1 : 0);
     const same = !dec.bit(L.mm.same, ctx);
     let ex = 0, ey = 0;
-    if (!same) {
+    const hasT = L.tok && L.tok[c] && (L.tx[c] !== PRED2[0] || L.ty[c] !== PRED2[1]);
+    if (!same && hasT && dec.bit(L.mm.temporal, 0)) {
+        ex = L.tx[c] - PRED2[0]; ey = L.ty[c] - PRED2[1];
+    } else if (!same) {
         ex = mvComponent(dec, L.mm, 0, true, MV_ESC_SEQ);
         ey = mvComponent(dec, L.mm, 1, ex !== 0, MV_ESC_SEQ);
     }
@@ -562,7 +605,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v13 file');
+        if (!this.info) throw new Error('not an NVDRV v14 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -640,6 +683,7 @@ export class SequenceDecoder {
         this.pos += FRAME_HEADER;
 
         let ref = kind === INTRA ? null : this.dpb[before].pixels;
+        let field = null;    // this frame's motion, for the frames after it
         if (block) {
             // The field has to arrive whole: without it there is no
             // reference to add the residual to, so a cut inside it ends
@@ -662,15 +706,24 @@ export class SequenceDecoder {
             const model0 = flags & FRAME_MODEL0 ? modelGet(bytes, mp) : [dx * 4, 0, 0, dy * 4, 0, 0];
             if (flags & FRAME_MODEL0) mp += MODEL_BYTES;
             const model1 = flags & FRAME_MODEL1 ? modelGet(bytes, mp) : [dx1 * 4, 0, 0, dy1 * 4, 0, 0];
-            const l0 = { G, M: model0, vx: v0x, vy: v0y, dx: d0x, dy: d0y };
+            // Each list's temporal prediction, from a frame decoded already.
+            const ts = temporalSource(this.dpb, before, after);
+            const t0x = new Int16Array(nb), t0y = new Int16Array(nb), t0ok = new Uint8Array(nb);
+            const t1x = new Int16Array(nb), t1y = new Int16Array(nb), t1ok = new Uint8Array(nb);
+            const dist0 = display - this.dpb[before].display, dist1 = after >= 0 ? display - this.dpb[after].display : 0;
+            const has0 = temporalPred(G, ts, dist0, t0x, t0y, t0ok);
+            const has1 = kind === BI && temporalPred(G, ts, dist1, t1x, t1y, t1ok);
+            const l0 = { G, M: model0, vx: v0x, vy: v0y, dx: d0x, dy: d0y, tx: t0x, ty: t0y, tok: has0 ? t0ok : null };
             if (kind === PRED) {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
                     throw new Error('motion field is damaged');
                 blockPredict(ref, this.pred, width, height, G.g, v0x, v0y);
                 if (flags & FRAME_OBMC) obmcApply(G, this.pred, width, height, ref, null, v0x, v0y, null, null, null);
+                field = storeField(G, null, v0x, v0y, dist0, null, null, 0);
             } else {
                 const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
-                const l1 = { G, M: model1, vx: v1x, vy: v1y, dx: new Int16Array(nb), dy: new Int16Array(nb) };
+                const l1 = { G, M: model1, vx: v1x, vy: v1y, dx: new Int16Array(nb), dy: new Int16Array(nb),
+                             tx: t1x, ty: t1y, tok: has1 ? t1ok : null };
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, mode, l0, l1))
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
@@ -690,6 +743,7 @@ export class SequenceDecoder {
                     }
                 }
                 if (flags & FRAME_OBMC) obmcApply(G, P0, width, height, ref, this.dpb[after].pixels, v0x, v0y, v1x, v1y, mode);
+                field = storeField(G, mode, v0x, v0y, dist0, v1x, v1y, dist1);
             }
             ref = this.pred;
             this.pos += 4 + fieldLen;
@@ -720,7 +774,7 @@ export class SequenceDecoder {
             if (partial) return false;
             throw new Error('frame does not decode');
         }
-        this.dpb.push({ display, kind, partial, pixels });
+        this.dpb.push({ display, kind, partial, pixels, ...(field || {}) });
         this.pos += len;
         return true;
     }

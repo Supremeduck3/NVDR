@@ -841,6 +841,51 @@ rewinds between decodes, so a sequence decoded through it keeps its
 speed (`newDecodeContext()` in nvdr.js; `SequenceDecoder.close()`
 gives them back).
 
+### The motion field: larger blocks, predicted in time (sequence v14)
+
+With everything else smaller, the motion field had become the largest
+part of a predicted frame: in the clean pan at q 24, 320 of a B frame's
+410 bytes and half of a P frame's, a quarter of the whole file. Each of
+a 960x540 frame's 2,040 units of 16x16 cost about a bit and a half,
+mostly the flag saying whether its vector was the one predicted from its
+neighbours, and the one unit in six that strayed paid for its vector in
+full.
+
+Two things cut it. Blocks of 32, halving to 16 where motions meet,
+quarter the units: -4.9, -4.9 and -6.5% on the clean pan, the clip with
+three objects and the noisy pan, against 16 halving to 8. Blocks of 64
+halving to 32 did better still on the pans (-5.3 and -7.0%) but lost
+2.3% on the objects, which need the finer motion. So 32 from 0.2 Mpx up;
+small pictures keep 8.
+
+And vectors are now predicted in time as well as in space. A frame
+decoded already has moved the same things: the frame after a B frame
+(for a P frame, the frame before) carries a field of its own, and a
+vector divided by the frames it spans is a velocity. Scaled by the
+frames between this frame and each of its references, the velocity of
+the cell in the same place predicts this frame's vectors there, as
+H.264's temporal direct mode does. A vector that is not its spatial
+prediction gets one more flag, "it is the temporal one", and then costs
+nothing more; the encoder offers the temporal vectors as candidates.
+With blocks of 16: -3.6% (noisy pan), -3.1% (clean pan), -1.7% (photo
+pan), -5.0% (still camera, noisy) and -8.1% (three objects); with
+blocks of 32, on top of them, -3.6, -5.7 and -3.8% on the three clips
+measured. Projecting each cell along its own motion to where its
+content lands in this frame, as AV1 does, came out the same on the
+whole: better on the objects, worse on the pans.
+
+Raising the weight of a field bit against block error helped the pans
+and hurt the objects (24: -2.9, -0.6 and -3.4%; 32: -3.5, +1.0 and
+-4.3%), so the weight stays at 16 for now.
+
+Together, against the encoder before, BD-rate on PSNR-Y over 25 frames:
+
+    noisy pan, one object                                -10.1%
+    clean pan, one object                                 -8.6%
+    whole-pixel pan over a photo                          -1.4%
+    still camera, noisy                                   -5.4%
+    three objects, light noise                           -10.3%
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

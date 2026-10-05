@@ -46,7 +46,12 @@ NvdrvConfig nvdrv_default_config(void) {
      * frame of field against 2386, for 0.16 dB of the 3 dB quarter pixels
      * bought. On the 128x128 sequence in the regression gate, where the
      * moving object is 30 px, 8x8 wins both ways: 7189 bytes against 8626
-     * and 0.3 dB more by the last frame. So 16 from 0.2 Mpx up, 8 below. */
+     * and 0.3 dB more by the last frame. So 16 from 0.2 Mpx up, 8 below.
+     * Since blocks split in two (format 9) and are predicted in time, 32
+     * splitting into 16 does better still on the 960x540 clips: -4.9 to
+     * -6.5% against 16 into 8, the field shrinking far more than the
+     * coarser motion costs; 64 into 32 gained more on pans but lost 2.3%
+     * on the clip with three objects. So 32 from 0.2 Mpx up. */
     c.block = -1;
     c.pred_q = 0;
     /* In SAD per bit of field. With quarter-pixel deltas a vector costs
@@ -491,6 +496,7 @@ typedef struct {
     NvdrProb zero[2];
     NvdrProb sign[2];
     NvdrProb mag[2][MV_MAG_CTX];
+    NvdrProb temporal;           /* a sequence's vector is its temporal prediction */
 } MvModels;
 
 static void mv_models_init(MvModels* m) {
@@ -1143,7 +1149,26 @@ typedef struct {
     int16_t *dx, *dy;       /* per cell, its unit's vector minus the model at the unit's centre */
     uint8_t* same;
     MvModels* mm;
+    /* Per cell, the vector the motion of a frame already decoded predicts
+     * for this list (see TEMPORAL PREDICTION), where tok is set; tok NULL
+     * when there is none for the frame. */
+    const int16_t *tx, *ty;
+    const uint8_t* tok;
 } VfList;
+
+/* Whether a unit at cell c has a temporal prediction worth a flag: one,
+ * and not the spatial prediction (px, py) already. */
+static int vf_has_temporal(const VfList* L, int c, int px, int py) {
+    return L->tok && L->tok[c] && (L->tx[c] != px || L->ty[c] != py);
+}
+
+/* Roughly the bits a unit's vector costs, for the encoder's choices. */
+static int vf_bits(const VfList* L, int c, int vx, int vy, int px, int py) {
+    if (vx == px && vy == py) return 1;
+    int t = vf_has_temporal(L, c, px, py);
+    if (t && vx == L->tx[c] && vy == L->ty[c]) return 2;
+    return mv_bits(vx - px, vy - py) + t;
+}
 
 static void vf_set(VfList* L, int fx, int fy, int w, int vx, int vy);
 
@@ -1166,6 +1191,11 @@ static void vf_enc_vector(NvdrEncoder* enc, VfList* L, int fx, int fy, int w) {
     vf_fill8(L->G, L->same, fx, fy, w, same);
     vf_set(L, fx, fy, w, L->vx[c], L->vy[c]);
     if (same) return;
+    if (vf_has_temporal(L, c, px, py)) {
+        int t = L->vx[c] == L->tx[c] && L->vy[c] == L->ty[c];
+        nvdr_enc_bit(enc, &L->mm->temporal, t);
+        if (t) return;
+    }
     mv_enc_component(enc, L->mm, 0, ex, 1, MV_ESC_SEQ);
     mv_enc_component(enc, L->mm, 1, ey, ex != 0, MV_ESC_SEQ);
 }
@@ -1174,8 +1204,10 @@ static int vf_dec_vector(NvdrDecoder* dec, VfList* L, int fx, int fy, int w) {
     int px, py;
     vf_pred(L->G, L->M, L->dx, L->dy, fx, fy, w, &px, &py);
     int same = !nvdr_dec_bit(dec, &L->mm->same[vf_same_ctx(L->G, L->same, fx, fy)]);
-    int ex = 0, ey = 0;
-    if (!same) {
+    int ex = 0, ey = 0, c = fy * L->G->nfx + fx;
+    if (!same && vf_has_temporal(L, c, px, py) && nvdr_dec_bit(dec, &L->mm->temporal)) {
+        ex = L->tx[c] - px; ey = L->ty[c] - py;
+    } else if (!same) {
         ex = mv_dec_component(dec, L->mm, 0, 1, MV_ESC_SEQ);
         ey = mv_dec_component(dec, L->mm, 1, ex != 0, MV_ESC_SEQ);
     }
@@ -1372,14 +1404,16 @@ static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x
     int t0x = fy > 0 ? D->l0->vx[c - G->nfx] : m0x, t0y = fy > 0 ? D->l0->vy[c - G->nfx] : m0y;
     int lim = NVDRV_MV_MAX;
     if (!D->r1) {
-        int cand[10][2] = { { p0x, p0y }, { o0x, o0y }, { alt0x, alt0y }, { m0x, m0y }, { l0x, l0y }, { t0x, t0y },
-                            { p0x - 1, p0y }, { p0x + 1, p0y }, { p0x, p0y - 1 }, { p0x, p0y + 1 } };
+        int cand[11][2] = { { p0x, p0y }, { o0x, o0y }, { alt0x, alt0y }, { m0x, m0y }, { l0x, l0y }, { t0x, t0y },
+                            { p0x - 1, p0y }, { p0x + 1, p0y }, { p0x, p0y - 1 }, { p0x, p0y + 1 }, { p0x, p0y } };
+        int nc = 10;
+        if (D->l0->tok && D->l0->tok[c]) { cand[nc][0] = D->l0->tx[c]; cand[nc][1] = D->l0->ty[c]; nc++; }
         int best = INT_MAX, bx = p0x, by = p0y;
-        for (int k = 0; k < 10; k++) {
+        for (int k = 0; k < nc; k++) {
             int vx = cand[k][0], vy = cand[k][1], dup = 0;
             for (int j = 0; j < k; j++) dup |= cand[j][0] == vx && cand[j][1] == vy;
             if (dup || vx < -lim || vx > lim || vy < -lim || vy > lim) continue;
-            int rate = D->lambda * mv_bits(vx - p0x, vy - p0y);
+            int rate = D->lambda * vf_bits(D->l0, c, vx, vy, p0x, p0y);
             if (rate >= best) continue;
             int cost = unit_sad(D, fx, fy, x0, y0, bw, bh, MODE_FWD, vx, vy, 0, 0, best - rate) + rate;
             if (cost < best) { best = cost; bx = vx; by = vy; }
@@ -1389,7 +1423,7 @@ static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x
     }
     vf_pred(G, D->l1->M, D->l1->dx, D->l1->dy, fx, fy, w, &p1x, &p1y);
     /* mode, then list 0's vector, then list 1's */
-    int cand[10][5] = {
+    int cand[13][5] = {
         { MODE_BI,  o0x, o0y, o1x, o1y },
         { MODE_BI,  p0x, p0y, p1x, p1y },
         { MODE_BI,  o0x, o0y, p1x, p1y },
@@ -1401,14 +1435,25 @@ static int vf_unit(VfDecide* D, int fx, int fy, int w, int o0x, int o0y, int o1x
         { MODE_BWD, p0x, p0y, o1x, o1y },
         { MODE_BWD, p0x, p0y, alt1x, alt1y },
     };
+    int nc = 10;
+    /* The temporal predictions: both together, and each alone. */
+    int tk0 = D->l0->tok && D->l0->tok[c], tk1 = D->l1->tok && D->l1->tok[c];
+    int tp0x = tk0 ? D->l0->tx[c] : p0x, tp0y = tk0 ? D->l0->ty[c] : p0y;
+    int tp1x = tk1 ? D->l1->tx[c] : p1x, tp1y = tk1 ? D->l1->ty[c] : p1y;
+    if (tk0 || tk1) {
+        int add[3][5] = { { MODE_BI, tp0x, tp0y, tp1x, tp1y }, { MODE_FWD, tp0x, tp0y, p1x, p1y },
+                          { MODE_BWD, p0x, p0y, tp1x, tp1y } };
+        for (int a = 0; a < 3; a++) for (int i = 0; i < 5; i++) cand[nc + a][i] = add[a][i];
+        nc += 3;
+    }
     int best = INT_MAX, bi = 1;
-    for (int k = 0; k < 10; k++) {
+    for (int k = 0; k < nc; k++) {
         int md = cand[k][0];
         if (cand[k][1] < -lim || cand[k][1] > lim || cand[k][2] < -lim || cand[k][2] > lim ||
             cand[k][3] < -lim || cand[k][3] > lim || cand[k][4] < -lim || cand[k][4] > lim) continue;
         int bits = 1 + 4 * ((fx > 0 && D->mode[c - 1] != md) + (fy > 0 && D->mode[c - G->nfx] != md));
-        if (md != MODE_BWD) bits += mv_bits(cand[k][1] - p0x, cand[k][2] - p0y);
-        if (md != MODE_FWD) bits += mv_bits(cand[k][3] - p1x, cand[k][4] - p1y);
+        if (md != MODE_BWD) bits += vf_bits(D->l0, c, cand[k][1], cand[k][2], p0x, p0y);
+        if (md != MODE_FWD) bits += vf_bits(D->l1, c, cand[k][3], cand[k][4], p1x, p1y);
         int rate = D->lambda * bits;
         if (rate >= best) continue;
         int cost = rate + unit_sad(D, fx, fy, x0, y0, bw, bh, md, cand[k][1], cand[k][2],
@@ -1494,9 +1539,10 @@ static void obmc_refine_list(VfDecide* D, const Motion* M, VfList* L, int fx, in
     int px, py;
     vf_pred(G, L->M, L->dx, L->dy, fx, fy, w, &px, &py);
     int bx = L->vx[c], by = L->vy[c];
-    int best = obmc_sad(G, M, D->cur, x0, y0, x1, y1, INT_MAX) + D->lambda * mv_bits(bx - px, by - py);
+    int best = obmc_sad(G, M, D->cur, x0, y0, x1, y1, INT_MAX) + D->lambda * vf_bits(L, c, bx, by, px, py);
     int cand[8][2], nc = 0;
     cand[nc][0] = px; cand[nc][1] = py; nc++;
+    if (L->tok && L->tok[c]) { cand[nc][0] = L->tx[c]; cand[nc][1] = L->ty[c]; nc++; }
     if (fx > 0) { cand[nc][0] = L->vx[c - 1]; cand[nc][1] = L->vy[c - 1]; nc++; }
     if (fy > 0) { cand[nc][0] = L->vx[c - G->nfx]; cand[nc][1] = L->vy[c - G->nfx]; nc++; }
     if (fx + w < G->nfx) { cand[nc][0] = L->vx[c + w]; cand[nc][1] = L->vy[c + w]; nc++; }
@@ -1513,7 +1559,7 @@ static void obmc_refine_list(VfDecide* D, const Motion* M, VfList* L, int fx, in
         for (int k = 0; k < nc; k++) {
             int vx = cand[k][0], vy = cand[k][1];
             if ((vx == bx && vy == by) || vx < -lim || vx > lim || vy < -lim || vy > lim) continue;
-            int rate = D->lambda * mv_bits(vx - px, vy - py);
+            int rate = D->lambda * vf_bits(L, c, vx, vy, px, py);
             if (rate >= best) continue;
             vf_set(L, fx, fy, w, vx, vy);
             int cost = obmc_sad(G, M, D->cur, x0, y0, x1, y1, best - rate) + rate;
@@ -1559,7 +1605,99 @@ typedef struct {
     int       kind;
     int       partial;
     NvdrImage img;
+    /* Its motion, for the frames after it (see TEMPORAL PREDICTION): per
+     * cell of its field's grid, a vector and how many frames away the
+     * reference it points at is, back positive, ahead negative, 0 where it
+     * has none. NULL for a frame without a field. */
+    int16_t  *fvx, *fvy;
+    int8_t   *fd;
+    int       fnfx, fnfy;
 } Slot;
+
+static void slot_free(Slot* s) {
+    nvdr_image_free(&s->img);
+    free(s->fvx); free(s->fvy); free(s->fd);
+    s->fvx = s->fvy = NULL; s->fd = NULL;
+}
+
+/*
+ * TEMPORAL PREDICTION
+ * -------------------
+ * Most of a B frame's bytes were its motion field: in a pan with one
+ * object, 320 of 410. Its vectors were predicted from the motion model and
+ * their neighbours, and the one in six that strayed from that paid for
+ * itself in full. But a frame decoded already has moved the same things:
+ * the frame after a B frame (or, for a P frame and where that has none,
+ * the frame before) carries a field of its own, and a vector divided by
+ * the frames it spans is a velocity. Scaled by the frames between this
+ * frame and each of its references, the velocity of the cell in the same
+ * place predicts this frame's vectors there, as H.264's temporal direct
+ * mode and AV1's projected motion do.
+ *
+ * Coded: a vector that is not its spatial prediction gets one more flag,
+ * "it is the temporal one", where that differs from the spatial one; then
+ * it costs nothing more. The encoder offers the temporal vectors as
+ * candidates, and both sides store every frame's field as it was coded:
+ * per cell its list 0 vector, or list 1's where the cell used only that.
+ *
+ * Measured, BD-rate on PSNR-Y over 25 frames with blocks of 16: -3.6 and
+ * -3.1% on the two pans, -1.7% on the photo pan, -5.0% with the camera
+ * still and noise, -8.1% on the clip with three objects. Projecting each
+ * source cell along its own motion to where its content is in this frame
+ * (AV1's way) instead of taking the cell in the same place gave 0.4 to
+ * 0.9 points more on the objects and 0.1 to 0.5 less on the pans: the
+ * same on the whole, for more code.
+ */
+static int slot_store_field(Slot* s, const Grid* G, const uint8_t* mode,
+                            const int16_t* v0x, const int16_t* v0y, int d0,
+                            const int16_t* v1x, const int16_t* v1y, int d1) {
+    size_t nf = (size_t)G->nfx * G->nfy;
+    s->fvx = (int16_t*)malloc(nf * sizeof(int16_t));
+    s->fvy = (int16_t*)malloc(nf * sizeof(int16_t));
+    s->fd = (int8_t*)malloc(nf);
+    if (!s->fvx || !s->fvy || !s->fd) { free(s->fvx); free(s->fvy); free(s->fd); s->fvx = s->fvy = NULL; s->fd = NULL; return -1; }
+    s->fnfx = G->nfx; s->fnfy = G->nfy;
+    for (size_t c = 0; c < nf; c++) {
+        int b = mode && mode[c] == MODE_BWD;
+        s->fvx[c] = b ? v1x[c] : v0x[c];
+        s->fvy[c] = b ? v1y[c] : v0y[c];
+        s->fd[c] = (int8_t)(b ? d1 : d0);
+    }
+    return 0;
+}
+
+/* v * num / den, rounded half away from zero. */
+static int scale_round(int v, int num, int den) {
+    long a = (long)v * num, b = den;
+    int neg = (a < 0) != (b < 0);
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    long r = (2 * a + b) / (2 * b);
+    return (int)(neg ? -r : r);
+}
+
+/* The frame whose field predicts this one's. */
+static const Slot* temporal_source(const Slot* dpb, int before, int after) {
+    if (after >= 0 && dpb[after].fd) return &dpb[after];
+    if (before >= 0 && dpb[before].fd) return &dpb[before];
+    return NULL;
+}
+
+/* Per cell, the vector toward a reference `dist` frames back (negative:
+ * ahead) that `src`'s motion predicts. Returns 0, with nothing set, when
+ * there is no such motion on this grid. */
+static int temporal_pred(const Grid* G, const Slot* src, int dist, int16_t* tx, int16_t* ty, uint8_t* tok) {
+    if (!src || !src->fd || src->fnfx != G->nfx || src->fnfy != G->nfy || !dist) return 0;
+    size_t nf = (size_t)G->nfx * G->nfy;
+    for (size_t c = 0; c < nf; c++) {
+        int d = src->fd[c];
+        tok[c] = d != 0;
+        if (!d) { tx[c] = ty[c] = 0; continue; }
+        tx[c] = (int16_t)clampi(scale_round(src->fvx[c], dist, d), -NVDRV_MV_MAX, NVDRV_MV_MAX);
+        ty[c] = (int16_t)clampi(scale_round(src->fvy[c], dist, d), -NVDRV_MV_MAX, NVDRV_MV_MAX);
+    }
+    return 1;
+}
 
 #define QCAP (NVDRV_MAX_B + 2 + NVDRV_MAX_LOOKAHEAD)
 
@@ -1600,6 +1738,8 @@ struct NvdrvEncoder {
     int16_t     *v0x, *v0y, *v1x, *v1y, *m0x, *m0y, *m1x, *m1y;
     uint8_t*    mode;
     uint8_t*    split;
+    int16_t     *t0x, *t0y, *t1x, *t1y;   /* the temporal predictions, per cell */
+    uint8_t     *t0ok, *t1ok;
     NvdrvReportFn report;
     void*       user;
 };
@@ -1659,7 +1799,7 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     e->width = width; e->height = height;
     e->anchor = -1;
 
-    if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 16 : 8;
+    if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 32 : 8;
     if (e->cfg.block > 128) e->cfg.block = 0;
     if (e->cfg.bframes < 0) e->cfg.bframes = 0;
     if (e->cfg.bframes > NVDRV_MAX_B) e->cfg.bframes = NVDRV_MAX_B;
@@ -1687,11 +1827,13 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
         Grid G;
         grid_init(&G, width, height, e->cfg.block);
         size_t nf = (size_t)G.nfx * G.nfy;
-        int16_t** v[16] = { &e->s0x, &e->s0y, &e->s1x, &e->s1y, &e->h0x, &e->h0y, &e->h1x, &e->h1y,
-                            &e->v0x, &e->v0y, &e->v1x, &e->v1y, &e->m0x, &e->m0y, &e->m1x, &e->m1y };
-        for (int i = 0; i < 16; i++)
+        int16_t** v[20] = { &e->s0x, &e->s0y, &e->s1x, &e->s1y, &e->h0x, &e->h0y, &e->h1x, &e->h1y,
+                            &e->v0x, &e->v0y, &e->v1x, &e->v1y, &e->m0x, &e->m0y, &e->m1x, &e->m1y,
+                            &e->t0x, &e->t0y, &e->t1x, &e->t1y };
+        for (int i = 0; i < 20; i++)
             if (!(*v[i] = (int16_t*)malloc(nf * sizeof(int16_t)))) { nvdrv_encode_close(e); return -1; }
-        if (!(e->mode = (uint8_t*)calloc(nf, 1)) || !(e->split = (uint8_t*)calloc(nf, 1))) {
+        if (!(e->mode = (uint8_t*)calloc(nf, 1)) || !(e->split = (uint8_t*)calloc(nf, 1)) ||
+            !(e->t0ok = (uint8_t*)calloc(nf, 1)) || !(e->t1ok = (uint8_t*)calloc(nf, 1))) {
             nvdrv_encode_close(e); return -1;
         }
     }
@@ -1905,6 +2047,14 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
      * would have to correct it: mv_lambda is set at the default q of 24. */
     int lambda = e->cfg.mv_lambda;
     if (kind != NVDRV_INTRA) lambda = (e->cfg.mv_lambda * q_for(e, kind, level) + 12) / 24;
+    /* Each list's temporal prediction, see TEMPORAL PREDICTION. */
+    const uint8_t *t0ok = NULL, *t1ok = NULL;
+    if (kind != NVDRV_INTRA && e->cfg.block > 0) {
+        const Slot* ts = temporal_source(e->dpb, before, after);
+        if (temporal_pred(&G, ts, display - e->dpb[before].display, e->t0x, e->t0y, e->t0ok)) t0ok = e->t0ok;
+        if (kind == NVDRV_BI &&
+            temporal_pred(&G, ts, display - e->dpb[after].display, e->t1x, e->t1y, e->t1ok)) t1ok = e->t1ok;
+    }
 
     if (kind == NVDRV_PRED) {
         const NvdrImage* r0 = &e->dpb[before].img;
@@ -1915,7 +2065,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
             Subpel sp;
             if (motion_list(e, src, r0, display - e->dpb[before].display, lambda, cx, cy, &dx, &dy,
                             e->s0x, e->s0y, e->h0x, e->h0y, &model0, &aff0, e->m0x, e->m0y, &sp) != 0) return -1;
-            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL };
+            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             VfDecide D = { src, &sp, NULL, &G, &l0, NULL, NULL, lambda };
             vf_decide(&D, e->s0x, e->s0y, NULL, NULL, e->h0x, e->h0y, NULL, NULL, e->split, VF_SPLIT_BITS);
             block_predict(&sp, &e->pred, G.g, e->v0x, e->v0y);
@@ -1952,8 +2102,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
                         e->s1x, e->s1y, e->h1x, e->h1y, &model1, &aff1, e->m1x, e->m1y, &sp1) != 0) {
             subpel_free(&sp0); subpel_free(&sp1); return -1;
         }
-        VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL };
-        VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL };
+        VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
+        VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
         VfDecide D = { src, &sp0, &sp1, &G, &l0, &l1, e->mode, lambda };
         vf_decide(&D, e->s0x, e->s0y, e->s1x, e->s1y, e->h0x, e->h0y, e->h1x, e->h1y, e->split, VF_SPLIT_BITS);
         block_predict_bi(&sp0, &sp1, &e->pred, G.g, e->v0x, e->v0y, e->v1x, e->v1y, e->mode);
@@ -1965,12 +2115,12 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
 
     if (kind != NVDRV_INTRA) {
         if (kind == NVDRV_PRED && block) {
-            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL };
+            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             field = with_models(aff0 ? &model0 : NULL, NULL,
                                 pack_vfield(&G, e->split, NULL, &l0, NULL, &field_len), &field_len);
         } else if (kind == NVDRV_BI) {
-            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL };
-            VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL };
+            VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
+            VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
             field = with_models(aff0 ? &model0 : NULL, aff1 ? &model1 : NULL,
                                 pack_vfield(&G, e->split, e->mode, &l0, &l1, &field_len), &field_len);
         }
@@ -2033,12 +2183,18 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     /* Carry the decoder's state forward by decoding what was just written,
      * so the two sides hold the same bytes from here on. */
     Slot* s = &e->dpb[e->ndpb];
+    s->fvx = s->fvy = NULL; s->fd = NULL;
     if (alloc_image(&s->img, e->width, e->height) != 0) { free(blob); return -1; }
     int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? e->dctx[fc] : NULL);
     free(blob);
     if (rc != 0) { nvdr_image_free(&s->img); return -1; }
     s->display = display;
     s->kind = kind;
+    if (block && slot_store_field(s, &G, kind == NVDRV_BI ? e->mode : NULL, e->v0x, e->v0y,
+                                  display - e->dpb[before].display, e->v1x, e->v1y,
+                                  kind == NVDRV_BI ? display - e->dpb[after].display : 0) != 0) {
+        slot_free(s); return -1;
+    }
     e->ndpb++;
     e->coded++;
 
@@ -2270,7 +2426,7 @@ static int code_between(NvdrvEncoder* e, int lo, int hi, int level) {
 static void drop_before(NvdrvEncoder* e, int display) {
     int k = 0;
     for (int i = 0; i < e->ndpb; i++) {
-        if (e->dpb[i].display < display) nvdr_image_free(&e->dpb[i].img);
+        if (e->dpb[i].display < display) slot_free(&e->dpb[i]);
         else e->dpb[k++] = e->dpb[i];
     }
     e->ndpb = k;
@@ -2523,7 +2679,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
         }
         if (fclose(e->f) != 0) rc = -1;
     }
-    for (int i = 0; i < e->ndpb; i++) nvdr_image_free(&e->dpb[i].img);
+    for (int i = 0; i < e->ndpb; i++) slot_free(&e->dpb[i]);
     for (int i = 0; i < QCAP; i++) free(e->pend[i].pixels);
     free(e->pred.pixels); free(e->error.pixels); free(e->last_src.pixels); free(e->tf.pixels);
     free(e->s0x); free(e->s0y); free(e->s1x); free(e->s1y);
@@ -2531,6 +2687,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     free(e->m0x); free(e->m0y); free(e->m1x); free(e->m1y);
     free(e->h0x); free(e->h0y); free(e->h1x); free(e->h1y);
     free(e->mode); free(e->split);
+    free(e->t0x); free(e->t0y); free(e->t1x); free(e->t1y); free(e->t0ok); free(e->t1ok);
     free(e->tile_q);
     for (int i = 0; i < 4; i++) { nvdr_context_free(e->ctx[i]); nvdr_context_free(e->dctx[i]); }
     free(e);
@@ -2631,6 +2788,9 @@ static int decode_one(NvdrvDecoder* d) {
     d->pos += NVDRV_FRAME_HEADER;
 
     const NvdrImage* ref = kind == NVDRV_INTRA ? NULL : &d->dpb[before].img;
+    Slot field;      /* holds this frame's field until the frame is held */
+    field.fvx = field.fvy = NULL; field.fd = NULL;
+    field.img.pixels = NULL;
 
     if (block) {
         /* The field has to arrive whole: without it there is no reference
@@ -2643,10 +2803,12 @@ static int decode_one(NvdrvDecoder* d) {
         size_t nb = (size_t)G.nfx * G.nfy;
         /* On the half-size grid: vectors of both lists, then their
          * deviations from the models; the modes; which blocks split. */
-        int16_t* v = (int16_t*)malloc(nb * 8 * sizeof(int16_t));
+        int16_t* v = (int16_t*)malloc(nb * 12 * sizeof(int16_t));
         int16_t* mv = v + 4 * nb;
-        uint8_t* mode = (uint8_t*)malloc(nb * 2);
+        int16_t* tv = v + 8 * nb;      /* the temporal predictions, both lists */
+        uint8_t* mode = (uint8_t*)malloc(nb * 4);
         uint8_t* split = mode + nb;
+        uint8_t* tok = mode + 2 * nb;
         Subpel sp0, sp1;
         memset(&sp0, 0, sizeof(sp0)); memset(&sp1, 0, sizeof(sp1));
         int rc = -1;
@@ -2657,8 +2819,14 @@ static int decode_one(NvdrvDecoder* d) {
             const uint8_t* mp = fp;
             if (flags & FRAME_MODEL0) { model_get(&m0, mp); mp += MODEL_BYTES; }
             if (flags & FRAME_MODEL1) model_get(&m1, mp);
-            VfList l0 = { &G, &m0, v, v + nb, mv, mv + nb, NULL, NULL };
-            VfList l1 = { &G, &m1, v + 2 * nb, v + 3 * nb, mv + 2 * nb, mv + 3 * nb, NULL, NULL };
+            const Slot* ts = temporal_source(d->dpb, before, after);
+            int dist0 = display - d->dpb[before].display, dist1 = after >= 0 ? display - d->dpb[after].display : 0;
+            const uint8_t* t0ok = temporal_pred(&G, ts, dist0, tv, tv + nb, tok) ? tok : NULL;
+            const uint8_t* t1ok = kind == NVDRV_BI && temporal_pred(&G, ts, dist1, tv + 2 * nb, tv + 3 * nb, tok + nb)
+                                ? tok + nb : NULL;
+            VfList l0 = { &G, &m0, v, v + nb, mv, mv + nb, NULL, NULL, tv, tv + nb, t0ok };
+            VfList l1 = { &G, &m1, v + 2 * nb, v + 3 * nb, mv + 2 * nb, mv + 3 * nb, NULL, NULL,
+                          tv + 2 * nb, tv + 3 * nb, t1ok };
             if (kind == NVDRV_PRED) {
                 if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0 &&
                     subpel_build(&sp0, ref) == 0) {
@@ -2677,6 +2845,10 @@ static int decode_one(NvdrvDecoder* d) {
             }
         }
         subpel_free(&sp0); subpel_free(&sp1);
+        /* The field as decoded, for the frames after this one. */
+        if (rc == 0 && slot_store_field(&field, &G, kind == NVDRV_BI ? mode : NULL, v, v + nb,
+                                        display - d->dpb[before].display, v + 2 * nb, v + 3 * nb,
+                                        kind == NVDRV_BI ? display - d->dpb[after].display : 0) != 0) rc = -1;
         free(v); free(mode);
         if (rc != 0) return -1;
         ref = &d->pred;
@@ -2693,17 +2865,18 @@ static int decode_one(NvdrvDecoder* d) {
     size_t have = d->size - d->pos;
     int partial = 0;
     if (len > have) { len = have; partial = 1; }
-    if (len == 0) return 0;
+    if (len == 0) { slot_free(&field); return 0; }
 
     Slot* s = &d->dpb[d->ndpb];
-    if (alloc_image(&s->img, d->width, d->height) != 0) return -1;
+    s->fvx = field.fvx; s->fvy = field.fvy; s->fd = field.fd; s->fnfx = field.fnfx; s->fnfy = field.fnfy;
+    if (alloc_image(&s->img, d->width, d->height) != 0) { slot_free(s); return -1; }
     /* A frame cut before its colour layer has no picture yet: the stream
      * ends there, it is not damaged. */
     int fc = frame_class(kind, before >= 0 ? d->dpb[before].display : 0, after >= 0 ? d->dpb[after].display : 0);
     if (kind == NVDRV_INTRA) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
     if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? NULL : ref, &s->img,
                     fc >= 0 ? d->ctx[fc] : NULL) != 0) {
-        nvdr_image_free(&s->img);
+        slot_free(s);
         return partial ? 0 : -1;
     }
     s->display = display;
@@ -2727,7 +2900,7 @@ int nvdrv_decode_next(NvdrvDecoder* d, NvdrImage* out, int* kind_out, int* parti
              * predicts from this one or something later. */
             int k = 0;
             for (int j = 0; j < d->ndpb; j++) {
-                if (d->dpb[j].display < d->shown) nvdr_image_free(&d->dpb[j].img);
+                if (d->dpb[j].display < d->shown) slot_free(&d->dpb[j]);
                 else d->dpb[k++] = d->dpb[j];
             }
             d->ndpb = k;
@@ -2755,7 +2928,7 @@ int nvdrv_decode_display(const NvdrvDecoder* d) { return d->shown; }
 void nvdrv_decode_close(NvdrvDecoder* d) {
     if (!d) return;
     free(d->data);
-    for (int i = 0; i < d->ndpb; i++) nvdr_image_free(&d->dpb[i].img);
+    for (int i = 0; i < d->ndpb; i++) slot_free(&d->dpb[i]);
     free(d->pred.pixels);
     free(d->err.pixels);
     for (int i = 0; i < 4; i++) nvdr_context_free(d->ctx[i]);
