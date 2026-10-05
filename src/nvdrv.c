@@ -55,8 +55,12 @@ NvdrvConfig nvdrv_default_config(void) {
     c.block = -1;
     c.pred_q = 0;
     /* In SAD per bit of field. With quarter-pixel deltas a vector costs
-     * more bits than it did, so the weight that balances them rose from 8. */
-    c.mv_lambda = 16;
+     * more bits than it did, so the weight that balances them rose from 8
+     * to 16; with blocks of 32 predicted in time, 24 does better on all
+     * five 960x540 test clips (-0.4 to -1.0 points against 16), while the
+     * regression gate's 128x128 clip, on blocks of 8, lost 0.15 dB with
+     * it. So -1: 24 with blocks of 32 and up, 16 below. */
+    c.mv_lambda = -1;
     c.bframes = 7;
     c.b_q_step = 0.5f;
     c.lookahead = 16;
@@ -1801,6 +1805,7 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
 
     if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 32 : 8;
     if (e->cfg.block > 128) e->cfg.block = 0;
+    if (e->cfg.mv_lambda < 0) e->cfg.mv_lambda = e->cfg.block >= 32 ? 24 : 16;
     if (e->cfg.bframes < 0) e->cfg.bframes = 0;
     if (e->cfg.bframes > NVDRV_MAX_B) e->cfg.bframes = NVDRV_MAX_B;
     if (e->cfg.lookahead < 0) e->cfg.lookahead = 0;
@@ -2977,7 +2982,8 @@ int nvdrv_motion_find(const NvdrImage* ref, const NvdrImage* cur, const NvdrvCon
     /* An album's field is predicted from one translation, the global
      * vector, and carries no model. */
     for (int b = 0; b < nbx * nby; b++) { tx[b] = (int16_t)(m->dx * 4); ty[b] = (int16_t)(m->dy * 4); }
-    if (m->cfg.mv_lambda > 0) field_rd(cur, &sp, block, 127, tx, ty, m->cfg.mv_lambda, vx, vy);
+    int mvl = m->cfg.mv_lambda < 0 ? 16 : m->cfg.mv_lambda;
+    if (mvl > 0) field_rd(cur, &sp, block, 127, tx, ty, mvl, vx, vy);
     block_predict(&sp, &pred, block, vx, vy);
     for (size_t i = 0; i < npx; i++)
         m->err.pixels[i] = (unsigned char)clamp255v((int)cur->pixels[i] - (int)pred.pixels[i] + 128);

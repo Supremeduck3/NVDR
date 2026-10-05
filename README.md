@@ -876,15 +876,20 @@ whole: better on the objects, worse on the pans.
 
 Raising the weight of a field bit against block error helped the pans
 and hurt the objects (24: -2.9, -0.6 and -3.4%; 32: -3.5, +1.0 and
--4.3%), so the weight stays at 16 for now.
+-4.3%). With blocks of 32 and temporal prediction the objects no longer
+need it so low, and 24 gains on all five clips.
 
 Together, against the encoder before, BD-rate on PSNR-Y over 25 frames:
 
-    noisy pan, one object                                -10.1%
-    clean pan, one object                                 -8.6%
-    whole-pixel pan over a photo                          -1.4%
-    still camera, noisy                                   -5.4%
-    three objects, light noise                           -10.3%
+                                           field weight 16   weight 24
+    noisy pan, one object                       -10.1%         -11.1%
+    clean pan, one object                        -8.6%          -9.3%
+    whole-pixel pan over a photo                 -1.4%          -1.8%
+    still camera, noisy                          -5.4%          -6.1%
+    three objects, light noise                  -10.3%         -10.3%
+
+The weight is now 24 with blocks of 32 and up; the regression gate's
+128x128 clip, on blocks of 8, lost 0.15 dB with it and keeps 16.
 
 ### Against the state of the art
 
