@@ -15,7 +15,7 @@
 import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext, VERSION as CONTAINER_VERSION } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 15;
+const VERSION = 16;
 const HEADER_SIZE = 24;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
 const MV_MAX = 384;            // NVDRV_MV_MAX, quarter pixels
@@ -72,7 +72,7 @@ function mvComponent(dec, m, c, canBeZero, esc) {
 
 function mvModels() {
     return {
-        same: newProbs(3),
+        same: newProbs(9),
         zero: newProbs(2),
         sign: newProbs(2),
         mag: [newProbs(MV_MAG_CTX),
@@ -230,7 +230,9 @@ function vfDecVector(dec, L, fx, fy, w) {
     vfPred(G, L.M, L.dx, L.dy, fx, fy, w, PRED2);
     const c = fy * G.nfx + fx;
     const ctx = (fx > 0 && L.same[c - 1] ? 1 : 0) + (fy > 0 && L.same[c - G.nfx] ? 1 : 0);
-    const same = !dec.bit(L.mm.same, ctx);
+    // Mirrors vf_same_ctx_t(): and whether the temporal prediction agrees.
+    const tAgree = !L.tok || !L.tok[c] ? 0 : (L.tx[c] === PRED2[0] && L.ty[c] === PRED2[1] ? 1 : 2);
+    const same = !dec.bit(L.mm.same, ctx + 3 * tAgree);
     let ex = 0, ey = 0;
     const hasT = L.tok && L.tok[c] && (L.tx[c] !== PRED2[0] || L.ty[c] !== PRED2[1]);
     if (!same && hasT && dec.bit(L.mm.temporal, 0)) {
@@ -256,7 +258,7 @@ function unpackVfield(bytes, offset, len, G, split, mode, l0, l1) {
     l0.same = new Uint8Array(nf); l0.mm = mvModels();
     if (l1) { l1.same = new Uint8Array(nf); l1.mm = mvModels(); }
     const splitM = newProbs(3), notBi = newProbs(3);
-    const bwd = newProbs(3);
+    const bwd = newProbs(3), directM = newProbs(3), direct = new Uint8Array(nf);
     if (mode) mode.fill(0);
     const dec = new ArithDecoder(bytes, offset, len);
     const modeCtxF = (fx, fy, which) => {
@@ -280,6 +282,19 @@ function unpackVfield(bytes, offset, len, G, split, mode, l0, l1) {
             }
             for (const [fx, fy, w] of units) {
                 let md = MODE_FWD;
+                const c = fy * G.nfx + fx;
+                // Mirrors the direct units of unpack_vfield().
+                if (mode && l0.tok && l0.tok[c] && l1.tok && l1.tok[c]) {
+                    const dctx = (fx > 0 && direct[c - 1] ? 1 : 0) + (fy > 0 && direct[c - G.nfx] ? 1 : 0);
+                    const d = dec.bit(directM, dctx);
+                    vfFill(G, direct, fx, fy, w, d);
+                    if (d) {
+                        vfFill(G, mode, fx, fy, w, MODE_BI);
+                        vfSet(l0, fx, fy, w, l0.tx[c], l0.ty[c]); vfSet(l1, fx, fy, w, l1.tx[c], l1.ty[c]);
+                        vfFill(G, l0.same, fx, fy, w, 1); vfFill(G, l1.same, fx, fy, w, 1);
+                        continue;
+                    }
+                }
                 if (mode) {
                     md = MODE_BI;
                     if (dec.bit(notBi, modeCtxF(fx, fy, 0))) md = dec.bit(bwd, modeCtxF(fx, fy, 1)) ? MODE_BWD : MODE_FWD;
@@ -378,8 +393,8 @@ function obmcApply(G, dst, width, height, r0, r1, v0x, v0y, v1x, v1y, mode) {
                 // The neighbour's prediction of the whole cell, then the
                 // strip along the shared edge blended into it.
                 const m = md(n), ls = bw * 3;
-                if (m !== MODE_BWD) predictRegion(r0, width, height, x0, y0, bw, bh, v0x[n], v0y[n], OT0, 0, ls);
-                if (m !== MODE_FWD) predictRegion(r1, width, height, x0, y0, bw, bh, v1x[n], v1y[n], m === MODE_BWD ? OT0 : OT1, 0, ls);
+                if (m !== MODE_BWD) predictRegionSeq(r0, width, height, x0, y0, bw, bh, v0x[n], v0y[n], OT0, 0, ls);
+                if (m !== MODE_FWD) predictRegionSeq(r1, width, height, x0, y0, bw, bh, v1x[n], v1y[n], m === MODE_BWD ? OT0 : OT1, 0, ls);
                 if (m !== MODE_FWD && m !== MODE_BWD)
                     for (let k = 0; k < bh * ls; k++) OT0[k] = (OT0[k] + OT1[k] + 1) >> 1;
                 const vertical = side < 2, len = Math.min(L, vertical ? bh : bw);
@@ -400,8 +415,9 @@ function obmcApply(G, dst, width, height, r0, r1, v0x, v0y, v1x, v1y, mode) {
 }
 
 /* Blocks whose `mode` is `skip` are left alone (a B frame's blocks that do
- * not read this reference). */
-function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip = -1) {
+ * not read this reference). `region` is predictRegion for an album's
+ * image, predictRegionSeq for a sequence's frame. */
+function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip = -1, region = predictRegion) {
     const nbx = Math.ceil(width / block), nby = Math.ceil(height / block);
     const stride = width * 3;
     for (let by = 0; by < nby; by++) {
@@ -410,7 +426,95 @@ function blockPredict(src, dst, width, height, block, vx, vy, mode = null, skip 
             const x0 = bx * block, bw = Math.min(block, width - x0);
             const b = by * nbx + bx;
             if (mode && mode[b] === skip) continue;
-            predictRegion(src, width, height, x0, y0, bw, bh, vx[b], vy[b], dst, y0 * stride + x0 * 3, stride);
+            region(src, width, height, x0, y0, bw, bh, vx[b], vy[b], dst, y0 * stride + x0 * 3, stride);
+        }
+    }
+}
+
+/*
+ * A sequence's prediction (format 16): mirrors subpel_build_seq() and
+ * qsample() in nvdrv.c, HEVC's 8-tap luma filters for every quarter
+ * position, across first with the sums unrounded, then down. Like
+ * predictRegion, it filters only the region the block reads.
+ */
+const DCTIF = [[0, 0, 0, 64, 0, 0, 0, 0], [-1, 4, -10, 58, 17, -5, 1, 0],
+               [-1, 4, -11, 40, 40, -11, 4, -1], [0, 1, -5, 17, 58, -10, 4, -1]];
+const SG8 = new Int32Array((MAXB + 7) * (MAXB + 7) * 3);
+const HT = new Int32Array((MAXB + 7) * MAXB * 3);
+const XS8 = new Int32Array(MAXB + 8), YS8 = new Int32Array(MAXB + 8);
+function predictRegionSeq(src, width, height, x0, y0, bw, bh, fx, fy, dst, obase, os) {
+    const stride = width * 3;
+    const X0 = x0 + (fx >> 2), Y0 = y0 + (fy >> 2), px = fx & 3, py = fy & 3;
+    // Clamped source columns X0-3 .. X0+bw+3 and rows Y0-3 .. Y0+bh+3.
+    for (let i = 0; i < bw + 7; i++) {
+        const X = X0 - 3 + i;
+        XS8[i] = (X < 0 ? 0 : X >= width ? width - 1 : X) * 3;
+    }
+    for (let j = 0; j < bh + 7; j++) {
+        const Y = Y0 - 3 + j;
+        YS8[j] = (Y < 0 ? 0 : Y >= height ? height - 1 : Y) * stride;
+    }
+    if (!px && !py) {
+        for (let j = 0; j < bh; j++) {
+            const row = YS8[j + 3];
+            let o = obase + j * os;
+            for (let i = 0; i < bw; i++, o += 3) {
+                const s0 = row + XS8[i + 3];
+                dst[o] = src[s0]; dst[o + 1] = src[s0 + 1]; dst[o + 2] = src[s0 + 2];
+            }
+        }
+        return;
+    }
+    const gs = (bw + 7) * 3;
+    for (let j = 0; j < bh + 7; j++) {
+        const row = YS8[j];
+        let g = j * gs;
+        for (let i = 0; i < bw + 7; i++, g += 3) {
+            const s0 = row + XS8[i];
+            SG8[g] = src[s0]; SG8[g + 1] = src[s0 + 1]; SG8[g + 2] = src[s0 + 2];
+        }
+    }
+    const n = bw * 3, h = DCTIF[px], v = DCTIF[py];
+    if (!py) {
+        for (let j = 0; j < bh; j++) {
+            const g = (j + 3) * gs, o = obase + j * os;
+            for (let k = 0; k < n; k++) {
+                const q = g + k;
+                const a = h[0] * SG8[q] + h[1] * SG8[q + 3] + h[2] * SG8[q + 6] + h[3] * SG8[q + 9] +
+                          h[4] * SG8[q + 12] + h[5] * SG8[q + 15] + h[6] * SG8[q + 18] + h[7] * SG8[q + 21];
+                dst[o + k] = clip8((a + 32) >> 6);
+            }
+        }
+        return;
+    }
+    if (!px) {
+        for (let j = 0; j < bh; j++) {
+            const g = j * gs + 9, o = obase + j * os;
+            for (let k = 0; k < n; k++) {
+                const q = g + k;
+                const a = v[0] * SG8[q] + v[1] * SG8[q + gs] + v[2] * SG8[q + 2 * gs] + v[3] * SG8[q + 3 * gs] +
+                          v[4] * SG8[q + 4 * gs] + v[5] * SG8[q + 5 * gs] + v[6] * SG8[q + 6 * gs] + v[7] * SG8[q + 7 * gs];
+                dst[o + k] = clip8((a + 32) >> 6);
+            }
+        }
+        return;
+    }
+    // The sums across, unrounded, for all bh + 7 rows; then down them.
+    for (let j = 0; j < bh + 7; j++) {
+        const g = j * gs, l = j * n;
+        for (let k = 0; k < n; k++) {
+            const q = g + k;
+            HT[l + k] = h[0] * SG8[q] + h[1] * SG8[q + 3] + h[2] * SG8[q + 6] + h[3] * SG8[q + 9] +
+                        h[4] * SG8[q + 12] + h[5] * SG8[q + 15] + h[6] * SG8[q + 18] + h[7] * SG8[q + 21];
+        }
+    }
+    for (let j = 0; j < bh; j++) {
+        const l = j * n, o = obase + j * os;
+        for (let k = 0; k < n; k++) {
+            const q = l + k;
+            const a = v[0] * HT[q] + v[1] * HT[q + n] + v[2] * HT[q + 2 * n] + v[3] * HT[q + 3 * n] +
+                      v[4] * HT[q + 4 * n] + v[5] * HT[q + 5 * n] + v[6] * HT[q + 6 * n] + v[7] * HT[q + 7 * n];
+            dst[o + k] = clip8((a + 2048) >> 12);
         }
     }
 }
@@ -582,35 +686,40 @@ function getVarint(bytes, pos, end) {
     return { v: 0, n: -1 };
 }
 const unzigzag = u => (u % 2 ? -((u - 1) / 2) - 1 : u / 2);
-/* The container back, or { damaged } when its header did not arrive whole
- * (false) or makes no sense (true). */
-function expandContainer(bytes, pos, avail, width, height) {
-    const end = pos + avail;
-    if (avail < 3) return { damaged: false };
-    const h = new Uint8Array(32), v = [];
-    h.set([0x4e, 0x56, 0x44, 0x52]);      // "NVDR"
-    h[4] = CONTAINER_VERSION;
-    h[5] = bytes[pos];
-    h[6] = width & 255; h[7] = width >> 8; h[8] = height & 255; h[9] = height >> 8;
-    h[10] = bytes[pos + 1]; h[11] = bytes[pos + 2];
-    let at = pos + 3;
-    for (let k = 0; k < 5; k++) {
+// The HDR_ bits of a frame header: what differs from the last frame of
+// its class, which starts unknown again at each intra frame.
+const HDR_BLOCK = 1, HDR_GLOBAL = 2, HDR_FLAGS = 4, HDR_BLOCKS = 8, HDR_QL = 16, HDR_QC = 32, HDR_BAND = 64;
+const HDR_ALL = 127, HDR_CLASSES = 5;
+const newHdrState = () => ({ known: 0, block: 0, g: [0, 0, 0, 0], ql: 0, qc: 0, flags: 0, maxBlock: 0, minBlock: 0, band: 0, grain: 0 });
+
+/* The container back from the first `avail` bytes of its compact form,
+ * `declared` long by the frame's header, and its class's header `st`; or
+ * { damaged } when its header did not arrive whole (false) or makes no
+ * sense (true). */
+function expandContainer(bytes, pos, avail, declared, st, width, height) {
+    const end = pos + avail, v = [];
+    let at = pos;
+    for (let k = 0; k < 3; k++) {
         const r = getVarint(bytes, at, end);
         if (r.n === 0) return { damaged: false };
         if (r.n < 0) return { damaged: true };
         v.push(r.v); at += r.n;
     }
-    if (v[0] > 0xffff || v[1] > 0xffff) return { damaged: true };
-    const dv = new DataView(h.buffer);
-    dv.setUint16(12, v[0], true); dv.setUint16(14, v[1], true);
-    dv.setUint32(16, v[2], true); dv.setUint32(20, v[3], true); dv.setUint32(24, v[4], true);
-    if (end - at < 2) return { damaged: false };
-    h[28] = bytes[at++]; h[29] = bytes[at++];
-    const r = getVarint(bytes, at, end);
-    if (r.n === 0) return { damaged: false };
-    if (r.n < 0 || r.v > 0xffff) return { damaged: true };
-    at += r.n;
-    dv.setUint16(30, r.v, true);
+    // Layer 0 is what the others leave of the declared length.
+    if (at - pos > declared) return { damaged: true };
+    const rest = declared - (at - pos), fixed = st.grain + v[2] + v[0] + v[1];
+    if (v[2] > 0xffff || v[0] > 0x7fffffff || v[1] > 0x7fffffff || fixed > rest || rest - fixed > 0x7fffffff)
+        return { damaged: true };
+    const h = new Uint8Array(32), dv = new DataView(h.buffer);
+    h.set([0x4e, 0x56, 0x44, 0x52]);      // "NVDR"
+    h[4] = CONTAINER_VERSION;
+    h[5] = st.flags;
+    dv.setUint16(6, width, true); dv.setUint16(8, height, true);
+    h[10] = st.maxBlock; h[11] = st.minBlock;
+    dv.setUint16(12, st.ql, true); dv.setUint16(14, st.qc, true);
+    dv.setUint32(16, rest - fixed, true); dv.setUint32(20, v[0], true); dv.setUint32(24, v[1], true);
+    h[28] = st.band; h[29] = st.grain;
+    dv.setUint16(30, v[2], true);
     const out = new Uint8Array(32 + (end - at));
     out.set(h);
     out.set(bytes.subarray(at, end), 32);
@@ -653,7 +762,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v15 file');
+        if (!this.info) throw new Error('not an NVDRV v16 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -668,6 +777,7 @@ export class SequenceDecoder {
         contextRegistry.register(this, held, this);
         this.nextOut = 0;
         this.lastDisplay = 0;    // of the frame last read, for the compact headers
+        this.hs = Array.from({ length: HDR_CLASSES }, newHdrState);    // each class's last header
         this.ended = false;
     }
 
@@ -709,31 +819,17 @@ export class SequenceDecoder {
         // Mirrors decode_one(): the compact frame header (COMPACT FRAMES).
         let at = this.pos;
         const a = bytes[at++];
-        const kind = a & 3, flags = (a >> 2) & 7, hasField = (a >> 5) & 1;
-        if (a >> 6) throw new Error('bad frame flags');
-        let block = 0;
-        if (hasField) {
-            if (at >= size) return false;
-            block = bytes[at++];
-            if (!block) throw new Error('bad block size');
-        }
-        const u = [];
-        for (let k = 0; k < (kind === BI ? 6 : 4); k++) {
-            const r = getVarint(bytes, at, size);
-            if (r.n === 0) return false;
-            if (r.n < 0) throw new Error('bad frame header');
-            u.push(r.v); at += r.n;
-        }
-        const display = this.lastDisplay + unzigzag(u[0]);
-        const dx = unzigzag(u[1]), dy = unzigzag(u[2]);
-        const dx1 = kind === BI ? unzigzag(u[3]) : 0, dy1 = kind === BI ? unzigzag(u[4]) : 0;
-        let len = u[u.length - 1];
-        if ([dx, dy, dx1, dy1].some(v => v < -32768 || v > 32767)) throw new Error('bad global vector');
+        const kind = a & 3, flags = (a >> 2) & 7, hasField = (a >> 5) & 1, changed = (a >> 6) & 1;
+        if (a >> 7) throw new Error('bad frame flags');
+        let r = getVarint(bytes, at, size);
+        if (r.n === 0) return false;
+        if (r.n < 0) throw new Error('bad frame header');
+        at += r.n;
+        const display = this.lastDisplay + unzigzag(r.v);
         if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
-        if (kind === INTRA && block) throw new Error('intra frame with a motion field');
-        if (flags && (!block || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
-        if (block && (block < 8 || block > 128 || (block & 1))) throw new Error('bad block size');
-        if (kind === BI && !block) throw new Error('B frame without a motion field');
+        if (kind === INTRA && hasField) throw new Error('intra frame with a motion field');
+        if (flags && (!hasField || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
+        if (kind === BI && !hasField) throw new Error('B frame without a motion field');
         if (display < 0 || display > 0x3fffffff) throw new Error('bad display number');
         this.lastDisplay = display;
         if (display < this.nextOut || this.dpb.length >= MAX_DPB ||
@@ -741,6 +837,65 @@ export class SequenceDecoder {
         const [before, after] = findRefs(this.dpb, display);
         if (kind !== INTRA && before < 0) throw new Error('predicted frame without a reference');
         if (kind === BI && after < 0) throw new Error('B frame without a reference after it');
+        const fc = frameClass(kind, before >= 0 ? this.dpb[before].display : 0,
+                              after >= 0 ? this.dpb[after].display : 0);
+
+        // Mirrors decode_one(): what differs from the last frame of this
+        // class (COMPACT FRAMES).
+        if (kind === INTRA) for (const h of this.hs) h.known = 0;
+        const st = this.hs[fc + 1];
+        let which = 0;
+        if (changed) {
+            if (at >= size) return false;
+            which = bytes[at++];
+            if (!which || (which & ~HDR_ALL) || ((which & HDR_BLOCK) && !hasField)) throw new Error('bad frame header');
+        }
+        const ng = kind === BI ? 4 : 2;
+        if (which & HDR_BLOCK) {
+            if (at >= size) return false;
+            st.block = bytes[at++];
+        }
+        if (which & HDR_GLOBAL)
+            for (let k = 0; k < ng; k++) {
+                r = getVarint(bytes, at, size);
+                if (r.n === 0) return false;
+                if (r.n < 0) throw new Error('bad frame header');
+                at += r.n;
+                const g = unzigzag(r.v);
+                if (g < -32768 || g > 32767) throw new Error('bad global vector');
+                st.g[k] = g;
+            }
+        if (which & HDR_FLAGS) {
+            if (at >= size) return false;
+            st.flags = bytes[at++];
+        }
+        if (which & HDR_BLOCKS) {
+            if (size - at < 2) return false;
+            st.maxBlock = bytes[at++]; st.minBlock = bytes[at++];
+        }
+        for (let k = 0; k < 2; k++) {
+            if (!(which & (k ? HDR_QC : HDR_QL))) continue;
+            r = getVarint(bytes, at, size);
+            if (r.n === 0) return false;
+            if (r.n < 0 || r.v > 0xffff) throw new Error('bad frame header');
+            at += r.n;
+            if (k) st.qc = r.v; else st.ql = r.v;
+        }
+        if (which & HDR_BAND) {
+            if (size - at < 2) return false;
+            st.band = bytes[at++]; st.grain = bytes[at++];
+        }
+        st.known |= which;
+        const need = (HDR_ALL & ~HDR_BLOCK) | (hasField ? HDR_BLOCK : 0);
+        if ((st.known & need) !== need) throw new Error('frame header leaves out what its class has no value for');
+        const block = hasField ? st.block : 0;
+        const dx = st.g[0], dy = st.g[1], dx1 = kind === BI ? st.g[2] : 0, dy1 = kind === BI ? st.g[3] : 0;
+        r = getVarint(bytes, at, size);
+        if (r.n === 0) return false;
+        if (r.n < 0) throw new Error('bad frame header');
+        at += r.n;
+        let len = r.v;
+        if (block && (block < 8 || block > 128 || (block & 1))) throw new Error('bad block size');
         this.pos = at;
 
         let ref = kind === INTRA ? null : this.dpb[before].pixels;
@@ -779,7 +934,7 @@ export class SequenceDecoder {
             if (kind === PRED) {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
                     throw new Error('motion field is damaged');
-                blockPredict(ref, this.pred, width, height, G.g, v0x, v0y);
+                blockPredict(ref, this.pred, width, height, G.g, v0x, v0y, null, -1, predictRegionSeq);
                 if (flags & FRAME_OBMC) obmcApply(G, this.pred, width, height, ref, null, v0x, v0y, null, null, null);
                 field = storeField(G, null, v0x, v0y, dist0, null, null, 0);
             } else {
@@ -789,8 +944,8 @@ export class SequenceDecoder {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, mode, l0, l1))
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
-                blockPredict(ref, P0, width, height, G.g, v0x, v0y, mode, MODE_BWD);
-                blockPredict(this.dpb[after].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD);
+                blockPredict(ref, P0, width, height, G.g, v0x, v0y, mode, MODE_BWD, predictRegionSeq);
+                blockPredict(this.dpb[after].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD, predictRegionSeq);
                 // Backward blocks take the second prediction, the mean
                 // blocks the rounded mean of both; forward ones are in P0.
                 const stride = width * 3;
@@ -817,12 +972,12 @@ export class SequenceDecoder {
 
         // A cut file ends mid-frame. The still decoder reads as far as the
         // bytes reach, so the last frame shows at the quality that arrived.
-        const have = size - this.pos;
+        const have = size - this.pos, declared = len;
         let partial = false;
         if (len > have) { len = have; partial = true; }
         if (len === 0) return false;
 
-        const ex = expandContainer(bytes, this.pos, len, width, height);
+        const ex = expandContainer(bytes, this.pos, len, declared, st, width, height);
         if (!ex.bytes) {
             if (partial && !ex.damaged) return false;
             throw new Error('frame does not decode');
@@ -834,8 +989,6 @@ export class SequenceDecoder {
         // block, and decodes straight to the picture.
         // Mirrors code_frame() and decode_one(): the models carry on from
         // the last frame of the same class, fresh again at an intra frame.
-        const fc = frameClass(kind, before >= 0 ? this.dpb[before].display : 0,
-                              after >= 0 ? this.dpb[after].display : 0);
         if (kind === INTRA) for (const c of this.ctxs) resetContext(c);
         if (!reconstruct(body, pixels, width, height, kind === INTRA ? null : ref, fc >= 0 ? this.ctxs[fc] : null)) {
             if (partial) return false;

@@ -60,9 +60,9 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      15
+#define NVDRV_VERSION      16
 #define NVDRV_HEADER_SIZE  24
-#define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 4 to 37 */
+#define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
 #define NVDRV_INTRA 0   /* the frame on its own */
 #define NVDRV_PRED  1   /* the error against the frame before it */

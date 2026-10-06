@@ -909,6 +909,70 @@ out 0.9% smaller at q 12, 1.8% at q 24 and 4.2% at q 56, the gain
 growing as the frames shrink; the regression gate's 128x128 sequence,
 whose frames are tiny, 8.3%.
 
+### Direct units, predicted headers, HEVC's interpolation (sequence v16)
+
+Frame by frame against AV1, the B frames were still the gap. Counted
+in a clean pan at q 24, a B frame of the finest level was about 150
+bytes: 80 of field, 20 of headers, 15 of restoration and 35 of residual.
+Three changes, one format:
+
+**Direct units.** In a B frame, a unit both of whose lists have a
+temporal prediction (see the motion field, v14) first codes one flag:
+set, it takes both predictions, averaged, with no mode and no vector.
+Its context is the left and upper units' flags. In the clean pan 85 to
+90% of a B frame's units come out direct, and the field of the finest B
+frames halves, 155 bytes to 80. The encoder prices the flag by how often
+the units it has decided so far set it, which is what it will cost:
+priced like any other choice of mode and vectors the candidate lost to
+them and the clip came out 4% bigger. On the regression gate's 128x128
+sequence, with blocks of 8, direct units cost 0.13 to 0.2 dB for the
+same bytes: the smaller the unit, the less a flag saved is worth. The
+"same as predicted" flag's
+context also learnt whether the temporal prediction agrees with the
+spatial one, which is worth 0.4% alone.
+
+**Predicted headers.** A frame header now leaves out whatever is as the
+last frame of its class had it (intra, P, and B by the gap between its
+references, as the carried models are classed): block size, global
+vectors, the container's flags, block sizes, steps, band and grain. One
+bit in the frame's first byte says something changed, and a byte then
+says what. Layer 0's length is what the frame's length leaves. Every
+class starts unknown at each intra frame, as the models do. A B frame's
+headers go from about 21 bytes to 8, pictures identical to the byte:
+0.5 to 0.8% of the file over 25 frames, more over a longer group.
+
+**HEVC's interpolation.** Quarter pixels were H.264's: a 6-tap half
+pixel, and each quarter the rounded mean of two 8-bit samples. Now every
+one of the sixteen positions has HEVC's own 8-tap filter, across and
+then down with the sums kept unrounded between the two passes (see
+QUARTER-PIXEL MOTION in nvdrv.c). A quarter-pixel vector, the most
+common kind, no longer blurs nor rounds twice. On the clean pan at q 24
+the predicted frames came out 10% smaller and the clip 0.2 dB better;
+-5.6 to -6.5% BD-rate on the three clips, the largest of the three
+changes. Albums keep H.264's filter and their format.
+
+BD-rate on PSNR-Y over 25 frames, each against the one before:
+
+                                     clean pan   three objects   noisy pan
+    same-flag context                    -0.4%         -0.4%          -0.4%
+    + direct units                       -2.9%         -2.6%          -3.9%
+    + predicted headers                  -0.7%         -0.5%          -0.8%
+    + HEVC's interpolation               -6.3%         -5.6%          -6.5%
+    all four, against format 15         -10.0%         -8.9%         -11.1%
+
+Over the 48 frames of the clean pan at q 20, frame by frame against AV1
+at crf 54 (AV1's bytes counted per temporal unit): the 47 frames after the intra
+frame went from 31.3 KB at 35.62 dB to 23.2 KB at 35.85 dB, where AV1's
+are 18.5 KB at 36.09 dB. The P frames are now 61% of that: 2.4 KB each,
+the quality falling 0.3 dB from one to the next across the group.
+
+Two things tried that did not pay: a P frame predicted from the two
+anchors before it as well as the one (the older one sixteen frames off,
+blended per unit like a B frame's lists) was 0.7% bigger for 0.03 dB on
+the clean pan; and a larger weight on the vectors' bits in P frames
+(1.5x: -1.3% bytes for -0.06 dB) or B frames (1.5x: -1.0% for -0.04 dB)
+sits on the same curve.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
