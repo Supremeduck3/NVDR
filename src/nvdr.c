@@ -137,8 +137,10 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b) {
 
 #define NSIZES     4           /* 4, 8, 16, 32 */
 #define POS_CTX    15
-#define NVDR_MODES 15          /* intra modes, see dir_predict() */
+#define NVDR_MODES 43          /* intra modes, see dir_predict() */
 #define MODE_INTER NVDR_MODES  /* with a base: the base picture's block */
+#define MODE_SMOOTH 35          /* AV1's smooth, smooth down, smooth across */
+#define MODE_FILTER 38          /* AV1's five recursive filters */
 #define SIG_CTX    25          /* 5 position classes x 5 neighbourhoods */
 #define GT1_CTX    10          /* 5 neighbourhoods x (a level over 1 yet or not) */
 #define MAG_UNARY  14
@@ -432,7 +434,7 @@ typedef struct {
     NvdrProb dc_sign[3];
     NvdrProb dc_mag[3][MAG_UNARY];
     NvdrProb tq_zero, tq_sign, tq_mag[2 * TQ_MAX];   /* the tile step offsets */
-    NvdrProb mode_flat[NSIZES], mode_tree[16];       /* a leaf's prediction mode */
+    NvdrProb mode_flat[NSIZES], mode_tree[64];       /* a leaf's prediction mode */
     NvdrProb mode_inter[NSIZES];                     /* INTER or not, with a base */
     NvdrProb tx_dct[3][3];                           /* DCT or not, by size and direction */
     NvdrProb tx_tree[3][8];                          /* which of the other four */
@@ -556,8 +558,10 @@ static void put_tq(Sink* s, ColourModels* m, int v) {
     }
 }
 
-/* A leaf's mode: "flat or not" by size, then 1..14 as four bits down a
- * tree of contexts. */
+/* A leaf's mode: "flat or not" by size, then 1..42 as six bits down a
+ * tree of contexts. A version 13 container had fifteen modes, four bits
+ * down the tree, which OLD_MODE renames. */
+static const uint8_t OLD_MODE[15] = { 0, 1, 2, 5, 7, 10, 13, 15, 18, 21, 23, 26, 29, 31, 34 };
 static void put_mode(Sink* s, ColourModels* m, int sc, int mode, int inter) {
     if (inter) {
         put_bit(s, &m->mode_inter[sc], mode != MODE_INTER);
@@ -566,28 +570,29 @@ static void put_mode(Sink* s, ColourModels* m, int sc, int mode, int inter) {
     put_bit(s, &m->mode_flat[sc], mode != 0);
     if (!mode) return;
     int v = mode - 1, node = 1;
-    for (int k = 3; k >= 0; k--) {
+    for (int k = 5; k >= 0; k--) {
         int b = (v >> k) & 1;
         put_bit(s, &m->mode_tree[node], b);
         node = 2 * node + b;
     }
 }
 
-static int get_mode(NvdrDecoder* d, ColourModels* m, int sc, int inter) {
+static int get_mode(NvdrDecoder* d, ColourModels* m, int sc, int inter, int legacy) {
     if (inter && !nvdr_dec_bit(d, &m->mode_inter[sc])) return MODE_INTER;
     if (!nvdr_dec_bit(d, &m->mode_flat[sc])) return 0;
     int v = 0, node = 1;
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < (legacy ? 4 : 6); k++) {
         int b = nvdr_dec_bit(d, &m->mode_tree[node]);
         v = 2 * v + b;
         node = 2 * node + b;
     }
-    return v < NVDR_MODES - 1 ? v + 1 : -1;    /* the last two are damage */
+    if (legacy) return v < 14 ? OLD_MODE[v + 1] : -1;
+    return v < NVDR_MODES - 1 ? v + 1 : -1;    /* the last 21 are damage */
 }
 
 /* Which way a mode predicts from, for the transform type's contexts:
- * flat and planar, from above, from the left. */
-static int mode_dir(int mode) { return mode <= 1 ? 0 : mode <= 8 ? 1 : 2; }
+ * flat, planar, smooth and the filters; from above; from the left. */
+static int mode_dir(int mode) { return mode <= 1 || mode >= MODE_SMOOTH ? 0 : mode <= 18 ? 1 : 2; }
 
 /* A leaf's transform type: "DCT or not" by size and direction, then the
  * other six as three bits down a tree by direction. */
@@ -773,6 +778,7 @@ typedef struct {
     int dirpred;                 /* NVDR_FLAG_DIRPRED: predict from `full`, along modes */
     int inter;                   /* NVDR_FLAG_INTER: and from `base` */
     int txsel;                   /* NVDR_FLAG_TXSEL: a transform type per leaf */
+    int legacy_modes;            /* a version 13 container: fifteen intra modes */
     uint8_t* base[3];            /* with it, the base picture on this canvas */
     uint8_t* flat[3];
     uint8_t* full[3];
@@ -882,22 +888,61 @@ static int predict(const Canvas* cv, int c, int x, int y, int n) {
  *
  *   0       flat: the mean of that row and column, as without the flag
  *   1       planar, HEVC's
- *   2..8    from above, at HEVC's angles -32 -17 -9 0 9 17 32 (in 32nds
- *           of a pixel per row; 0 is vertical, -32 comes from the corner,
- *           32 from above-right)
- *   9..14   from the left, at -17 -9 0 9 17 32 (0 is horizontal, 32 from
+ *   2..18   from above, at all 17 of HEVC's angles, -32 to 32 in 32nds of
+ *           a pixel per row (10, angle 0, is vertical; -32 comes from the
+ *           corner, 32 from above-right)
+ *   19..34  from the left, at -26 to 32 (26 is horizontal, 34 from
  *           below-left)
+ *   35..37  AV1's smooth modes: the row above blended toward the bottom
+ *           left pixel down the leaf and the column to the left toward
+ *           the top right pixel across it, by AV1's weights; both, down
+ *           only, across only
+ *   38..42  AV1's recursive filters: 4x2 patches in raster order, each
+ *           pixel seven taps over the corner, the four pixels above the
+ *           patch and the two to its left, already predicted or not
  *
  * The angular modes are HEVC's exactly: each row steps along the
  * reference by the angle, interpolated in 32nds, and a negative angle
  * reaches round the corner by projecting the other side with HEVC's
  * inverse angles. The DC level then moves the whole prediction by a
  * constant, and the texture is the DCT of what is left. All integer.
+ *
+ * Containers before version 14 had 15 modes, 7 angles from above and 6
+ * from the left, which read as the same angles here (OLD_MODE).
  */
-static const int MODE_ANGLE[NVDR_MODES] = { 0, 0, -32, -17, -9, 0, 9, 17, 32, -17, -9, 0, 9, 17, 32 };
+static const int MODE_ANGLE[NVDR_MODES] = { 0, 0,
+    -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+    -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32 };
 static int inv_angle(int a) {
-    return a == -32 ? -256 : a == -17 ? -482 : a == -9 ? -910 : 0;
+    switch (a) {
+    case -32: return -256;  case -26: return -315; case -21: return -390; case -17: return -482;
+    case -13: return -630;  case -9:  return -910; case -5:  return -1638; case -2: return -4096;
+    default:  return 0;
+    }
 }
+
+/* AV1's smooth weights, by leaf size. */
+static const uint8_t SM_W4[4] = { 255, 149, 85, 64 };
+static const uint8_t SM_W8[8] = { 255, 197, 146, 105, 73, 50, 37, 32 };
+static const uint8_t SM_W16[16] = { 255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16 };
+static const uint8_t SM_W32[32] = { 255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83, 74,
+                                    66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8 };
+
+/* AV1's filter-intra taps: per filter, per pixel of the 4x2 patch (row
+ * then column), over the corner, the four above and the two to the left,
+ * in sixteenths. */
+static const int8_t FI_TAPS[5][8][7] = {
+    { { -6, 10, 0, 0, 0, 12, 0 }, { -5, 2, 10, 0, 0, 9, 0 }, { -3, 1, 1, 10, 0, 7, 0 }, { -3, 1, 1, 2, 10, 5, 0 },
+      { -4, 6, 0, 0, 0, 2, 12 }, { -3, 2, 6, 0, 0, 2, 9 }, { -3, 2, 2, 6, 0, 2, 7 }, { -3, 1, 2, 2, 6, 3, 5 } },
+    { { -10, 16, 0, 0, 0, 10, 0 }, { -6, 0, 16, 0, 0, 6, 0 }, { -4, 0, 0, 16, 0, 4, 0 }, { -2, 0, 0, 0, 16, 2, 0 },
+      { -10, 16, 0, 0, 0, 0, 10 }, { -6, 0, 16, 0, 0, 0, 6 }, { -4, 0, 0, 16, 0, 0, 4 }, { -2, 0, 0, 0, 16, 0, 2 } },
+    { { -8, 8, 0, 0, 0, 16, 0 }, { -8, 0, 8, 0, 0, 16, 0 }, { -8, 0, 0, 8, 0, 16, 0 }, { -8, 0, 0, 0, 8, 16, 0 },
+      { -4, 4, 0, 0, 0, 0, 16 }, { -4, 0, 4, 0, 0, 0, 16 }, { -4, 0, 0, 4, 0, 0, 16 }, { -4, 0, 0, 0, 4, 0, 16 } },
+    { { -2, 8, 0, 0, 0, 10, 0 }, { -1, 3, 8, 0, 0, 6, 0 }, { -1, 2, 3, 8, 0, 4, 0 }, { 0, 1, 2, 3, 8, 2, 0 },
+      { -1, 4, 0, 0, 0, 3, 10 }, { -1, 3, 4, 0, 0, 4, 6 }, { -1, 2, 3, 4, 0, 4, 4 }, { -1, 2, 2, 3, 4, 3, 3 } },
+    { { -12, 14, 0, 0, 0, 14, 0 }, { -10, 0, 14, 0, 0, 12, 0 }, { -9, 0, 0, 14, 0, 11, 0 }, { -8, 0, 0, 0, 14, 10, 0 },
+      { -10, 12, 0, 0, 0, 0, 14 }, { -9, 1, 12, 0, 0, 0, 12 }, { -8, 0, 0, 12, 0, 1, 11 }, { -7, 0, 0, 1, 12, 1, 9 } },
+};
 
 /* One angular prediction along `main`, with `side` round the corner:
  * main[0] and side[0] are the corner, then 2n samples each. Writes
@@ -957,6 +1002,35 @@ static void dir_predict(const Canvas* cv, int c, int x, int y, int n, int mode, 
     else if (!top) { for (int i = 0; i <= 2 * n; i++) T[i] = L[1]; L[0] = L[1]; }
     else if (!left) { for (int i = 0; i <= 2 * n; i++) L[i] = T[1]; T[0] = T[1]; }
     else T[0] = L[0] = f[(size_t)(y - 1) * pw + x - 1];
+    if (mode >= MODE_FILTER) {
+        int B[NVDR_MAX_BLOCK + 2][NVDR_MAX_BLOCK + 1];
+        const int8_t (*tp)[7] = FI_TAPS[mode - MODE_FILTER];
+        for (int i = 0; i <= n; i++) { B[0][i] = T[i]; B[i][0] = L[i]; }
+        for (int r = 1; r <= n; r += 2)
+            for (int c = 1; c <= n; c += 4) {
+                int p[7] = { B[r - 1][c - 1], B[r - 1][c], B[r - 1][c + 1], B[r - 1][c + 2], B[r - 1][c + 3],
+                             B[r][c - 1], B[r + 1][c - 1] };
+                for (int k = 0; k < 8; k++) {
+                    int a = 0;
+                    for (int t = 0; t < 7; t++) a += tp[k][t] * p[t];
+                    a = a >= 0 ? (a + 8) >> 4 : -((-a + 8) >> 4);
+                    B[r + (k >> 2)][c + (k & 3)] = clamp_u8(a);
+                }
+            }
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) P[j * n + i] = B[j + 1][i + 1];
+        return;
+    }
+    if (mode >= MODE_SMOOTH) {
+        const uint8_t* w = n == 4 ? SM_W4 : n == 8 ? SM_W8 : n == 16 ? SM_W16 : SM_W32;
+        int below = L[n], right = T[n], k = mode - MODE_SMOOTH;
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                int v = w[j] * T[i + 1] + (256 - w[j]) * below, h = w[i] * L[j + 1] + (256 - w[i]) * right;
+                P[j * n + i] = k == 0 ? (v + h + 256) >> 9 : k == 1 ? (v + 128) >> 8 : (h + 128) >> 8;
+            }
+        return;
+    }
     if (n >= 8 && mode != 0) {
         /* HEVC's [1 2 1] over the references, corner shared. */
         int t2[2 * NVDR_MAX_BLOCK + 1], l2[2 * NVDR_MAX_BLOCK + 1];
@@ -977,7 +1051,7 @@ static void dir_predict(const Canvas* cv, int c, int x, int y, int n, int mode, 
         return;
     }
     int tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-    if (mode <= 8) { angular(T, L, n, MODE_ANGLE[mode], P); return; }
+    if (mode <= 18) { angular(T, L, n, MODE_ANGLE[mode], P); return; }
     /* From the left: the same along the column, then transposed. */
     angular(L, T, n, MODE_ANGLE[mode], tmp);
     for (int j = 0; j < n; j++)
@@ -1095,9 +1169,12 @@ static void restore_planes(const NvdrHeader* h, NvdrRestorePlane* g) {
 }
 
 static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
-    if (size < NVDR_HEADER_SIZE || memcmp(data, NVDR_MAGIC, 4) != 0 || data[4] != NVDR_VERSION)
+    /* Version 13 differs only in having fifteen intra modes. */
+    if (size < NVDR_HEADER_SIZE || memcmp(data, NVDR_MAGIC, 4) != 0 ||
+        (data[4] != NVDR_VERSION && data[4] != 13))
         return -1;
     memset(h, 0, sizeof(*h));
+    h->version = data[4];
     h->width = (uint16_t)get_u16(data + 6);
     h->height = (uint16_t)get_u16(data + 8);
     h->max_block = data[10];
@@ -1360,7 +1437,7 @@ static void leaf_emit(Enc* e, Sink* s0, Sink* s1, int n, int mode, int tx,
  * frame, and a background that does not move shimmers.
  */
 /* How many directional modes code_leaf() tries in full after screening. */
-#define DIR_TRIED 5
+#define DIR_TRIED 9
 /* Mean squared error per sample above which a leaf of a picture with a
  * base tries the other modes besides INTER. */
 #define INTRA_TRY 16.0
@@ -2391,7 +2468,7 @@ static int read_node(Layer0* L, int x, int y, int n) {
     int sc = size_class(n);
     int mode = 0;
     if (cv->dirpred) {
-        mode = get_mode(L->d, L->cm, sc, cv->inter);
+        mode = get_mode(L->d, L->cm, sc, cv->inter, cv->legacy_modes);
         if (mode < 0) { L->corrupt = 1; return 0; }
     }
     int tx = has_tx(cv, n, mode) ? get_tx(L->d, L->cm, sc, mode) : TX_DCT;
@@ -2599,6 +2676,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
         cvs[k].dirpred = dirpred;
         cvs[k].inter = (h.flags & NVDR_FLAG_INTER) != 0;
         cvs[k].txsel = (h.flags & NVDR_FLAG_TXSEL) != 0;
+        cvs[k].legacy_modes = h.version < NVDR_VERSION;
     }
     /* A picture predicted from a base cannot be decoded without it. */
     if (h.flags & NVDR_FLAG_INTER) {

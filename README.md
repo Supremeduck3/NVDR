@@ -987,6 +987,56 @@ of 1 + 0.5) were 1.1 to 2.5% bigger; refining the intra frame three
 times as hard for its reuse (`--tpl 3`) was 0 to 3.3% bigger; groups of
 16 instead of 8 went either way (+0.9, -2.2 and +1.4%).
 
+### More intra modes: every HEVC angle, AV1's smooth and filters (container v14)
+
+Measured as a still against libaom's (cpu-used 3, still picture), PSNR-Y
+on I420, the intra frame was 0.2 to 9.6% bigger on five photographs and
+35% on a small, smooth one (macarrão). To find what AV1 has that NVDR
+lacks, its tools were turned off one at a time, which is the cost of
+lacking each (BD-rate of libaom without the tool, against libaom whole):
+
+    tool off                      macarrão   clip frame   montanha
+    smooth modes                    +0.5%       +1.0%       +0.6%
+    Paeth                           -0.1%        0.0%        0.0%
+    chroma from luma                +0.6%       +0.1%        0.0%
+    recursive filter modes          -0.3%       +1.7%       +0.6%
+    fine angles (56, not 8)        +12.0%       +0.9%       +1.1%
+    edge filter                     +1.0%       +0.7%       +0.1%
+    all six together               +15.7%       +9.0%       +4.3%
+    rectangular partitions          +5.6%       +2.0%       +1.3%
+    64x64 blocks, 64 transforms     ~0           ~0          ~0
+    palette                          0            0           0
+
+The intra tools together are about the whole gap on the clip's frame,
+though no one of them is much, since each stands in for the others. Chroma
+is 8% of an intra frame's bits, so chroma from luma could not be worth
+more; neighbour contexts for the mode, tried on the leaves' modes, saved
+1% of the mode's bits.
+
+So a leaf now has 43 modes where it had 15 (see DIRECTIONAL PREDICTION
+in nvdr.c): all 33 of HEVC's angles with its inverse angles, AV1's three
+smooth modes with its weights, and AV1's five recursive filters, which
+predict 4x2 patches in raster order from the patch's corner, the four
+pixels above it and the two to its left, already predicted or not, with
+AV1's taps. The mode is the "flat or not" bit, then six bits down the
+tree. The encoder screens the 42 by the Hadamard sum and tries 9 in full
+instead of 5. Version 13 containers still decode: their fifteen modes
+are the same angles under other numbers.
+
+Against AV1 as a still, BD-rate on PSNR-Y:
+
+                          before    + 33 angles,   + smooth   + filters
+                                    9 tried
+    clip frame, clean      +9.6%       +8.9%         +7.9%       +5.9%
+    clip frame, noisy      +8.9%                                 +5.6%
+    montanha_pessoas       +6.7%       +6.1%         +6.2%       +5.7%
+    OIP-4140498144         +5.5%                                 +4.6%
+    OIP-3451121336         +0.2%                                 +0.0%
+    macarrão              +35.0%      +29.1%        +29.6%      +29.7%
+
+Encoding an intra frame takes 1.7 times as long; decoding is unchanged.
+Sequences are format 17 for it, their containers being version 14.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

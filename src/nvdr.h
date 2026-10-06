@@ -186,7 +186,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     13
+#define NVDR_VERSION     14
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -202,6 +202,7 @@ typedef struct {
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
+    uint8_t  version;                   /* 14, or 13: fifteen intra modes */
     uint8_t  band;
     uint8_t  grain_len;                 /* bytes of grain parameters after the header */
     NvdrGrain grain;

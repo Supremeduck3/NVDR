@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-export const VERSION = 13;
+export const VERSION = 14;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -297,14 +297,14 @@ function colourModels() {
         dcSign: probs(3),
         dcMag: grid(3, MAG_UNARY),
         tqZero: probs(1), tqSign: probs(1), tqMag: probs(2 * TQ_MAX),
-        modeFlat: probs(NSIZES), modeTree: probs(16), modeInter: probs(NSIZES),
+        modeFlat: probs(NSIZES), modeTree: probs(64), modeInter: probs(NSIZES),
         txDct: grid(3, 3), txTree: grid(3, 8)
     };
 }
 
 /* Mirrors mode_dir() and get_tx(): "DCT or not" by size and direction,
  * then the other six as three bits down a tree by direction. */
-const modeDir = mode => (mode <= 1 ? 0 : mode <= 8 ? 1 : 2);
+const modeDir = mode => (mode <= 1 || mode >= MODE_SMOOTH ? 0 : mode <= 18 ? 1 : 2);
 function getTx(d, m, sc, mode) {
     const dir = modeDir(mode);
     if (!d.bit(m.txDct[sc], dir)) return 0;
@@ -318,25 +318,51 @@ function getTx(d, m, sc, mode) {
 }
 
 /* Mirrors get_mode(): INTER or not by size with a base, flat or not by
- * size, then four bits down a tree. */
-function getMode(d, m, sc, inter) {
+ * size, then six bits down a tree (four in a version 13 container, whose
+ * fifteen modes OLD_MODE renames). */
+const OLD_MODE = [0, 1, 2, 5, 7, 10, 13, 15, 18, 21, 23, 26, 29, 31, 34];
+function getMode(d, m, sc, inter, legacy) {
     if (inter && !d.bit(m.modeInter, sc)) return MODE_INTER;
     if (!d.bit(m.modeFlat, sc)) return 0;
     let v = 0, node = 1;
-    for (let k = 0; k < 4; k++) {
+    for (let k = 0; k < (legacy ? 4 : 6); k++) {
         const b = d.bit(m.modeTree, node);
         v = 2 * v + b;
         node = 2 * node + b;
     }
-    return v < MODES - 1 ? v + 1 : -1;    // the last two are damage
+    if (legacy) return v < 14 ? OLD_MODE[v + 1] : -1;
+    return v < MODES - 1 ? v + 1 : -1;    // the last 21 are damage
 }
 
 /* Mirrors the directional prediction in nvdr.c: MODE_ANGLE, angular(),
  * zorder(), decoded_before() and dir_predict(). */
-const MODES = 15;
+const MODES = 43;
 const MODE_INTER = MODES;
-const MODE_ANGLE = [0, 0, -32, -17, -9, 0, 9, 17, 32, -17, -9, 0, 9, 17, 32];
-const invAngle = a => (a === -32 ? -256 : a === -17 ? -482 : a === -9 ? -910 : 0);
+const MODE_SMOOTH = 35, MODE_FILTER = 38;
+const MODE_ANGLE = [0, 0,
+    -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+    -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32];
+const INV_ANGLE = { '-32': -256, '-26': -315, '-21': -390, '-17': -482, '-13': -630, '-9': -910, '-5': -1638, '-2': -4096 };
+const invAngle = a => INV_ANGLE[a] || 0;
+const SM_W = {
+    4: [255, 149, 85, 64], 8: [255, 197, 146, 105, 73, 50, 37, 32],
+    16: [255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16],
+    32: [255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83, 74,
+         66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8]
+};
+const FI_TAPS = [
+    [[-6, 10, 0, 0, 0, 12, 0], [-5, 2, 10, 0, 0, 9, 0], [-3, 1, 1, 10, 0, 7, 0], [-3, 1, 1, 2, 10, 5, 0],
+     [-4, 6, 0, 0, 0, 2, 12], [-3, 2, 6, 0, 0, 2, 9], [-3, 2, 2, 6, 0, 2, 7], [-3, 1, 2, 2, 6, 3, 5]],
+    [[-10, 16, 0, 0, 0, 10, 0], [-6, 0, 16, 0, 0, 6, 0], [-4, 0, 0, 16, 0, 4, 0], [-2, 0, 0, 0, 16, 2, 0],
+     [-10, 16, 0, 0, 0, 0, 10], [-6, 0, 16, 0, 0, 0, 6], [-4, 0, 0, 16, 0, 0, 4], [-2, 0, 0, 0, 16, 0, 2]],
+    [[-8, 8, 0, 0, 0, 16, 0], [-8, 0, 8, 0, 0, 16, 0], [-8, 0, 0, 8, 0, 16, 0], [-8, 0, 0, 0, 8, 16, 0],
+     [-4, 4, 0, 0, 0, 0, 16], [-4, 0, 4, 0, 0, 0, 16], [-4, 0, 0, 4, 0, 0, 16], [-4, 0, 0, 0, 4, 0, 16]],
+    [[-2, 8, 0, 0, 0, 10, 0], [-1, 3, 8, 0, 0, 6, 0], [-1, 2, 3, 8, 0, 4, 0], [0, 1, 2, 3, 8, 2, 0],
+     [-1, 4, 0, 0, 0, 3, 10], [-1, 3, 4, 0, 0, 4, 6], [-1, 2, 3, 4, 0, 4, 4], [-1, 2, 2, 3, 4, 3, 3]],
+    [[-12, 14, 0, 0, 0, 14, 0], [-10, 0, 14, 0, 0, 12, 0], [-9, 0, 0, 14, 0, 11, 0], [-8, 0, 0, 0, 14, 10, 0],
+     [-10, 12, 0, 0, 0, 0, 14], [-9, 1, 12, 0, 0, 0, 12], [-8, 0, 0, 12, 0, 1, 11], [-7, 0, 0, 1, 12, 1, 9]]
+];
+const FB = new Int32Array((MAX_BLOCK + 2) * (MAX_BLOCK + 1));
 const REF = new Int32Array(4 * MAX_BLOCK + 2), REF0 = 2 * MAX_BLOCK;
 function angular(main, side, n, angle, P) {
     for (let k = 0; k <= 2 * n; k++) REF[REF0 + k] = main[k];
@@ -443,8 +469,10 @@ export function readHeader(buffer) {
     const v = ArrayBuffer.isView(buffer)
         ? new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
         : new DataView(buffer);
-    if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) !== VERSION) return null;
+    // Version 13 differs only in having fifteen intra modes.
+    if (v.getUint32(0, true) !== MAGIC || (v.getUint8(4) !== VERSION && v.getUint8(4) !== 13)) return null;
     const h = {
+        version: v.getUint8(4),
         width: v.getUint16(6, true),
         height: v.getUint16(8, true),
         maxBlock: v.getUint8(10),
@@ -785,6 +813,37 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
         else if (!top) { for (let i = 0; i <= 2 * n; i++) T[i] = L[1]; L[0] = L[1]; }
         else if (!left) { for (let i = 0; i <= 2 * n; i++) L[i] = T[1]; T[0] = T[1]; }
         else T[0] = L[0] = f[(y - 1) * pw + x - 1];
+        if (mode >= MODE_FILTER) {
+            // Mirrors AV1's recursive filters in dir_predict().
+            const W = n + 1, tp = FI_TAPS[mode - MODE_FILTER], p = [0, 0, 0, 0, 0, 0, 0];
+            for (let i = 0; i <= n; i++) { FB[i] = T[i]; FB[i * W] = L[i]; }
+            for (let r = 1; r <= n; r += 2)
+                for (let c = 1; c <= n; c += 4) {
+                    const up = (r - 1) * W;
+                    p[0] = FB[up + c - 1]; p[1] = FB[up + c]; p[2] = FB[up + c + 1]; p[3] = FB[up + c + 2]; p[4] = FB[up + c + 3];
+                    p[5] = FB[r * W + c - 1]; p[6] = FB[(r + 1) * W + c - 1];
+                    for (let k = 0; k < 8; k++) {
+                        const t = tp[k];
+                        let a = 0;
+                        for (let q = 0; q < 7; q++) a += t[q] * p[q];
+                        a = a >= 0 ? (a + 8) >> 4 : -((-a + 8) >> 4);
+                        FB[(r + (k >> 2)) * W + c + (k & 3)] = clampU8(a);
+                    }
+                }
+            for (let j = 0; j < n; j++)
+                for (let i = 0; i < n; i++) out[j * n + i] = FB[(j + 1) * W + i + 1];
+            return;
+        }
+        if (mode >= MODE_SMOOTH) {
+            // Mirrors AV1's smooth modes in dir_predict().
+            const w = SM_W[n], below = L[n], right = T[n], k = mode - MODE_SMOOTH;
+            for (let j = 0; j < n; j++)
+                for (let i = 0; i < n; i++) {
+                    const v = w[j] * T[i + 1] + (256 - w[j]) * below, hh = w[i] * L[j + 1] + (256 - w[i]) * right;
+                    out[j * n + i] = k === 0 ? (v + hh + 256) >> 9 : k === 1 ? (v + 128) >> 8 : (hh + 128) >> 8;
+                }
+            return;
+        }
         if (n >= 8 && mode !== 0) {
             T2[0] = L2[0] = (T[1] + 2 * T[0] + L[1] + 2) >> 2;
             for (let i = 1; i < 2 * n; i++) {
@@ -802,7 +861,7 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
                                       (n - 1 - j) * T[i + 1] + (j + 1) * L[n + 1] + n) >> (sh + 1);
             return;
         }
-        if (mode <= 8) { angular(T, L, n, MODE_ANGLE[mode], out); return; }
+        if (mode <= 18) { angular(T, L, n, MODE_ANGLE[mode], out); return; }
         angular(L, T, n, MODE_ANGLE[mode], TMP);
         for (let j = 0; j < n; j++)
             for (let i = 0; i < n; i++) out[j * n + i] = TMP[i * n + j];
@@ -983,7 +1042,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     const cm = warm ? ctx.cm : colourModels();
     if (!cm.splitC) cm.splitC = probs(NSIZES);
     if (!cm.tqZero) { cm.tqZero = probs(1); cm.tqSign = probs(1); cm.tqMag = probs(2 * TQ_MAX); }
-    if (!cm.modeFlat) { cm.modeFlat = probs(NSIZES); cm.modeTree = probs(16); }
+    if (!cm.modeFlat) { cm.modeFlat = probs(NSIZES); cm.modeTree = probs(64); }
     if (!cm.modeInter) cm.modeInter = probs(NSIZES);
     if (!cm.txDct) { cm.txDct = grid(3, 3); cm.txTree = grid(3, 8); }
     // The tiles' step offsets as layer 0 delivers them, zero where it
@@ -1041,7 +1100,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         const sc = sizeClass(n);
         let mode = 0;
         if (dirpred) {
-            mode = getMode(d0, cm, sc, inter);
+            mode = getMode(d0, cm, sc, inter, h.version < VERSION);
             if (mode < 0) { s0.corrupt = true; return; }
         }
         // Mirrors has_tx(): a leaf's transform type; without the DCT the
