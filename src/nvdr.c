@@ -470,6 +470,7 @@ struct NvdrContext {
 NvdrContext* nvdr_context_new(void) { return (NvdrContext*)calloc(1, sizeof(NvdrContext)); }
 void nvdr_context_free(NvdrContext* ctx) { free(ctx); }
 void nvdr_context_reset(NvdrContext* ctx) { if (ctx) ctx->valid = 0; }
+size_t nvdr_context_size(void) { return sizeof(NvdrContext); }
 void nvdr_context_copy(NvdrContext* dst, const NvdrContext* src) { *dst = *src; }
 int nvdr_context_equal(const NvdrContext* a, const NvdrContext* b) {
     if (a->valid != b->valid) return 0;
@@ -2545,9 +2546,9 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
 }
 
 int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
-                         NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
-    int rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 0, NULL);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, NULL, 1, NULL);
+                         NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
+    int rc = decode_once(data, size, -1, base, out, hdr_out, info, ctx, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, ctx, 1, NULL);
     return rc;
 }
 

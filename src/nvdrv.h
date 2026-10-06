@@ -60,9 +60,9 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      12
+#define NVDRV_VERSION      16
 #define NVDRV_HEADER_SIZE  24
-#define NVDRV_FRAME_HEADER 20
+#define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
 #define NVDRV_INTRA 0   /* the frame on its own */
 #define NVDRV_PRED  1   /* the error against the frame before it */
@@ -112,7 +112,8 @@ typedef struct {
     int   pred_q;
     /* What one bit of motion field is worth in sum of absolute differences
      * over a block, when the encoder chooses between a block's own vector
-     * and the one its neighbours predict. 0 keeps the search's choice. */
+     * and the one its neighbours predict. 0 keeps the search's choice; -1
+     * (the default) chooses by block size, 24 for 32 and up, 16 below. */
     int   mv_lambda;
     /* B frames between two anchors (I or P frames), 0 to NVDRV_MAX_B. The
      * anchor is coded first, then the frame halfway between the two

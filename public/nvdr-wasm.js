@@ -26,7 +26,7 @@ export function loadWasm(url = new URL('./nvdr.wasm', import.meta.url)) {
             if (!res.ok) return null;
             const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
             exports_ = instance.exports;
-            setFastDecoder(decodeWasm);
+            setFastDecoder(decodeWasm, wasmContexts);
             return exports_;
         })().catch(() => null);
     }
@@ -37,14 +37,21 @@ export function loadWasm(url = new URL('./nvdr.wasm', import.meta.url)) {
 export async function loadWasmBytes(bytes) {
     const { instance } = await WebAssembly.instantiate(bytes, {});
     exports_ = instance.exports;
-    setFastDecoder(decodeWasm);
+    setFastDecoder(decodeWasm, wasmContexts);
     return exports_;
 }
 
 /* decode() of nvdr.js, without a fluid context. Each view is a decode of
  * its own (the C decoder shows one layer per call); layer 0 and 1 are
  * the cheap ones. */
-export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false, base = null) {
+/* The pool of contexts wasm/api.c keeps, for newDecodeContext(). */
+const wasmContexts = {
+    alloc: () => exports_.nvdr_wasm_ctx_alloc(),
+    reset: k => exports_.nvdr_wasm_ctx_reset(k),
+    free: k => exports_.nvdr_wasm_ctx_free(k)
+};
+
+export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false, base = null, slot = -1) {
     const w = exports_;
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const header = readHeader(bytes);
@@ -68,6 +75,8 @@ export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = fal
         w.nvdr_wasm_release();
         return out;
     };
+    // A context moves with one decode: the main view's.
+    if (slot >= 0) w.nvdr_wasm_use_ctx(slot);
     const main = view(maxLayer);
     if (!main) return null;
     return {
