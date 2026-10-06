@@ -917,11 +917,19 @@ that much more:
     clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
       (fmt 11)
     noisy, the same               +111.5%       +14.9%      -15.7%
+    clean, + adaptive transforms,
+      restoration, adaptive rate,
+      carried models                +74.3%       +17.4%      -14.1%
+    noisy, the same                +86.8%        -1.2%      -27.2%
+    clean, + field of 32 blocks
+      predicted in time (seq v14)   +52.2%        +1.5%      -25.7%
+    noisy, the same                +58.6%       -16.6%      -38.6%
 
-That is the honest position: past the browser's encoders, near x264 at
-its slowest, and AV1 needs well under half the bytes. The intra frame
-alone, measured on the first frame, is 5% behind x264's, 17% behind
-x265's and 38% behind AV1's at equal luma; the rest is prediction.
+That is the honest position now: well past x264 at its slowest, level
+with x265 on the clean clip and past it on the noisy one, and AV1 still
+needs about two thirds of the bytes. In the clean clip at q 24 the intra
+frame is 56% of the file; the predicted frames average 544 bytes, the B
+frames about half of that motion field.
 
 ### Albums and the fluid context
 
