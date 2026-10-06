@@ -966,7 +966,12 @@ frame went from 31.3 KB at 35.62 dB to 23.2 KB at 35.85 dB, where AV1's
 are 18.5 KB at 36.09 dB. The P frames are now 61% of that: 2.4 KB each,
 the quality falling 0.3 dB from one to the next across the group.
 
-Two things tried that did not pay: a P frame predicted from the two
+Things tried that did not pay: a transform type for INTER leaves too
+(the seven of intra leaves, chosen by error plus bits, with a context of
+their own) came out the same to 0.01%, the residuals of predicted frames
+at their steps being too small for the shape of the transform to matter;
+HEVC's interpolation in albums, whose residual is coded differently, was
+0.4% smaller for 0.07 dB less; a P frame predicted from the two
 anchors before it as well as the one (the older one sixteen frames off,
 blended per unit like a B frame's lists) was 0.7% bigger for 0.03 dB on
 the clean pan; and a larger weight on the vectors' bits in P frames
@@ -1006,12 +1011,17 @@ that much more:
     clean, + field of 32 blocks
       predicted in time (seq v14)   +52.2%        +1.5%      -25.7%
     noisy, the same                +58.6%       -16.6%      -38.6%
+    clean, + direct units,
+      predicted headers, HEVC's
+      interpolation (seq v16)       +28.0%       -15.3%      -37.7%
+    noisy, the same                +31.1%       -32.3%      -49.9%
 
-That is the honest position now: well past x264 at its slowest, level
-with x265 on the clean clip and past it on the noisy one, and AV1 still
-needs about two thirds of the bytes. In the clean clip at q 24 the intra
-frame is 56% of the file; the predicted frames average 544 bytes, the B
-frames about half of that motion field.
+That is the honest position now: half the bytes of x264 at its slowest
+on the noisy clip, a sixth to a third fewer than x265, and AV1 still
+needing about four fifths of NVDRV's bytes. In the clean clip at q 20
+the intra frame is 63% of the file, 39 KB where AV1's is 34 KB at 0.9 dB
+less; the 47 frames after it average 495 bytes against AV1's 393, at
+0.24 dB less.
 
 ### Albums and the fluid context
 
