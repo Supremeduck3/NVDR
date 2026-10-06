@@ -978,6 +978,15 @@ the clean pan; and a larger weight on the vectors' bits in P frames
 (1.5x: -1.3% bytes for -0.06 dB) or B frames (1.5x: -1.0% for -0.04 dB)
 sits on the same curve.
 
+The steps between frame kinds, against this format on the three clips:
+P frames at 1.6 times the intra step instead of 1.4 were 0.4 to 0.9%
+smaller, and 1.8 gave it back, but the regression gate's 128x128
+sequence lost 0.34 dB for 1.1% fewer bytes at 1.6, so 1.4 stays; B
+levels closer together (each 1 + 0.3 x level times the P step instead
+of 1 + 0.5) were 1.1 to 2.5% bigger; refining the intra frame three
+times as hard for its reuse (`--tpl 3`) was 0 to 3.3% bigger; groups of
+16 instead of 8 went either way (+0.9, -2.2 and +1.4%).
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
