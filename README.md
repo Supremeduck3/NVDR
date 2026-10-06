@@ -891,6 +891,24 @@ Together, against the encoder before, BD-rate on PSNR-Y over 25 frames:
 The weight is now 24 with blocks of 32 and up; the regression gate's
 128x128 clip, on blocks of 8, lost 0.15 dB with it and keeps 16.
 
+### Compact frame headers (sequence v15)
+
+Set side by side with AV1's, frame by frame, the B frames of a clean pan
+were 250 to 700 bytes where AV1's are 5 to 100, and 56 of those bytes
+were headers: 20 for the frame, 4 for its field's length and 32 for its
+container's, which repeats in every frame the magic, the version and
+the size of the sequence. A frame now carries only what varies, in
+variable-length integers: its kind and flags in a byte, its block size,
+its display number as the change from the frame before it, its global
+vectors, its lengths, and of its container's header the flags, block
+sizes, steps, layer lengths, band and side information. The decoder
+puts the 32-byte header back before handing the container to the still
+decoder, which does not change. Headers go from 56 bytes to 15 to 20,
+pictures stay identical to the byte. On the clean pan the file comes
+out 0.9% smaller at q 12, 1.8% at q 24 and 4.2% at q 56, the gain
+growing as the frames shrink; the regression gate's 128x128 sequence,
+whose frames are tiny, 8.3%.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

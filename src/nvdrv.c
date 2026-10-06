@@ -20,6 +20,106 @@ static uint32_t get_u32v(const uint8_t* p) {
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int clamp255v(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
+/*
+ * COMPACT FRAMES (sequence format 15)
+ * -----------------------------------
+ * A B frame of a clean pan came to 250 bytes, and 56 of them were
+ * headers: 20 for the frame, 4 for its field's length and 32 for its
+ * container's, which repeats the magic, the version and the size of every
+ * frame of the sequence. AV1 codes such a frame in 5 to 100 bytes. Frames
+ * now carry only what varies, as variable-length integers (7 bits a byte,
+ * low first, the high bit saying more follow; signed values zigzagged):
+ *
+ *   [kind | flags << 2 | has field << 5][block u8, with a field]
+ *   [display, as the change from the frame coded before]
+ *   [dx][dy], and for a B frame [dx1][dy1]   (global vectors)
+ *   [body length], then the body:
+ *   [field length][field] (with a field)
+ *   [flags][max block][min block][luma step][colour step]
+ *   [layer 0, 1 and 2 lengths][band][grain bytes][restoration bytes]
+ *   and the container after its 32-byte header.
+ *
+ * The decoder puts the 32-byte header back from these and the sequence's
+ * size before handing the container to the still decoder, which is
+ * unchanged. 56 bytes become 15 to 20.
+ */
+static int put_varint(uint8_t* p, uint32_t v) {
+    int n = 0;
+    while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; }
+    p[n++] = (uint8_t)v;
+    return n;
+}
+
+/* Bytes used, 0 when `avail` ends first, -1 when longer than 5 bytes. */
+static int get_varint(const uint8_t* p, size_t avail, uint32_t* v) {
+    uint32_t r = 0;
+    for (int i = 0; i < 5; i++) {
+        if ((size_t)i >= avail) return 0;
+        r |= (uint32_t)(p[i] & 0x7f) << (7 * i);
+        if (!(p[i] & 0x80)) { *v = r; return i + 1; }
+    }
+    return -1;
+}
+
+static uint32_t zigzag(int v) { return v >= 0 ? 2u * (uint32_t)v : 2u * (uint32_t)(-(long)v) - 1u; }
+static int unzigzag(uint32_t u) { return (u & 1) ? -(int)((u >> 1) + 1) : (int)(u >> 1); }
+
+/* The container `c` (len bytes, its 32-byte header first) in compact form
+ * into `out`, which has room for len + 16 bytes; returns its length. */
+static size_t compact_container(const uint8_t* c, size_t len, uint8_t* out) {
+    size_t n = 0;
+    out[n++] = c[5]; out[n++] = c[10]; out[n++] = c[11];
+    n += (size_t)put_varint(out + n, get_u16v(c + 12));
+    n += (size_t)put_varint(out + n, get_u16v(c + 14));
+    for (int k = 0; k < 3; k++) n += (size_t)put_varint(out + n, get_u32v(c + 16 + 4 * k));
+    out[n++] = c[28]; out[n++] = c[29];
+    n += (size_t)put_varint(out + n, get_u16v(c + 30));
+    memcpy(out + n, c + 32, len - 32);
+    return n + len - 32;
+}
+
+/* The container back from its compact form (the first `avail` bytes of
+ * it): allocated, its length in *out_len. NULL when its header did not
+ * all arrive (*damaged 0) or makes no sense (*damaged 1). */
+static uint8_t* expand_container(const uint8_t* p, size_t avail, int width, int height,
+                                 size_t* out_len, int* damaged) {
+    uint8_t h[32];
+    size_t at = 0;
+    uint32_t v[6];
+    *damaged = 0;
+    if (avail < 3) return NULL;
+    memcpy(h, NVDR_MAGIC, 4);
+    h[4] = NVDR_VERSION;
+    h[5] = p[0];
+    put_u16v(h + 6, (uint16_t)width);
+    put_u16v(h + 8, (uint16_t)height);
+    h[10] = p[1]; h[11] = p[2];
+    at = 3;
+    for (int k = 0; k < 5; k++) {
+        int n = get_varint(p + at, avail - at, &v[k]);
+        if (n == 0) return NULL;
+        if (n < 0) { *damaged = 1; return NULL; }
+        at += (size_t)n;
+    }
+    if (v[0] > 0xffff || v[1] > 0xffff) { *damaged = 1; return NULL; }
+    put_u16v(h + 12, (uint16_t)v[0]);
+    put_u16v(h + 14, (uint16_t)v[1]);
+    put_u32v(h + 16, v[2]); put_u32v(h + 20, v[3]); put_u32v(h + 24, v[4]);
+    if (avail - at < 2) return NULL;
+    h[28] = p[at++]; h[29] = p[at++];
+    int n = get_varint(p + at, avail - at, &v[5]);
+    if (n == 0) return NULL;
+    if (n < 0 || v[5] > 0xffff) { *damaged = 1; return NULL; }
+    at += (size_t)n;
+    put_u16v(h + 30, (uint16_t)v[5]);
+    uint8_t* out = (uint8_t*)malloc(32 + (avail - at));
+    if (!out) { *damaged = 1; return NULL; }
+    memcpy(out, h, 32);
+    memcpy(out + 32, p + at, avail - at);
+    *out_len = 32 + (avail - at);
+    return out;
+}
+
 NvdrvConfig nvdrv_default_config(void) {
     NvdrvConfig c;
     c.frame = nvdr_default_config();
@@ -1729,6 +1829,7 @@ struct NvdrvEncoder {
     int         use_tile_q;
     NvdrImage   last_src;
     int         anchor;      /* display number of the last anchor, -1 before any */
+    int         last_display;   /* of the frame last written, see COMPACT FRAMES */
     NvdrImage   pred, error;
     NvdrImage   tf;          /* the anchor, filtered */
     /* The models the frames leave, carried from one to the next in coding
@@ -1869,40 +1970,42 @@ void nvdrv_encode_set_report(NvdrvEncoder* e, NvdrvReportFn fn, void* user) {
 }
 
 /*
- * [kind u8][block u8][dx i16][dy i16][body length u32][dx1 i16][dy1 i16]
- * [display u32][flags u8][0 u8], then the body: for a frame with a field,
- * [u32 field length][field][container], otherwise the container. dx, dy
+ * One frame, in the compact form described under COMPACT FRAMES: dx, dy
  * is the global vector toward the frame before, dx1, dy1 (B frames) the
  * one toward the frame after, both in whole pixels. A sequence's field
  * starts with the affine model of each list whose flag is set (bit 0 the
  * list before, bit 1 the list after), 12 bytes each; a list without one
- * takes its global vector as a plain translation.
+ * takes its global vector as a plain translation. Returns the bytes
+ * written, 0 on failure.
  */
-static int write_frame(NvdrvEncoder* e, int kind, int display, int block, int flags,
-                       int dx, int dy, int dx1, int dy1,
-                       const uint8_t* field, size_t field_len,
-                       const uint8_t* payload, size_t len) {
-    uint8_t h[NVDRV_FRAME_HEADER];
-    memset(h, 0, sizeof(h));
-    h[0] = (uint8_t)kind;
-    h[1] = (uint8_t)block;
-    put_u16v(h + 2, (uint16_t)(int16_t)dx);
-    put_u16v(h + 4, (uint16_t)(int16_t)dy);
-    size_t body = len + (block ? 4 + field_len : 0);
-    put_u32v(h + 6, (uint32_t)body);
-    put_u16v(h + 10, (uint16_t)(int16_t)dx1);
-    put_u16v(h + 12, (uint16_t)(int16_t)dy1);
-    put_u32v(h + 14, (uint32_t)display);
-    h[18] = (uint8_t)flags;
-    if (fwrite(h, 1, sizeof(h), e->f) != sizeof(h)) return -1;
-    if (block) {
-        uint8_t n[4];
-        put_u32v(n, (uint32_t)field_len);
-        if (fwrite(n, 1, 4, e->f) != 4) return -1;
-        if (fwrite(field, 1, field_len, e->f) != field_len) return -1;
+static size_t write_frame(NvdrvEncoder* e, int kind, int display, int block, int flags,
+                          int dx, int dy, int dx1, int dy1,
+                          const uint8_t* field, size_t field_len,
+                          const uint8_t* payload, size_t len) {
+    uint8_t h[64], fl[8];
+    uint8_t* c = (uint8_t*)malloc(len + 16);
+    if (!c || len < NVDR_HEADER_SIZE) { free(c); return 0; }
+    size_t clen = compact_container(payload, len, c);
+    int fn = block ? put_varint(fl, (uint32_t)field_len) : 0;
+    size_t body = clen + (block ? (size_t)fn + field_len : 0);
+    size_t n = 0;
+    h[n++] = (uint8_t)(kind | flags << 2 | (block ? 1 : 0) << 5);
+    if (block) h[n++] = (uint8_t)block;
+    n += (size_t)put_varint(h + n, zigzag(display - e->last_display));
+    n += (size_t)put_varint(h + n, zigzag(dx));
+    n += (size_t)put_varint(h + n, zigzag(dy));
+    if (kind == NVDRV_BI) {
+        n += (size_t)put_varint(h + n, zigzag(dx1));
+        n += (size_t)put_varint(h + n, zigzag(dy1));
     }
-    if (fwrite(payload, 1, len, e->f) != len) return -1;
-    return 0;
+    n += (size_t)put_varint(h + n, (uint32_t)body);
+    e->last_display = display;
+    int ok = fwrite(h, 1, n, e->f) == n &&
+             (!block || (fwrite(fl, 1, (size_t)fn, e->f) == (size_t)fn &&
+                         fwrite(field, 1, field_len, e->f) == field_len)) &&
+             fwrite(c, 1, clen, e->f) == clen;
+    free(c);
+    return ok ? n + body : 0;
 }
 
 /* One list's searches: the global vector around `c`, then every block
@@ -2180,9 +2283,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
 
     int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0) |
                 (block && obmc ? FRAME_OBMC : 0);
-    if (write_frame(e, kind, display, block, flags, dx, dy, dx1, dy1, field, field_len, blob, len) != 0) {
-        free(blob); free(field); return -1;
-    }
+    size_t written = write_frame(e, kind, display, block, flags, dx, dy, dx1, dy1, field, field_len, blob, len);
+    if (!written) { free(blob); free(field); return -1; }
     free(field);
 
     /* Carry the decoder's state forward by decoding what was just written,
@@ -2207,7 +2309,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         NvdrvFrameReport r;
         r.display = display; r.kind = kind; r.level = kind == NVDRV_BI ? level : 0;
         r.q = fcfg.q; r.dx = dx; r.dy = dy;
-        r.bytes = len + NVDRV_FRAME_HEADER + (block ? 4 + field_len : 0);
+        r.bytes = written;
         r.field_bytes = field_len;
         e->report(e->user, &r);
     }
@@ -2709,6 +2811,7 @@ struct NvdrvDecoder {
     int       ndpb;
     int       next_out;      /* display number of the next frame to show */
     int       shown;         /* display number of the frame last shown */
+    int       last_display;  /* of the frame last read, see COMPACT FRAMES */
     int       ended;
     NvdrImage pred, err;
     NvdrContext* ctx[4];     /* the models frames left, per class: see code_frame() */
@@ -2762,26 +2865,41 @@ int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
 /* The next frame in coding order into the held frames: 1 when one was
  * decoded, 0 at the end of the stream, -1 on damage. */
 static int decode_one(NvdrvDecoder* d) {
-    if (d->pos + NVDRV_FRAME_HEADER > d->size) return 0;
+    if (d->pos >= d->size) return 0;
     const uint8_t* h = d->data + d->pos;
-    int kind = h[0];
-    int block = h[1];
-    int dx = (int16_t)get_u16v(h + 2);
-    int dy = (int16_t)get_u16v(h + 4);
-    size_t len = get_u32v(h + 6);
-    int dx1 = (int16_t)get_u16v(h + 10);
-    int dy1 = (int16_t)get_u16v(h + 12);
-    int flags = h[18];
-    uint32_t display32 = get_u32v(h + 14);
+    size_t avail = d->size - d->pos, at = 0;
+    int a = h[at++];
+    int kind = a & 3, flags = (a >> 2) & 7, has_field = (a >> 5) & 1, block = 0;
+    if (a >> 6) return -1;
+    if (has_field) {
+        if (at >= avail) return 0;
+        block = h[at++];
+        if (!block) return -1;
+    }
+    /* A header cut short ends the stream; one that makes no sense is damage. */
+    uint32_t u[6];
+    int nv = kind == NVDRV_BI ? 6 : 4;
+    for (int k = 0; k < nv; k++) {
+        int n = get_varint(h + at, avail - at, &u[k]);
+        if (n == 0) return 0;
+        if (n < 0) return -1;
+        at += (size_t)n;
+    }
+    long display_l = (long)d->last_display + unzigzag(u[0]);
+    int dx = unzigzag(u[1]), dy = unzigzag(u[2]);
+    int dx1 = kind == NVDRV_BI ? unzigzag(u[3]) : 0, dy1 = kind == NVDRV_BI ? unzigzag(u[4]) : 0;
+    size_t len = u[nv - 1];
+    if (dx < -32768 || dx > 32767 || dy < -32768 || dy > 32767 ||
+        dx1 < -32768 || dx1 > 32767 || dy1 < -32768 || dy1 > 32767) return -1;
     if (kind != NVDRV_INTRA && kind != NVDRV_PRED && kind != NVDRV_BI) return -1;
     if (kind == NVDRV_INTRA && block) return -1;
-    if (flags & ~(FRAME_MODEL0 | FRAME_MODEL1 | FRAME_OBMC) || h[19]) return -1;
     if (flags && (!block || (kind != NVDRV_BI && (flags & FRAME_MODEL1)))) return -1;
     /* A field's blocks split into halves: 8 to 128, even. */
     if (kind == NVDRV_BI && (block < 8 || block > 128 || (block & 1))) return -1;
     if (kind == NVDRV_PRED && block && (block < 8 || block > 128 || (block & 1))) return -1;
-    if (display32 > INT_MAX / 2) return -1;
-    int display = (int)display32;
+    if (display_l < 0 || display_l > INT_MAX / 2) return -1;
+    int display = (int)display_l;
+    d->last_display = display;
     /* A frame shown already, or twice, or more held frames than any
      * encoder makes, is damage. */
     if (display < d->next_out || d->ndpb >= NVDRV_MAX_DPB) return -1;
@@ -2790,7 +2908,7 @@ static int decode_one(NvdrvDecoder* d) {
     find_refs(d->dpb, d->ndpb, display, &before, &after);
     if (kind != NVDRV_INTRA && before < 0) return -1;
     if (kind == NVDRV_BI && after < 0) return -1;
-    d->pos += NVDRV_FRAME_HEADER;
+    d->pos += at;
 
     const NvdrImage* ref = kind == NVDRV_INTRA ? NULL : &d->dpb[before].img;
     Slot field;      /* holds this frame's field until the frame is held */
@@ -2800,9 +2918,12 @@ static int decode_one(NvdrvDecoder* d) {
     if (block) {
         /* The field has to arrive whole: without it there is no reference
          * to add the residual to, so a cut inside it ends the stream. */
-        if (d->pos + 4 > d->size || len < 4) return 0;
-        size_t field_len = get_u32v(d->data + d->pos);
-        if (field_len > len - 4 || d->pos + 4 + field_len > d->size) return 0;
+        uint32_t fl32;
+        int fk = get_varint(d->data + d->pos, d->size - d->pos < len ? d->size - d->pos : len, &fl32);
+        if (fk == 0) return 0;
+        if (fk < 0) return -1;
+        size_t field_len = fl32;
+        if (field_len > len - (size_t)fk || d->pos + (size_t)fk + field_len > d->size) return 0;
         Grid G;
         grid_init(&G, d->width, d->height, block);
         size_t nb = (size_t)G.nfx * G.nfy;
@@ -2817,7 +2938,7 @@ static int decode_one(NvdrvDecoder* d) {
         Subpel sp0, sp1;
         memset(&sp0, 0, sizeof(sp0)); memset(&sp1, 0, sizeof(sp1));
         int rc = -1;
-        const uint8_t* fp = d->data + d->pos + 4;
+        const uint8_t* fp = d->data + d->pos + fk;
         size_t head = MODEL_BYTES * (!!(flags & FRAME_MODEL0) + !!(flags & FRAME_MODEL1));
         if (v && mode && field_len >= head) {
             Model m0 = { dx * 4, 0, 0, dy * 4, 0, 0 }, m1 = { dx1 * 4, 0, 0, dy1 * 4, 0, 0 };
@@ -2857,8 +2978,8 @@ static int decode_one(NvdrvDecoder* d) {
         free(v); free(mode);
         if (rc != 0) return -1;
         ref = &d->pred;
-        d->pos += 4 + field_len;
-        len -= 4 + field_len;
+        d->pos += (size_t)fk + field_len;
+        len -= (size_t)fk + field_len;
     } else if (kind == NVDRV_PRED && (dx || dy)) {
         shift_into(ref, &d->pred, dx, dy);
         ref = &d->pred;
@@ -2879,8 +3000,16 @@ static int decode_one(NvdrvDecoder* d) {
      * ends there, it is not damaged. */
     int fc = frame_class(kind, before >= 0 ? d->dpb[before].display : 0, after >= 0 ? d->dpb[after].display : 0);
     if (kind == NVDRV_INTRA) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
-    if (reconstruct(d->data + d->pos, len, kind == NVDRV_INTRA ? NULL : ref, &s->img,
-                    fc >= 0 ? d->ctx[fc] : NULL) != 0) {
+    size_t clen = 0;
+    int damaged = 0;
+    uint8_t* cont = expand_container(d->data + d->pos, len, d->width, d->height, &clen, &damaged);
+    if (!cont) {
+        slot_free(s);
+        return partial && !damaged ? 0 : -1;
+    }
+    int rc = reconstruct(cont, clen, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? d->ctx[fc] : NULL);
+    free(cont);
+    if (rc != 0) {
         slot_free(s);
         return partial ? 0 : -1;
     }

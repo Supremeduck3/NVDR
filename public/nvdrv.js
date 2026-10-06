@@ -12,12 +12,11 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
-import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext } from './nvdr.js';
+import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext, VERSION as CONTAINER_VERSION } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 14;
+const VERSION = 15;
 const HEADER_SIZE = 24;
-const FRAME_HEADER = 20;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
 const MV_MAX = 384;            // NVDRV_MV_MAX, quarter pixels
 const MAX_DPB = 15 + 3;        // NVDRV_MAX_DPB
@@ -569,6 +568,55 @@ export function predictDecode(ref, width, height, data) {
 
 const contextRegistry = new FinalizationRegistry(ctxs => ctxs.forEach(freeContext));
 
+/* Mirrors COMPACT FRAMES in nvdrv.c: get_varint(), unzigzag() and
+ * expand_container(). A varint is { v, n }: n bytes used, 0 when the bytes
+ * ran out first, -1 when longer than five. */
+function getVarint(bytes, pos, end) {
+    let r = 0;
+    for (let i = 0; i < 5; i++) {
+        if (pos + i >= end) return { v: 0, n: 0 };
+        const b = bytes[pos + i];
+        r += (b & 0x7f) * 2 ** (7 * i);
+        if (!(b & 0x80)) return r > 0xffffffff ? { v: 0, n: -1 } : { v: r, n: i + 1 };
+    }
+    return { v: 0, n: -1 };
+}
+const unzigzag = u => (u % 2 ? -((u - 1) / 2) - 1 : u / 2);
+/* The container back, or { damaged } when its header did not arrive whole
+ * (false) or makes no sense (true). */
+function expandContainer(bytes, pos, avail, width, height) {
+    const end = pos + avail;
+    if (avail < 3) return { damaged: false };
+    const h = new Uint8Array(32), v = [];
+    h.set([0x4e, 0x56, 0x44, 0x52]);      // "NVDR"
+    h[4] = CONTAINER_VERSION;
+    h[5] = bytes[pos];
+    h[6] = width & 255; h[7] = width >> 8; h[8] = height & 255; h[9] = height >> 8;
+    h[10] = bytes[pos + 1]; h[11] = bytes[pos + 2];
+    let at = pos + 3;
+    for (let k = 0; k < 5; k++) {
+        const r = getVarint(bytes, at, end);
+        if (r.n === 0) return { damaged: false };
+        if (r.n < 0) return { damaged: true };
+        v.push(r.v); at += r.n;
+    }
+    if (v[0] > 0xffff || v[1] > 0xffff) return { damaged: true };
+    const dv = new DataView(h.buffer);
+    dv.setUint16(12, v[0], true); dv.setUint16(14, v[1], true);
+    dv.setUint32(16, v[2], true); dv.setUint32(20, v[3], true); dv.setUint32(24, v[4], true);
+    if (end - at < 2) return { damaged: false };
+    h[28] = bytes[at++]; h[29] = bytes[at++];
+    const r = getVarint(bytes, at, end);
+    if (r.n === 0) return { damaged: false };
+    if (r.n < 0 || r.v > 0xffff) return { damaged: true };
+    at += r.n;
+    dv.setUint16(30, r.v, true);
+    const out = new Uint8Array(32 + (end - at));
+    out.set(h);
+    out.set(bytes.subarray(at, end), 32);
+    return { bytes: out };
+}
+
 /* Mirrors frame_class(): -1 intra, 0 P, 1..3 a B frame by the gap
  * between its references. */
 function frameClass(kind, before, after) {
@@ -605,7 +653,7 @@ function findRefs(dpb, display) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v14 file');
+        if (!this.info) throw new Error('not an NVDRV v15 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -619,6 +667,7 @@ export class SequenceDecoder {
         const held = this.ctxs.slice();
         contextRegistry.register(this, held, this);
         this.nextOut = 0;
+        this.lastDisplay = 0;    // of the frame last read, for the compact headers
         this.ended = false;
     }
 
@@ -656,31 +705,43 @@ export class SequenceDecoder {
     decodeOne() {
         const { width, height } = this.info;
         const bytes = this.bytes, size = bytes.length;
-        if (this.pos + FRAME_HEADER > size) return false;
-
-        const view = new DataView(bytes.buffer, bytes.byteOffset + this.pos, FRAME_HEADER);
-        const kind = view.getUint8(0);
-        const block = view.getUint8(1);
-        const dx = view.getInt16(2, true);
-        const dy = view.getInt16(4, true);
-        let len = view.getUint32(6, true);
-        const dx1 = view.getInt16(10, true);
-        const dy1 = view.getInt16(12, true);
-        const display = view.getUint32(14, true);
-        const flags = view.getUint8(18);
+        if (this.pos >= size) return false;
+        // Mirrors decode_one(): the compact frame header (COMPACT FRAMES).
+        let at = this.pos;
+        const a = bytes[at++];
+        const kind = a & 3, flags = (a >> 2) & 7, hasField = (a >> 5) & 1;
+        if (a >> 6) throw new Error('bad frame flags');
+        let block = 0;
+        if (hasField) {
+            if (at >= size) return false;
+            block = bytes[at++];
+            if (!block) throw new Error('bad block size');
+        }
+        const u = [];
+        for (let k = 0; k < (kind === BI ? 6 : 4); k++) {
+            const r = getVarint(bytes, at, size);
+            if (r.n === 0) return false;
+            if (r.n < 0) throw new Error('bad frame header');
+            u.push(r.v); at += r.n;
+        }
+        const display = this.lastDisplay + unzigzag(u[0]);
+        const dx = unzigzag(u[1]), dy = unzigzag(u[2]);
+        const dx1 = kind === BI ? unzigzag(u[3]) : 0, dy1 = kind === BI ? unzigzag(u[4]) : 0;
+        let len = u[u.length - 1];
+        if ([dx, dy, dx1, dy1].some(v => v < -32768 || v > 32767)) throw new Error('bad global vector');
         if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
         if (kind === INTRA && block) throw new Error('intra frame with a motion field');
-        if ((flags & ~(FRAME_MODEL0 | FRAME_MODEL1 | FRAME_OBMC)) || view.getUint8(19)) throw new Error('bad frame flags');
         if (flags && (!block || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
         if (block && (block < 8 || block > 128 || (block & 1))) throw new Error('bad block size');
         if (kind === BI && !block) throw new Error('B frame without a motion field');
-        if (display > 0x3fffffff) throw new Error('bad display number');
+        if (display < 0 || display > 0x3fffffff) throw new Error('bad display number');
+        this.lastDisplay = display;
         if (display < this.nextOut || this.dpb.length >= MAX_DPB ||
             this.dpb.some(s => s.display === display)) throw new Error('frame out of order');
         const [before, after] = findRefs(this.dpb, display);
         if (kind !== INTRA && before < 0) throw new Error('predicted frame without a reference');
         if (kind === BI && after < 0) throw new Error('B frame without a reference after it');
-        this.pos += FRAME_HEADER;
+        this.pos = at;
 
         let ref = kind === INTRA ? null : this.dpb[before].pixels;
         let field = null;    // this frame's motion, for the frames after it
@@ -688,10 +749,11 @@ export class SequenceDecoder {
             // The field has to arrive whole: without it there is no
             // reference to add the residual to, so a cut inside it ends
             // the stream.
-            if (this.pos + 4 > size || len < 4) return false;
-            const fieldLen = new DataView(bytes.buffer, bytes.byteOffset + this.pos, 4)
-                .getUint32(0, true);
-            if (fieldLen > len - 4 || this.pos + 4 + fieldLen > size) return false;
+            const fr = getVarint(bytes, this.pos, Math.min(size, this.pos + len));
+            if (fr.n === 0) return false;
+            if (fr.n < 0) throw new Error('motion field is damaged');
+            const fk = fr.n, fieldLen = fr.v;
+            if (fieldLen > len - fk || this.pos + fk + fieldLen > size) return false;
             const G = makeGrid(width, height, block), nb = G.nfx * G.nfy;
             const v0x = new Int16Array(nb), v0y = new Int16Array(nb);
             const d0x = new Int16Array(nb), d0y = new Int16Array(nb);
@@ -699,7 +761,7 @@ export class SequenceDecoder {
             // The field starts with the affine model of each flagged list;
             // the others are their global vector. Then the vectors, in
             // quarter pixels, on the half-size grid.
-            const fp = this.pos + 4;
+            const fp = this.pos + fk;
             const head = MODEL_BYTES * ((flags & FRAME_MODEL0 ? 1 : 0) + (flags & FRAME_MODEL1 ? 1 : 0));
             if (fieldLen < head) throw new Error('motion field is damaged');
             let mp = fp;
@@ -746,8 +808,8 @@ export class SequenceDecoder {
                 field = storeField(G, mode, v0x, v0y, dist0, v1x, v1y, dist1);
             }
             ref = this.pred;
-            this.pos += 4 + fieldLen;
-            len -= 4 + fieldLen;
+            this.pos += fk + fieldLen;
+            len -= fk + fieldLen;
         } else if (kind === PRED && (dx || dy)) {
             shiftInto(ref, this.pred, width, height, dx, dy);
             ref = this.pred;
@@ -760,7 +822,12 @@ export class SequenceDecoder {
         if (len > have) { len = have; partial = true; }
         if (len === 0) return false;
 
-        const body = bytes.subarray(this.pos, this.pos + len);
+        const ex = expandContainer(bytes, this.pos, len, width, height);
+        if (!ex.bytes) {
+            if (partial && !ex.damaged) return false;
+            throw new Error('frame does not decode');
+        }
+        const body = ex.bytes;
         const pixels = new Uint8Array(width * height * 3);
         // A frame cut before its colour layer ends the stream.
         // A predicted frame's container is predicted from `ref`, block by
