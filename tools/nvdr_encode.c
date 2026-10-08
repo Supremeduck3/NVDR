@@ -39,6 +39,7 @@ static void usage(const char* argv0) {
         "                   layer, decoded together with the colours)\n"
         "  --no-adaptive-tx with --directional, keep every leaf on the DCT\n"
         "                   instead of choosing its transform per leaf\n"
+        "  --no-halves      with --directional, never cut a node in two\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
         "                   choosing them by rate-distortion\n"
         "  --tile-q-test    give every tile a step offset from a fixed pattern,\n"
@@ -70,6 +71,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
+        else if (!strcmp(argv[i], "--no-halves")) cfg.halves = 0;
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];
             if (!strcmp(v, "off")) cfg.grain = NVDR_GRAIN_OFF;

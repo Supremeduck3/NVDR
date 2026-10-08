@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-export const VERSION = 14;
+export const VERSION = 15;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -164,13 +164,48 @@ const TMATK = [TMAT, ADST, IDTX];
 // reads, -1 off the block.
 const SCAN_NB = [];
 
+// Mirrors LEAF SHAPES in nvdr.c: the four squares, then the halves of a
+// node, 8x4, 4x8, 16x8, 8x16, 32x16, 16x32 (w x h); a shape's class picks
+// the models.
+const NSHAPES = 10, NMC = 7;
+const SHAPE_W = [4, 8, 16, 32, 8, 4, 16, 8, 32, 16], SHAPE_H = [4, 8, 16, 32, 4, 8, 8, 16, 16, 32];
+const SHAPE_MC = [0, 1, 2, 3, 4, 4, 5, 5, 6, 6];
+const shapeOf = (w, h) => (w === h ? sizeClass(w) : 4 + 2 * sizeClass(Math.min(w, h)) + (w < h ? 1 : 0));
+
 /* Mirrors band_split(): the first scan position of the high band. */
 function bandSplit(sc, band) {
-    const n = MIN_BLOCK << sc, count = n * n;
+    const n = Math.max(SHAPE_W[sc], SHAPE_H[sc]), count = SHAPE_W[sc] * SHAPE_H[sc];
     if (band <= 0) return count;
     const dmax = Math.max(1, Math.floor(n * band / 32));
     for (let i = 1; i < count; i++) if (SCAN_DIAG[sc][i] > dmax) return i;
     return count;
+}
+// Scans per shape: diagonal, a position v * w + u.
+for (let s = 0; s < NSHAPES; s++) {
+    const w = SHAPE_W[s], h = SHAPE_H[s], count = w * h;
+    const pos = new Int32Array(count), ctx = new Uint8Array(count), diag = new Uint8Array(count);
+    let at = 0;
+    for (let d = 0; d <= w + h - 2; d++)
+        for (let v = 0; v < h; v++) {
+            const u = d - v;
+            if (u < 0 || u >= w) continue;
+            pos[at] = v * w + u;
+            ctx[at] = d < 8 ? d : 8 + Math.min((d - 8) >> 2, 6);
+            diag[at] = d;
+            at++;
+        }
+    const idx = new Int32Array(count);
+    for (let i = 0; i < count; i++) idx[pos[i]] = i;
+    const nb = new Int32Array(count * 5).fill(-1);
+    const du = [1, 0, 1, 2, 0], dv = [0, 1, 1, 0, 2];
+    for (let i = 0; i < count; i++) {
+        const u = pos[i] % w, v = (pos[i] - u) / w;
+        for (let k = 0; k < 5; k++) {
+            const uu = u - du[k], vv = v - dv[k];
+            if (uu >= 0 && vv >= 0) nb[i * 5 + k] = idx[vv * w + uu];
+        }
+    }
+    SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag); SCAN_NB.push(nb);
 }
 for (let s = 0; s < NSIZES; s++) {
     const n = MIN_BLOCK << s, unit = MAX_BLOCK / n;
@@ -178,28 +213,6 @@ for (let s = 0; s < NSIZES; s++) {
     for (let k = 0; k < n; k++)
         for (let x = 0; x < n; x++)
             t[k * n + x] = k ? cosEntry((2 * x + 1) * k * unit) : 64;
-    const pos = new Int32Array(n * n), ctx = new Uint8Array(n * n), diag = new Uint8Array(n * n);
-    let at = 0;
-    for (let d = 0; d <= 2 * (n - 1); d++)
-        for (let v = 0; v < n; v++) {
-            const u = d - v;
-            if (u < 0 || u >= n) continue;
-            pos[at] = v * n + u;
-            ctx[at] = d < 8 ? d : 8 + Math.min((d - 8) >> 2, 6);
-            diag[at] = d;
-            at++;
-        }
-    const idx = new Int32Array(n * n);
-    for (let i = 0; i < n * n; i++) idx[pos[i]] = i;
-    const nb = new Int32Array(n * n * 5).fill(-1);
-    const du = [1, 0, 1, 2, 0], dv = [0, 1, 1, 0, 2];
-    for (let i = 0; i < n * n; i++) {
-        const u = pos[i] & (n - 1), v = (pos[i] - u) / n;
-        for (let k = 0; k < 5; k++) {
-            const uu = u - du[k], vv = v - dv[k];
-            if (uu >= 0 && vv >= 0) nb[i * 5 + k] = idx[vv * n + uu];
-        }
-    }
     TMAT.push(t);
     // The DST-VII and the identity, as tables_init() builds them.
     const a = new Int32Array(n * n), id = new Int32Array(n * n);
@@ -216,7 +229,6 @@ for (let s = 0; s < NSIZES; s++) {
             }
     }
     ADST.push(a); IDTX.push(id);
-    SCAN_POS.push(pos); SCAN_CTX.push(ctx); SCAN_DIAG.push(diag); SCAN_NB.push(nb);
 }
 
 /* Mirrors nb_mag(), sig_ctx() and gt1_ctx(): what is coded around a
@@ -251,7 +263,8 @@ function divRound(a, n) {
 }
 
 /*
- * Mirrors inverse_tx: columns >> 6 with a 16-bit clip, rows >> 6+log2 n.
+ * Mirrors inverse_tx: columns >> 6 with a 16-bit clip, rows >> 6+log2 n;
+ * a half leaf's columns also times 181 / 256, its rows >> 6+log2 min(w, h).
  * `mu` and `mv` bound the nonzero coefficients (u <= mu, v <= mv). Every
  * term past them is a zero, so skipping them changes nothing but the
  * time: most leaves carry only a few low frequencies.
@@ -261,27 +274,37 @@ const ROW = new Int32Array(MAX_BLOCK);
 function inverseTx(s, tx, input, out, mu, mv) {
     // Integer sums, so the order, chosen for contiguous inner loops and to
     // skip zero terms, changes nothing.
-    const n = MIN_BLOCK << s, t = TMATK[TX_V[tx]][s], th = TMATK[TX_H[tx]][s];
-    const shift2 = 6 + log2(n), half = 1 << (shift2 - 1);
-    for (let y = 0; y < n; y++) {
+    const w = SHAPE_W[s], h = SHAPE_H[s];
+    const t = TMATK[TX_V[tx]][sizeClass(h)], th = TMATK[TX_H[tx]][sizeClass(w)];
+    const shift2 = 6 + log2(Math.min(w, h)), half = 1 << (shift2 - 1), cut = w !== h;
+    for (let y = 0; y < h; y++) {
         ROW.fill(0, 0, mu + 1);
         for (let v = 0; v <= mv; v++) {
-            const k = t[v * n + y], r = v * n;
+            const k = t[v * h + y], r = v * w;
             for (let u = 0; u <= mu; u++) ROW[u] += k * input[r + u];
         }
-        for (let u = 0; u <= mu; u++) TMP[y * n + u] = clampCoef((ROW[u] + 32) >> 6);
+        for (let u = 0; u <= mu; u++) {
+            const c = clampCoef((ROW[u] + 32) >> 6);
+            TMP[y * w + u] = cut ? (c * 181 + 128) >> 8 : c;
+        }
     }
-    for (let y = 0; y < n; y++) {
-        const row = y * n;
-        ROW.fill(0, 0, n);
+    for (let y = 0; y < h; y++) {
+        const row = y * w;
+        ROW.fill(0, 0, w);
         for (let u = 0; u <= mu; u++) {
             const k = TMP[row + u];
             if (k === 0) continue;
-            const r = u * n;
-            for (let x = 0; x < n; x++) ROW[x] += k * th[r + x];
+            const r = u * w;
+            for (let x = 0; x < w; x++) ROW[x] += k * th[r + x];
         }
-        for (let x = 0; x < n; x++) out[row + x] = (ROW[x] + half) >> shift2;
+        for (let x = 0; x < w; x++) out[row + x] = (ROW[x] + half) >> shift2;
     }
+}
+
+/* Mirrors dc_offset(): the pixels a DC of v (level times step) adds. */
+function dcOffset(v, w, h) {
+    if (w === h) return divRound(v, w);
+    return divRound(v * 181, 256 * Math.min(w, h));
 }
 
 /* --- models ------------------------------------------------------------ */
@@ -293,12 +316,13 @@ function colourModels() {
     return {
         split: probs(NSIZES),
         splitC: probs(NSIZES),   // the colour tree's, in 4:2:0
-        dcZero: grid(NSIZES, 3),
+        half: grid(NSIZES, 2), halfDir: grid(NSIZES, 2),   // half nodes, by size and tree
+        dcZero: grid(NMC, 3),
         dcSign: probs(3),
         dcMag: grid(3, MAG_UNARY),
         tqZero: probs(1), tqSign: probs(1), tqMag: probs(2 * TQ_MAX),
-        modeFlat: probs(NSIZES), modeTree: probs(64), modeInter: probs(NSIZES),
-        txDct: grid(3, 3), txTree: grid(3, 8)
+        modeFlat: probs(NMC), modeTree: probs(64), modeInter: probs(NMC),
+        txDct: grid(NMC, 3), txTree: grid(3, 8)
     };
 }
 
@@ -364,17 +388,19 @@ const FI_TAPS = [
 ];
 const FB = new Int32Array((MAX_BLOCK + 2) * (MAX_BLOCK + 1));
 const REF = new Int32Array(4 * MAX_BLOCK + 2), REF0 = 2 * MAX_BLOCK;
-function angular(main, side, n, angle, P) {
-    for (let k = 0; k <= 2 * n; k++) REF[REF0 + k] = main[k];
+// Mirrors angular(): P[r * nk + k] for r < nr along the angle, k < nk across.
+function angular(main, side, nk, nr, angle, P) {
+    const end = nk + nr;
+    for (let k = 0; k <= end; k++) REF[REF0 + k] = main[k];
     if (angle < 0) {
-        const last = (n * angle) >> 5, inv = invAngle(angle);
+        const last = (nr * angle) >> 5, inv = invAngle(angle);
         for (let k = -1; k >= last; k--) REF[REF0 + k] = side[(k * inv + 128) >> 8];
     }
-    for (let r = 0; r < n; r++) {
+    for (let r = 0; r < nr; r++) {
         const pos = (r + 1) * angle, idx = pos >> 5, fact = pos & 31;
-        for (let k = 0; k < n; k++) {
-            const a0 = REF[REF0 + k + idx + 1], a1 = REF[REF0 + (k + idx + 2 <= 2 * n ? k + idx + 2 : 2 * n)];
-            P[r * n + k] = fact ? ((32 - fact) * a0 + fact * a1 + 16) >> 5 : a0;
+        for (let k = 0; k < nk; k++) {
+            const a0 = REF[REF0 + k + idx + 1], a1 = REF[REF0 + (k + idx + 2 <= end ? k + idx + 2 : end)];
+            P[r * nk + k] = fact ? ((32 - fact) * a0 + fact * a1 + 16) >> 5 : a0;
         }
     }
 }
@@ -398,9 +424,9 @@ function getTq(d, m) {
 
 function textureModels() {
     return {
-        cbf: grid(NSIZES, 3),
-        sig: Array.from({ length: NSIZES }, () => grid(3, SIG_CTX)),
-        last: Array.from({ length: NSIZES }, () => grid(3, POS_CTX)),
+        cbf: grid(NMC, 3),
+        sig: Array.from({ length: NMC }, () => grid(3, SIG_CTX)),
+        last: Array.from({ length: NMC }, () => grid(3, POS_CTX)),
         gt1: grid(3, GT1_CTX),
         mag: grid(3, MAG_UNARY)
     };
@@ -429,16 +455,17 @@ function getDc(d, m, sc, c, state) {
     return neg ? -(r + 1) : r + 1;
 }
 
-/* Mirrors get_texture(): fills lv[start, end). */
+/* Mirrors get_texture(): fills lv[start, end) of a leaf of shape sc. */
 function getTexture(d, m, sc, c, lv, start, end, state) {
+    const mc = SHAPE_MC[sc];
     lv.fill(0, start, end);
-    if (!d.bit(m.cbf[sc], c)) return false;
+    if (!d.bit(m.cbf[mc], c)) return false;
     let g = 0;
     for (let i = start; i < end; i++) {
         const pc = SCAN_CTX[sc][i], t = nbMag(lv, sc, i, start);
-        const sig = i < end - 1 ? d.bit(m.sig[sc][c], sigCtx(sc, i, t)) : 1;
+        const sig = i < end - 1 ? d.bit(m.sig[mc][c], sigCtx(sc, i, t)) : 1;
         if (!sig) continue;
-        const last = i < end - 1 ? d.bit(m.last[sc][c], pc) : 1;
+        const last = i < end - 1 ? d.bit(m.last[mc][c], pc) : 1;
         let a;
         if (!d.bit(m.gt1[c], gt1Ctx(t, g))) a = 1;
         else {
@@ -469,8 +496,9 @@ export function readHeader(buffer) {
     const v = ArrayBuffer.isView(buffer)
         ? new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
         : new DataView(buffer);
-    // Version 13 differs only in having fifteen intra modes.
-    if (v.getUint32(0, true) !== MAGIC || (v.getUint8(4) !== VERSION && v.getUint8(4) !== 13)) return null;
+    // Version 14 differs only in having no half nodes, 13 also in having
+    // fifteen intra modes.
+    if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) < 13 || v.getUint8(4) > VERSION) return null;
     const h = {
         version: v.getUint8(4),
         width: v.getUint16(6, true),
@@ -740,7 +768,7 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
         full: Array.from({ length: np }, () => new Uint8Array(pw * ph)),
         // Texture added so far, unclamped to 16 bits; full = clamp(flat + acc).
         acc: Array.from({ length: np }, () => new Int16Array(pw * ph)),
-        lx: [], ly: [], ln: [],
+        lx: [], ly: [], lw: [], lh: [],
         whole: (x, y, n) => x + n <= pw && y + n <= ph,
         exists: (x, y) => x < pw && y < ph
     };
@@ -767,17 +795,17 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
             for (let at = j * pw + x, end = at + ww; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
     };
     P.dirpred = dirpred;
-    P.predict = (c, x, y, n) => {
+    P.predict = (c, x, y, bw, bh) => {
         if (fixedPred) return 128;
         const p = dirpred ? P.full[c] : P.flat[c];
         let sum = 0, k = 0;
         if (y > 0) {
-            const x1 = Math.min(x + n, pw);
+            const x1 = Math.min(x + bw, pw);
             for (let i = x; i < x1; i++) sum += p[(y - 1) * pw + i];
             k += x1 - x;
         }
         if (x > 0) {
-            const y1 = Math.min(y + n, ph);
+            const y1 = Math.min(y + bh, ph);
             for (let j = y; j < y1; j++) sum += p[j * pw + x - 1];
             k += y1 - y;
         }
@@ -793,32 +821,34 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
     const T = new Int32Array(2 * MAX_BLOCK + 1), L = new Int32Array(2 * MAX_BLOCK + 1);
     const T2 = new Int32Array(2 * MAX_BLOCK + 1), L2 = new Int32Array(2 * MAX_BLOCK + 1);
     const TMP = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-    P.dirPredict = (c, x, y, n, mode, out) => {
+    // Mirrors dir_predict(), for a leaf bw across and bh down.
+    P.dirPredict = (c, x, y, bw, bh, mode, out) => {
         if (mode === MODE_INTER) {
             const b = P.base[c];
-            for (let j = 0; j < n; j++)
-                for (let i = 0; i < n; i++) out[j * n + i] = b[(y + j) * pw + x + i];
+            for (let j = 0; j < bh; j++)
+                for (let i = 0; i < bw; i++) out[j * bw + i] = b[(y + j) * pw + x + i];
             return;
         }
-        const f = P.full[c], top = y > 0, left = x > 0;
+        const f = P.full[c], top = y > 0, left = x > 0, ne = bw + bh;
         T.fill(0); L.fill(0);
         let tr = top, bl = left;
-        for (let i = 0; i < 2 * n; i++) {
-            if (i >= n && tr && !(i % 4) && !decodedBefore(x, y, x + i, y - 1)) tr = false;
-            if (i >= n && bl && !(i % 4) && !decodedBefore(x, y, x - 1, y + i)) bl = false;
-            T[i + 1] = !top ? 0 : (i < n || tr) ? f[(y - 1) * pw + x + i] : T[i];
-            L[i + 1] = !left ? 0 : (i < n || bl) ? f[(y + i) * pw + x - 1] : L[i];
+        for (let i = 0; i < ne; i++) {
+            if (i >= bw && tr && !(i % 4) && !decodedBefore(x, y, x + i, y - 1)) tr = false;
+            if (i >= bh && bl && !(i % 4) && !decodedBefore(x, y, x - 1, y + i)) bl = false;
+            T[i + 1] = !top ? 0 : (i < bw || tr) ? f[(y - 1) * pw + x + i] : T[i];
+            L[i + 1] = !left ? 0 : (i < bh || bl) ? f[(y + i) * pw + x - 1] : L[i];
         }
-        if (!top && !left) { for (let i = 0; i <= 2 * n; i++) T[i] = L[i] = 128; }
-        else if (!top) { for (let i = 0; i <= 2 * n; i++) T[i] = L[1]; L[0] = L[1]; }
-        else if (!left) { for (let i = 0; i <= 2 * n; i++) L[i] = T[1]; T[0] = T[1]; }
+        if (!top && !left) { for (let i = 0; i <= ne; i++) T[i] = L[i] = 128; }
+        else if (!top) { for (let i = 0; i <= ne; i++) T[i] = L[1]; L[0] = L[1]; }
+        else if (!left) { for (let i = 0; i <= ne; i++) L[i] = T[1]; T[0] = T[1]; }
         else T[0] = L[0] = f[(y - 1) * pw + x - 1];
         if (mode >= MODE_FILTER) {
             // Mirrors AV1's recursive filters in dir_predict().
-            const W = n + 1, tp = FI_TAPS[mode - MODE_FILTER], p = [0, 0, 0, 0, 0, 0, 0];
-            for (let i = 0; i <= n; i++) { FB[i] = T[i]; FB[i * W] = L[i]; }
-            for (let r = 1; r <= n; r += 2)
-                for (let c = 1; c <= n; c += 4) {
+            const W = bw + 1, tp = FI_TAPS[mode - MODE_FILTER], p = [0, 0, 0, 0, 0, 0, 0];
+            for (let i = 0; i <= bw; i++) FB[i] = T[i];
+            for (let j = 0; j <= bh; j++) FB[j * W] = L[j];
+            for (let r = 1; r <= bh; r += 2)
+                for (let c = 1; c <= bw; c += 4) {
                     const up = (r - 1) * W;
                     p[0] = FB[up + c - 1]; p[1] = FB[up + c]; p[2] = FB[up + c + 1]; p[3] = FB[up + c + 2]; p[4] = FB[up + c + 3];
                     p[5] = FB[r * W + c - 1]; p[6] = FB[(r + 1) * W + c - 1];
@@ -830,48 +860,51 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
                         FB[(r + (k >> 2)) * W + c + (k & 3)] = clampU8(a);
                     }
                 }
-            for (let j = 0; j < n; j++)
-                for (let i = 0; i < n; i++) out[j * n + i] = FB[(j + 1) * W + i + 1];
+            for (let j = 0; j < bh; j++)
+                for (let i = 0; i < bw; i++) out[j * bw + i] = FB[(j + 1) * W + i + 1];
             return;
         }
         if (mode >= MODE_SMOOTH) {
             // Mirrors AV1's smooth modes in dir_predict().
-            const w = SM_W[n], below = L[n], right = T[n], k = mode - MODE_SMOOTH;
-            for (let j = 0; j < n; j++)
-                for (let i = 0; i < n; i++) {
-                    const v = w[j] * T[i + 1] + (256 - w[j]) * below, hh = w[i] * L[j + 1] + (256 - w[i]) * right;
-                    out[j * n + i] = k === 0 ? (v + hh + 256) >> 9 : k === 1 ? (v + 128) >> 8 : (hh + 128) >> 8;
+            const wv = SM_W[bh], wh = SM_W[bw], below = L[bh], right = T[bw], k = mode - MODE_SMOOTH;
+            for (let j = 0; j < bh; j++)
+                for (let i = 0; i < bw; i++) {
+                    const v = wv[j] * T[i + 1] + (256 - wv[j]) * below, hh = wh[i] * L[j + 1] + (256 - wh[i]) * right;
+                    out[j * bw + i] = k === 0 ? (v + hh + 256) >> 9 : k === 1 ? (v + 128) >> 8 : (hh + 128) >> 8;
                 }
             return;
         }
-        if (n >= 8 && mode !== 0) {
+        if (bw * bh >= 64 && mode !== 0) {
             T2[0] = L2[0] = (T[1] + 2 * T[0] + L[1] + 2) >> 2;
-            for (let i = 1; i < 2 * n; i++) {
+            for (let i = 1; i < ne; i++) {
                 T2[i] = (T[i - 1] + 2 * T[i] + T[i + 1] + 2) >> 2;
                 L2[i] = (L[i - 1] + 2 * L[i] + L[i + 1] + 2) >> 2;
             }
-            T2[2 * n] = T[2 * n]; L2[2 * n] = L[2 * n];
-            T.set(T2.subarray(0, 2 * n + 1)); L.set(L2.subarray(0, 2 * n + 1));
+            T2[ne] = T[ne]; L2[ne] = L[ne];
+            T.set(T2.subarray(0, ne + 1)); L.set(L2.subarray(0, ne + 1));
         }
-        const sh = log2(n);
         if (mode === 1) {
-            for (let j = 0; j < n; j++)
-                for (let i = 0; i < n; i++)
-                    out[j * n + i] = ((n - 1 - i) * L[j + 1] + (i + 1) * T[n + 1] +
-                                      (n - 1 - j) * T[i + 1] + (j + 1) * L[n + 1] + n) >> (sh + 1);
+            // Planar, as VVC writes it for any shape.
+            const lw = log2(bw), lh = log2(bh);
+            for (let j = 0; j < bh; j++)
+                for (let i = 0; i < bw; i++) {
+                    const pv = ((bh - 1 - j) * T[i + 1] + (j + 1) * L[bh + 1]) << lw;
+                    const ph2 = ((bw - 1 - i) * L[j + 1] + (i + 1) * T[bw + 1]) << lh;
+                    out[j * bw + i] = (pv + ph2 + bw * bh) >> (lw + lh + 1);
+                }
             return;
         }
-        if (mode <= 18) { angular(T, L, n, MODE_ANGLE[mode], out); return; }
-        angular(L, T, n, MODE_ANGLE[mode], TMP);
-        for (let j = 0; j < n; j++)
-            for (let i = 0; i < n; i++) out[j * n + i] = TMP[i * n + j];
+        if (mode <= 18) { angular(T, L, bw, bh, MODE_ANGLE[mode], out); return; }
+        angular(L, T, bh, bw, MODE_ANGLE[mode], TMP);
+        for (let j = 0; j < bh; j++)
+            for (let i = 0; i < bw; i++) out[j * bw + i] = TMP[i * bh + j];
     };
     // Mirrors paint_pred().
-    P.paintPred = (c, x, y, n, pr, offset) => {
+    P.paintPred = (c, x, y, bw, bh, pr, offset) => {
         const f = P.flat[c], o = P.full[c], a = P.acc[c];
-        for (let j = 0; j < n; j++)
-            for (let i = 0; i < n; i++) {
-                const at = (y + j) * pw + x + i, v = clampU8(pr[j * n + i] + offset);
+        for (let j = 0; j < bh; j++)
+            for (let i = 0; i < bw; i++) {
+                const at = (y + j) * pw + x + i, v = clampU8(pr[j * bw + i] + offset);
                 f[at] = v; o[at] = v; a[at] = 0;
             }
     };
@@ -1042,9 +1075,10 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     const cm = warm ? ctx.cm : colourModels();
     if (!cm.splitC) cm.splitC = probs(NSIZES);
     if (!cm.tqZero) { cm.tqZero = probs(1); cm.tqSign = probs(1); cm.tqMag = probs(2 * TQ_MAX); }
-    if (!cm.modeFlat) { cm.modeFlat = probs(NSIZES); cm.modeTree = probs(64); }
-    if (!cm.modeInter) cm.modeInter = probs(NSIZES);
-    if (!cm.txDct) { cm.txDct = grid(3, 3); cm.txTree = grid(3, 8); }
+    if (!cm.modeFlat) { cm.modeFlat = probs(NMC); cm.modeTree = probs(64); }
+    if (!cm.modeInter) cm.modeInter = probs(NMC);
+    if (!cm.txDct) { cm.txDct = grid(NMC, 3); cm.txTree = grid(3, 8); }
+    if (!cm.half) { cm.half = grid(NSIZES, 2); cm.halfDir = grid(NSIZES, 2); }
     // The tiles' step offsets as layer 0 delivers them, zero where it
     // never did, and the step of the tile being read.
     const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
@@ -1056,23 +1090,24 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     // Mirrors texture_residual() + add_residual(): texture levels in
     // [start, end) added to a leaf.
     const tcoef = new Int32Array(MAX_BLOCK * MAX_BLOCK), tres = new Int32Array(MAX_BLOCK * MAX_BLOCK);
-    function applyTex(P, c, x, y, n, tx, lv, start, end, stepv) {
-        const sc = sizeClass(n), count = n * n, pos = SCAN_POS[sc], sh = log2(n), ppw = P.pw;
+    // Mirrors apply_texture() for a leaf of shape sc.
+    function applyTex(P, c, x, y, sc, tx, lv, start, end, stepv) {
+        const bw = SHAPE_W[sc], bh = SHAPE_H[sc], count = bw * bh, pos = SCAN_POS[sc], sh = log2(bw), ppw = P.pw;
         tcoef.fill(0, 0, count);
         let mu = 0, mv = 0;
         for (let q = start; q < end; q++) {
             if (!lv[q]) continue;
-            const p = pos[q], u = p & (n - 1), v = p >> sh;
+            const p = pos[q], u = p & (bw - 1), v = p >> sh;
             tcoef[p] = clampCoef(lv[q] * stepv);
             if (u > mu) mu = u;
             if (v > mv) mv = v;
         }
         inverseTx(sc, tx, tcoef, tres, mu, mv);
         const o = P.full[c], f = P.flat[c], a = P.acc[c];
-        for (let j = 0; j < n; j++)
-            for (let ii = 0; ii < n; ii++) {
+        for (let j = 0; j < bh; j++)
+            for (let ii = 0; ii < bw; ii++) {
                 const at = (y + j) * ppw + x + ii;
-                let v = a[at] + tres[j * n + ii];
+                let v = a[at] + tres[j * bw + ii];
                 v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
                 a[at] = v;
                 o[at] = clampU8(f[at] + v);
@@ -1084,9 +1119,47 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     const lvd = new Int32Array(MAX_BLOCK * MAX_BLOCK), prd = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     for (const P of parts) P.ltex = [];
 
+    // Mirrors read_leaf(): one leaf, bw across and bh down.
+    function readLeaf(P, x, y, bw, bh) {
+        const sc = shapeOf(bw, bh), mc = SHAPE_MC[sc];
+        let mode = 0;
+        if (dirpred) {
+            mode = getMode(d0, cm, mc, inter, h.version < 14);
+            if (mode < 0) { s0.corrupt = true; return; }
+        }
+        // Mirrors has_tx(): a leaf's transform type; without the DCT the
+        // leaf has no DC level and its texture starts at position 0.
+        const tx = txsel && bw <= TX_MAX_N && bh <= TX_MAX_N && mode !== MODE_INTER ? getTx(d0, cm, mc, mode) : 0;
+        if (tx < 0) { s0.corrupt = true; return; }
+        for (let c = 0; c < P.np; c++) {
+            const k = P.comp0 + c;
+            const dl = tx ? 0 : getDc(d0, cm, mc, k, s0);
+            const offset = dcOffset(clampCoef(dl * tstep[k]), bw, bh);
+            if (mode > 0) {
+                P.dirPredict(c, x, y, bw, bh, mode, prd);
+                P.paintPred(c, x, y, bw, bh, prd, offset);
+            } else P.paintFlat(c, x, y, bw, bh, clampU8(P.predict(c, x, y, bw, bh) + offset));
+        }
+        P.lx.push(x); P.ly.push(y); P.lw.push(bw); P.lh.push(bh);
+        let tex = 0;
+        if (dirpred) {
+            const count = bw * bh;
+            for (let c = 0; c < P.np && !s0.corrupt && !d1.overrun; c++)
+                if (getTexture(d1, tms[0], sc, P.comp0 + c, lvd, tx ? 0 : 1, count, s0) && !s0.corrupt && !d1.overrun) {
+                    applyTex(P, c, x, y, sc, tx, lvd, tx ? 0 : 1, count, tstep[P.comp0 + c]);
+                    tex = 1;
+                }
+            if (d1.overrun) s0.corrupt = true;
+        }
+        P.ltex.push(tex);
+    }
+
+    // Mirrors read_node(), with HALF NODES from version 15.
+    const halves = dirpred && h.version >= 15;
     function readNode(P, x, y, n) {
+        const whole = P.whole(x, y, n);
         let split = 0;
-        if (n > P.minBlock) split = P.whole(x, y, n) ? d0.bit(P.comp0 ? cm.splitC : cm.split, sizeClass(n)) : 1;
+        if (n > P.minBlock) split = whole ? d0.bit(P.comp0 ? cm.splitC : cm.split, sizeClass(n)) : 1;
         if (d0.overrun || s0.corrupt) return;
         if (split) {
             const hh = n >> 1;
@@ -1097,37 +1170,24 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
             }
             return;
         }
-        const sc = sizeClass(n);
-        let mode = 0;
-        if (dirpred) {
-            mode = getMode(d0, cm, sc, inter, h.version < VERSION);
-            if (mode < 0) { s0.corrupt = true; return; }
-        }
-        // Mirrors has_tx(): a leaf's transform type; without the DCT the
-        // leaf has no DC level and its texture starts at position 0.
-        const tx = txsel && n <= TX_MAX_N && mode !== MODE_INTER ? getTx(d0, cm, sc, mode) : 0;
-        if (tx < 0) { s0.corrupt = true; return; }
-        for (let c = 0; c < P.np; c++) {
-            const k = P.comp0 + c;
-            const dl = tx ? 0 : getDc(d0, cm, sc, k, s0);
-            const offset = divRound(clampCoef(dl * tstep[k]), n);
-            if (mode > 0) {
-                P.dirPredict(c, x, y, n, mode, prd);
-                P.paintPred(c, x, y, n, prd, offset);
-            } else P.paintFlat(c, x, y, n, n, clampU8(P.predict(c, x, y, n) + offset));
-        }
-        P.lx.push(x); P.ly.push(y); P.ln.push(n);
-        let tex = 0;
-        if (dirpred) {
-            const count = n * n;
-            for (let c = 0; c < P.np && !s0.corrupt && !d1.overrun; c++)
-                if (getTexture(d1, tms[0], sc, P.comp0 + c, lvd, tx ? 0 : 1, count, s0) && !s0.corrupt && !d1.overrun) {
-                    applyTex(P, c, x, y, n, tx, lvd, tx ? 0 : 1, count, tstep[P.comp0 + c]);
-                    tex = 1;
+        if (halves && n >= 8 && (n >> 1) >= P.minBlock) {
+            const sc = sizeClass(n), t = P.comp0 ? 1 : 0;
+            if (d0.bit(cm.half[sc], t)) {
+                const down = d0.bit(cm.halfDir[sc], t), m = n >> 1;
+                if (d0.overrun) return;
+                if (down) {
+                    readLeaf(P, x, y, m, n);
+                    if (d0.overrun || s0.corrupt) return;
+                    readLeaf(P, x + m, y, m, n);
+                } else {
+                    readLeaf(P, x, y, n, m);
+                    if (d0.overrun || s0.corrupt) return;
+                    readLeaf(P, x, y + m, n, m);
                 }
-            if (d1.overrun) s0.corrupt = true;
+                return;
+            }
         }
-        P.ltex.push(tex);
+        readLeaf(P, x, y, n, n);
     }
 
     let complete0 = 0, stopped = false, tqPrev = 0;
@@ -1150,7 +1210,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         }
         if (stopped) {
             parts.forEach((P, k) => {
-                P.lx.length = P.ly.length = P.ln.length = P.ltex.length = P.tileStart[t];
+                P.lx.length = P.ly.length = P.lw.length = P.lh.length = P.ltex.length = P.tileStart[t];
                 P.tileFallback(tx / (k + 1), ty / (k + 1));
             });
         } else complete0++;
@@ -1203,7 +1263,8 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
             for (let k = 0; k < parts.length && !d.overrun && !st.corrupt; k++) {
                 const P = parts[k], ppw = P.pw;
                 for (let i = P.tileStart[t]; i < P.tileStart[t + 1] && !d.overrun && !st.corrupt; i++) {
-                    const x = P.lx[i], y = P.ly[i], n = P.ln[i], sc = sizeClass(n), count = n * n;
+                    // Layered pictures are not directional: leaves are square.
+                    const x = P.lx[i], y = P.ly[i], n = P.lw[i], sc = sizeClass(n), count = n * n;
                     const start = layer === 1 ? 1 : bandAt[sc], end = layer === 1 ? bandAt[sc] : count;
                     if (start >= end) continue;
                     for (let c = 0; c < P.np && !d.overrun && !st.corrupt; c++) {
@@ -1260,16 +1321,16 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         const ppw = P.pw, gw = P.pw >> 2, gh = P.ph >> 2, ptile = P.tile;
         const vedge = new Uint8Array(gw * gh), hedge = new Uint8Array(gw * gh);
         const textured = new Uint8Array(gw * gh);   // the cell's leaf shows texture
-        const mark = (x, y, n, t) => {
-            for (let j = y; j < y + n && j < gh; j++)
-                for (let k = x; k < x + n && k < gw; k++) textured[j * gw + k] = t;
-            if (x > 0) for (let j = y; j < y + n && j < gh; j++) vedge[j * gw + x] = 1;
-            if (y > 0) for (let k = x; k < x + n && k < gw; k++) hedge[y * gw + k] = 1;
+        const mark = (x, y, bw, bh, t) => {
+            for (let j = y; j < y + bh && j < gh; j++)
+                for (let k = x; k < x + bw && k < gw; k++) textured[j * gw + k] = t;
+            if (x > 0) for (let j = y; j < y + bh && j < gh; j++) vedge[j * gw + x] = 1;
+            if (y > 0) for (let k = x; k < x + bw && k < gw; k++) hedge[y * gw + k] = 1;
         };
         const kept = P.tileStart[complete0];
-        for (let i = 0; i < kept; i++) mark(P.lx[i] >> 2, P.ly[i] >> 2, P.ln[i] >> 2, tex ? tex[i] : 0);
+        for (let i = 0; i < kept; i++) mark(P.lx[i] >> 2, P.ly[i] >> 2, P.lw[i] >> 2, P.lh[i] >> 2, tex ? tex[i] : 0);
         for (let t = complete0; t < tiles; t++)
-            mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, 0);
+            mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, ptile >> 2, 0);
         for (let c = 0; c < P.np; c++) {
             const p = planes[c], base = step[P.comp0 + c];
             // The step at an edge is its second side's tile's.

@@ -476,8 +476,8 @@ async function showLevels() {
         // A container of another version is the encoder and this page out
         // of step: one rebuilt and the other not, or the page cached.
         const v = container && container.byteLength > 4 ? new Uint8Array(container)[4] : 0;
-        setStatus(v && v !== VERSION && v !== 13
-            ? `Contêiner da versão ${v}; esta página lê a 13 e a ${VERSION}. Recompile o encoder (make) ` +
+        setStatus(v && (v < 13 || v > VERSION)
+            ? `Contêiner da versão ${v}; esta página lê da 13 à ${VERSION}. Recompile o encoder (make) ` +
               `e recarregue a página sem cache (Ctrl+Shift+R).`
             : 'Container ilegível.', true);
         return;
@@ -659,7 +659,7 @@ function indexFrames(bytes) {
 
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v17 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV v18 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
     const frames = indexFrames(new Uint8Array(buffer));
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;

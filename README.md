@@ -1037,6 +1037,49 @@ Against AV1 as a still, BD-rate on PSNR-Y:
 Encoding an intra frame takes 1.7 times as long; decoding is unchanged.
 Sequences are format 17 for it, their containers being version 14.
 
+### Half nodes: rectangular leaves (container v15)
+
+After the modes, the next of AV1's tools by what lacking it costs was
+rectangular partitions: libaom without them was 2.0% bigger on the
+clip's frame, 1.3% on montanha and 5.6% on macarrão. In a directional
+picture (a sequence's frames, `--directional` stills) a whole node of 8
+to 32 that does not split in four may now be cut in two, across into
+n x n/2 leaves or down into n/2 x n, as AV1's PARTITION_HORZ and
+PARTITION_VERT; the halves are leaves (see HALF NODES in nvdr.c). It
+took a leaf that need not be square everywhere a leaf is:
+
+- **Prediction** over w x h: the row above and the column to the left
+  run on to w + h; the angles, planar (VVC's form, which is HEVC's for a
+  square), the smooth modes with a weight table per axis, and the
+  recursive filters all take any shape.
+- **Transform**: the h-point transform down, the w-point one across, for
+  any of the seven types up to 16. The integer matrices are 64 sqrt(N)
+  times orthonormal, so w x h needs 4096 sqrt(w h), which for halves is
+  4096 sqrt(2) min(w, h): the columns are scaled by 181/256 (sqrt(2)/2 to
+  0.01%) and the rows shifted by 6 + log2 min(w, h). The DC level moves
+  the leaf by the same factor.
+- **Coefficients** in a diagonal scan per shape, with the contexts as
+  before; the six halves share three model sets by area.
+- **Signalling**: after "split in four", a "cut in two" flag and a
+  "down" flag, by node size and tree.
+
+The z-order of 4x4 cells already gives every reference pixel the right
+answer, since the halves of a node cover its quadrants in decoding
+order. The encoder codes each whole node whole, cut across, cut down
+and split, and keeps the cheapest; versions 13 and 14 still decode.
+
+Against libaom as a still, BD-rate on PSNR-Y:
+
+                          v14 (modes)   v15 (halves)
+    clip frame, clean        +5.9%         +3.9%
+    clip frame, noisy        +5.6%         +3.7%
+    montanha_pessoas         +5.7%         +4.7%
+    OIP-4140498144           +4.6%         +4.5%
+    OIP-3451121336           +0.0%         +0.3%
+    macarrão                +29.7%        +22.9%
+
+Coding an intra frame takes twice as long again; decoding is unchanged.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
