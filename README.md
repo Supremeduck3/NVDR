@@ -1035,7 +1035,9 @@ Against AV1 as a still, BD-rate on PSNR-Y:
     macarrão              +35.0%      +29.1%        +29.6%      +29.7%
 
 Encoding an intra frame takes 1.7 times as long; decoding is unchanged.
-Sequences are format 17 for it, their containers being version 14.
+Sequences are format 17 for it, their containers being version 14. Over
+25 frames, BD-rate on PSNR-Y against format 16: -2.4% on the clean pan,
+-1.7% on the three objects, -2.0% on the noisy pan.
 
 ### Half nodes: rectangular leaves (container v15)
 
@@ -1079,6 +1081,11 @@ Against libaom as a still, BD-rate on PSNR-Y:
     macarrão                +29.7%        +22.9%
 
 Coding an intra frame takes twice as long again; decoding is unchanged.
+Trying the halves only at 8 and 16, where nearly all of them are chosen
+(a third to half of those nodes come out cut, a tenth at 32), saved 5% of
+the time and lost 2.3 points on macarrão. Sequences (format 18), over 25
+frames against format 17: -2.6% on the clean pan, -2.9% on the three
+objects, -2.4% on the noisy pan.
 
 ### Against the state of the art
 
