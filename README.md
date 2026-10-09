@@ -1125,7 +1125,8 @@ format 18, +0.2% on the clean pan, -0.5% on the three objects, +0.1% on
 the noisy pan (PSNR-RGB +0.2%, -0.4%, +0.1%). Each frame's levels are
 the best for that frame, and a frame is also the next one's reference,
 which least error now does not account for; choosing only on intra
-frames and leaving predicted ones at 8 came out the same (+0.1%, -0.4%).
+frames and leaving predicted ones at 8 came out the same (+0.1%, -0.4%,
+-0.1%).
 
 A lower lambda had looked like a gain on PSNR-Y (0.09 instead of 0.12:
 macarrão +22.0%, the clip +3.2%), but it only moved bytes from colour
