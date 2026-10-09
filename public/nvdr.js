@@ -20,7 +20,7 @@
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-export const VERSION = 15;
+export const VERSION = 16;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -47,7 +47,7 @@ function tqStep(step, d) {
 }
 const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
-const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3;
+const DB_ALPHA = 20, DB_BETA = 6, DB_TC = 3, DB_LEVEL = 8;
 const POS_CTX = 15, MAG_UNARY = 14, EG_LIMIT = 24, COEF_MAX = 32767;
 const SIG_CTX = 25, GT1_CTX = 10;
 
@@ -496,8 +496,8 @@ export function readHeader(buffer) {
     const v = ArrayBuffer.isView(buffer)
         ? new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
         : new DataView(buffer);
-    // Version 14 differs only in having no half nodes, 13 also in having
-    // fifteen intra modes.
+    // Version 15 differs only in having no deblocking levels, 14 also in
+    // having no half nodes, 13 also in having fifteen intra modes.
     if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) < 13 || v.getUint8(4) > VERSION) return null;
     const h = {
         version: v.getUint8(4),
@@ -510,9 +510,16 @@ export function readHeader(buffer) {
         flags: v.getUint8(5),
         storedBytes: [v.getUint32(16, true), v.getUint32(20, true), v.getUint32(24, true)],
         band: v.getUint8(28),
+        deblock: [DB_LEVEL, DB_LEVEL],
         grainLen: v.getUint8(29),
         grain: null
     };
+    // Mirrors read_header(): a directional picture's band is 0, and from
+    // version 16 its byte holds the deblocking levels, luma's low.
+    if ((h.flags & FLAG_DIRPRED) && h.version >= 16) {
+        h.deblock = [h.band & 15, h.band >> 4];
+        h.band = 0;
+    }
     if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
     if (!validBlock(h.maxBlock) || !validBlock(h.minBlock) || h.minBlock > h.maxBlock) return null;
     if (!h.qLuma || !h.qChroma) return null;
@@ -1332,12 +1339,14 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         for (let t = complete0; t < tiles; t++)
             mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, ptile >> 2, 0);
         for (let c = 0; c < P.np; c++) {
-            const p = planes[c], base = step[P.comp0 + c];
+            const p = planes[c], base = step[P.comp0 + c], level = h.deblock[P.comp0 + c ? 1 : 0];
+            if (!level) continue;
             // The step at an edge is its second side's tile's.
             let alpha = 0, beta = 0, tc = 0;
             const at = (gx, gy) => {
                 const sp = tq ? tqStep(base, tq[Math.floor(gy * 4 / ptile) * tilesX + Math.floor(gx * 4 / ptile)]) : base;
-                alpha = (sp * DB_ALPHA + 8) >> 4; beta = (sp * DB_BETA + 8) >> 4; tc = (sp * DB_TC + 8) >> 4;
+                alpha = (sp * DB_ALPHA * level + 64) >> 7; beta = (sp * DB_BETA * level + 64) >> 7;
+                tc = (sp * DB_TC * level + 64) >> 7;
             };
             at(0, 0);
             for (let gy = 0; gy < gh; gy++)

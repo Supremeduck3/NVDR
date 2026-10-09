@@ -60,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      18
+#define NVDRV_VERSION      19
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 

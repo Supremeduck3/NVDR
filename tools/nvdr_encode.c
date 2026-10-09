@@ -126,9 +126,11 @@ int main(int argc, char** argv) {
      * file skips it. */
     if (quiet) { nvdr_image_free(&source); return 0; }
 
-    printf("%s  %dx%d  q %d/%d  blocks %d..%d  colour %s\n", in_path, source.width, source.height,
+    printf("%s  %dx%d  q %d/%d  blocks %d..%d  colour %s", in_path, source.width, source.height,
            hdr.q_luma, hdr.q_chroma, hdr.min_block, hdr.max_block,
            (hdr.flags & NVDR_FLAG_CHROMA420) ? "4:2:0" : "4:4:4");
+    if (hdr.flags & NVDR_FLAG_DEBLOCK) printf("  deblock %d/%d", hdr.deblock[0], hdr.deblock[1]);
+    printf("\n");
     if (hdr.flags & NVDR_FLAG_GRAIN) {
         printf("  grain: kernel %d, colour %d/%d, luma sigma x8", hdr.grain.kernel, hdr.grain.cb, hdr.grain.cr);
         for (int k = 0; k < NVDR_GRAIN_POINTS; k++) printf(" %d", hdr.grain.sigma[k]);

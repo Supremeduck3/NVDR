@@ -1087,6 +1087,44 @@ the time and lost 2.3 points on macarrão. Sequences (format 18), over 25
 frames against format 17: -2.6% on the clean pan, -2.9% on the three
 objects, -2.4% on the noisy pan.
 
+### Deblocking levels (container v16)
+
+The deblocking filter (see "Deblocking") was tuned on the progressive
+pictures of format v10, and a directional picture's seams are not
+theirs: its predictions run across the leaves, RDOQ drops what it can,
+and restoration comes after it. Against libaom, turning it off made
+luma better on the clip's frame and on OIP-4140498144 (by 0.4 and 0.3
+points) and worse on macarrão (0.5), and colour cost macarrão and
+OIP-4140498144 6 to 8% less without it and the clip 0.7% more. Scoring only luma had hidden that; scored as AOM's
+test conditions also do, PSNR-YUV weighted 6:1:1, NVDR spends on colour
+what libaom does not and gets it back (its U and V are 4 to 26% cheaper
+than libaom's at equal PSNR).
+
+So a directional picture now says how hard to filter: a level for luma
+and one for colour, 0 to 15 in eighths of the thresholds, 8 being the
+filter as it was. They take byte 28 of the header, the band, which a
+directional picture always had at 0. The encoder decodes the picture
+anyway to fit restoration; in that decode it tries all sixteen levels on
+each tree's planes and keeps the one that leaves the least squared error
+against the source, before restoration is fitted to what it left.
+Luma's lands around 5 or 6; colour's anywhere from 0 (macarrão) to 14
+(the clip at q 40). Versions 13 to 15 still decode, at level 8.
+
+Against libaom as a still, BD-rate on PSNR-Y and on PSNR-YUV 6:1:1:
+
+                          v15 Y    v16 Y    v15 YUV   v16 YUV
+    clip frame, clean     +3.9%    +3.4%    -2.3%     -2.7%
+    clip frame, noisy     +3.7%    +3.1%    -1.1%     -1.5%
+    montanha_pessoas      +4.7%    +4.3%    +0.5%     -0.2%
+    OIP-4140498144        +4.5%    +4.2%    +2.1%     +0.3%
+    OIP-3451121336        +0.3%    -0.0%    -0.8%     -1.9%
+    macarrão             +22.9%   +22.7%   +14.7%    +11.7%
+
+A lower lambda had looked like a gain on PSNR-Y (0.09 instead of 0.12:
+macarrão +22.0%, the clip +3.2%), but it only moved bytes from colour
+to luma: PSNR-YUV did not change (+15.3% and -2.4%), nor the sequences'
+PSNR-RGB. It stays at 0.12.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -1326,11 +1364,13 @@ error in pixels is step / n, a fraction of a level for any leaf larger
 than 4. Filtering those edges anyway cost the `blocos` probe 6.7 dB, and
 skipping them costs the photographs nothing.
 
-In a sequence the filter runs on intra frames, whose decoded picture is
-the next frame's reference. It does not run on predicted frames'
-containers: those hold a residual, not a picture.
+In a sequence the filter runs on every frame, whose decoded picture is
+the next frame's reference: a predicted frame has been a picture against
+its motion-compensated base since format 10, not a residual.
 
-At the defaults, per sample: +0.14 to +0.47 dB at the same bytes.
+At the defaults, per sample: +0.14 to +0.47 dB at the same bytes. A
+directional picture chooses how hard since container 16 (see
+"Deblocking levels").
 
 ## The decomposition
 
@@ -2698,11 +2738,10 @@ side, a slider that truncates the container, and plays sequences.
 Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
 directional prediction, 0x40 a base picture and 0x80 a transform type
-per leaf (see their sections).
-
-directional prediction, 0x40 a base picture and 0x80 restoration, whose
-parameters follow the grain's and whose length is bytes 30 and 31 (see
-their sections).
+per leaf (see their sections). Byte 29 is the grain parameters' length
+and bytes 30 and 31 the restoration's, which follow the header in that
+order. A directional picture has no band, and from container 16 its
+byte 28 holds the deblocking levels instead, luma's in the low half.
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does

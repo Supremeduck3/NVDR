@@ -146,6 +146,7 @@ double nvdr_psnr(const NvdrImage* a, const NvdrImage* b) {
 #define MAG_UNARY  14
 #define EG_LIMIT   24          /* longest Exp-Golomb prefix a decoder accepts */
 #define COEF_MAX   32767
+#define DB_LEVEL   8           /* the deblocking filter as tuned, see deblock() */
 
 static int size_class(int n) { return n == 4 ? 0 : n == 8 ? 1 : n == 16 ? 2 : 3; }
 
@@ -1216,8 +1217,8 @@ static void restore_planes(const NvdrHeader* h, NvdrRestorePlane* g) {
 }
 
 static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
-    /* Version 14 differs only in having no half nodes, 13 also in having
-     * fifteen intra modes. */
+    /* Version 15 differs only in having no deblocking levels, 14 also in
+     * having no half nodes, 13 also in having fifteen intra modes. */
     if (size < NVDR_HEADER_SIZE || memcmp(data, NVDR_MAGIC, 4) != 0 ||
         data[4] < 13 || data[4] > NVDR_VERSION)
         return -1;
@@ -1234,6 +1235,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     h->stored_bytes[1] = get_u32(data + 20);
     h->stored_bytes[2] = get_u32(data + 24);
     h->band = data[28];
+    h->deblock[0] = h->deblock[1] = DB_LEVEL;
     if (!h->width || !h->height || (size_t)h->width * h->height > NVDR_MAX_PIXELS) return -1;
     if (!valid_block(h->max_block) || !valid_block(h->min_block) || h->min_block > h->max_block)
         return -1;
@@ -1250,10 +1252,17 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     } else if (h->grain_len) return -1;
     if ((h->flags & NVDR_FLAG_CHROMA420) && h->max_block < 8) return -1;
     for (int k = 0; k < NVDR_LAYERS; k++) if (h->stored_bytes[k] > 0x7fffffffu) return -1;
-    if (h->band > 32) return -1;
     /* Directional prediction decodes colour and texture together, so it
-     * has no second texture layer, and a residual has nothing to predict
-     * from. */
+     * has no second texture layer and its band is 0: version 16 keeps the
+     * deblocking levels in that byte instead (see deblock()), luma's in
+     * the low half and colour's in the high. A residual has nothing to
+     * predict from. */
+    if ((h->flags & NVDR_FLAG_DIRPRED) && h->version >= 16) {
+        h->deblock[0] = h->band & 15;
+        h->deblock[1] = h->band >> 4;
+        h->band = 0;
+    }
+    if (h->band > 32) return -1;
     if ((h->flags & NVDR_FLAG_DIRPRED) && (h->band != 0 || (h->flags & NVDR_FLAG_RESIDUAL))) return -1;
     if ((h->flags & NVDR_FLAG_INTER) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
     if ((h->flags & NVDR_FLAG_TXSEL) && !(h->flags & NVDR_FLAG_DIRPRED)) return -1;
@@ -1978,7 +1987,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
                        NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
                        int careful, NvdrRestoreFit* fit);
 static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc* e, const NvdrImage* img,
-                           const NvdrImage* base, NvdrContext* start);
+                           const NvdrImage* base, NvdrContext* start, int restore, int choose_deblock);
 
 /* One encode in the mode cfg->chroma420 names (420 when nonzero). */
 static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
@@ -2204,7 +2213,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     put_u32(buf + 16, (uint32_t)enc0.count);
     put_u32(buf + 20, (uint32_t)enc1.count);
     put_u32(buf + 24, (uint32_t)n2);
-    buf[28] = (uint8_t)band;
+    /* A directional picture's deblocking levels go where its band (0)
+     * would; add_restoration() chooses them. */
+    buf[28] = (uint8_t)(dirpred ? (cfg.deblock ? DB_LEVEL | DB_LEVEL << 4 : 0) : band);
     memcpy(buf + NVDR_HEADER_SIZE, enc0.bytes, enc0.count);
     memcpy(buf + NVDR_HEADER_SIZE + enc0.count, enc1.bytes, enc1.count);
     if (n2) memcpy(buf + NVDR_HEADER_SIZE + enc0.count + enc1.count, enc2.bytes, n2);
@@ -2217,8 +2228,11 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     h.stored_bytes[1] = (uint32_t)enc1.count;
     h.stored_bytes[2] = (uint32_t)n2;
     h.band = (uint8_t)band;
+    h.deblock[0] = h.deblock[1] = dirpred && !cfg.deblock ? 0 : DB_LEVEL;
     for (int c = 0; c < 3; c++) h.plane_bits[c] = e.plane_bits[c];
-    if (restore && add_restoration(&buf, &total, &h, &e, img, inter ? cfg.base : NULL, start) != 0) {
+    int choose_deblock = dirpred && cfg.deblock;
+    if ((restore || choose_deblock) &&
+        add_restoration(&buf, &total, &h, &e, img, inter ? cfg.base : NULL, start, restore, choose_deblock) != 0) {
         free(buf); goto done;
     }
     if (hdr_out) *hdr_out = h;
@@ -2251,12 +2265,16 @@ done:
  * Fits restoration to the container just coded (see restore.c): decodes
  * it, handing the decoded planes and the source to the fit, and puts the
  * parameters it chose after the header, flagged, when any component
- * chose one. The container is left as it was when none did.
+ * chose one. The container is left as it was when none did. With
+ * choose_deblock the same decode chooses a directional picture's
+ * deblocking levels (see deblock()), which go in the header either way.
  */
 static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc* e, const NvdrImage* img,
-                           const NvdrImage* base, NvdrContext* start) {
+                           const NvdrImage* base, NvdrContext* start, int restore, int choose_deblock) {
     NvdrRestoreFit fit;
     memset(&fit, 0, sizeof(fit));
+    fit.restore = restore;
+    fit.choose_deblock = choose_deblock;
     for (int k = 0; k < e->nparts; k++)
         for (int c = 0; c < e->part[k].cv.np; c++) {
             int comp = e->part[k].cv.comp0 + c;
@@ -2287,6 +2305,11 @@ static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc*
     free(shown.pixels);
     free(full[1]); free(full[2]);
     if (rc != 0 || fit.failed) { nvdr_bits_free(&fit.out); return -1; }
+    if (choose_deblock) {
+        (*buf)[28] = (uint8_t)(fit.deblock[0] | fit.deblock[1] << 4);
+        h->deblock[0] = (uint8_t)fit.deblock[0];
+        h->deblock[1] = (uint8_t)fit.deblock[1];
+    }
     int used = 0;
     for (int c = 0; c < 3; c++) if (fit.bits[c] > 3) used = 1;
     if (!used || fit.out.count > 0xffff) { nvdr_bits_free(&fit.out); return 0; }
@@ -2660,14 +2683,25 @@ static int read_node(Layer0* L, int x, int y, int n) {
  * reference too. Vertical edges first, then horizontal, in integers; edges
  * are 4 px apart at least, so no pixel is read by one edge and written by
  * another within a pass. The header flag turns it on.
+ *
+ * A directional picture says how hard (container 16): a level for luma
+ * and one for colour, 0 to 15 in eighths of the thresholds below, which
+ * are level 8. Its predictions and its RDOQ leave seams the tuning never
+ * saw, and they differ from picture to picture: against libaom, the
+ * filter on colour cost one picture 8% of its colour's bitrate and saved
+ * another 0.7%, and on luma it helped one picture and hurt two. The
+ * encoder decodes the picture anyway to fit restoration, and there it
+ * tries every level on each tree's planes and keeps the one that leaves
+ * the least squared error (deblock()).
  */
-/* alpha, beta and tc are step * 20/16, 6/16 and 3/16. Swept on the six
- * samples at q 24 and 48: +0.24 and +0.28 dB on average, where a filter
- * twice as strong starts to cost PSNR. */
+/* alpha, beta and tc are step * 20/16, 6/16 and 3/16 at level 8. Swept
+ * on the six samples at q 24 and 48: +0.24 and +0.28 dB on average, where
+ * a filter twice as strong starts to cost PSNR. */
 #define DB_ALPHA 20
 #define DB_BETA   6
 #define DB_TC     3
-static int db_param(int step, int k16) { return (step * k16 + 8) >> 4; }
+#define DB_LEVELS 16
+static int db_param(int step, int k16, int level) { return (step * k16 * level + 64) >> 7; }
 
 /*
  * Which edges are filtered. Only those with texture on at least one side:
@@ -2684,8 +2718,9 @@ static int edge_filtered(int ca, int cb) { return ((ca | cb) & 0x80) != 0; }
 /* The step at an edge is that of the tile its second side lies in. */
 static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
                           const uint8_t* vedge, const uint8_t* hedge, int base,
-                          const int8_t* tq, int tile, int tiles_x) {
+                          const int8_t* tq, int tile, int tiles_x, int level) {
     int gw = pw / 4, gh = ph / 4;
+    if (!level) return;
     for (int pass = 0; pass < 2; pass++)
         for (int gy = pass; gy < gh; gy++)
             for (int gx = 1 - pass; gx < gw; gx++) {
@@ -2694,8 +2729,8 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
                 int other = pass ? (gy - 1) * gw + gx : gy * gw + gx - 1;
                 if (!edge_filtered(cell[gy * gw + gx], cell[other])) continue;
                 int step = tq ? tq_step(base, tq[(gy * 4 / tile) * tiles_x + gx * 4 / tile]) : base;
-                int alpha = db_param(step, DB_ALPHA), beta = db_param(step, DB_BETA);
-                int tc = db_param(step, DB_TC);
+                int alpha = db_param(step, DB_ALPHA, level), beta = db_param(step, DB_BETA, level);
+                int tc = db_param(step, DB_TC, level);
                 int along = pass ? 1 : pw, across = pass ? pw : 1;
                 uint8_t* r = p + (size_t)gy * 4 * pw + gx * 4;
                 for (int k = 0; k < 4; k++, r += along) {
@@ -2709,13 +2744,26 @@ static void deblock_plane(uint8_t* p, int pw, int ph, const uint8_t* cell,
             }
 }
 
+/* The squared error of a plane's visible part against its source. */
+static double plane_sse(const uint8_t* p, const double* src, int pw, int w, int h) {
+    double e = 0.0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            double d = p[(size_t)y * pw + x] - src[(size_t)y * pw + x];
+            e += d * d;
+        }
+    return e;
+}
+
 /* Edges on a 4-px grid: every leaf's left and top side, and every tile
  * that never arrived as one block. `cell` holds, per 4x4 cell, log2 of its
  * leaf's size in cells and 0x80 when the leaf shows texture; `textured` is
- * NULL when only colours are shown. */
+ * NULL when only colours are shown. Each tree's planes (luma's, colour's)
+ * are filtered at its level, or with `fit` choosing at the level that
+ * leaves the least error against the source, recorded there. */
 static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const uint8_t* textured,
                    size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step,
-                   const int8_t* tq) {
+                   const int8_t* tq, const uint8_t level[2], NvdrRestoreFit* fit) {
     int gw = cv->pw / 4, gh = cv->ph / 4;
     uint8_t* vedge = (uint8_t*)calloc((size_t)gw * gh, 1);
     uint8_t* hedge = (uint8_t*)calloc((size_t)gw * gh, 1);
@@ -2736,10 +2784,36 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
         if (x > 0) for (int j = y; j < y + n && j < gh; j++) vedge[(size_t)j * gw + x] = 1;
         if (y > 0) for (int k = x; k < x + n && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
     }
-    for (int c = 0; c < cv->np; c++)
-        deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c], tq, cv->tile, tiles_x);
+    int rc = 0;
+    uint8_t* trial = NULL;
+    for (int t = 0; t < 2; t++) {
+        /* luma's plane is the first of the luma canvas; the rest are colour */
+        int c0 = t && !cv->comp0 ? 1 : 0, c1 = t ? cv->np : (cv->comp0 ? 0 : 1);
+        if (c0 >= c1) continue;
+        int lv = level[t];
+        if (fit && fit->choose_deblock) {
+            size_t n = (size_t)cv->pw * cv->ph;
+            if (!trial && !(trial = (uint8_t*)malloc(n))) { rc = -1; break; }
+            double best = 0.0;
+            for (int l = 0; l < DB_LEVELS; l++) {
+                double e = 0.0;
+                for (int c = c0; c < c1; c++) {
+                    memcpy(trial, planes[c], n);
+                    deblock_plane(trial, cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c], tq, cv->tile,
+                                  tiles_x, l);
+                    e += plane_sse(trial, fit->src[cv->comp0 + c], cv->pw, cv->w, cv->h);
+                }
+                if (!l || e < best) { best = e; lv = l; }
+            }
+            fit->deblock[t] = lv;
+        }
+        for (int c = c0; c < c1; c++)
+            deblock_plane(planes[c], cv->pw, cv->ph, cell, vedge, hedge, step[cv->comp0 + c], tq, cv->tile,
+                          tiles_x, lv);
+    }
+    free(trial);
     free(vedge); free(hedge); free(cell);
-    return 0;
+    return rc;
 }
 
 int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
@@ -2988,14 +3062,14 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
         uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
         if ((h.flags & NVDR_FLAG_DEBLOCK) &&
             deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][complete0],
-                    complete0, tiles_x, tiles, step, tq) != 0) {
+                    complete0, tiles_x, tiles, step, tq, h.deblock, fit) != 0) {
             free(out->pixels); out->pixels = NULL; goto done;
         }
         for (int c = 0; c < cvs[k].np; c++) {
             int comp = cvs[k].comp0 + c;
 #ifndef NVDR_WASM   /* only the encoder fits; keeps the fit out of the browser's decoder */
             NvdrRestorePlane pg = { cvs[k].pw, cvs[k].ph, k ? NVDR_RESTORE_UNIT / 2 : NVDR_RESTORE_UNIT };
-            if (fit && nvdr_restore_fit(fit, comp, pl[c], &pg, cvs[k].w, cvs[k].h) != 0) {
+            if (fit && fit->restore && nvdr_restore_fit(fit, comp, pl[c], &pg, cvs[k].w, cvs[k].h) != 0) {
                 free(out->pixels); out->pixels = NULL; goto done;
             }
 #endif
