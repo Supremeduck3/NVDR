@@ -611,6 +611,20 @@ Encoding takes 8% longer. The strength and radius were swept (see
 nvdrv.c); filtering the B frame halfway between anchors too measured
 nothing.
 
+On a clean clip the filter did next to nothing, while libaom without
+its filtered alternate references comes out 4.9% bigger on the same pan:
+its noise is the interpolation's small mismatch, and four times that let
+a neighbour count only where it matched almost exactly. A clean clip
+wants a far larger allowance, a noisy one no more than its own, so the
+threshold is now 4 times the noise raised to 32 times it, but never
+past 600 (the noise is 8 on the clean pan, 47 on the three objects, 97
+on the noisy pan). Against the filter as it was, sequence format 19,
+25 frames:
+
+    pan, zoom, one object, clean        -1.3% (PSNR-RGB -1.4%)
+    three objects, light noise          -2.0% (-2.2%)
+    the same pan, noisy                 -0.2% (-0.1%)
+
 ### Overlapped blocks (sequence format 11)
 
 A block's vector is right for its middle and less so at its edges,
