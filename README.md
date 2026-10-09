@@ -1124,10 +1124,13 @@ that much more:
       predicted headers, HEVC's
       interpolation (seq v16)       +28.0%       -15.3%      -37.7%
     noisy, the same                +31.1%       -32.3%      -49.9%
+    clean, + 43 intra modes,
+      half nodes (seq v18)          +21.3%       -19.2%      -40.7%
+    noisy, the same                +24.6%       -35.1%      -52.0%
 
 That is the honest position now: half the bytes of x264 at its slowest
-on the noisy clip, a sixth to a third fewer than x265, and AV1 still
-needing about four fifths of NVDRV's bytes. In the clean clip at q 20
+on the noisy clip, a fifth to a third fewer than x265, and AV1 still
+needing about five sixths of NVDRV's bytes. In the clean clip at q 20
 the intra frame is 63% of the file, 39 KB where AV1's is 34 KB at 0.9 dB
 less; the 47 frames after it average 495 bytes against AV1's 393, at
 0.24 dB less.
