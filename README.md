@@ -1187,6 +1187,10 @@ that much more:
     clean, + 43 intra modes,
       half nodes (seq v18)          +21.3%       -19.2%      -40.7%
     noisy, the same                +24.6%       -35.1%      -52.0%
+    clean, + deblocking levels,
+      wider filter on clean clips
+      (seq v19)                     +18.6%       -20.6%      -41.9%
+    noisy, the same                +24.8%       -35.2%      -52.0%
 
 That is the honest position now: half the bytes of x264 at its slowest
 on the noisy clip, a fifth to a third fewer than x265, and AV1 still
