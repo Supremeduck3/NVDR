@@ -1816,6 +1816,19 @@ point, a lossy link with no second chance; directional pictures, which
 every sequence and every comparison against AV1 uses, have one layer
 and are not affected. Noted, not scheduled.
 
+## Measured but not built: screen content
+
+Measured from outside (a WASI build, the six samples): on the Windows
+screenshot (OIP-1304511485) YCbCr does not decorrelate the colours at
+all (mean |rho| between channels 0.40 in RGB, 0.41 after), Cr carries
+more variance than Y, and the partition hardly moves with the rate (7.3
+to 8.8 px from q 8 to q 96), where every photograph coarsens. It is also
+where WebP beats NVDR the most. The tools for it are AV1's and VVC's:
+a colour transform chosen per tile (YCbCr or YCoCg-R, one bit), palette
+mode and intra block copy. All change the format, none of the test
+clips is screen content, and photographs and camera video come first.
+Noted, not scheduled.
+
 ## Measured but not built: cutting along a line
 
 Everything here partitions into axis-aligned rectangles, so any boundary
