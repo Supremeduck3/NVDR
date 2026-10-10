@@ -1798,6 +1798,24 @@ not the delivery, and reverting the schedule is what fixed it. What
 interleaving actually buys is that a cut can no longer discard work that
 already arrived, which is worth keeping because it costs nothing.
 
+## Measured but not built: ordering a cut by worth
+
+A progressive container can be cut anywhere, but what a cut costs was
+measured against the alternative only later (an outside build, WASI,
+the six samples at q 8): a prefix of 15 to 80% of the file showed 5.2 to
+11.2 dB less than the same codec re-encoded to that size, 8.7 dB on
+average, and the gap grows with the share delivered. That is the
+signature of a stream ordered by place: within a layer the tiles come
+in raster order, so a cut leaves the last tiles with no texture at all,
+which is the worst way to lose bits. JPEG 2000's EBCOT orders each
+block's contributions by their rate-distortion slope across the whole
+picture instead, so every cut is near the best file of that size. Doing
+the same here would be a new progressive format (container, both
+decoders, the gate), and it matters only where a cut is the whole
+point, a lossy link with no second chance; directional pictures, which
+every sequence and every comparison against AV1 uses, have one layer
+and are not affected. Noted, not scheduled.
+
 ## Measured but not built: cutting along a line
 
 Everything here partitions into axis-aligned rectangles, so any boundary
