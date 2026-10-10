@@ -1271,8 +1271,23 @@ requests. `nvda_decode` does the same in C with the bytes it has, holding
 at most `window` decoded images.
 
 The fluid context works against that: it makes every photo depend on
-all the ones before it. It is worth 0.7% and is off unless `pack` is
-given `--fluid`; a fluid album still decodes, only in order.
+all the ones before it. It was worth 0.7%, but since container 13 a
+model carries the count that sets how fast it adapts, a carried model
+arrives at the slowest rate, and on the samples it now costs 0.0 to 1.1%
+(q 24 to 96; keeping the odds and restarting the count, -0.3 to +0.5%,
+was not worth a format change). It is off unless `pack` is given
+`--fluid`; a fluid album still decodes, only in order.
+
+The window only reaches back so far, so the order photos are given in
+matters: eight frames from each of three 960x540 clips, shuffled, came
+to 310 KB. `pack --reorder` stores them nearest-first by thumbnail
+distance instead (from the first photo, always the closest one left),
+and the same 24 came to 272 KB, less than in the order of their names,
+grouped by clip (289 KB). The names keep the photos apart, so only the
+order they are listed in changes. Keeping a display order apart from
+the storage order, and predicting between photos of different sizes
+(today a crop or a portrait among landscapes is never a reference),
+are not built.
 
 `public/nvdr-img.js` is the piece a site uses, an element in place of
 `<img>`:

@@ -2,7 +2,7 @@
  * nvdr_album — many still images in one .nvda file, each coded with what
  * the codec learned on the ones before it (see src/nvda.h).
  *
- *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict]
+ *   nvdr_album pack   <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict] [--reorder]
  *   nvdr_album unpack <in.nvda> <out-dir>    [--compare <dir>] [--only N]
  *
  * pack reports every image's bytes against what it costs coded alone, and
@@ -19,7 +19,7 @@
 
 static void usage(const char* a0) {
     fprintf(stderr,
-        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict]\n"
+        "usage: %s pack <out.nvda> <images...> [--q N] [--band N] [--window N] [--distance D] [--fluid] [--no-predict] [--reorder]\n"
         "       %s unpack <in.nvda> <out-dir> [--compare <dir>] [--only N]\n"
         "  --window N     how many earlier photos a photo may be predicted from (default 8)\n"
         "  --distance D   skip earlier photos whose thumbnails differ by more than D\n"
@@ -27,6 +27,8 @@ static void usage(const char* a0) {
         "  --fluid        carry the fluid context between photos coded alone (the album\n"
         "                 must then be read in order)\n"
         "  --no-predict   never predict a photo from another\n"
+        "  --reorder      store similar photos next to each other instead of in the\n"
+        "                 order given (the names still tell them apart)\n"
         "  --only N       decode photo N alone, and only what it depends on\n", a0, a0);
 }
 
@@ -56,6 +58,7 @@ static int pack(int argc, char** argv) {
     NvdrConfig cfg = nvdr_default_config();
     NvdaOptions opt = nvda_default_options();
     const char* out = argv[2];
+    int reorder = 0;
     const char** paths = (const char**)calloc((size_t)argc, sizeof(char*));
     int n = 0;
     for (int i = 3; i < argc; i++) {
@@ -65,6 +68,7 @@ static int pack(int argc, char** argv) {
         else if (!strcmp(argv[i], "--distance") && i + 1 < argc) opt.max_distance = atof(argv[++i]);
         else if (!strcmp(argv[i], "--fluid")) opt.fluid = 1;
         else if (!strcmp(argv[i], "--no-predict")) opt.predict = 0;
+        else if (!strcmp(argv[i], "--reorder")) reorder = 1;
         else paths[n++] = argv[i];
     }
     if (!n || n > NVDA_MAX_IMAGES) { usage(argv[0]); return 2; }
@@ -77,6 +81,16 @@ static int pack(int argc, char** argv) {
             return 1;
         }
         names[i] = base_name(paths[i]);
+    }
+    if (reorder && n > 1) {
+        int* ord = (int*)malloc(sizeof(int) * (size_t)n);
+        NvdrImage* ri = (NvdrImage*)malloc(sizeof(NvdrImage) * (size_t)n);
+        const char** rn = (const char**)malloc(sizeof(char*) * (size_t)n);
+        if (!ord || !ri || !rn || nvda_order(n, imgs, ord) != 0) { fprintf(stderr, "out of memory\n"); return 1; }
+        for (int i = 0; i < n; i++) { ri[i] = imgs[ord[i]]; rn[i] = names[ord[i]]; }
+        memcpy(imgs, ri, sizeof(NvdrImage) * (size_t)n);
+        memcpy((void*)names, rn, sizeof(char*) * (size_t)n);
+        free(ord); free(ri); free(rn);
     }
     if (nvda_write(out, n, names, imgs, &cfg, &opt, rep) != 0) {
         fprintf(stderr, "cannot write '%s'\n", out);
