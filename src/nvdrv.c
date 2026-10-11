@@ -2826,10 +2826,24 @@ static float tpl_scale(const NvdrvEncoder* e, int first, int count, int8_t* tile
  * spatial estimate, Immerkaer's, was tried first and could not tell the
  * noisy clip from a clean one: sensor noise is a little blurred, and the
  * clean clip's detail looks like noise to it.) A clean clip's median is
- * the interpolation's small mismatch, so its neighbours count only where
- * they agree almost exactly, which changes almost nothing.
+ * the interpolation's small mismatch, so at strength 4 its neighbours
+ * counted only where they agreed almost exactly, which changed almost
+ * nothing (-0.5%).
+ *
+ * A clean clip wants a far larger allowance than its small noise gives,
+ * and a noisy one no more than its own (libaom without its filtered
+ * alternate references is 4.9% bigger on the clean pan). The threshold
+ * is now tf_strength times the noise, raised to TF_CLEAN times the
+ * noise but no further than TF_CAP. Against strength 4 alone, BD-rate on
+ * PSNR-Y over 25 frames: the clean pan (noise 8) did best near 270
+ * (-1.0, -1.3 and -0.8% at 100, 270 and 500), the three objects (47)
+ * anywhere past 560 (-1.4, -1.8 and -1.8% at 500, 560 and 1500), and the
+ * noisy pan (97) lost past 500 (0.0, +0.2 and +1.5% at 500, 1170 and
+ * 3100).
  */
 #define TF_B 16
+#define TF_CLEAN 32.0
+#define TF_CAP 600.0
 
 static int cmp_float(const void* a, const void* b) {
     float x = *(const float*)a, y = *(const float*)b;
@@ -2891,7 +2905,9 @@ static int temporal_filter(NvdrvEncoder* e, int idx, NvdrImage* out) {
     }
     if (noise > 1e29) goto done;
     if (noise < 1.0) noise = 1.0;
-    double inv = 1.0 / (e->cfg.tf_strength * noise);
+    double thr = e->cfg.tf_strength * noise, clean = TF_CLEAN * noise < TF_CAP ? TF_CLEAN * noise : TF_CAP;
+    if (thr < clean) thr = clean;
+    double inv = 1.0 / thr;
     for (size_t i = 0; i < npx; i++) acc[i] = cur->pixels[i];
     for (size_t i = 0; i < (size_t)w * h; i++) wsum[i] = 1.0f;
     for (int n = 0; n < nn; n++) {

@@ -96,6 +96,41 @@ static double thumb_distance(const Thumb* a, const Thumb* b) {
     return best;
 }
 
+/*
+ * A storage order that puts similar photos next to each other: from the
+ * first photo, always the nearest one not placed yet by thumbnail
+ * distance (photos of another size count as far as possible, so they
+ * keep their place in the order given). A prediction can only reach back
+ * `window` photos, so an album given shuffled loses much of what the
+ * similarity is worth: eight frames from each of three 960x540 clips,
+ * shuffled, came to 310 KB, and 272 KB put in this order (289 KB in
+ * the order of their names, grouped by clip). Only the encoder changes;
+ * the names keep the photos apart.
+ */
+int nvda_order(int count, const NvdrImage* imgs, int* order) {
+    if (count <= 0) return 0;
+    Thumb* t = (Thumb*)calloc((size_t)count, sizeof(Thumb));
+    uint8_t* used = (uint8_t*)calloc((size_t)count, 1);
+    if (!t || !used) { free(t); free(used); return -1; }
+    for (int i = 0; i < count; i++) thumb_make(&t[i], &imgs[i]);
+    int cur = 0;
+    order[0] = 0; used[0] = 1;
+    for (int k = 1; k < count; k++) {
+        int best = -1;
+        double bd = 1e29;
+        for (int j = 0; j < count; j++) {
+            if (used[j]) continue;
+            double d = thumb_distance(&t[cur], &t[j]);
+            if (d < bd) { bd = d; best = j; }
+        }
+        if (best < 0) for (int j = 0; j < count; j++) if (!used[j]) { best = j; break; }
+        order[k] = best; used[best] = 1; cur = best;
+    }
+    for (int i = 0; i < count; i++) free(t[i].p);
+    free(t); free(used);
+    return 0;
+}
+
 /* ---------------------------------------------------------------- writer */
 
 /*

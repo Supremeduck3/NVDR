@@ -30,10 +30,14 @@
  * THE FLUID CONTEXT
  * -----------------
  * With NVDA_FLAG_FLUID, every photo coded on its own starts from the
- * models the one before it left (nvdr.h). That is worth 0.7% on the
- * samples and makes every photo depend on all the ones before it, so it
- * is off unless asked for: an album a site serves one photo at a time
- * wants each photo reachable on its own.
+ * models the one before it left (nvdr.h). It was worth 0.7% on the
+ * samples; since container 13 the models carry a count that fixes how
+ * fast they adapt, a carried model arrives at the slowest rate, and the
+ * same samples come out 0.0 to 1.1% bigger (q 24 to 96; keeping the
+ * odds but restarting the count was -0.3 to +0.5%). It also makes every
+ * photo depend on all the ones before it, so it is off unless asked for:
+ * an album a site serves one photo at a time wants each photo reachable
+ * on its own.
  *
  * The encoder tries, for every photo, the photo alone and a prediction
  * from the most similar earlier photos of the same size in the window, at
@@ -67,6 +71,10 @@ typedef struct {
 } NvdaOptions;
 
 NvdaOptions nvda_default_options(void);
+
+/* A storage order (indices into imgs) putting similar photos next to
+ * each other, for an album given in no useful order; see nvda.c. */
+int nvda_order(int count, const NvdrImage* imgs, int* order);
 
 typedef struct {
     size_t bytes;      /* payload */

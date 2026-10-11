@@ -611,6 +611,20 @@ Encoding takes 8% longer. The strength and radius were swept (see
 nvdrv.c); filtering the B frame halfway between anchors too measured
 nothing.
 
+On a clean clip the filter did next to nothing, while libaom without
+its filtered alternate references comes out 4.9% bigger on the same pan:
+its noise is the interpolation's small mismatch, and four times that let
+a neighbour count only where it matched almost exactly. A clean clip
+wants a far larger allowance, a noisy one no more than its own, so the
+threshold is now 4 times the noise raised to 32 times it, but never
+past 600 (the noise is 8 on the clean pan, 47 on the three objects, 97
+on the noisy pan). Against the filter as it was, sequence format 19,
+25 frames:
+
+    pan, zoom, one object, clean        -1.3% (PSNR-RGB -1.4%)
+    three objects, light noise          -2.0% (-2.2%)
+    the same pan, noisy                 -0.2% (-0.1%)
+
 ### Overlapped blocks (sequence format 11)
 
 A block's vector is right for its middle and less so at its edges,
@@ -987,6 +1001,152 @@ of 1 + 0.5) were 1.1 to 2.5% bigger; refining the intra frame three
 times as hard for its reuse (`--tpl 3`) was 0 to 3.3% bigger; groups of
 16 instead of 8 went either way (+0.9, -2.2 and +1.4%).
 
+### More intra modes: every HEVC angle, AV1's smooth and filters (container v14)
+
+Measured as a still against libaom's (cpu-used 3, still picture), PSNR-Y
+on I420, the intra frame was 0.2 to 9.6% bigger on five photographs and
+35% on a small, smooth one (macarrão). To find what AV1 has that NVDR
+lacks, its tools were turned off one at a time, which is the cost of
+lacking each (BD-rate of libaom without the tool, against libaom whole):
+
+    tool off                      macarrão   clip frame   montanha
+    smooth modes                    +0.5%       +1.0%       +0.6%
+    Paeth                           -0.1%        0.0%        0.0%
+    chroma from luma                +0.6%       +0.1%        0.0%
+    recursive filter modes          -0.3%       +1.7%       +0.6%
+    fine angles (56, not 8)        +12.0%       +0.9%       +1.1%
+    edge filter                     +1.0%       +0.7%       +0.1%
+    all six together               +15.7%       +9.0%       +4.3%
+    rectangular partitions          +5.6%       +2.0%       +1.3%
+    64x64 blocks, 64 transforms     ~0           ~0          ~0
+    palette                          0            0           0
+
+The intra tools together are about the whole gap on the clip's frame,
+though no one of them is much, since each stands in for the others. Chroma
+is 8% of an intra frame's bits, so chroma from luma could not be worth
+more; neighbour contexts for the mode, tried on the leaves' modes, saved
+1% of the mode's bits.
+
+So a leaf now has 43 modes where it had 15 (see DIRECTIONAL PREDICTION
+in nvdr.c): all 33 of HEVC's angles with its inverse angles, AV1's three
+smooth modes with its weights, and AV1's five recursive filters, which
+predict 4x2 patches in raster order from the patch's corner, the four
+pixels above it and the two to its left, already predicted or not, with
+AV1's taps. The mode is the "flat or not" bit, then six bits down the
+tree. The encoder screens the 42 by the Hadamard sum and tries 9 in full
+instead of 5. Version 13 containers still decode: their fifteen modes
+are the same angles under other numbers.
+
+Against AV1 as a still, BD-rate on PSNR-Y:
+
+                          before    + 33 angles,   + smooth   + filters
+                                    9 tried
+    clip frame, clean      +9.6%       +8.9%         +7.9%       +5.9%
+    clip frame, noisy      +8.9%                                 +5.6%
+    montanha_pessoas       +6.7%       +6.1%         +6.2%       +5.7%
+    OIP-4140498144         +5.5%                                 +4.6%
+    OIP-3451121336         +0.2%                                 +0.0%
+    macarrão              +35.0%      +29.1%        +29.6%      +29.7%
+
+Encoding an intra frame takes 1.7 times as long; decoding is unchanged.
+Sequences are format 17 for it, their containers being version 14. Over
+25 frames, BD-rate on PSNR-Y against format 16: -2.4% on the clean pan,
+-1.7% on the three objects, -2.0% on the noisy pan.
+
+### Half nodes: rectangular leaves (container v15)
+
+After the modes, the next of AV1's tools by what lacking it costs was
+rectangular partitions: libaom without them was 2.0% bigger on the
+clip's frame, 1.3% on montanha and 5.6% on macarrão. In a directional
+picture (a sequence's frames, `--directional` stills) a whole node of 8
+to 32 that does not split in four may now be cut in two, across into
+n x n/2 leaves or down into n/2 x n, as AV1's PARTITION_HORZ and
+PARTITION_VERT; the halves are leaves (see HALF NODES in nvdr.c). It
+took a leaf that need not be square everywhere a leaf is:
+
+- **Prediction** over w x h: the row above and the column to the left
+  run on to w + h; the angles, planar (VVC's form, which is HEVC's for a
+  square), the smooth modes with a weight table per axis, and the
+  recursive filters all take any shape.
+- **Transform**: the h-point transform down, the w-point one across, for
+  any of the seven types up to 16. The integer matrices are 64 sqrt(N)
+  times orthonormal, so w x h needs 4096 sqrt(w h), which for halves is
+  4096 sqrt(2) min(w, h): the columns are scaled by 181/256 (sqrt(2)/2 to
+  0.01%) and the rows shifted by 6 + log2 min(w, h). The DC level moves
+  the leaf by the same factor.
+- **Coefficients** in a diagonal scan per shape, with the contexts as
+  before; the six halves share three model sets by area.
+- **Signalling**: after "split in four", a "cut in two" flag and a
+  "down" flag, by node size and tree.
+
+The z-order of 4x4 cells already gives every reference pixel the right
+answer, since the halves of a node cover its quadrants in decoding
+order. The encoder codes each whole node whole, cut across, cut down
+and split, and keeps the cheapest; versions 13 and 14 still decode.
+
+Against libaom as a still, BD-rate on PSNR-Y:
+
+                          v14 (modes)   v15 (halves)
+    clip frame, clean        +5.9%         +3.9%
+    clip frame, noisy        +5.6%         +3.7%
+    montanha_pessoas         +5.7%         +4.7%
+    OIP-4140498144           +4.6%         +4.5%
+    OIP-3451121336           +0.0%         +0.3%
+    macarrão                +29.7%        +22.9%
+
+Coding an intra frame takes twice as long again; decoding is unchanged.
+Trying the halves only at 8 and 16, where nearly all of them are chosen
+(a third to half of those nodes come out cut, a tenth at 32), saved 5% of
+the time and lost 2.3 points on macarrão. Sequences (format 18), over 25
+frames against format 17: -2.6% on the clean pan, -2.9% on the three
+objects, -2.4% on the noisy pan.
+
+### Deblocking levels (container v16)
+
+The deblocking filter (see "Deblocking") was tuned on the progressive
+pictures of format v10, and a directional picture's seams are not
+theirs: its predictions run across the leaves, RDOQ drops what it can,
+and restoration comes after it. Against libaom, turning it off made
+luma better on the clip's frame and on OIP-4140498144 (by 0.4 and 0.3
+points) and worse on macarrão (0.5), and colour cost macarrão and
+OIP-4140498144 6 to 8% less without it and the clip 0.7% more. Scoring only luma had hidden that; scored as AOM's
+test conditions also do, PSNR-YUV weighted 6:1:1, NVDR spends on colour
+what libaom does not and gets it back (its U and V are 4 to 26% cheaper
+than libaom's at equal PSNR).
+
+So a directional picture now says how hard to filter: a level for luma
+and one for colour, 0 to 15 in eighths of the thresholds, 8 being the
+filter as it was. They take byte 28 of the header, the band, which a
+directional picture always had at 0. The encoder decodes the picture
+anyway to fit restoration; in that decode it tries all sixteen levels on
+each tree's planes and keeps the one that leaves the least squared error
+against the source, before restoration is fitted to what it left.
+Luma's lands around 5 or 6; colour's anywhere from 0 (macarrão) to 14
+(the clip at q 40). Versions 13 to 15 still decode, at level 8.
+
+Against libaom as a still, BD-rate on PSNR-Y and on PSNR-YUV 6:1:1:
+
+                          v15 Y    v16 Y    v15 YUV   v16 YUV
+    clip frame, clean     +3.9%    +3.4%    -2.3%     -2.7%
+    clip frame, noisy     +3.7%    +3.1%    -1.1%     -1.5%
+    montanha_pessoas      +4.7%    +4.3%    +0.5%     -0.2%
+    OIP-4140498144        +4.5%    +4.2%    +2.1%     +0.3%
+    OIP-3451121336        +0.3%    -0.0%    -0.8%     -1.9%
+    macarrão             +22.9%   +22.7%   +14.7%    +11.7%
+
+Sequences (format 19) gain nothing from it: over 25 frames against
+format 18, +0.2% on the clean pan, -0.5% on the three objects, +0.1% on
+the noisy pan (PSNR-RGB +0.2%, -0.4%, +0.1%). Each frame's levels are
+the best for that frame, and a frame is also the next one's reference,
+which least error now does not account for; choosing only on intra
+frames and leaving predicted ones at 8 came out the same (+0.1%, -0.4%,
+-0.1%).
+
+A lower lambda had looked like a gain on PSNR-Y (0.09 instead of 0.12:
+macarrão +22.0%, the clip +3.2%), but it only moved bytes from colour
+to luma: PSNR-YUV did not change (+15.3% and -2.4%), nor the sequences'
+PSNR-RGB. It stays at 0.12.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
@@ -1024,10 +1184,17 @@ that much more:
       predicted headers, HEVC's
       interpolation (seq v16)       +28.0%       -15.3%      -37.7%
     noisy, the same                +31.1%       -32.3%      -49.9%
+    clean, + 43 intra modes,
+      half nodes (seq v18)          +21.3%       -19.2%      -40.7%
+    noisy, the same                +24.6%       -35.1%      -52.0%
+    clean, + deblocking levels,
+      wider filter on clean clips
+      (seq v19)                     +18.6%       -20.6%      -41.9%
+    noisy, the same                +24.8%       -35.2%      -52.0%
 
 That is the honest position now: half the bytes of x264 at its slowest
-on the noisy clip, a sixth to a third fewer than x265, and AV1 still
-needing about four fifths of NVDRV's bytes. In the clean clip at q 20
+on the noisy clip, a fifth to a third fewer than x265, and AV1 still
+needing about five sixths of NVDRV's bytes. In the clean clip at q 20
 the intra frame is 63% of the file, 39 KB where AV1's is 34 KB at 0.9 dB
 less; the 47 frames after it average 495 bytes against AV1's 393, at
 0.24 dB less.
@@ -1104,8 +1271,23 @@ requests. `nvda_decode` does the same in C with the bytes it has, holding
 at most `window` decoded images.
 
 The fluid context works against that: it makes every photo depend on
-all the ones before it. It is worth 0.7% and is off unless `pack` is
-given `--fluid`; a fluid album still decodes, only in order.
+all the ones before it. It was worth 0.7%, but since container 13 a
+model carries the count that sets how fast it adapts, a carried model
+arrives at the slowest rate, and on the samples it now costs 0.0 to 1.1%
+(q 24 to 96; keeping the odds and restarting the count, -0.3 to +0.5%,
+was not worth a format change). It is off unless `pack` is given
+`--fluid`; a fluid album still decodes, only in order.
+
+The window only reaches back so far, so the order photos are given in
+matters: eight frames from each of three 960x540 clips, shuffled, came
+to 310 KB. `pack --reorder` stores them nearest-first by thumbnail
+distance instead (from the first photo, always the closest one left),
+and the same 24 came to 272 KB, less than in the order of their names,
+grouped by clip (289 KB). The names keep the photos apart, so only the
+order they are listed in changes. Keeping a display order apart from
+the storage order, and predicting between photos of different sizes
+(today a crop or a portrait among landscapes is never a reference),
+are not built.
 
 `public/nvdr-img.js` is the piece a site uses, an element in place of
 `<img>`:
@@ -1223,11 +1405,13 @@ error in pixels is step / n, a fraction of a level for any leaf larger
 than 4. Filtering those edges anyway cost the `blocos` probe 6.7 dB, and
 skipping them costs the photographs nothing.
 
-In a sequence the filter runs on intra frames, whose decoded picture is
-the next frame's reference. It does not run on predicted frames'
-containers: those hold a residual, not a picture.
+In a sequence the filter runs on every frame, whose decoded picture is
+the next frame's reference: a predicted frame has been a picture against
+its motion-compensated base since format 10, not a residual.
 
-At the defaults, per sample: +0.14 to +0.47 dB at the same bytes.
+At the defaults, per sample: +0.14 to +0.47 dB at the same bytes. A
+directional picture chooses how hard since container 16 (see
+"Deblocking levels").
 
 ## The decomposition
 
@@ -1628,6 +1812,37 @@ there. The flat ladder was the broken tolerance schedule described above,
 not the delivery, and reverting the schedule is what fixed it. What
 interleaving actually buys is that a cut can no longer discard work that
 already arrived, which is worth keeping because it costs nothing.
+
+## Measured but not built: ordering a cut by worth
+
+A progressive container can be cut anywhere, but what a cut costs was
+measured against the alternative only later (an outside build, WASI,
+the six samples at q 8): a prefix of 15 to 80% of the file showed 5.2 to
+11.2 dB less than the same codec re-encoded to that size, 8.7 dB on
+average, and the gap grows with the share delivered. That is the
+signature of a stream ordered by place: within a layer the tiles come
+in raster order, so a cut leaves the last tiles with no texture at all,
+which is the worst way to lose bits. JPEG 2000's EBCOT orders each
+block's contributions by their rate-distortion slope across the whole
+picture instead, so every cut is near the best file of that size. Doing
+the same here would be a new progressive format (container, both
+decoders, the gate), and it matters only where a cut is the whole
+point, a lossy link with no second chance; directional pictures, which
+every sequence and every comparison against AV1 uses, have one layer
+and are not affected. Noted, not scheduled.
+
+## Measured but not built: screen content
+
+Measured from outside (a WASI build, the six samples): on the Windows
+screenshot (OIP-1304511485) YCbCr does not decorrelate the colours at
+all (mean |rho| between channels 0.40 in RGB, 0.41 after), Cr carries
+more variance than Y, and the partition hardly moves with the rate (7.3
+to 8.8 px from q 8 to q 96), where every photograph coarsens. It is also
+where WebP beats NVDR the most. The tools for it are AV1's and VVC's:
+a colour transform chosen per tile (YCbCr or YCoCg-R, one bit), palette
+mode and intra block copy. All change the format, none of the test
+clips is screen content, and photographs and camera video come first.
+Noted, not scheduled.
 
 ## Measured but not built: cutting along a line
 
@@ -2650,11 +2865,10 @@ side, a slider that truncates the container, and plays sequences.
 Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
 Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
 directional prediction, 0x40 a base picture and 0x80 a transform type
-per leaf (see their sections).
-
-directional prediction, 0x40 a base picture and 0x80 restoration, whose
-parameters follow the grain's and whose length is bytes 30 and 31 (see
-their sections).
+per leaf (see their sections). Byte 29 is the grain parameters' length
+and bytes 30 and 31 the restoration's, which follow the header in that
+order. A directional picture has no band, and from container 16 its
+byte 28 holds the deblocking levels instead, luma's in the low half.
 
 The canvas is padded to a multiple of the smallest block. A node that
 runs past it has no split flag and always splits; one wholly past it does

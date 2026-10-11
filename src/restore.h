@@ -95,6 +95,11 @@ typedef struct {
     /* filled in: squared error removed per component, and bits spent */
     double gain[3];
     size_t bits[3];
+    /* The same decode also chooses the deblocking levels (nvdr.c) when
+     * choose_deblock is set, luma's and colour's, and fits restoration
+     * only when restore is. */
+    int choose_deblock, restore;
+    int deblock[2];
 } NvdrRestoreFit;
 
 /* Chooses a restoration for one component's decoded plane (visible area

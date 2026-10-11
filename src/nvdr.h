@@ -113,6 +113,7 @@ typedef struct {
      * or both, or none (see TRANSFORM TYPES in nvdr.c). Flagged in the
      * header; it has no effect on progressive pictures. */
     int   adaptive_tx;
+    int   halves;          /* with directional, try cutting nodes in two (default 1) */
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
@@ -186,7 +187,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
-#define NVDR_VERSION     13
+#define NVDR_VERSION     16
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -202,7 +203,14 @@ typedef struct {
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
+    uint8_t  version;                   /* 16; 15 had no deblocking levels, 14 no half nodes,
+                                           13 also fifteen intra modes */
     uint8_t  band;
+    /* How hard leaf seams are deblocked, luma's and colour's: 8 is the
+     * filter as tuned, 0 none, each step an eighth of its thresholds. A
+     * directional picture's encoder chooses them (container 16); every
+     * other picture has 8. */
+    uint8_t  deblock[2];
     uint8_t  grain_len;                 /* bytes of grain parameters after the header */
     NvdrGrain grain;
     uint16_t restore_len;               /* bytes of restoration parameters after those */
