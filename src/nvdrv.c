@@ -1920,12 +1920,29 @@ typedef struct {
     int16_t  *fvx, *fvy;
     int8_t   *fd;
     int       fnfx, fnfy;
+    /* Its subpixel planes, built the first time a frame predicts from it
+     * and kept while it is a reference: a group's B frames all predict
+     * from the same few, and building them was a tenth of the encoding. */
+    Subpel    sp;
+    int       sp_ok;
 } Slot;
 
 static void slot_free(Slot* s) {
     nvdr_image_free(&s->img);
     free(s->fvx); free(s->fvy); free(s->fd);
     s->fvx = s->fvy = NULL; s->fd = NULL;
+    if (s->sp_ok) subpel_free(&s->sp);
+    s->sp_ok = 0;
+}
+
+/* The slot's planes, as a shallow copy the caller must not free. */
+static int slot_subpel(Slot* s, Subpel* out) {
+    if (!s->sp_ok) {
+        if (subpel_build_seq(&s->sp, &s->img) != 0) return -1;
+        s->sp_ok = 1;
+    }
+    *out = s->sp;
+    return 0;
 }
 
 /*
@@ -2237,10 +2254,11 @@ static size_t write_frame(NvdrvEncoder* e, int kind, int hc, int display, int bl
  * around it and around zero at block size and at half size, refined to
  * quarter pixels; the model fitted to the block-size vectors, and its
  * vectors on the half-size grid. */
-static int motion_list(NvdrvEncoder* e, const NvdrImage* cur, const NvdrImage* ref, int dist, int lambda,
+static int motion_list(NvdrvEncoder* e, const NvdrImage* cur, Slot* rs, int dist, int lambda,
                        int cx, int cy, int* gdx, int* gdy, int16_t* sx, int16_t* sy,
                        int16_t* hx, int16_t* hy, Model* model, int* affine,
                        int16_t* mx, int16_t* my, Subpel* sp) {
+    const NvdrImage* ref = &rs->img;
     int block = e->cfg.block, lim = NVDRV_MV_MAX / 4 - 8;
     cx = clampi(cx, -lim, lim); cy = clampi(cy, -lim, lim);
     /* Next to its reference the whole search range, as a P frame always
@@ -2249,7 +2267,7 @@ static int motion_list(NvdrvEncoder* e, const NvdrImage* cur, const NvdrImage* r
     *gdx = clampi(*gdx, -lim, lim); *gdy = clampi(*gdy, -lim, lim);
     block_search(cur, ref, block, dist, *gdx, *gdy, sx, sy);
     block_search(cur, ref, block / 2, dist, *gdx, *gdy, hx, hy);
-    if (subpel_build_seq(sp, ref) != 0) return -1;
+    if (slot_subpel(rs, sp) != 0) return -1;
     block_refine(cur, sp, block, NVDRV_MV_MAX, sx, sy);
     block_refine(cur, sp, block / 2, NVDRV_MV_MAX, hx, hy);
     *affine = model_fit(sx, sy, cur->width, cur->height, block, *gdx * 4, *gdy * 4, model);
@@ -2396,7 +2414,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         if (e->cfg.block > 0) {
             block = e->cfg.block;
             Subpel sp;
-            if (motion_list(e, src, r0, display - e->dpb[before].display, lambda, cx, cy, &dx, &dy,
+            if (motion_list(e, src, &e->dpb[before], display - e->dpb[before].display, lambda, cx, cy, &dx, &dy,
                             e->s0x, e->s0y, e->h0x, e->h0y, &model0, &aff0, e->m0x, e->m0y, &sp) != 0) return -1;
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             VfDecide D = { src, &sp, NULL, &G, &l0, NULL, NULL, lambda, 0, 0 };
@@ -2404,7 +2422,6 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
             block_predict(&sp, &e->pred, G.g, e->v0x, e->v0y);
             Motion M = { &sp, NULL, e->v0x, e->v0y, NULL, NULL, NULL };
             obmc = obmc_choose(e, &D, &M, src);
-            subpel_free(&sp);
             ref = &e->pred;
         } else {
             find_shift_at(src, r0, cx, cy, (cx || cy) ? 4 : e->cfg.search, &dx, &dy);
@@ -2422,19 +2439,17 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         }
     } else if (kind == NVDRV_BI) {
         block = e->cfg.block;
-        const Slot* a = &e->dpb[before];
-        const Slot* c = &e->dpb[after];
+        Slot* a = &e->dpb[before];
+        Slot* c = &e->dpb[after];
         int c0x, c0y, c1x, c1y;
         group_motion(e, display, a->display, &c0x, &c0y);
         group_motion(e, display, c->display, &c1x, &c1y);
         Subpel sp0, sp1;
         memset(&sp1, 0, sizeof(sp1));
-        if (motion_list(e, src, &a->img, display - a->display, lambda, c0x, c0y, &dx, &dy,
+        if (motion_list(e, src, a, display - a->display, lambda, c0x, c0y, &dx, &dy,
                         e->s0x, e->s0y, e->h0x, e->h0y, &model0, &aff0, e->m0x, e->m0y, &sp0) != 0) return -1;
-        if (motion_list(e, src, &c->img, c->display - display, lambda, c1x, c1y, &dx1, &dy1,
-                        e->s1x, e->s1y, e->h1x, e->h1y, &model1, &aff1, e->m1x, e->m1y, &sp1) != 0) {
-            subpel_free(&sp0); subpel_free(&sp1); return -1;
-        }
+        if (motion_list(e, src, c, c->display - display, lambda, c1x, c1y, &dx1, &dy1,
+                        e->s1x, e->s1y, e->h1x, e->h1y, &model1, &aff1, e->m1x, e->m1y, &sp1) != 0) return -1;
         VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
         VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
         VfDecide D = { src, &sp0, &sp1, &G, &l0, &l1, e->mode, lambda, 0, 0 };
@@ -2442,7 +2457,6 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         block_predict_bi(&sp0, &sp1, &e->pred, G.g, e->v0x, e->v0y, e->v1x, e->v1y, e->mode);
         Motion M = { &sp0, &sp1, e->v0x, e->v0y, e->v1x, e->v1y, e->mode };
         obmc = obmc_choose(e, &D, &M, src);
-        subpel_free(&sp0); subpel_free(&sp1);
         ref = &e->pred;
     }
 
@@ -2515,7 +2529,7 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     /* Carry the decoder's state forward by decoding what was just written,
      * so the two sides hold the same bytes from here on. */
     Slot* s = &e->dpb[e->ndpb];
-    s->fvx = s->fvy = NULL; s->fd = NULL;
+    s->fvx = s->fvy = NULL; s->fd = NULL; s->sp_ok = 0;
     if (alloc_image(&s->img, e->width, e->height) != 0) { free(blob); return -1; }
     int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? e->dctx[fc] : NULL);
     free(blob);
@@ -3199,6 +3213,7 @@ static int decode_one(NvdrvDecoder* d) {
     Slot field;      /* holds this frame's field until the frame is held */
     field.fvx = field.fvy = NULL; field.fd = NULL;
     field.img.pixels = NULL;
+    field.sp_ok = 0;
 
     if (block) {
         /* The field has to arrive whole: without it there is no reference
@@ -3240,22 +3255,22 @@ static int decode_one(NvdrvDecoder* d) {
                           tv + 2 * nb, tv + 3 * nb, t1ok };
             if (kind == NVDRV_PRED) {
                 if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0 &&
-                    subpel_build_seq(&sp0, ref) == 0) {
+                    slot_subpel(&d->dpb[before], &sp0) == 0) {
                     block_predict(&sp0, &d->pred, G.g, v, v + nb);
                     Motion M = { &sp0, NULL, v, v + nb, NULL, NULL, NULL };
                     if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
                     rc = 0;
                 }
             } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1) == 0 &&
-                       subpel_build_seq(&sp0, ref) == 0 &&
-                       subpel_build_seq(&sp1, &d->dpb[after].img) == 0) {
+                       slot_subpel(&d->dpb[before], &sp0) == 0 &&
+                       slot_subpel(&d->dpb[after], &sp1) == 0) {
                 block_predict_bi(&sp0, &sp1, &d->pred, G.g, v, v + nb, v + 2 * nb, v + 3 * nb, mode);
                 Motion M = { &sp0, &sp1, v, v + nb, v + 2 * nb, v + 3 * nb, mode };
                 if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
                 rc = 0;
             }
         }
-        subpel_free(&sp0); subpel_free(&sp1);
+        /* sp0 and sp1 are the slots' own planes: nothing to free. */
         /* The field as decoded, for the frames after this one. */
         if (rc == 0 && slot_store_field(&field, &G, kind == NVDRV_BI ? mode : NULL, v, v + nb,
                                         display - d->dpb[before].display, v + 2 * nb, v + 3 * nb,
@@ -3279,6 +3294,7 @@ static int decode_one(NvdrvDecoder* d) {
     if (len == 0) { slot_free(&field); return 0; }
 
     Slot* s = &d->dpb[d->ndpb];
+    s->sp_ok = 0;
     s->fvx = field.fvx; s->fvy = field.fvy; s->fd = field.fd; s->fnfx = field.fnfx; s->fnfy = field.fnfy;
     if (alloc_image(&s->img, d->width, d->height) != 0) { slot_free(s); return -1; }
     /* A frame cut before its colour layer has no picture yet: the stream
