@@ -685,20 +685,20 @@ static int get_tq(NvdrDecoder* d, ColourModels* m) {
  * magnitude is conditioned on the same sum and on whether a level over 1
  * has been seen in the band yet.
  */
-static int nb_mag(const int* lv, int s, int i, int start) {
-    static const int du[5] = { 1, 0, 1, 2, 0 }, dv[5] = { 0, 1, 1, 0, 2 };
-    int w = SHAPE_W[s], p = scan_pos[s][i];
-    int u = p % w, v = p / w, t = 0;
-    for (int k = 0; k < 5; k++) {
-        int uu = u - du[k], vv = v - dv[k];
-        if (uu < 0 || vv < 0) continue;
-        int j = scan_idx[s][vv * w + uu];
-        if (j < start || j >= i) continue;
-        int a = lv[j] < 0 ? -lv[j] : lv[j];
-        t += a < 3 ? a : 3;
-    }
+/* The sum is read from a grid of the levels coded so far, each already
+ * counted up to 3, laid out as the block is: positions before `start`
+ * and not yet reached hold 0, which is what the scan order would give.
+ * It is most of what costing a leaf's texture does, so it is a few loads
+ * and no lookups. */
+static int nb_mag(const uint8_t* g, int w, int p) {
+    int u = p & (w - 1), v = p / w, t = 0;
+    const uint8_t* r = g + p;
+    if (u >= 1) { t += r[-1]; if (u >= 2) t += r[-2]; }
+    if (v >= 1) { t += r[-w]; if (u >= 1) t += r[-w - 1]; if (v >= 2) t += r[-2 * w]; }
     return t;
 }
+
+static uint8_t mag3(int l) { int a = l < 0 ? -l : l; return (uint8_t)(a < 3 ? a : 3); }
 
 static int sig_ctx(int s, int i, int t) {
     int d = scan_diag[s][i];
@@ -734,10 +734,13 @@ static void put_texture(Sink* s, TextureModels* m, int sc, int c, const int* lv,
     for (int i = start; i < end; i++) if (lv[i]) last = i;
     put_bit(s, &m->cbf[mc][c], last >= 0);
     if (last < 0) return;
-    int g = 0;
+    int g = 0, w = SHAPE_W[sc];
+    uint8_t grid[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    memset(grid, 0, (size_t)(w * SHAPE_H[sc]));
     for (int i = start; i <= last; i++) {
-        int a = lv[i] < 0 ? -lv[i] : lv[i];
-        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        int a = lv[i] < 0 ? -lv[i] : lv[i], p = scan_pos[sc][i];
+        int pc = scan_ctx[sc][i], t = nb_mag(grid, w, p);
+        grid[p] = mag3(a);
         if (i < end - 1) put_bit(s, &m->sig[mc][c][sig_ctx(sc, i, t)], a != 0);
         if (!a) continue;
         if (i < end - 1) put_bit(s, &m->last[mc][c][pc], i == last);
@@ -753,9 +756,11 @@ static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
     int mc = SHAPE_MC[sc];
     memset(lv + start, 0, sizeof(int) * (size_t)(end - start));
     if (!nvdr_dec_bit(d, &m->cbf[mc][c])) return 0;
-    int g = 0;
+    int g = 0, w = SHAPE_W[sc];
+    uint8_t grid[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    memset(grid, 0, (size_t)(w * SHAPE_H[sc]));
     for (int i = start; i < end; i++) {
-        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start);
+        int pc = scan_ctx[sc][i], p = scan_pos[sc][i], t = nb_mag(grid, w, p);
         int sig = i < end - 1 ? nvdr_dec_bit(d, &m->sig[mc][c][sig_ctx(sc, i, t)]) : 1;
         if (!sig) continue;
         int last = i < end - 1 ? nvdr_dec_bit(d, &m->last[mc][c][pc]) : 1;
@@ -773,6 +778,7 @@ static int get_texture(NvdrDecoder* d, TextureModels* m, int sc, int c, int* lv,
             g++;
         }
         lv[i] = nvdr_dec_direct(d, 1) ? -a : a;
+        grid[p] = mag3(a);
         if (last || *corrupt || d->overrun) break;
     }
     return 1;
@@ -1728,10 +1734,13 @@ static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv
                  int start, int end, double lam, int keep) {
     double cost[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* coded cost of each position */
     double drop[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* its error if dropped */
-    int g = 0, mc = SHAPE_MC[sc];
+    int g = 0, mc = SHAPE_MC[sc], w = SHAPE_W[sc];
+    uint8_t grid[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    memset(grid, 0, (size_t)(w * SHAPE_H[sc]));
     for (int i = start; i < end; i++) {
         double a = fabs(v[i]);
-        int pc = scan_ctx[sc][i], t = nb_mag(lv, sc, i, start), sp = sig_ctx(sc, i, t);
+        int p = scan_pos[sc][i];
+        int pc = scan_ctx[sc][i], t = nb_mag(grid, w, p), sp = sig_ctx(sc, i, t);
         int l = (int)(a + 0.5);
         if (l > COEF_MAX) l = COEF_MAX;
         drop[i] = a * a;
@@ -1743,6 +1752,7 @@ static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv
             bl = (int)(a + 0.4);
             if (bl > COEF_MAX) bl = COEF_MAX;
             lv[i] = v[i] < 0 ? -bl : bl;
+            grid[p] = mag3(bl);
             double bits = bl ? rd_mag_bits(m, c, gt1_ctx(t, g), bl) + 1.0 +
                                (i < end - 1 ? rd_bit(&m->sig[mc][c][sp], 1) + rd_bit(&m->last[mc][c][pc], 0) : 0.0)
                              : zero_bits;
@@ -1757,6 +1767,7 @@ static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv
             if (j < best) { best = j; bl = lvl; }
         }
         lv[i] = v[i] < 0 ? -bl : bl;
+        grid[p] = mag3(bl);
         cost[i] = best;
         if (bl > 1) g++;
     }
