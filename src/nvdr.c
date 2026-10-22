@@ -1914,6 +1914,7 @@ static double search(Enc* e, int x, int y, int n, double budget) {
     int sc = size_class(n), tree = cv->comp0 ? 1 : 0, choice = 1;
     double best = 1e300, split_cost = 0.0;
     uint8_t *kept = NULL, *orig = NULL;
+    int stop = 0;
 
     if (whole) {
         if (halves) {
@@ -1932,6 +1933,14 @@ static double search(Enc* e, int x, int y, int n, double budget) {
          * with no texture, is not cut: on 9 frames of the clean pan that
          * made the encoder 22% faster for the same bytes and quality. */
         if (halves && cv->inter && e->last_mode == MODE_INTER && !tex) halves = 0;
+        /* A picture without a base stops at a node that needs no texture
+         * whole (as HEVC's reference encoder stops a coding unit whose
+         * prediction leaves nothing to code): neither halves nor quarters
+         * are tried. On the six samples, directional, that was 6% faster
+         * and 0.2% smaller (progressive: 7%, the same size); in predicted
+         * frames it cost 0.9 to 1.1%, and in an album's residuals 3.9%. */
+        stop = !tex && !cv->inter && P->skip_lambda == 0.0;
+        if (stop) halves = 0;
         if (!can_split) { P->split[id] = 0; free(orig); return best; }
         kept = (uint8_t*)malloc((size_t)12 * n * n);
         if (kept) save_block(cv, x, y, n, kept);
@@ -1957,6 +1966,9 @@ static double search(Enc* e, int x, int y, int n, double budget) {
         free(orig);
     }
 
+    if (whole && stop && kept) {
+        load_block(cv, x, y, n, kept); free(kept); P->split[id] = choice; return best;
+    }
     Sink s0 = { NULL, 0 };
     if (whole) put_bit(&s0, split_model(&e->cm, cv, n), 1);
     split_cost = P->lambda * s0.bits;
