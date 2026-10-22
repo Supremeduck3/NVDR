@@ -183,6 +183,7 @@ NvdrConfig nvdr_default_config(void) {
     c.base = NULL;
     c.adaptive_tx = 1;
     c.halves = 1;
+    c.tx_modes = 0;
     /* The split decision is flat across 0.06..0.3; this is the middle. */
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
@@ -1348,6 +1349,7 @@ typedef struct {
     TextureModels  tm2;          /* the high band */
     int            band_at[NSHAPES];   /* first high-band scan position per shape */
     int            try_halves;  /* whether the search cuts nodes in two (they are flagged anyway) */
+    int            tx_modes;    /* see NvdrConfig */
     int            last_mode;   /* the mode code_leaf() chose last */
     double         plane_bits[3];   /* what the coded leaves cost, per component */
 } Enc;
@@ -1563,6 +1565,34 @@ static double choose_tx(Enc* e, int x, int y, int w, int h, int mode, double bes
     return best;
 }
 
+/* The modes in cand[0, nc) coded with the DCT, then the other transform
+ * types tried on all of them, or with tx_modes on that many of the
+ * cheapest; *mode and *tx get the winner, and its cost is returned. */
+static double try_modes(Enc* e, int x, int y, int w, int h, const int* cand, int nc, double best,
+                        int* mode, int* tx) {
+    static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    int sh = shape_of(w, h);
+    double jd[1 + DIR_TRIED];
+    for (int ci = 0; ci < nc; ci++) {
+        Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
+        double d = leaf_levels(e, x, y, w, h, 0, cand[ci], TX_DCT, dl, lv, NULL);
+        leaf_emit(e, &c0, c1, sh, cand[ci], TX_DCT, dl, lv);
+        jd[ci] = d + e->p->lambda * (c0.bits + c1[0].bits + c1[1].bits);
+        if (jd[ci] < best) { best = jd[ci]; *mode = cand[ci]; *tx = TX_DCT; }
+    }
+    int rounds = e->tx_modes > 0 && e->tx_modes < nc ? e->tx_modes : nc;
+    for (int r = 0; r < rounds; r++) {
+        int bi = -1;
+        for (int ci = 0; ci < nc; ci++) if (jd[ci] < 1e299 && (bi < 0 || jd[ci] < jd[bi])) bi = ci;
+        if (bi < 0) break;
+        int t;
+        double j = choose_tx(e, x, y, w, h, cand[bi], jd[bi], &t);
+        if (j < best) { best = j; *mode = cand[bi]; *tx = t; }
+        jd[bi] = 1e300;
+    }
+    return best;
+}
+
 static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int w, int h, int* textured) {
     static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int sh = shape_of(w, h);
@@ -1594,15 +1624,7 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int w, int h, 
                     int tm = cand[a + 1]; cand[a + 1] = cand[a]; cand[a] = tm;
                 }
             }
-            for (int ci = 0; ci < nc; ci++) {
-                Sink k0 = { NULL, 0 }, k1[2] = { { NULL, 0 }, { NULL, 0 } };
-                double dm = leaf_levels(e, x, y, w, h, 0, cand[ci], TX_DCT, dl, lv, NULL);
-                leaf_emit(e, &k0, k1, sh, cand[ci], TX_DCT, dl, lv);
-                double j = dm + e->p->lambda * (k0.bits + k1[0].bits + k1[1].bits);
-                int t;
-                j = choose_tx(e, x, y, w, h, cand[ci], j, &t);
-                if (j < best) { best = j; mode = cand[ci]; tx = t; }
-            }
+            best = try_modes(e, x, y, w, h, cand, nc, best, &mode, &tx);
         }
     } else if (e->p->cv.dirpred) {
         /* The directional modes screened by the Hadamard sum of their
@@ -1629,17 +1651,7 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int w, int h, 
                 }
             }
         }
-        double best = 1e300;
-        for (int ci = 0; ci < nc; ci++) {
-            int m = cand[ci];
-            Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
-            double d = leaf_levels(e, x, y, w, h, 0, m, TX_DCT, dl, lv, NULL);
-            leaf_emit(e, &c0, c1, sh, m, TX_DCT, dl, lv);
-            double j = d + e->p->lambda * (c0.bits + c1[0].bits + c1[1].bits);
-            int t;
-            j = choose_tx(e, x, y, w, h, m, j, &t);
-            if (j < best) { best = j; mode = m; tx = t; }
-        }
+        try_modes(e, x, y, w, h, cand, nc, 1e300, &mode, &tx);
     } else if (skip_lambda > 0.0) {
         Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
         double d_skip = leaf_levels(e, x, y, w, h, 1, 0, TX_DCT, dl, lv, NULL);
@@ -2114,6 +2126,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     for (int c = 0; c < 3; c++) e.base_step[c] = e.step[c];
     e.deadzone = cfg.deadzone;
     e.try_halves = cfg.halves;
+    e.tx_modes = cfg.tx_modes;
     e.rdoq = cfg.rdoq;
     double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     for (int k = 0; k < e.nparts; k++) {

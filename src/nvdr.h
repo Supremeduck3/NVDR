@@ -114,6 +114,11 @@ typedef struct {
      * header; it has no effect on progressive pictures. */
     int   adaptive_tx;
     int   halves;          /* with directional, try cutting nodes in two (default 1) */
+    /* With adaptive_tx, how many of a leaf's modes, the cheapest with the
+     * DCT, also try the other transform types; 0 (the default) tries them
+     * on every mode tried. 2 encodes 2.7 times faster for 0.8% more bytes
+     * (the samples, directional): what --fast sets. */
+    int   tx_modes;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;
