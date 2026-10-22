@@ -1884,7 +1884,16 @@ static void precompute_row(Enc* e, int ty) {
  * wholly past it does not exist. The decision: 0 whole, 1 split, 2 cut
  * across, 3 cut down.
  */
-static double search(Enc* e, int x, int y, int n) {
+/*
+ * Every cost here is an error plus lambda times bits, never negative, so
+ * a split stops mattering as soon as its first quarters cost more than
+ * the node whole: the rest are not tried. `budget` carries the same bound
+ * down: the cost past which the caller's choice cannot change, so a node
+ * that will not fit stops there too, and returns something no smaller
+ * than its budget. Only a choice that loses is ever cut short, so the
+ * decisions, and the container, are what the full search makes.
+ */
+static double search(Enc* e, int x, int y, int n, double budget) {
     Part* P = e->p;
     Canvas* cv = &P->cv;
     size_t id = node_id(e, x, y, n);
@@ -1921,8 +1930,10 @@ static double search(Enc* e, int x, int y, int n) {
             put_bit(&a0, split_model(&e->cm, cv, n), 0);
             put_bit(&a0, &e->cm.half[sc][tree], 1);
             put_bit(&a0, &e->cm.half_dir[sc][tree], down);
-            double dd = down ? code_leaf(e, &a0, a1, x, y, m, n, NULL) + code_leaf(e, &a0, a1, x + m, y, m, n, NULL)
-                             : code_leaf(e, &a0, a1, x, y, n, m, NULL) + code_leaf(e, &a0, a1, x, y + m, n, m, NULL);
+            double dd = down ? code_leaf(e, &a0, a1, x, y, m, n, NULL) : code_leaf(e, &a0, a1, x, y, n, m, NULL);
+            /* the first half alone already costs more: the second cannot help */
+            if (dd + P->lambda * (a0.bits + a1[0].bits + a1[1].bits) >= best) continue;
+            dd += down ? code_leaf(e, &a0, a1, x + m, y, m, n, NULL) : code_leaf(e, &a0, a1, x, y + m, n, m, NULL);
             double cost = dd + P->lambda * (a0.bits + a1[0].bits + a1[1].bits);
             if (cost < best) {
                 best = cost;
@@ -1938,9 +1949,10 @@ static double search(Enc* e, int x, int y, int n) {
     if (whole) put_bit(&s0, split_model(&e->cm, cv, n), 1);
     split_cost = P->lambda * s0.bits;
     int h = n / 2;
-    for (int k = 0; k < 4; k++) {
+    double limit = budget < best ? budget : best;
+    for (int k = 0; k < 4 && split_cost < limit; k++) {
         int cx = x + (k & 1) * h, cy = y + (k >> 1) * h;
-        if (node_exists(cv, cx, cy)) split_cost += search(e, cx, cy, h);
+        if (node_exists(cv, cx, cy)) split_cost += search(e, cx, cy, h, limit - split_cost);
     }
 
     if (whole && kept && best <= split_cost) {
@@ -2193,7 +2205,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                 e.p = &e.part[k];
                 int x = tx / (k + 1), y = ty / (k + 1);
                 if (!node_exists(&e.p->cv, x, y)) continue;
-                search(&e, x, y, e.p->cv.tile);
+                search(&e, x, y, e.p->cv.tile, 1e300);
                 emit(&e, &s0, s1, x, y, e.p->cv.tile, &h);
             }
         }
