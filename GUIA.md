@@ -103,7 +103,12 @@ esse toca direto, sem passar pelo servidor.
 - Precisa de `gst-launch-1.0` no PATH, com os plugins base, good e libav
   (no Ubuntu/Debian: `sudo apt install gstreamer1.0-tools
   gstreamer1.0-plugins-good gstreamer1.0-libav`; H.264 e HEVC vêm do
-  libav). Se estiver em outro lugar:
+  libav). No Windows, o instalador do GStreamer (pacote "runtime",
+  MSVC 64-bit, instalação completa) não põe nada no PATH, mas o servidor
+  acha sozinho pela variável `GSTREAMER_1_0_ROOT_MSVC_X86_64` que ele cria
+  — abra um terminal novo depois de instalar. No macOS, o pacote oficial
+  também é achado sem PATH. Ao subir, o servidor mostra qual
+  `gst-launch-1.0` vai usar. Se estiver em outro lugar:
   `NVDR_GST_LAUNCH=/caminho/gst-launch-1.0 node server.js`.
 - Sem GStreamer, ou se ele não tiver o plugin daquele formato, o servidor
   tenta o `ffmpeg` (`NVDR_FFMPEG=/caminho/ffmpeg` para apontar). Sem
