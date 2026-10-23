@@ -1185,6 +1185,21 @@ byte for byte. The JS decoder reads PRED2 and matches the C pixels,
 whole and cut. A P frame's references are far apart with seven B frames
 between anchors, which is where the gain stays small.
 
+Without B frames (`--bframes 0`, every frame a P frame, as a live or
+low-delay stream codes) the two references are one and two frames back,
+every frame but the first two can use them, and the gain is the one the
+literature reports:
+
+                    PSNR-Y    PSNR-RGB   encoding time
+    clean          -2.0%      -2.3%      +58%
+    noisy          -4.7%      -4.8%      +63%
+    multi          -5.8%      -5.0%      +56%
+
+(25 frames, `--fast`, against `--refs 1`.) The noisy clip gains most of
+the pans: there the mean of two neighbouring frames is a mean over two
+draws of the noise, which with B frames the anchors' temporal filter had
+already taken.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says
