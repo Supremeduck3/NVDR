@@ -369,6 +369,36 @@ node server.js     # abra http://localhost:3000/galeria.html
 
 ---
 
+## Compartilhar como PNG
+
+```bash
+./nvdr_png /tmp/foto.nvdr /tmp/foto.png
+./nvdr_png --extract /tmp/foto.png /tmp/de_volta.nvdr
+```
+
+O `foto.png` é um PNG normal: qualquer celular, navegador ou visualizador
+mostra uma **prévia**, e o `.nvdr` inteiro vai **dentro** dele, num bloco
+privado que os visualizadores ignoram. Serve também para álbum (`.nvda`,
+a prévia é a primeira foto) e vídeo (`.nvdrv`, o primeiro quadro).
+
+A prévia é a maior que couber (até 640 px) **sem custar mais que o próprio
+`.nvdr`**, então o PNG fica com mais ou menos o dobro do `.nvdr`: montanha
+em q24 dá 41 KB de `.nvdr` e 82 KB de PNG, com prévia de 280 px. São 256
+cores com pontilhado, para pele e céu não ficarem em faixas.
+
+- `--budget F` muda o limite (prévia até F vezes o `.nvdr`; 0 desliga),
+  `--preview N` o tamanho máximo (0 = inteira), `--colours N` as cores
+  (0 = cores completas) e `--dither N` o pontilhado (0 a 100, 0 desliga).
+- Na página, um PNG desses solto na aba Imagem ou Vídeo abre o NVDR de
+  dentro, e cada resultado tem o botão **Baixar como PNG**.
+- `<nvdr-img src="foto.png">` mostra o NVDR de dentro, desenhando enquanto
+  baixa como com um `.nvdr`.
+- **Cuidado:** WhatsApp, Instagram, X e Facebook recomprimem a imagem e
+  jogam o bloco fora; quem recebe vê só a prévia. E-mail, Google Drive,
+  GitHub e Discord (como arquivo) mantêm o arquivo inteiro.
+
+---
+
 ## Vídeo
 
 ```bash

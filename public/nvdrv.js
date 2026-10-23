@@ -759,6 +759,52 @@ function findRefs(dpb, display) {
  * frames before it), so a frame is shown once every frame before it has
  * been; mirrors nvdrv_decode_next().
  */
+/*
+ * Where each frame is, without decoding any: { kind, display, start, end }
+ * in file order, read from the compact frame headers as decodeOne() reads
+ * them. A frame cut short ends at the end of the bytes; the walk stops at
+ * a header that did not arrive whole or makes no sense.
+ */
+export function frameIndex(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer), size = bytes.length;
+    const out = [];
+    let pos = HEADER_SIZE, lastDisplay = 0;
+    while (pos < size) {
+        let at = pos;
+        const a = bytes[at++], kind = a & 3, changed = (a >> 6) & 1;
+        if (a >> 7) break;
+        let r = getVarint(bytes, at, size);
+        if (r.n <= 0) break;
+        at += r.n;
+        const display = lastDisplay + unzigzag(r.v);
+        lastDisplay = display;
+        let which = 0;
+        if (changed) { if (at >= size) break; which = bytes[at++]; }
+        if (which & HDR_BLOCK) at++;
+        if (which & HDR_GLOBAL)
+            for (let k = 0; k < (kind === BI ? 4 : 2); k++) {
+                r = getVarint(bytes, at, size);
+                if (r.n <= 0) return out;
+                at += r.n;
+            }
+        if (which & HDR_FLAGS) at++;
+        if (which & HDR_BLOCKS) at += 2;
+        for (const bit of [HDR_QL, HDR_QC]) {
+            if (!(which & bit)) continue;
+            r = getVarint(bytes, at, size);
+            if (r.n <= 0) return out;
+            at += r.n;
+        }
+        if (which & HDR_BAND) at += 2;
+        r = getVarint(bytes, at, size);
+        if (r.n <= 0) break;
+        at += r.n;
+        out.push({ kind, display, start: pos, end: at + r.v });
+        pos = at + r.v;
+    }
+    return out;
+}
+
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);

@@ -1352,6 +1352,60 @@ not be bigger, and the 12-frame sequence as a burst, where every image
 after the first must be predicted. The fuzzer mutates an album's header
 and index as well as its payloads, and reads its last photo alone.
 
+### Sharing as a PNG
+
+`nvdr_png` dresses an NVDR image, album or video as a PNG, so it can go
+where only common formats go and still open as itself:
+
+    ./nvdr_png foto.nvdr foto.png [--budget 1] [--preview 640] [--colours 256] [--dither 75]
+    ./nvdr_png --extract foto.png foto.nvdr
+
+Any viewer shows the PNG's picture: a preview decoded from the file (an
+album's first photo, a video's first frame). It is as large as it can be,
+up to 640 pixels on its longer side, while its picture data costs no more
+than the NVDR file itself (`--budget 1`, found by bisection on the size),
+so the PNG is about twice the file. Its 256 colours come from median cut
+(Heckbert, "Color image quantization for frame buffer display", SIGGRAPH
+1982) refined by five rounds of k-means, and pixels take them through
+Floyd-Steinberg error diffusion (Floyd and Steinberg, "An adaptive
+algorithm for spatial grey scale", Proc. SID, 1976) at 75% of the error,
+serpentine, so skin and sky show grain instead of bands. The NVDR file
+rides along untouched in a private ancillary chunk, `nvDr`,
+which PNG readers skip by rule (lower-case first letter: ancillary;
+second: private; fourth: safe to copy). It comes right after IHDR, so its
+data starts at byte 41 and a page streaming the PNG decodes the NVDR in it
+as it arrives.
+
+On the six samples, directional with `--fast`, against the first version
+(320 pixels always, median cut alone, no dithering):
+
+                     NVDR      PNG, first version     PNG now
+    q 24             138 KB    365 KB (2.65x)         278 KB (2.02x)
+    q 12             222 KB    456 KB (2.06x)         444 KB (2.00x)
+
+The preview follows the file: 128 to 280 pixels at q 24, 154 to 384 at
+q 12 (montanha_pessoas, 75.8 KB of NVDR, gets 384). Each change on its
+own, at q 24 and 320 pixels: k-means 0.35 dB better and 1% smaller;
+dithering at 75% 0.4 dB worse pixel by pixel but 0.8 dB better once
+blurred as an eye at a normal distance does, for 9% more bytes; 64 or
+128 colours dithered lose 1.1 to 2.7 dB blurred; full colour costs 2.7
+times the palette. 128 pixels is the floor, which the smallest files
+cross: macarrao at q 24 is 3.7 KB of NVDR in an 8.9 KB PNG.
+
+The page opens such a PNG wherever it opens the file inside (an image or
+an album on the image tab, a video on the video tab, either tab passing
+it to the other), offers "Baixar como PNG" next to each result (through
+the server's `/png`, which runs `nvdr_png`; served as plain files, the
+page makes the same kind of PNG itself, deflated by the browser's
+CompressionStream), and `<nvdr-img
+src="foto.png">` shows one, `#n` picking a photo of an album in it.
+`public/nvdr-png.js` reads and writes the layout.
+
+Services that recompress what they are sent, which is most social
+networks and chat apps, drop ancillary chunks, and what arrives is the
+preview alone. E-mail, file hosting, and anything that passes a file as a
+file keep it whole.
+
 ### Frequency bands (format v11)
 
 Texture used to travel as one layer, tile by tile from the top. Half of
@@ -2021,6 +2075,45 @@ The tree is not threaded. Its subtrees allocate nodes from one arena as
 they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
+
+### The directional encoder's search
+
+The directional modes and the transform types made the encoder slow: a
+leaf candidate was coded in full for each of ten modes and, on each, for
+each of seven transform types, about 7 million forward transforms for a
+768x512 photo, and the partition search tried every shape of every node.
+What changed, in order, and what each did:
+
+    change                                          output
+    texture contexts read from a grid (nb_mag)      identical
+    a split stops once it cannot beat the whole     identical
+      (branch and bound: costs are never negative)
+    a reference's subpixel planes built once        identical
+    a node needing no texture is not split further  0.2% smaller
+      (intra pictures only; HEVC's HM does the same)
+    motion search reads subpixel samples by rows    identical
+    a leaf's transform types share each row pass    identical
+    modes and types ranked on estimated error       BD 0.0%
+    --fast: other types on the 2 cheapest modes     +0.8% bytes
+
+Encoding time, one machine, 4 cores (stills run on one):
+
+                              before    now      --fast
+    montanha_pessoas, q 24    20.3 s    13.8 s    5.7 s
+    macarrao, q 24             5.5 s     2.3 s    0.9 s
+    clean clip, 9 frames      67.4 s    44.9 s   28.6 s
+
+The estimated error is the coefficients' quantisation error, which equals
+the pixels' since the transforms are orthonormal (Parseval), so a
+candidate costs no inverse transform and paints nothing. The ranking is
+checked by coding the two cheapest estimates in full: on the six samples
+that gives the same BD-rate on PSNR-Y and PSNR-RGB as coding every
+candidate in full, in 85% of the time (87% with --fast, where it is 0.1%
+smaller), and keeping only the cheapest loses 0.4%. On the clean and
+multi clips it is within 0.3% either way; video gains less time, since a
+predicted frame's leaves mostly stop at INTER. RDOQ weighs each level the
+same way (Karczewicz, Ye and Chong, "Rate distortion optimized
+quantization", ITU-T VCEG-AH21, 2008).
 
 ### v11, and albums of large photos
 
@@ -2825,7 +2918,8 @@ B frames came later: see "B frames (sequence format 7)".
 
     src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
                 nvdrv.c for sequences
-    tools/      five CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album
+    tools/      six CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
+                nvdr_png
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
     samples/    the images every number in this file was measured on
@@ -2844,6 +2938,8 @@ B frames came later: see "B frames (sequence format 7)".
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
     ./nvdr_album unpack album.nvda out/ --compare .
+    ./nvdr_png out.nvdr out.png         # any of the three, as a PNG
+    ./nvdr_png --extract out.png back.nvdr
     make check          # the regression gate
     make fuzz           # the decoders under ASan and UBSan
 

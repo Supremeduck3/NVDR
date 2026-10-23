@@ -23,14 +23,21 @@
  *   the worker decodes the longest prefix that has arrived each time it
  *   is free; the ones in between are skipped, not queued.
  *
+ * - A PNG made by nvdr_png (nvdr-png.js) works as src too, an image or an
+ *   album inside it: <nvdr-img src="foto.png">, <nvdr-img src="album.png#2">.
+ *   The NVDR file starts at byte 41, so an image inside one still paints
+ *   while it downloads; an album inside one is fetched whole, since range
+ *   requests would need the PNG's layout.
+ *
  * `throttle="bytes-per-second"` slows the download down, to watch the
  * progressive render on a fast connection. The element fires `load` with
  * { detail: { bytes } } when it is done and `error` when it cannot be
- * shown. Deploy nvdr-img.js with nvdr.js, nvda.js, nvdrv.js,
+ * shown. Deploy nvdr-img.js with nvdr.js, nvda.js, nvdrv.js, nvdr-png.js,
  * nvdr-decoder.js, nvdr-worker.js and nvdr-tasks.js next to it.
  */
 import { paintFitted, shownWidth } from './nvdr.js';
 import { decoderFor } from './nvdr-decoder.js';
+import { isPng, nvdrInPngPrefix, nvdrFromPng, kindOf } from './nvdr-png.js';
 
 class NvdrImg extends HTMLElement {
     static get observedAttributes() { return ['src']; }
@@ -78,7 +85,7 @@ class NvdrImg extends HTMLElement {
                 this.paint(got.image.rgb, got.image.width, got.image.height, got.image.fitted);
                 bytes = got.fetched;
             } else {
-                bytes = await this.stream(url, generation);
+                bytes = await this.stream(url, generation, which);
             }
             if (generation === this.generation)
                 this.dispatchEvent(new CustomEvent('load', { detail: { bytes } }));
@@ -88,8 +95,10 @@ class NvdrImg extends HTMLElement {
         }
     }
 
-    /* Fetch a single image, painting prefixes as the worker keeps up. */
-    async stream(url, generation) {
+    /* Fetch a single image, painting prefixes as the worker keeps up; or a
+     * PNG carrying an image (painted the same way) or an album (`which`
+     * of its photos, once it has all arrived). */
+    async stream(url, generation, which) {
         const res = await fetch(url);
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
         const total = Number(res.headers.get('Content-Length')) || 0;
@@ -97,12 +106,22 @@ class NvdrImg extends HTMLElement {
         const decoder = decoderFor(new URL(url, document.baseURI).href);
         let buf = new Uint8Array(total || 65536), have = 0;
         let busy = null, painted = 0;
+        // Where the NVDR is in what arrives: all of it, or inside a PNG.
+        let lo = 0, hi = Infinity, png;
         // Decode what has arrived, unless a decode is running: then the
         // next one, when it ends, takes whatever has arrived by then.
         const repaint = () => {
             if (busy || have === painted || generation !== this.generation) return busy;
+            if (png === undefined) {
+                png = nvdrInPngPrefix(buf, have);
+                if (png) { lo = png.start; hi = png.start + png.length; }
+            }
+            // A PNG laid out otherwise (an editor moved the chunk) waits
+            // for its end, and so does an album.
+            if (png === undefined || (png === null && isPng(buf.subarray(0, have)))) return busy;
+            if (have <= lo + 4 || kindOf(buf.subarray(lo, lo + 4)) === 'NVDA') return busy;
             const upto = have;
-            busy = decoder.run({ op: 'decode', bytes: buf.slice(0, upto), fit: shownWidth(this.canvas) }).then(r => {
+            busy = decoder.run({ op: 'decode', bytes: buf.slice(lo, Math.min(upto, hi)), fit: shownWidth(this.canvas) }).then(r => {
                 busy = null;
                 if (generation !== this.generation) return;
                 if (r) this.paint(r.rgb, r.header.width, r.header.height, r.fitted);
@@ -138,6 +157,18 @@ class NvdrImg extends HTMLElement {
         }
         // The whole file, once whatever is running has finished.
         while (busy) await busy;
+        const inner = isPng(buf.subarray(0, have)) ? nvdrFromPng(buf.subarray(0, have)) : null;
+        if (isPng(buf.subarray(0, have)) && !inner) throw new Error('not a PNG carrying an NVDR file');
+        if (inner && !png) { png = { start: inner.byteOffset, length: inner.length }; lo = png.start; hi = lo + png.length; painted = 0; }
+        if (inner && kindOf(inner) === 'NVDA') {
+            await decoder.run({ op: 'put', key: 'album', bytes: inner.slice() });
+            const album = await decoder.run({ op: 'albumOpen', key: 'album' });
+            const index = /^\d+$/.test(which || '') ? Number(which) - 1 : Math.max(0, album.names.indexOf(which));
+            const img = await decoder.run({ op: 'albumDecode', key: 'album', index, fit: shownWidth(this.canvas) });
+            if (!img) throw new Error('photo did not arrive');
+            if (generation === this.generation) this.paint(img.rgb, img.width, img.height, img.fitted);
+            return have;
+        }
         await repaint();
         return have;
     }
