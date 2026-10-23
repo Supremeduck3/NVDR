@@ -2362,8 +2362,9 @@ grid and `<nvdr-img>` all use it.
 
 `public/nvdrv.js` is the sequence decoder in the browser, and the page has
 a video tab that plays a `.nvdrv` at the source's frame rate. A video
-dropped on the page goes to `POST /video`, where the server's ffmpeg cuts
-it into frames, `nvdrv_encode` codes them, and the container comes back.
+dropped on the page goes to `POST /video`, where the server's GStreamer
+(`gst-launch-1.0`, or ffmpeg when GStreamer is missing or lacks the
+format's plugin) cuts it into frames, `nvdrv_encode` codes them, and the container comes back.
 
 The JS decoder has to hold the same state as the C one after every frame,
 not just draw something similar: a predicted frame is a residual on top of
