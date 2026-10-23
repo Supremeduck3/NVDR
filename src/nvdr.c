@@ -262,6 +262,9 @@ static const int ADST8[8] = { 16, 32, 46, 59, 70, 79, 85, 87 };
 static const int ADST16[16] = { 8, 16, 25, 33, 41, 48, 55, 62, 68, 73, 77, 81, 84, 87, 88, 88 };
 
 static int tmat[3][NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* [kind][size][k * n + x] */
+/* The same as doubles, and transposed, for forward_tx(). */
+static double tmat_d[3][NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* [k * n + x] */
+static double tmat_t[3][NSIZES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];    /* [x * n + k] */
 static int scan_pos[NSHAPES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_ctx[NSHAPES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
 static uint8_t scan_diag[NSHAPES][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];   /* u + v */
@@ -300,6 +303,12 @@ static void tables_init(void) {
                     tmat[TX_IDTX][s][k * n + x] = k == x ? id : 0;
                 }
         }
+        for (int t = 0; t < 3; t++)
+            for (int k = 0; k < n; k++)
+                for (int x = 0; x < n; x++) {
+                    tmat_d[t][s][k * n + x] = tmat[t][s][k * n + x];
+                    tmat_t[t][s][x * n + k] = tmat[t][s][k * n + x];
+                }
     }
     /* Diagonal scan, low frequencies first; the context of a position is
      * its diagonal, fine at the low end where most coefficients live and
@@ -332,26 +341,65 @@ static void tables_init(void) {
  * across and h down, under transform type `tx` (0, the DCT, for every
  * leaf without a choice): the h-point transform down, the w-point one
  * across. */
+/*
+ * The seven transform types are three one-dimensional transforms, one per
+ * axis, and a leaf tries them all on the same block: so the pass across
+ * the rows is kept, per kind, for the last block seen, and the identity
+ * is a scaling rather than a product with a matrix of zeros. Each sum
+ * still runs over its terms in the order of a plain row-times-column
+ * product (the loops are nested so the innermost walks contiguous memory,
+ * which the compiler vectorises), and the identity's skipped terms are
+ * exact zeros: the coefficients are the same to the last bit.
+ */
+typedef struct {
+    int    s;                                   /* shape of the block held, -1 for none */
+    double in[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    double rows[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    int    ok[3];
+} RowPasses;
+/* One block per plane: a leaf's types are tried plane after plane. */
+#define ROW_CACHE 4
+static _Thread_local RowPasses row_cache[ROW_CACHE] = { { .s = -1 }, { .s = -1 }, { .s = -1 }, { .s = -1 } };
+static _Thread_local int row_next;
+
 static void forward_tx(int s, int tx, const double* in, double* out) {
-    /* Every sum runs over its terms in the same order as a plain row-times-
-     * column product; the loops are only nested so the innermost one walks
-     * contiguous memory, which the compiler vectorises. */
-    int w = SHAPE_W[s], h = SHAPE_H[s];
-    const int* t = tmat[TX_V[tx]][size_class(h)];
-    const int* th = tmat[TX_H[tx]][size_class(w)];
-    double tmp[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], tt[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-    double scale = 1.0 / (4096.0 * sqrt((double)w * h));
-    for (int u = 0; u < w; u++)
-        for (int x = 0; x < w; x++) tt[x * w + u] = th[u * w + x];
-    for (int y = 0; y < h; y++) {
-        double* row = tmp + y * w;
-        for (int u = 0; u < w; u++) row[u] = 0.0;
-        for (int x = 0; x < w; x++) {
-            double p = in[y * w + x];
-            const double* col = tt + x * w;
-            for (int u = 0; u < w; u++) row[u] += col[u] * p;
-        }
+    int w = SHAPE_W[s], h = SHAPE_H[s], n = w * h, kh = TX_H[tx], kv = TX_V[tx];
+    RowPasses* rc = NULL;
+    for (int i = 0; i < ROW_CACHE && !rc; i++)
+        if (row_cache[i].s == s && !memcmp(row_cache[i].in, in, sizeof(double) * (size_t)n)) rc = &row_cache[i];
+    if (!rc) {
+        rc = &row_cache[row_next];
+        row_next = (row_next + 1) % ROW_CACHE;
+        rc->s = s;
+        memcpy(rc->in, in, sizeof(double) * (size_t)n);
+        rc->ok[0] = rc->ok[1] = rc->ok[2] = 0;
     }
+    double* tmp = rc->rows[kh];
+    if (!rc->ok[kh]) {
+        if (kh == TX_IDTX) {
+            double id = tmat_d[TX_IDTX][size_class(w)][0];
+            for (int i = 0; i < n; i++) tmp[i] = id * in[i];
+        } else {
+            const double* tt = tmat_t[kh][size_class(w)];
+            for (int y = 0; y < h; y++) {
+                double* row = tmp + y * w;
+                for (int u = 0; u < w; u++) row[u] = 0.0;
+                for (int x = 0; x < w; x++) {
+                    double p = in[y * w + x];
+                    const double* col = tt + x * w;
+                    for (int u = 0; u < w; u++) row[u] += col[u] * p;
+                }
+            }
+        }
+        rc->ok[kh] = 1;
+    }
+    double scale = 1.0 / (4096.0 * sqrt((double)w * h));
+    if (kv == TX_IDTX) {
+        double id = tmat_d[TX_IDTX][size_class(h)][0];
+        for (int i = 0; i < n; i++) out[i] = id * tmp[i] * scale;
+        return;
+    }
+    const double* t = tmat_d[kv][size_class(h)];
     for (int v = 0; v < h; v++) {
         double* row = out + v * w;
         for (int u = 0; u < w; u++) row[u] = 0.0;
