@@ -73,6 +73,7 @@ static void usage(const char* a0) {
         "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.5)\n"
         "  --lookahead N    frames looked ahead of each intra frame (default 16)\n"
         "  --tpl F          how much their reuse refines the intra frame (default 1; 0 = off)\n"
+        "  --refs N         anchors a P frame predicts from, 1 or 2 (default 1)\n"
         "  --fast           try the other transform types only on the two cheapest\n"
         "                   modes of a leaf: much faster, slightly bigger\n"
         "  --tf N           source frames each side averaged into each anchor (default 7; 0 = off)\n"
@@ -84,7 +85,7 @@ static void usage(const char* a0) {
 typedef struct { size_t total, intra_total; int intra_count, count; } Totals;
 
 static const char* kind_name(int kind) {
-    return kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : "bi";
+    return kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : kind == NVDRV_PRED2 ? "pred2" : "bi";
 }
 
 /* Frames are reported as they are written, in coding order. */
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lookahead") && i+1 < argc) cfg.lookahead = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tpl") && i+1 < argc) cfg.tpl_strength = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fast")) cfg.frame.tx_modes = 2;
+        else if (!strcmp(argv[i], "--refs") && i+1 < argc) cfg.refs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf") && i+1 < argc) cfg.tf_radius = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-strength") && i+1 < argc) cfg.tf_strength = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--tf-levels") && i+1 < argc) cfg.tf_levels = atoi(argv[++i]);

@@ -67,6 +67,7 @@
 #define NVDRV_INTRA 0   /* the frame on its own */
 #define NVDRV_PRED  1   /* the error against the frame before it */
 #define NVDRV_BI    2   /* the error against the frames before and after it */
+#define NVDRV_PRED2 3   /* the error against the two anchors before it */
 
 /* The longest vector a sequence's field holds, in quarter pixels (96 px):
  * an anchor eight frames from its reference under a brisk pan. */
@@ -75,7 +76,7 @@
  * decoder holds at once (both anchors, the frames between, and the one
  * last shown). */
 #define NVDRV_MAX_B    15
-#define NVDRV_MAX_DPB  (NVDRV_MAX_B + 3)
+#define NVDRV_MAX_DPB  (NVDRV_MAX_B + 4)   /* and the anchor before the last, see MORE REFERENCES */
 #define NVDRV_MAX_LOOKAHEAD 32
 #define NVDRV_MAX_TF   7
 
@@ -143,6 +144,9 @@ typedef struct {
     /* B frames filtered too, by level: 1 the frame halfway between two
      * anchors, which the frames either side are predicted from. */
     int   tf_levels;
+    /* Anchors a P frame predicts from, 1 or 2 (see MORE REFERENCES in
+     * nvdrv.c). */
+    int   refs;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;
 
