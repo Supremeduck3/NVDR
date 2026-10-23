@@ -2022,6 +2022,45 @@ they descend, so running them in parallel makes the numbering depend on
 which finished first — which is the bug the old pipeline had, and would
 need per-subtree arenas merged in fixed order to avoid.
 
+### The directional encoder's search
+
+The directional modes and the transform types made the encoder slow: a
+leaf candidate was coded in full for each of ten modes and, on each, for
+each of seven transform types, about 7 million forward transforms for a
+768x512 photo, and the partition search tried every shape of every node.
+What changed, in order, and what each did:
+
+    change                                          output
+    texture contexts read from a grid (nb_mag)      identical
+    a split stops once it cannot beat the whole     identical
+      (branch and bound: costs are never negative)
+    a reference's subpixel planes built once        identical
+    a node needing no texture is not split further  0.2% smaller
+      (intra pictures only; HEVC's HM does the same)
+    motion search reads subpixel samples by rows    identical
+    a leaf's transform types share each row pass    identical
+    modes and types ranked on estimated error       BD 0.0%
+    --fast: other types on the 2 cheapest modes     +0.8% bytes
+
+Encoding time, one machine, 4 cores (stills run on one):
+
+                              before    now      --fast
+    montanha_pessoas, q 24    20.3 s    13.8 s    5.7 s
+    macarrao, q 24             5.5 s     2.3 s    0.9 s
+    clean clip, 9 frames      67.4 s    44.9 s   28.6 s
+
+The estimated error is the coefficients' quantisation error, which equals
+the pixels' since the transforms are orthonormal (Parseval), so a
+candidate costs no inverse transform and paints nothing. The ranking is
+checked by coding the two cheapest estimates in full: on the six samples
+that gives the same BD-rate on PSNR-Y and PSNR-RGB as coding every
+candidate in full, in 85% of the time (87% with --fast, where it is 0.1%
+smaller), and keeping only the cheapest loses 0.4%. On the clean and
+multi clips it is within 0.3% either way; video gains less time, since a
+predicted frame's leaves mostly stop at INTER. RDOQ weighs each level the
+same way (Karczewicz, Ye and Chong, "Rate distortion optimized
+quantization", ITU-T VCEG-AH21, 2008).
+
 ### v11, and albums of large photos
 
 A 3000x4500 photo took 13.6 s to encode and an album of three of them
