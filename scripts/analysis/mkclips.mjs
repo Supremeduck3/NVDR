@@ -1,4 +1,4 @@
-// node scripts/analysis/mkclips.mjs <outdir> [frames]
+// node scripts/analysis/mkclips.mjs <outdir> [frames] [long]
 //
 // The three test sequences the sequence measurements use, rebuilt from a
 // sample photo so anyone can reproduce them (they are not committed, and
@@ -11,6 +11,10 @@
 //   noisy   the same with sensor-like noise, new in every frame
 //   multi   a camera nearly still and three patches moving their own
 //           ways, with light noise
+//   long    (only when asked, for timing runs of any length) a camera
+//           wandering and zooming in and out on slow periodic paths, a
+//           patch bouncing across it, light noise: motion that stays inside
+//           the photo however many frames are made
 //
 // Synthetic, so optimistic in the ways frames.c lists: no light changes,
 // no content entering that the source does not have, noise that is white.
@@ -22,8 +26,8 @@ import { fileURLToPath } from 'node:url';
 import { writePPM } from './addnoise.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const [out, nArg] = process.argv.slice(2);
-if (!out) { console.error('usage: node mkclips.mjs <outdir> [frames]'); process.exit(2); }
+const [out, nArg, which] = process.argv.slice(2);
+if (!out) { console.error('usage: node mkclips.mjs <outdir> [frames] [long]'); process.exit(2); }
 const N = Number(nArg || 48), W = 960, H = 540;
 
 const SW = 1920;
@@ -76,6 +80,20 @@ const three = k => [
     { sx: 900, sy: 950, w: 220, h: 100, dx: 300 + 1.2 * k, dy: 420 - 3.4 * k },
 ];
 
-clip('clean', pan, one, 0);
-clip('noisy', pan, one, 4.0);
-clip('multi', still, three, 2.5);
+// Periods of 400, 290 and 500 frames: never quite repeating, never leaving the photo.
+const wander = k => {
+    const s = 1.25 + 0.15 * Math.sin(2 * Math.PI * k / 500);
+    return { x: 260 + 220 * Math.sin(2 * Math.PI * k / 400) + (1.4 - s) * W / 2,
+             y: 140 + 90 * Math.sin(2 * Math.PI * k / 290) + (1.4 - s) * H / 2, s };
+};
+const bounce = k => {
+    const tri = (t, p) => { const u = (t % (2 * p)) / p; return u < 1 ? u : 2 - u; };
+    return [{ sx: 60, sy: 40, w: 200, h: 140, dx: 20 + 720 * tri(k, 170), dy: 20 + 360 * tri(k, 110) }];
+};
+
+if (which === 'long') clip('long', wander, bounce, 2.0);
+else {
+    clip('clean', pan, one, 0);
+    clip('noisy', pan, one, 4.0);
+    clip('multi', still, three, 2.5);
+}

@@ -73,6 +73,8 @@ static void usage(const char* a0) {
         "  --b-q-step F     each level of B frames is 1 + F times coarser than P (default 0.5)\n"
         "  --lookahead N    frames looked ahead of each intra frame (default 16)\n"
         "  --tpl F          how much their reuse refines the intra frame (default 1; 0 = off)\n"
+        "  --fast           try the other transform types only on the two cheapest\n"
+        "                   modes of a leaf: much faster, slightly bigger\n"
         "  --tf N           source frames each side averaged into each anchor (default 7; 0 = off)\n"
         "  --tf-strength F  how far a match may differ, in units of the noise (default 4)\n"
         "  --no-restore     send no restoration filter with any frame\n"
@@ -119,6 +121,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--b-q-step") && i+1 < argc) cfg.b_q_step = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--lookahead") && i+1 < argc) cfg.lookahead = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tpl") && i+1 < argc) cfg.tpl_strength = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fast")) cfg.frame.tx_modes = 2;
         else if (!strcmp(argv[i], "--tf") && i+1 < argc) cfg.tf_radius = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-strength") && i+1 < argc) cfg.tf_strength = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--tf-levels") && i+1 < argc) cfg.tf_levels = atoi(argv[++i]);
