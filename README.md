@@ -1352,6 +1352,43 @@ not be bigger, and the 12-frame sequence as a burst, where every image
 after the first must be predicted. The fuzzer mutates an album's header
 and index as well as its payloads, and reads its last photo alone.
 
+### Sharing as a PNG
+
+`nvdr_png` dresses an NVDR image, album or video as a PNG, so it can go
+where only common formats go and still open as itself:
+
+    ./nvdr_png foto.nvdr foto.png [--preview 320] [--colours 256]
+    ./nvdr_png --extract foto.png foto.nvdr
+
+Any viewer shows the PNG's picture: a preview decoded from the file (an
+album's first photo, a video's first frame), shrunk to 320 pixels on its
+longer side and reduced to a 256-colour palette by median cut (Heckbert,
+"Color image quantization for frame buffer display", SIGGRAPH 1982). The
+NVDR file rides along untouched in a private ancillary chunk, `nvDr`,
+which PNG readers skip by rule (lower-case first letter: ancillary;
+second: private; fourth: safe to copy). It comes right after IHDR, so its
+data starts at byte 41 and a page streaming the PNG decodes the NVDR in it
+as it arrives.
+
+On montanha_pessoas at q 24, `--fast`: a 41.7 KB `.nvdr` makes a 91.2 KB
+PNG, the preview being 49.5 KB of it. The preview is the price of opening
+everywhere: 33 KB at 64 colours, 30 KB at 240 pixels, 127 KB in full
+colour at 320, 563 KB at full size, which is what a plain PNG of the
+decoded picture costs.
+
+The page opens such a PNG wherever it opens the file inside (an image or
+an album on the image tab, a video on the video tab, either tab passing
+it to the other), offers "Baixar como PNG" next to each result (through
+the server's `/png`, which runs `nvdr_png`; served as plain files, the
+page makes the PNG itself with a full-colour preview), and `<nvdr-img
+src="foto.png">` shows one, `#n` picking a photo of an album in it.
+`public/nvdr-png.js` reads and writes the layout.
+
+Services that recompress what they are sent, which is most social
+networks and chat apps, drop ancillary chunks, and what arrives is the
+preview alone. E-mail, file hosting, and anything that passes a file as a
+file keep it whole.
+
 ### Frequency bands (format v11)
 
 Texture used to travel as one layer, tile by tile from the top. Half of
@@ -2863,7 +2900,8 @@ B frames came later: see "B frames (sequence format 7)".
 
     src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
                 nvdrv.c for sequences
-    tools/      five CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album
+    tools/      six CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
+                nvdr_png
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
     samples/    the images every number in this file was measured on
@@ -2882,6 +2920,8 @@ B frames came later: see "B frames (sequence format 7)".
     ./nvdrv_decode out.nvdrv --out played/ --compare frames/
     ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
     ./nvdr_album unpack album.nvda out/ --compare .
+    ./nvdr_png out.nvdr out.png         # any of the three, as a PNG
+    ./nvdr_png --extract out.png back.nvdr
     make check          # the regression gate
     make fuzz           # the decoders under ASan and UBSan
 

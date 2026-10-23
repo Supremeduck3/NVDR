@@ -121,9 +121,10 @@
     <div id="drop">
       <p><strong>Solte uma imagem aqui</strong> ou clique para escolher</p>
       <p style="font-size:.85rem;margin-top:6px">JPG, PNG, BMP, WEBP, GIF ou TGA. Várias de uma vez viram
-        um álbum <code>.nvda</code>; um <code>.nvda</code> pronto abre direto.</p>
+        um álbum <code>.nvda</code>; um <code>.nvdr</code> ou <code>.nvda</code> pronto abre direto,
+        e também um PNG feito por <code>nvdr_png</code> ou pelo botão "Baixar como PNG".</p>
     </div>
-    <input type="file" id="file" accept="image/*,.nvda" multiple class="hidden">
+    <input type="file" id="file" accept="image/*,.nvdr,.nvda,.nvdrv" multiple class="hidden">
     <label class="note" style="display:block;margin-top:10px">Grão de sensor:
       <select id="grain">
         <option value="off">manter como está</option>
@@ -145,6 +146,10 @@
         "Sozinha" é quanto cada uma custaria codificada à parte, com a mesma qualidade.
       </p>
       <div id="albumSummary" class="note" style="margin:0 0 14px"></div>
+      <div class="player-bar" style="margin:0 0 14px">
+        <button id="albumSaveNvda" class="ghost">Baixar .nvda</button>
+        <button id="albumSavePng" class="ghost">Baixar como PNG</button>
+      </div>
       <div class="levels" id="albumGrid"></div>
     </div>
   </section>
@@ -159,6 +164,12 @@
         acumulados são exatamente o que o arquivo ocupa e o que trafegaria na rede.
       </p>
       <div class="levels" id="levels"></div>
+      <div class="player-bar">
+        <button id="saveNvdr" class="ghost">Baixar .nvdr</button>
+        <button id="savePng" class="ghost">Baixar como PNG</button>
+        <span class="note" style="margin:0">O PNG abre em qualquer lugar com uma prévia pequena e leva o
+          <code>.nvdr</code> inteiro dentro; esta página mostra o <code>.nvdr</code>.</span>
+      </div>
     </div>
 
     <div class="panel">
@@ -191,10 +202,11 @@
         <p><strong>Solte um vídeo aqui</strong> ou clique para escolher</p>
         <p style="font-size:.85rem;margin-top:6px">
           MP4, WebM, MOV, MKV ou AVI — o servidor extrai os quadros com ffmpeg.
-          Um <code>.nvdrv</code> pronto toca direto, sem passar pelo servidor.
+          Um <code>.nvdrv</code> pronto toca direto, sem passar pelo servidor, e também
+          um PNG que leve um.
         </p>
       </div>
-      <input type="file" id="vfile" accept="video/*,.nvdrv" class="hidden">
+      <input type="file" id="vfile" accept="video/*,.nvdrv,.png" class="hidden">
       <div class="opts">
         <label>Duração
           <select id="vseconds">
@@ -224,6 +236,8 @@
         <div class="player-bar">
           <button id="vplay">▶ Tocar</button>
           <button id="vrestart" class="ghost">⟲ Início</button>
+          <button id="vsaveNvdrv" class="ghost">Baixar .nvdrv</button>
+          <button id="vsavePng" class="ghost">Baixar como PNG</button>
           <span class="hud" id="vhud"></span>
         </div>
       </div>
@@ -254,6 +268,7 @@
 <script type="module">
 import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION } from './nvdr.js';
 import { decoderFor } from './nvdr-decoder.js';
+import { isPng, nvdrFromPng, kindOf, pngFor, download } from './nvdr-png.js';
 
 // Decoding runs in workers (nvdr-decoder.js): a large photo takes seconds,
 // and the page stays responsive meanwhile. `shown` counts what the page
@@ -295,13 +310,66 @@ drop.addEventListener('drop', (e) => {
 });
 fileInput.addEventListener('change', () => handleFiles([...fileInput.files]));
 
-function handleFiles(files) {
+async function handleFiles(files) {
     if (!files.length) return;
-    if (files.length === 1 && files[0].name.toLowerCase().endsWith('.nvda')) { openAlbumFile(files[0]); return; }
+    if (files.length === 1 && await openEncoded(files[0])) return;
     if (files.length > 1) { makeAlbum(files); return; }
     albumEl.classList.add('hidden');
     handleFile(files[0]);
 }
+
+/* A file already encoded, as itself or inside a PNG (nvdr-png.js), opens
+ * here without the server: an image or an album in this tab, a video in
+ * the other. False for anything else, which goes to the encoder. */
+async function openEncoded(file) {
+    if (!/\.(nvdr|nvda|nvdrv|png)$/i.test(file.name)) return false;
+    const whole = new Uint8Array(await file.arrayBuffer());
+    const bytes = isPng(whole) ? nvdrFromPng(whole) : whole;
+    const kind = bytes && kindOf(bytes);
+    if (!kind) return false;
+    const buffer = bytes.slice().buffer;
+    const name = file.name.replace(/\.png$/i, '');
+    if (kind === 'NVDV') {
+        document.dispatchEvent(new CustomEvent('nvdr-open-video', { detail: { buffer, name } }));
+        return true;
+    }
+    results.classList.add('hidden');
+    albumEl.classList.add('hidden');
+    if (kind === 'NVDA') { albumName = name; showAlbum(buffer, '', 0); }
+    else showContainer(buffer, name, 0, '(arquivo aberto localmente, sem relatório)');
+    return true;
+}
+
+let containerName = 'imagem', albumName = 'album', albumBuffer = null;
+const stem = (name) => name.replace(/\.[^.]*$/, '') || 'nvdr';
+
+document.getElementById('saveNvdr').onclick = () => {
+    if (container) download(container, `${stem(containerName)}.nvdr`);
+};
+document.getElementById('savePng').onclick = async () => {
+    if (!container) return;
+    const canvas = levelsEl.querySelectorAll('canvas')[2] || truncCanvas;
+    try { download(await pngFor(container, canvas), `${stem(containerName)}.png`, 'image/png'); }
+    catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
+};
+document.getElementById('albumSaveNvda').onclick = () => {
+    if (albumBuffer) download(albumBuffer, `${stem(albumName)}.nvda`);
+};
+document.getElementById('albumSavePng').onclick = async () => {
+    const canvas = albumGrid.querySelector('canvas');
+    if (!albumBuffer || !canvas) return;
+    try { download(await pngFor(albumBuffer, canvas), `${stem(albumName)}.png`, 'image/png'); }
+    catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
+};
+
+// The video tab asks this one to open what it was given that is not a video.
+document.addEventListener('nvdr-open-image', (e) => {
+    results.classList.add('hidden');
+    albumEl.classList.add('hidden');
+    const { buffer, name } = e.detail;
+    if (kindOf(buffer) === 'NVDA') { albumName = name; showAlbum(buffer, '', 0); }
+    else showContainer(buffer, name, 0, '(arquivo aberto localmente, sem relatório)');
+});
 
 const albumEl = document.getElementById('album');
 const albumGrid = document.getElementById('albumGrid');
@@ -334,16 +402,13 @@ async function makeAlbum(files) {
     if (!response.ok) { setStatus(`Encoder falhou: ${await response.text()}`, true); return; }
     const buffer = await response.arrayBuffer();
     const report = response.headers.get('X-Encoder-Report');
+    albumName = 'album';
     showAlbum(buffer, report ? new TextDecoder().decode(Uint8Array.from(atob(report), c => c.charCodeAt(0))) : '', original);
-}
-
-async function openAlbumFile(file) {
-    results.classList.add('hidden');
-    showAlbum(await file.arrayBuffer(), '', 0);
 }
 
 async function showAlbum(buffer, report, original) {
     const mine = ++shown;
+    albumBuffer = buffer;
     let album;
     try {
         await albumDecoder.run({ op: 'put', key: 'album', bytes: buffer });
@@ -423,20 +488,26 @@ async function handleFile(file) {
         return;
     }
 
-    container = await response.arrayBuffer();
+    const encoded = response.headers.get('X-Encoder-Report');
+    // The encoder names the server's temp upload; show the real filename.
+    await showContainer(await response.arrayBuffer(), file.name, file.size, encoded
+        ? atob(encoded).trim().replace(/^\S*temp_[0-9a-f-]+\.\w+/, file.name)
+        : '(sem relatório)');
+}
+
+/* An image container, from the encoder or opened as it is (`size` 0:
+ * there is no original to compare with). */
+async function showContainer(buffer, name, size, report) {
+    container = buffer;
+    containerName = name;
     wholeDecode = null;
     shown++;
     imageDecoder.run({ op: 'put', key: 'image', bytes: container }).catch(() => {});
-    sourceSize = file.size;
+    sourceSize = size;
+    reportEl.textContent = report;
 
-    const encoded = response.headers.get('X-Encoder-Report');
-    // The encoder names the server's temp upload; show the real filename.
-    reportEl.textContent = encoded
-        ? atob(encoded).trim().replace(/^\S*temp_[0-9a-f-]+\.\w+/, file.name)
-        : '(sem relatório)';
-
-    setStatus(`${formatBytes(container.byteLength)} para qualidade cheia, ` +
-              `${(100 * container.byteLength / file.size).toFixed(0)}% do original.`);
+    setStatus(`${formatBytes(container.byteLength)} para qualidade cheia` +
+              (size ? `, ${(100 * container.byteLength / size).toFixed(0)}% do original.` : '.'));
     results.classList.remove('hidden');
 
     await showLevels();
@@ -553,7 +624,8 @@ async function showTruncated() {
  * shows it at the rate the source was shot, one decode per animation tick,
  * so the timing it reports is the real cost of playing the file here.
  */
-import { SequenceDecoder, readSequenceHeader, showRGB, INTRA, PRED } from './nvdrv.js';
+import { SequenceDecoder, readSequenceHeader, frameIndex, showRGB, INTRA, PRED } from './nvdrv.js';
+import { isPng, nvdrFromPng, kindOf, pngFor, download } from './nvdr-png.js';
 
 const $ = (id) => document.getElementById(id);
 const AHEAD = 6;          // frames decoded ahead of the one on screen
@@ -575,6 +647,13 @@ function showTab(video) {
 $('tabImage').onclick = () => showTab(false);
 $('tabVideo').onclick = () => showTab(true);
 
+// A video dropped on the image tab, as itself or inside a PNG.
+document.addEventListener('nvdr-open-video', (e) => {
+    showTab(true);
+    pause();
+    openSequence(e.detail.buffer, e.detail.name, 0, '(arquivo aberto localmente, sem relatório)');
+});
+
 /* --- loading --------------------------------------------------------- */
 const vstatus = $('vstatus');
 const setStatus = (html, err) => { vstatus.innerHTML = err ? `<span class="err">${html}</span>` : html; };
@@ -594,9 +673,17 @@ async function loadFile(file) {
     const dot = file.name.lastIndexOf('.');
     const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
 
-    if (ext === '.nvdrv') {
-        // Already encoded: it plays here and never touches the server.
-        openSequence(await file.arrayBuffer(), file.name, 0, '(arquivo aberto localmente, sem relatório)');
+    if (ext === '.nvdrv' || ext === '.png') {
+        // Already encoded: it plays here and never touches the server. A
+        // PNG carrying an image or an album goes to the image tab.
+        const whole = new Uint8Array(await file.arrayBuffer());
+        const bytes = isPng(whole) ? nvdrFromPng(whole) : whole;
+        const kind = bytes && kindOf(bytes), name = file.name.replace(/\.png$/i, '');
+        if (kind === 'NVDV') openSequence(bytes.slice().buffer, name, 0, '(arquivo aberto localmente, sem relatório)');
+        else if (kind) {
+            showTab(false);
+            document.dispatchEvent(new CustomEvent('nvdr-open-image', { detail: { buffer: bytes.slice().buffer, name } }));
+        } else setStatus('Este PNG não leva um arquivo NVDR.', true);
         return;
     }
 
@@ -645,22 +732,10 @@ const player = {
 };
 
 /* Frame boundaries from the headers alone, without decoding anything. */
-function indexFrames(bytes) {
-    const out = [];
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    let pos = 24;
-    while (pos + 20 <= bytes.length) {
-        const len = dv.getUint32(pos + 6, true);
-        out.push({ kind: bytes[pos], display: dv.getUint32(pos + 14, true), start: pos, end: pos + 20 + len });
-        pos += 20 + len;
-    }
-    return out;
-}
-
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
     if (!info) { setStatus('Não é um arquivo NVDRV v19 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
-    const frames = indexFrames(new Uint8Array(buffer));
+    const frames = frameIndex(buffer);
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;
     seq = { buffer, info, frames, name };
@@ -682,11 +757,19 @@ function openSequence(buffer, name, sourceSize, report, seconds) {
     play();
 }
 
+const vstem = (name) => name.replace(/\.[^.]*$/, '') || 'video';
+$('vsaveNvdrv').onclick = () => { if (seq) download(seq.buffer, `${vstem(seq.name)}.nvdrv`); };
+$('vsavePng').onclick = async () => {
+    if (!seq) return;
+    try { download(await pngFor(seq.buffer, $('vcanvas')), `${vstem(seq.name)}.png`, 'image/png'); }
+    catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
+};
+
 function setKept(bytes) {
     player.kept = bytes;
     rewind();
     const whole = seq.frames.filter(f => f.end <= bytes).length;
-    const partial = seq.frames.some(f => f.start + 20 < bytes && f.end > bytes);
+    const partial = seq.frames.some(f => f.start < bytes && f.end > bytes);
     $('vtruncOut').innerHTML =
         `<b>${formatBytes(bytes)}</b> de ${formatBytes(seq.buffer.byteLength)} — ` +
         `${whole} quadro${whole === 1 ? '' : 's'} inteiro${whole === 1 ? '' : 's'}` +

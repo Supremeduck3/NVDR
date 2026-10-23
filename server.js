@@ -15,6 +15,9 @@ const ALLOWED_EXTS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', 
 // otherwise. It runs on the machine serving the page, not in the browser.
 const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+
+// What /png accepts: an NVDR image, album or video, to dress as a PNG.
+const NVDR_EXTS = new Set(['.nvdr', '.nvda', '.nvdrv']);
 const FFMPEG = process.env.NVDR_FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.NVDR_FFPROBE || 'ffprobe';
 
@@ -27,6 +30,8 @@ const STATIC_TYPES = {
     '.nvdr': 'application/octet-stream',
     '.nvda': 'application/octet-stream',
     '.nvdrv': 'application/octet-stream',
+    // NVDR files dressed as PNGs (tools/nvdr_png.c): <nvdr-img> reads them too.
+    '.png': 'image/png',
     // The decoder as WebAssembly (public/nvdr.wasm).
     '.wasm': 'application/wasm'
 };
@@ -442,6 +447,25 @@ const server = http.createServer((req, res) => {
 
     if (req.url === '/video') {
         handleVideo(req, res);
+        return;
+    }
+
+    if (req.url === '/png') {
+        receiveUpload(req, res, (inputPath, fileId) => {
+            const outPng = path.join(outDir, `temp_${fileId}.png`);
+            const artifacts = [inputPath, outPng];
+            const exePath = findExecutable(__dirname, 'nvdr_png');
+            if (!exePath) {
+                if (!res.writableEnded) {
+                    res.writeHead(500);
+                    res.end(`nvdr_png not found in ${__dirname}. Build it with \`make\`.`);
+                }
+                setTimeout(() => artifacts.forEach(safeUnlink), 5000);
+                return;
+            }
+            const args = [inputPath, outPng, '--preview', String(intHeader(req, 'x-preview', 320, 0, 4096))];
+            runConverter(res, { exePath, args, resultPath: outPng, artifacts, label: 'PNG' });
+        }, { exts: NVDR_EXTS });
         return;
     }
 
