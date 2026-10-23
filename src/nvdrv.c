@@ -313,6 +313,15 @@ static int block_sad(const NvdrImage* cur, const NvdrImage* ref,
         if (sy >= ref->height) sy = ref->height - 1;
         const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
         const unsigned char* row = ref->pixels + (size_t)sy * ref->width * 3;
+        if (x0 + dx >= 0 && x0 + bw + dx <= ref->width) {
+            /* no column to clamp: one run, which the compiler vectorises */
+            const unsigned char* b = row + (size_t)(x0 + dx) * 3;
+            int s = 0;
+            for (int i = 0; i < 3 * bw; i++) s += abs(a[i] - b[i]);
+            acc += s;
+            if (acc >= limit) return acc;
+            continue;
+        }
         for (int x = x0; x < x0 + bw; x++, a += 3) {
             int sx = x + dx;
             if (sx < 0) sx = 0;
@@ -615,16 +624,31 @@ static inline int qsample(const Subpel* s, int x, int y, int fx, int fy, int c) 
     }
 }
 
+/* n pixels of one row from (x, y) under one vector, three channels each:
+ * what qsample() gives them one at a time. A sequence's planes hold every
+ * phase, so the row is a run of one plane. */
+static inline void qrow(const Subpel* s, int x, int y, int fx, int fy, int n, int* out) {
+    if (s->Q[1]) {
+        const uint8_t* p = s->Q[((fy & 3) << 2) | (fx & 3)] + sp_at(s, x + (fx >> 2), y + (fy >> 2));
+        for (int i = 0; i < 3 * n; i++) out[i] = p[i];
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        for (int c = 0; c < 3; c++) out[3 * i + c] = qsample(s, x + i, y, fx, fy, c);
+}
+
+#define ROW_MAX (3 * 256)    /* a row of a block or unit, 128 px at most, with room */
+
 static int block_sad_q(const NvdrImage* cur, const Subpel* ref,
                        int x0, int y0, int bw, int bh, int fx, int fy, int limit) {
-    int acc = 0;
+    int acc = 0, row[ROW_MAX];
     for (int y = y0; y < y0 + bh; y++) {
         const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
-        for (int x = x0; x < x0 + bw; x++, a += 3)
-            for (int c = 0; c < 3; c++) {
-                int d = a[c] - qsample(ref, x, y, fx, fy, c);
-                acc += d < 0 ? -d : d;
-            }
+        qrow(ref, x0, y, fx, fy, bw, row);
+        for (int i = 0; i < 3 * bw; i++) {
+            int d = a[i] - row[i];
+            acc += d < 0 ? -d : d;
+        }
         if (acc >= limit) return acc;
     }
     return acc;
@@ -674,9 +698,11 @@ static void block_predict(const Subpel* src, NvdrImage* dst, int block,
         const int16_t* rvx = vx + (size_t)(y / block) * nbx;
         const int16_t* rvy = vy + (size_t)(y / block) * nbx;
         unsigned char* out = dst->pixels + (size_t)y * dst->width * 3;
-        for (int x = 0; x < dst->width; x++, out += 3) {
-            int b = x / block;
-            for (int c = 0; c < 3; c++) out[c] = (unsigned char)qsample(src, x, y, rvx[b], rvy[b], c);
+        int row[ROW_MAX];
+        for (int x = 0; x < dst->width; x += block) {
+            int b = x / block, n = dst->width - x < block ? dst->width - x : block;
+            qrow(src, x, y, rvx[b], rvy[b], n, row);
+            for (int i = 0; i < 3 * n; i++) out[(size_t)x * 3 + i] = (unsigned char)row[i];
         }
     }
 }
@@ -1094,16 +1120,15 @@ static void block_predict_bi(const Subpel* r0, const Subpel* r1, NvdrImage* dst,
     for (int y = 0; y < dst->height; y++) {
         size_t row = (size_t)(y / block) * nbx;
         unsigned char* out = dst->pixels + (size_t)y * dst->width * 3;
-        for (int x = 0; x < dst->width; x++, out += 3) {
+        int pa[ROW_MAX], pb[ROW_MAX];
+        for (int x = 0; x < dst->width; x += block) {
             size_t b = row + (size_t)(x / block);
-            for (int c = 0; c < 3; c++) {
-                int v;
-                if (mode[b] == MODE_FWD) v = qsample(r0, x, y, v0x[b], v0y[b], c);
-                else if (mode[b] == MODE_BWD) v = qsample(r1, x, y, v1x[b], v1y[b], c);
-                else v = (qsample(r0, x, y, v0x[b], v0y[b], c) +
-                          qsample(r1, x, y, v1x[b], v1y[b], c) + 1) >> 1;
-                out[c] = (unsigned char)v;
-            }
+            int n = dst->width - x < block ? dst->width - x : block;
+            if (mode[b] != MODE_BWD) qrow(r0, x, y, v0x[b], v0y[b], n, pa);
+            if (mode[b] != MODE_FWD) qrow(r1, x, y, v1x[b], v1y[b], n, pb);
+            for (int i = 0; i < 3 * n; i++)
+                out[(size_t)x * 3 + i] = (unsigned char)(mode[b] == MODE_FWD ? pa[i] : mode[b] == MODE_BWD ? pb[i]
+                                                         : (pa[i] + pb[i] + 1) >> 1);
         }
     }
 }
@@ -1243,10 +1268,9 @@ static void obmc_apply(const Grid* G, const Motion* M, NvdrImage* dst) {
 
 /* One channel of obmc_apply's result at (x, y), alone: a pixel is only
  * blended by its own cell's passes, in the same order. */
-static int obmc_sample(const Grid* G, const Motion* M, const uint8_t* mask, int L, int x, int y, int c) {
+static int obmc_blend(const Grid* G, const Motion* M, const uint8_t* mask, int L, int x, int y, int c, int p) {
     int g = G->g, fx = x / g, fy = y / g, b = fy * G->nfx + fx, x0 = fx * g, y0 = fy * g;
     int bw = G->w - x0 < g ? G->w - x0 : g, bh = G->h - y0 < g ? G->h - y0 : g;
-    int p = motion_sample(M, b, x, y, c);
     for (int side = 0; side < 4; side++) {
         int n, d, extent;
         if (side == 0) { if (fy == 0) continue; n = b - G->nfx; d = y - y0; extent = bh; }
@@ -1261,15 +1285,34 @@ static int obmc_sample(const Grid* G, const Motion* M, const uint8_t* mask, int 
 
 /* Absolute error of the overlapped prediction against `cur` over a
  * rectangle, stopping once past `limit`. */
+/* A row of cells' own predictions, n pixels from (x, y): motion_sample()
+ * a run at a time, one run per cell. */
+static void motion_row(const Grid* G, const Motion* M, int x, int y, int n, int* out) {
+    int pa[ROW_MAX], pb[ROW_MAX];
+    for (int i = 0; i < n;) {
+        int xx = x + i, b = (y / G->g) * G->nfx + xx / G->g;
+        int run = G->g - xx % G->g;
+        if (run > n - i) run = n - i;
+        int md = M->mode ? M->mode[b] : MODE_FWD;
+        if (md != MODE_BWD) qrow(M->r0, xx, y, M->v0x[b], M->v0y[b], run, pa);
+        if (md != MODE_FWD) qrow(M->r1, xx, y, M->v1x[b], M->v1y[b], run, pb);
+        for (int k = 0; k < 3 * run; k++)
+            out[3 * i + k] = md == MODE_FWD ? pa[k] : md == MODE_BWD ? pb[k] : (pa[k] + pb[k] + 1) >> 1;
+        i += run;
+    }
+}
+
 static int obmc_sad(const Grid* G, const Motion* M, const NvdrImage* cur,
                     int x0, int y0, int x1, int y1, int limit) {
     int L = G->g / 2 > 0 ? G->g / 2 : 1, acc = 0;
     const uint8_t* mask = obmc_mask(L);
+    int own[ROW_MAX];
     for (int y = y0; y < y1; y++) {
         const unsigned char* a = cur->pixels + ((size_t)y * cur->width + x0) * 3;
+        motion_row(G, M, x0, y, x1 - x0, own);
         for (int x = x0; x < x1; x++, a += 3)
             for (int c = 0; c < 3; c++) {
-                int d = a[c] - obmc_sample(G, M, mask, L, x, y, c);
+                int d = a[c] - obmc_blend(G, M, mask, L, x, y, c, own[3 * (x - x0) + c]);
                 acc += d < 0 ? -d : d;
             }
         if (acc >= limit) return acc;
@@ -1633,9 +1676,13 @@ static int unit_sad(const VfDecide* D, int fx, int fy, int x0, int y0, int bw, i
     const Grid* G = D->G;
     int g = G->g, L = g / 2 > 0 ? g / 2 : 1, acc = 0;
     const uint8_t* mask = obmc_mask(L);
+    int pa[ROW_MAX], pb[ROW_MAX];
     for (int j = 0; j < bh; j++) {
         int y = y0 + j, cy = fy + j / g, jj = j % g;
         const unsigned char* a = D->cur->pixels + ((size_t)y * D->cur->width + x0) * 3;
+        /* the candidate's own prediction of the row, as cand_sample() makes it */
+        if (md != MODE_BWD) qrow(D->r0, x0, y, v0x, v0y, bw, pa);
+        if (md != MODE_FWD) qrow(D->r1, x0, y, v1x, v1y, bw, pb);
         for (int i = 0; i < bw; i++, a += 3) {
             int x = x0 + i, cx = fx + i / g, ii = i % g;
             /* The neighbours this pixel blends with: above if it is in the
@@ -1650,7 +1697,8 @@ static int unit_sad(const VfDecide* D, int fx, int fy, int x0, int y0, int bw, i
                 if (!cell_same(D, b, md, v0x, v0y, v1x, v1y)) lf = b;
             }
             for (int c = 0; c < 3; c++) {
-                int p = cand_sample(D, md, v0x, v0y, v1x, v1y, x, y, c);
+                int k = 3 * i + c;
+                int p = md == MODE_FWD ? pa[k] : md == MODE_BWD ? pb[k] : (pa[k] + pb[k] + 1) >> 1;
                 if (up >= 0) p = (mask[jj] * p + (64 - mask[jj]) * cell_sample(D, up, x, y, c) + 32) >> 6;
                 if (lf >= 0) p = (mask[ii] * p + (64 - mask[ii]) * cell_sample(D, lf, x, y, c) + 32) >> 6;
                 int d = a[c] - p;
