@@ -16,7 +16,7 @@ const ALLOWED_EXTS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', 
 // otherwise. They run on the machine serving the page, not in the browser.
 const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
-const GST_LAUNCH = process.env.NVDR_GST_LAUNCH || 'gst-launch-1.0';
+const GST_LAUNCH = process.env.NVDR_GST_LAUNCH || findGstLaunch();
 const FFMPEG = process.env.NVDR_FFMPEG || 'ffmpeg';
 const FFPROBE = process.env.NVDR_FFPROBE || 'ffprobe';
 
@@ -72,6 +72,26 @@ function findExecutable(dir, name) {
         } catch (e) { /* permission errors fall through */ }
     }
     return null;
+}
+
+/*
+ * The Windows installer records where GStreamer went in
+ * GSTREAMER_1_0_ROOT_MSVC_X86_64 (or _MINGW_X86_64) but leaves PATH alone,
+ * and the macOS framework is off PATH too, so those places come first.
+ */
+function findGstLaunch() {
+    const dirs = process.platform === 'win32'
+        ? [...Object.keys(process.env).filter(k => /^GSTREAMER_1_0_ROOT_/i.test(k))
+                                      .map(k => path.join(process.env[k], 'bin')),
+           'C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\\bin',
+           'C:\\gstreamer\\1.0\\msvc_x86_64\\bin',
+           'C:\\gstreamer\\1.0\\mingw_x86_64\\bin']
+        : ['/Library/Frameworks/GStreamer.framework/Versions/1.0/bin'];
+    for (const dir of dirs) {
+        const exe = findExecutable(dir, 'gst-launch-1.0');
+        if (exe) return exe;
+    }
+    return 'gst-launch-1.0';
 }
 
 /*
@@ -574,5 +594,6 @@ server.listen(PORT, () => {
     console.log(`\n==========================================`);
     console.log(`🚀 NVDR server running!`);
     console.log(`➡️  http://localhost:${PORT}/`);
+    console.log(`🎞️  vídeo: ${GST_LAUNCH} (ou ${FFMPEG})`);
     console.log(`==========================================\n`);
 });
