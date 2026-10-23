@@ -340,25 +340,25 @@ async function openEncoded(file) {
     return true;
 }
 
-let containerName = 'imagem', albumName = 'album', albumBuffer = null;
+let containerName = 'imagem', albumName = 'album', albumBuffer = null, albumFirst = null;
 const stem = (name) => name.replace(/\.[^.]*$/, '') || 'nvdr';
 
 document.getElementById('saveNvdr').onclick = () => {
     if (container) download(container, `${stem(containerName)}.nvdr`);
 };
 document.getElementById('savePng').onclick = async () => {
-    if (!container) return;
-    const canvas = levelsEl.querySelectorAll('canvas')[2] || truncCanvas;
-    try { download(await pngFor(container, canvas), `${stem(containerName)}.png`, 'image/png'); }
+    if (!container || !wholeDecode) return;
+    const { rgb, header } = wholeDecode;
+    try { download(await pngFor(container, rgb, header.width, header.height), `${stem(containerName)}.png`, 'image/png'); }
     catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
 };
 document.getElementById('albumSaveNvda').onclick = () => {
     if (albumBuffer) download(albumBuffer, `${stem(albumName)}.nvda`);
 };
 document.getElementById('albumSavePng').onclick = async () => {
-    const canvas = albumGrid.querySelector('canvas');
-    if (!albumBuffer || !canvas) return;
-    try { download(await pngFor(albumBuffer, canvas), `${stem(albumName)}.png`, 'image/png'); }
+    if (!albumBuffer || !albumFirst) return;
+    const { rgb, width, height } = albumFirst;
+    try { download(await pngFor(albumBuffer, rgb, width, height), `${stem(albumName)}.png`, 'image/png'); }
     catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
 };
 
@@ -409,6 +409,7 @@ async function makeAlbum(files) {
 async function showAlbum(buffer, report, original) {
     const mine = ++shown;
     albumBuffer = buffer;
+    albumFirst = null;
     let album;
     try {
         await albumDecoder.run({ op: 'put', key: 'album', bytes: buffer });
@@ -444,6 +445,7 @@ async function showAlbum(buffer, report, original) {
             } catch (e) { wrap.remove(); throw e; }
             if (mine !== shown) return;
             if (!img) { wrap.remove(); break; }
+            if (i === 0) albumFirst = img;   // the PNG's preview
             wrap.querySelector('.meta').innerHTML = `${x.kind === 1 ? `prevista da ${i - x.ref + 1} · ` : ''}${formatBytes(bytes)}${solo ? ` · sozinha ${formatBytes(solo)} ` +
                 `(${(100 * (bytes - solo) / solo).toFixed(1)}%)` : ''}${img.partial ? ' · parcial' : ''}`;
             paintFitted(canvas, img.rgb, img.width, img.height, img.fitted);
@@ -761,7 +763,11 @@ const vstem = (name) => name.replace(/\.[^.]*$/, '') || 'video';
 $('vsaveNvdrv').onclick = () => { if (seq) download(seq.buffer, `${vstem(seq.name)}.nvdrv`); };
 $('vsavePng').onclick = async () => {
     if (!seq) return;
-    try { download(await pngFor(seq.buffer, $('vcanvas')), `${vstem(seq.name)}.png`, 'image/png'); }
+    // The frame on screen, as the PNG's preview.
+    const c = $('vcanvas'), rgba = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    const rgb = new Uint8Array(c.width * c.height * 3);
+    for (let i = 0, j = 0; i < rgba.length; i += 4, j += 3) { rgb[j] = rgba[i]; rgb[j + 1] = rgba[i + 1]; rgb[j + 2] = rgba[i + 2]; }
+    try { download(await pngFor(seq.buffer, rgb, c.width, c.height), `${vstem(seq.name)}.png`, 'image/png'); }
     catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
 };
 

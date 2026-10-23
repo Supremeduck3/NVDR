@@ -85,14 +85,168 @@ export function wrapPng(nvdr, preview) {
     return out;
 }
 
+/* ---------------------------------------------- previews, as nvdr_png's */
+
+const PREVIEW_MAX = 640, PREVIEW_MIN = 128, REFINE = 5, DITHER = 0.75;
+
+/* `rgb` (3 bytes a pixel, w x h) averaged down so the longer side is
+ * `side`: shrink() in nvdr_png.c. */
+function shrinkTo(rgb, w, h, side) {
+    const big = Math.max(w, h);
+    if (big <= side) return { rgb, w, h };
+    const W = Math.max(1, Math.floor(w * side / big)), H = Math.max(1, Math.floor(h * side / big));
+    const o = new Uint8Array(W * H * 3);
+    for (let y = 0; y < H; y++) {
+        const y0 = Math.floor(y * h / H), y1 = Math.floor((y + 1) * h / H);
+        for (let x = 0; x < W; x++) {
+            const x0 = Math.floor(x * w / W), x1 = Math.floor((x + 1) * w / W), n = (x1 - x0) * (y1 - y0);
+            for (let c = 0; c < 3; c++) {
+                let s = 0;
+                for (let j = y0; j < y1; j++) for (let i = x0; i < x1; i++) s += rgb[(j * w + i) * 3 + c];
+                o[(y * W + x) * 3 + c] = Math.floor((s + (n >> 1)) / n);
+            }
+        }
+    }
+    return { rgb: o, w: W, h: H };
+}
+
+/* Median cut on a 15-bit histogram, then k-means: quantise_palette(). */
+function palette(rgb, colours) {
+    const hist = new Float64Array(32768), sum = new Float64Array(32768 * 3);
+    for (let i = 0; i < rgb.length; i += 3) {
+        const k = (rgb[i] >> 3) << 10 | (rgb[i + 1] >> 3) << 5 | rgb[i + 2] >> 3;
+        hist[k]++; sum[k * 3] += rgb[i]; sum[k * 3 + 1] += rgb[i + 1]; sum[k * 3 + 2] += rgb[i + 2];
+    }
+    const fit = b => {
+        const lo = [31, 31, 31], hi = [0, 0, 0];
+        let n = 0;
+        for (let r = b.lo[0]; r <= b.hi[0]; r++) for (let g = b.lo[1]; g <= b.hi[1]; g++) for (let u = b.lo[2]; u <= b.hi[2]; u++) {
+            const h = hist[r << 10 | g << 5 | u];
+            if (!h) continue;
+            n += h;
+            [r, g, u].forEach((v, c) => { if (v < lo[c]) lo[c] = v; if (v > hi[c]) hi[c] = v; });
+        }
+        b.count = n;
+        if (n) { b.lo = lo; b.hi = hi; }
+        return b;
+    };
+    const boxes = [fit({ lo: [0, 0, 0], hi: [31, 31, 31], count: 0 })];
+    while (boxes.length < colours) {
+        let pick = -1, axis = 0, worth = 0;
+        boxes.forEach((b, i) => {
+            let a = 0;
+            for (let c = 1; c < 3; c++) if (b.hi[c] - b.lo[c] > b.hi[a] - b.lo[a]) a = c;
+            const w = b.count * (b.hi[a] - b.lo[a]);
+            if (w > worth) { worth = w; pick = i; axis = a; }
+        });
+        if (pick < 0) break;
+        const b = boxes[pick], half = Math.floor(b.count / 2);
+        let acc = 0, cut = b.lo[axis];
+        for (let v = b.lo[axis]; v < b.hi[axis]; v++) {
+            const slab = fit({ lo: b.lo.slice(), hi: b.hi.slice(), count: 0 });
+            slab.lo[axis] = slab.hi[axis] = v;
+            acc += fit(slab).count;
+            cut = v;
+            if (acc >= half) break;
+        }
+        const upper = { lo: b.lo.slice(), hi: b.hi.slice(), count: 0 };
+        b.hi = b.hi.slice(); b.hi[axis] = cut; upper.lo[axis] = cut + 1;
+        fit(b); boxes.push(fit(upper));
+    }
+    const pal = boxes.map(b => {
+        const s = [0, 0, 0];
+        let c = 0;
+        for (let r = b.lo[0]; r <= b.hi[0]; r++) for (let g = b.lo[1]; g <= b.hi[1]; g++) for (let u = b.lo[2]; u <= b.hi[2]; u++) {
+            const k = r << 10 | g << 5 | u;
+            c += hist[k]; s[0] += sum[k * 3]; s[1] += sum[k * 3 + 1]; s[2] += sum[k * 3 + 2];
+        }
+        return s.map(v => c ? Math.round(v / c) : 0);
+    });
+    for (let it = 0; it < REFINE; it++) {
+        const acc = pal.map(() => [0, 0, 0, 0]);
+        for (let k = 0; k < 32768; k++) {
+            if (!hist[k]) continue;
+            const v = [sum[k * 3] / hist[k], sum[k * 3 + 1] / hist[k], sum[k * 3 + 2] / hist[k]];
+            let best = 0, bd = Infinity;
+            pal.forEach((p, i) => { const d = (v[0] - p[0]) ** 2 + (v[1] - p[1]) ** 2 + (v[2] - p[2]) ** 2; if (d < bd) { bd = d; best = i; } });
+            const a = acc[best];
+            a[0] += sum[k * 3]; a[1] += sum[k * 3 + 1]; a[2] += sum[k * 3 + 2]; a[3] += hist[k];
+        }
+        acc.forEach((a, i) => { if (a[3]) pal[i] = [a[0], a[1], a[2]].map(v => Math.round(v / a[3])); });
+    }
+    return pal;
+}
+
+/* Palette indices, Floyd-Steinberg dithered, serpentine: map_pixels(). */
+function indices(rgb, w, h, pal) {
+    const memo = new Int16Array(1 << 18).fill(-1), out = new Uint8Array(w * h);
+    const nearest = (r, g, b) => {
+        const k = (r >> 2) << 12 | (g >> 2) << 6 | b >> 2;
+        if (memo[k] >= 0) return memo[k];
+        let best = 0, bd = Infinity;
+        pal.forEach((p, i) => { const d = (r - p[0]) ** 2 + (g - p[1]) ** 2 + (b - p[2]) ** 2; if (d < bd) { bd = d; best = i; } });
+        return (memo[k] = best);
+    };
+    let cur = new Float32Array((w + 2) * 3), next = new Float32Array((w + 2) * 3);
+    for (let y = 0; y < h; y++) {
+        next.fill(0);
+        const rev = y & 1;
+        for (let i = 0; i < w; i++) {
+            const x = rev ? w - 1 - i : i, dx = rev ? -1 : 1, v = [0, 0, 0];
+            for (let c = 0; c < 3; c++) {
+                const t = rgb[(y * w + x) * 3 + c] + cur[(x + 1) * 3 + c];
+                v[c] = t < 0 ? 0 : t > 255 ? 255 : Math.round(t);
+            }
+            const k = nearest(v[0], v[1], v[2]);
+            out[y * w + x] = k;
+            for (let c = 0; c < 3; c++) {
+                const e = (v[c] - pal[k][c]) * DITHER;
+                cur[(x + 1 + dx) * 3 + c] += e * 7 / 16;
+                next[(x + 1 - dx) * 3 + c] += e * 3 / 16;
+                next[(x + 1) * 3 + c] += e * 5 / 16;
+                next[(x + 1 + dx) * 3 + c] += e / 16;
+            }
+        }
+        [cur, next] = [next, cur];
+    }
+    return out;
+}
+
+function chunk(type, data) {
+    const out = new Uint8Array(12 + data.length), v = new DataView(out.buffer);
+    v.setUint32(0, data.length);
+    for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+    out.set(data, 8);
+    v.setUint32(8 + data.length, crc32(out, 4, 8 + data.length));
+    return out;
+}
+
+/* A palette PNG of `rgb` at `side`, deflated by the browser (zlib's
+ * format is what IDAT holds). */
+async function palettePng(rgb, w, h, side) {
+    const s = shrinkTo(rgb, w, h, side), pal = palette(s.rgb, 256), idx = indices(s.rgb, s.w, s.h, pal);
+    const raw = new Uint8Array((s.w + 1) * s.h);
+    for (let y = 0; y < s.h; y++) raw.set(idx.subarray(y * s.w, (y + 1) * s.w), y * (s.w + 1) + 1);
+    const idat = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
+    const ihdr = new Uint8Array(13), v = new DataView(ihdr.buffer);
+    v.setUint32(0, s.w); v.setUint32(4, s.h); ihdr[8] = 8; ihdr[9] = 3;
+    const parts = [new Uint8Array(SIGNATURE), chunk('IHDR', ihdr), chunk('PLTE', Uint8Array.from(pal.flat())),
+                   chunk('IDAT', idat), chunk('IEND', new Uint8Array(0))];
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return { png: out, idat: idat.length };
+}
+
 /*
  * A PNG carrying `bytes` (an NVDR image, album or video), for a page to
- * offer as a download. The page's server makes it with nvdr_png, whose
- * preview is a 256-colour palette; served as plain files (no /png), the
- * preview is `canvas` shrunk to 320 pixels on its longer side, in full
- * colour, which costs more bytes.
+ * offer as a download, with `rgb` (w x h, the decoded picture) as its
+ * preview. The page's server makes it with nvdr_png when it has /png;
+ * served as plain files, it is made here the same way: the largest
+ * preview, to 8 pixels and at most 640, whose picture data costs no more
+ * than the NVDR file, in 256 dithered colours.
  */
-export async function pngFor(bytes, canvas) {
+export async function pngFor(bytes, rgb, w, h) {
     const kind = kindOf(bytes);
     const ext = { NVDR: '.nvdr', NVDA: '.nvda', NVDV: '.nvdrv' }[kind];
     if (!ext) throw new Error('not an NVDR file');
@@ -103,15 +257,17 @@ export async function pngFor(bytes, canvas) {
             if (nvdrFromPng(png)) return png;
         }
     } catch { /* no server: made here */ }
-    const side = 320, s = Math.min(1, side / Math.max(canvas.width, canvas.height));
-    const small = document.createElement('canvas');
-    small.width = Math.max(1, Math.round(canvas.width * s));
-    small.height = Math.max(1, Math.round(canvas.height * s));
-    const g = small.getContext('2d');
-    g.imageSmoothingQuality = 'high';
-    g.drawImage(canvas, 0, 0, small.width, small.height);
-    const blob = await new Promise(r => small.toBlob(r, 'image/png'));
-    return wrapPng(bytes, await blob.arrayBuffer());
+    const budget = bytes.byteLength;
+    let hi = Math.min(PREVIEW_MAX, Math.max(w, h)), best = await palettePng(rgb, w, h, hi);
+    if (best.idat > budget && hi > PREVIEW_MIN) {
+        let lo = PREVIEW_MIN;
+        best = await palettePng(rgb, w, h, lo);
+        while (best.idat <= budget && hi - lo > 8) {
+            const mid = (lo + hi) >> 1, t = await palettePng(rgb, w, h, mid);
+            if (t.idat <= budget) { best = t; lo = mid; } else hi = mid;
+        }
+    }
+    return wrapPng(bytes, best.png);
 }
 
 /* Hands `bytes` to the browser as a download named `name`. */

@@ -463,7 +463,9 @@ const server = http.createServer((req, res) => {
                 setTimeout(() => artifacts.forEach(safeUnlink), 5000);
                 return;
             }
-            const args = [inputPath, outPng, '--preview', String(intHeader(req, 'x-preview', 320, 0, 4096))];
+            const args = [inputPath, outPng];
+            // nvdr_png sizes the preview to its budget unless told a size.
+            if (req.headers['x-preview']) args.push('--preview', String(intHeader(req, 'x-preview', 640, 0, 4096)));
             runConverter(res, { exePath, args, resultPath: outPng, artifacts, label: 'PNG' });
         }, { exts: NVDR_EXTS });
         return;

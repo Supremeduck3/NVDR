@@ -1357,30 +1357,47 @@ and index as well as its payloads, and reads its last photo alone.
 `nvdr_png` dresses an NVDR image, album or video as a PNG, so it can go
 where only common formats go and still open as itself:
 
-    ./nvdr_png foto.nvdr foto.png [--preview 320] [--colours 256]
+    ./nvdr_png foto.nvdr foto.png [--budget 1] [--preview 640] [--colours 256] [--dither 75]
     ./nvdr_png --extract foto.png foto.nvdr
 
 Any viewer shows the PNG's picture: a preview decoded from the file (an
-album's first photo, a video's first frame), shrunk to 320 pixels on its
-longer side and reduced to a 256-colour palette by median cut (Heckbert,
-"Color image quantization for frame buffer display", SIGGRAPH 1982). The
-NVDR file rides along untouched in a private ancillary chunk, `nvDr`,
+album's first photo, a video's first frame). It is as large as it can be,
+up to 640 pixels on its longer side, while its picture data costs no more
+than the NVDR file itself (`--budget 1`, found by bisection on the size),
+so the PNG is about twice the file. Its 256 colours come from median cut
+(Heckbert, "Color image quantization for frame buffer display", SIGGRAPH
+1982) refined by five rounds of k-means, and pixels take them through
+Floyd-Steinberg error diffusion (Floyd and Steinberg, "An adaptive
+algorithm for spatial grey scale", Proc. SID, 1976) at 75% of the error,
+serpentine, so skin and sky show grain instead of bands. The NVDR file
+rides along untouched in a private ancillary chunk, `nvDr`,
 which PNG readers skip by rule (lower-case first letter: ancillary;
 second: private; fourth: safe to copy). It comes right after IHDR, so its
 data starts at byte 41 and a page streaming the PNG decodes the NVDR in it
 as it arrives.
 
-On montanha_pessoas at q 24, `--fast`: a 41.7 KB `.nvdr` makes a 91.2 KB
-PNG, the preview being 49.5 KB of it. The preview is the price of opening
-everywhere: 33 KB at 64 colours, 30 KB at 240 pixels, 127 KB in full
-colour at 320, 563 KB at full size, which is what a plain PNG of the
-decoded picture costs.
+On the six samples, directional with `--fast`, against the first version
+(320 pixels always, median cut alone, no dithering):
+
+                     NVDR      PNG, first version     PNG now
+    q 24             138 KB    365 KB (2.65x)         278 KB (2.02x)
+    q 12             222 KB    456 KB (2.06x)         444 KB (2.00x)
+
+The preview follows the file: 128 to 280 pixels at q 24, 154 to 384 at
+q 12 (montanha_pessoas, 75.8 KB of NVDR, gets 384). Each change on its
+own, at q 24 and 320 pixels: k-means 0.35 dB better and 1% smaller;
+dithering at 75% 0.4 dB worse pixel by pixel but 0.8 dB better once
+blurred as an eye at a normal distance does, for 9% more bytes; 64 or
+128 colours dithered lose 1.1 to 2.7 dB blurred; full colour costs 2.7
+times the palette. 128 pixels is the floor, which the smallest files
+cross: macarrao at q 24 is 3.7 KB of NVDR in an 8.9 KB PNG.
 
 The page opens such a PNG wherever it opens the file inside (an image or
 an album on the image tab, a video on the video tab, either tab passing
 it to the other), offers "Baixar como PNG" next to each result (through
 the server's `/png`, which runs `nvdr_png`; served as plain files, the
-page makes the PNG itself with a full-colour preview), and `<nvdr-img
+page makes the same kind of PNG itself, deflated by the browser's
+CompressionStream), and `<nvdr-img
 src="foto.png">` shows one, `#n` picking a photo of an album in it.
 `public/nvdr-png.js` reads and writes the layout.
 
