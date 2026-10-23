@@ -201,7 +201,11 @@ NvdrvConfig nvdrv_default_config(void) {
     c.tf_radius = 7;
     c.tf_strength = 4.0f;
     c.tf_levels = 0;
-    c.refs = 1;
+    /* P frames coded from one anchor and from two, keeping the cheaper
+     * (MORE REFERENCES): -0.5 to -0.8% on the clip with three objects,
+     * -0.2 to -0.5% on the long one, nothing either way on the pans, for
+     * 6.5% more encoding time. */
+    c.refs = 2;
     c.fps = 24;
     return c;
 }

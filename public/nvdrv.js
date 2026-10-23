@@ -15,16 +15,17 @@
 import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext, VERSION as CONTAINER_VERSION } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 19;
+const VERSION = 20;
 const HEADER_SIZE = 24;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
 const MV_MAX = 384;            // NVDRV_MV_MAX, quarter pixels
-const MAX_DPB = 15 + 3;        // NVDRV_MAX_DPB
+const MAX_DPB = 15 + 4;        // NVDRV_MAX_DPB
 const MV_ESC_ALBUM = 8, MV_ESC_SEQ = 10;
 
 export const INTRA = 0;
 export const PRED = 1;
 export const BI = 2;
+export const PRED2 = 3;   // a P frame from two anchors (MORE REFERENCES in nvdrv.c)
 const MODE_BI = 0, MODE_FWD = 1, MODE_BWD = 2;
 
 function clamp255(v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
@@ -137,11 +138,11 @@ function mvPredict(vx, vy, mx, my, nbx, b, out) {
     out[1] = my[b] + median3(ly, vy[t] - my[t], ry);
 }
 
-const PRED2 = new Int32Array(2);
+const MV_PRED = new Int32Array(2);
 
 /* dec_vector(): false for a vector outside -lim-1 .. lim, which is damage. */
 function decVector(dec, m, same, vx, vy, mx, my, nbx, b, esc, lim) {
-    mvPredict(vx, vy, mx, my, nbx, b, PRED2);
+    mvPredict(vx, vy, mx, my, nbx, b, MV_PRED);
     const x = b % nbx;
     const ctx = (x > 0 && same[b - 1] ? 1 : 0) + (b >= nbx && same[b - nbx] ? 1 : 0);
     same[b] = dec.bit(m.same, ctx) ? 0 : 1;
@@ -150,7 +151,7 @@ function decVector(dec, m, same, vx, vy, mx, my, nbx, b, esc, lim) {
         ex = mvComponent(dec, m, 0, true, esc);
         ey = mvComponent(dec, m, 1, ex !== 0, esc);
     }
-    const nx = PRED2[0] + ex, ny = PRED2[1] + ey;
+    const nx = MV_PRED[0] + ex, ny = MV_PRED[1] + ey;
     if (nx < -lim - 1 || nx > lim || ny < -lim - 1 || ny > lim) return false;
     vx[b] = nx; vy[b] = ny;
     return true;
@@ -227,29 +228,29 @@ function vfSet(L, fx, fy, w, vx, vy) {
 }
 function vfDecVector(dec, L, fx, fy, w) {
     const G = L.G;
-    vfPred(G, L.M, L.dx, L.dy, fx, fy, w, PRED2);
+    vfPred(G, L.M, L.dx, L.dy, fx, fy, w, MV_PRED);
     const c = fy * G.nfx + fx;
     const ctx = (fx > 0 && L.same[c - 1] ? 1 : 0) + (fy > 0 && L.same[c - G.nfx] ? 1 : 0);
     // Mirrors vf_same_ctx_t(): and whether the temporal prediction agrees.
-    const tAgree = !L.tok || !L.tok[c] ? 0 : (L.tx[c] === PRED2[0] && L.ty[c] === PRED2[1] ? 1 : 2);
+    const tAgree = !L.tok || !L.tok[c] ? 0 : (L.tx[c] === MV_PRED[0] && L.ty[c] === MV_PRED[1] ? 1 : 2);
     const same = !dec.bit(L.mm.same, ctx + 3 * tAgree);
     let ex = 0, ey = 0;
-    const hasT = L.tok && L.tok[c] && (L.tx[c] !== PRED2[0] || L.ty[c] !== PRED2[1]);
+    const hasT = L.tok && L.tok[c] && (L.tx[c] !== MV_PRED[0] || L.ty[c] !== MV_PRED[1]);
     if (!same && hasT && dec.bit(L.mm.temporal, 0)) {
-        ex = L.tx[c] - PRED2[0]; ey = L.ty[c] - PRED2[1];
+        ex = L.tx[c] - MV_PRED[0]; ey = L.ty[c] - MV_PRED[1];
     } else if (!same) {
         ex = mvComponent(dec, L.mm, 0, true, MV_ESC_SEQ);
         ey = mvComponent(dec, L.mm, 1, ex !== 0, MV_ESC_SEQ);
     }
-    const x = PRED2[0] + ex, y = PRED2[1] + ey;
+    const x = MV_PRED[0] + ex, y = MV_PRED[1] + ey;
     if (x < -MV_MAX - 1 || x > MV_MAX || y < -MV_MAX - 1 || y > MV_MAX) return false;
     vfFill(G, L.same, fx, fy, w, same ? 1 : 0);
     vfSet(L, fx, fy, w, x, y);
     return true;
 }
 function vfInherit(L, fx, fy, w) {
-    vfPred(L.G, L.M, L.dx, L.dy, fx, fy, w, PRED2);
-    vfSet(L, fx, fy, w, PRED2[0], PRED2[1]);
+    vfPred(L.G, L.M, L.dx, L.dy, fx, fy, w, MV_PRED);
+    vfSet(L, fx, fy, w, MV_PRED[0], MV_PRED[1]);
     vfFill(L.G, L.same, fx, fy, w, 1);
 }
 /* Returns false where unpack_vfield returns -1. `mode` null for P. */
@@ -730,7 +731,7 @@ function expandContainer(bytes, pos, avail, declared, st, width, height) {
  * between its references. */
 function frameClass(kind, before, after) {
     if (kind === INTRA) return -1;
-    if (kind === PRED) return 0;
+    if (kind === PRED || kind === PRED2) return 0;
     const gap = after - before;
     return gap >= 8 ? 1 : gap >= 4 ? 2 : 3;
 }
@@ -739,6 +740,24 @@ function frameClass(kind, before, after) {
  * find_refs(): among the held frames, the nearest before `display` and
  * the nearest after it, as indices, -1 where there is none.
  */
+/* find_older(): the frame held just before dpb[before], -1 for none. */
+function findOlder(dpb, before) {
+    let k = -1;
+    for (let i = 0; i < dpb.length; i++)
+        if (dpb[i].display < dpb[before].display && (k < 0 || dpb[i].display > dpb[k].display)) k = i;
+    return k;
+}
+
+/* still_held(): once everything before `from` is shown, a frame stays
+ * held from there on, or while it is one of the two latest anchors. */
+function stillHeld(dpb, f, from) {
+    if (f.display >= from) return true;
+    if (f.kind === BI) return false;
+    let later = 0;
+    for (const g of dpb) if (g.kind !== BI && g.display > f.display) later++;
+    return later < 2;
+}
+
 function findRefs(dpb, display) {
     let before = -1, after = -1;
     for (let i = 0; i < dpb.length; i++) {
@@ -782,7 +801,7 @@ export function frameIndex(buffer) {
         if (changed) { if (at >= size) break; which = bytes[at++]; }
         if (which & HDR_BLOCK) at++;
         if (which & HDR_GLOBAL)
-            for (let k = 0; k < (kind === BI ? 4 : 2); k++) {
+            for (let k = 0; k < (kind === BI || kind === PRED2 ? 4 : 2); k++) {
                 r = getVarint(bytes, at, size);
                 if (r.n <= 0) return out;
                 at += r.n;
@@ -808,7 +827,7 @@ export function frameIndex(buffer) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v19 file');
+        if (!this.info) throw new Error('not an NVDRV v20 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -840,7 +859,7 @@ export class SequenceDecoder {
                 const s = this.dpb[i];
                 const shown = this.nextOut++;
                 // Every frame still to come predicts from this one or later.
-                this.dpb = this.dpb.filter(x => x.display >= shown);
+                this.dpb = this.dpb.filter(x => stillHeld(this.dpb, x, shown));
                 return { index: s.display, kind: s.kind, partial: s.partial, pixels: s.pixels };
             }
             if (!this.ended) {
@@ -872,10 +891,10 @@ export class SequenceDecoder {
         if (r.n < 0) throw new Error('bad frame header');
         at += r.n;
         const display = this.lastDisplay + unzigzag(r.v);
-        if (kind !== INTRA && kind !== PRED && kind !== BI) throw new Error('bad frame type');
+        const two = kind === BI || kind === PRED2;
         if (kind === INTRA && hasField) throw new Error('intra frame with a motion field');
-        if (flags && (!hasField || (kind !== BI && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
-        if (kind === BI && !hasField) throw new Error('B frame without a motion field');
+        if (flags && (!hasField || (!two && (flags & FRAME_MODEL1)))) throw new Error('bad frame flags');
+        if (two && !hasField) throw new Error('B frame without a motion field');
         if (display < 0 || display > 0x3fffffff) throw new Error('bad display number');
         this.lastDisplay = display;
         if (display < this.nextOut || this.dpb.length >= MAX_DPB ||
@@ -883,6 +902,9 @@ export class SequenceDecoder {
         const [before, after] = findRefs(this.dpb, display);
         if (kind !== INTRA && before < 0) throw new Error('predicted frame without a reference');
         if (kind === BI && after < 0) throw new Error('B frame without a reference after it');
+        // A PRED2 frame's second reference: the frame held before its first.
+        let r1 = after;
+        if (kind === PRED2 && (r1 = findOlder(this.dpb, before)) < 0) throw new Error('PRED2 frame without a second reference');
         const fc = frameClass(kind, before >= 0 ? this.dpb[before].display : 0,
                               after >= 0 ? this.dpb[after].display : 0);
 
@@ -896,7 +918,7 @@ export class SequenceDecoder {
             which = bytes[at++];
             if (!which || (which & ~HDR_ALL) || ((which & HDR_BLOCK) && !hasField)) throw new Error('bad frame header');
         }
-        const ng = kind === BI ? 4 : 2;
+        const ng = two ? 4 : 2;
         if (which & HDR_BLOCK) {
             if (at >= size) return false;
             st.block = bytes[at++];
@@ -935,7 +957,7 @@ export class SequenceDecoder {
         const need = (HDR_ALL & ~HDR_BLOCK) | (hasField ? HDR_BLOCK : 0);
         if ((st.known & need) !== need) throw new Error('frame header leaves out what its class has no value for');
         const block = hasField ? st.block : 0;
-        const dx = st.g[0], dy = st.g[1], dx1 = kind === BI ? st.g[2] : 0, dy1 = kind === BI ? st.g[3] : 0;
+        const dx = st.g[0], dy = st.g[1], dx1 = two ? st.g[2] : 0, dy1 = two ? st.g[3] : 0;
         r = getVarint(bytes, at, size);
         if (r.n === 0) return false;
         if (r.n < 0) throw new Error('bad frame header');
@@ -970,12 +992,12 @@ export class SequenceDecoder {
             if (flags & FRAME_MODEL0) mp += MODEL_BYTES;
             const model1 = flags & FRAME_MODEL1 ? modelGet(bytes, mp) : [dx1 * 4, 0, 0, dy1 * 4, 0, 0];
             // Each list's temporal prediction, from a frame decoded already.
-            const ts = temporalSource(this.dpb, before, after);
+            const ts = temporalSource(this.dpb, before, kind === BI ? after : -1);
             const t0x = new Int16Array(nb), t0y = new Int16Array(nb), t0ok = new Uint8Array(nb);
             const t1x = new Int16Array(nb), t1y = new Int16Array(nb), t1ok = new Uint8Array(nb);
-            const dist0 = display - this.dpb[before].display, dist1 = after >= 0 ? display - this.dpb[after].display : 0;
+            const dist0 = display - this.dpb[before].display, dist1 = r1 >= 0 ? display - this.dpb[r1].display : 0;
             const has0 = temporalPred(G, ts, dist0, t0x, t0y, t0ok);
-            const has1 = kind === BI && temporalPred(G, ts, dist1, t1x, t1y, t1ok);
+            const has1 = two && temporalPred(G, ts, dist1, t1x, t1y, t1ok);
             const l0 = { G, M: model0, vx: v0x, vy: v0y, dx: d0x, dy: d0y, tx: t0x, ty: t0y, tok: has0 ? t0ok : null };
             if (kind === PRED) {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
@@ -991,7 +1013,7 @@ export class SequenceDecoder {
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
                 blockPredict(ref, P0, width, height, G.g, v0x, v0y, mode, MODE_BWD, predictRegionSeq);
-                blockPredict(this.dpb[after].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD, predictRegionSeq);
+                blockPredict(this.dpb[r1].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD, predictRegionSeq);
                 // Backward blocks take the second prediction, the mean
                 // blocks the rounded mean of both; forward ones are in P0.
                 const stride = width * 3;
@@ -1005,7 +1027,7 @@ export class SequenceDecoder {
                         else for (let k = o; k < o + n; k++) P0[k] = (P0[k] + P1[k] + 1) >> 1;
                     }
                 }
-                if (flags & FRAME_OBMC) obmcApply(G, P0, width, height, ref, this.dpb[after].pixels, v0x, v0y, v1x, v1y, mode);
+                if (flags & FRAME_OBMC) obmcApply(G, P0, width, height, ref, this.dpb[r1].pixels, v0x, v0y, v1x, v1y, mode);
                 field = storeField(G, mode, v0x, v0y, dist0, v1x, v1y, dist1);
             }
             ref = this.pred;

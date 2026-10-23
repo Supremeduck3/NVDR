@@ -60,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      19
+#define NVDRV_VERSION      20
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
@@ -144,8 +144,9 @@ typedef struct {
     /* B frames filtered too, by level: 1 the frame halfway between two
      * anchors, which the frames either side are predicted from. */
     int   tf_levels;
-    /* Anchors a P frame predicts from, 1 or 2 (see MORE REFERENCES in
-     * nvdrv.c). */
+    /* Anchors a P frame may predict from, 1 or 2 (see MORE REFERENCES in
+     * nvdrv.c); with 2 each P frame is coded both ways and the cheaper
+     * kept. */
     int   refs;
     int   fps;             /* carried in the header, informational */
 } NvdrvConfig;

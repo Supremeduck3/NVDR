@@ -626,7 +626,7 @@ async function showTruncated() {
  * shows it at the rate the source was shot, one decode per animation tick,
  * so the timing it reports is the real cost of playing the file here.
  */
-import { SequenceDecoder, readSequenceHeader, frameIndex, showRGB, INTRA, PRED } from './nvdrv.js';
+import { SequenceDecoder, readSequenceHeader, frameIndex, showRGB, INTRA, BI } from './nvdrv.js';
 import { isPng, nvdrFromPng, kindOf, pngFor, download } from './nvdr-png.js';
 
 const $ = (id) => document.getElementById(id);
@@ -736,10 +736,10 @@ const player = {
 /* Frame boundaries from the headers alone, without decoding anything. */
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v19 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV v20 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
     const frames = frameIndex(buffer);
     const intra = frames.filter(f => f.kind === INTRA).length;
-    const bi = frames.filter(f => f.kind !== INTRA && f.kind !== PRED).length;
+    const bi = frames.filter(f => f.kind === BI).length;
     seq = { buffer, info, frames, name };
 
     const canvas = $('vcanvas');
