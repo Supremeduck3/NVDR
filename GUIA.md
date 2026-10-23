@@ -95,15 +95,22 @@ Abre `http://localhost:3000`. A página tem duas abas, **Imagem** e **Vídeo**.
 
 ### Vídeo
 
-Arrasta um MP4, WebM, MOV, MKV ou AVI. O servidor usa o **ffmpeg da sua
-máquina** para extrair os quadros, codifica com `nvdrv_encode`, e o player
+Arrasta um MP4, WebM, MOV, MKV ou AVI. O servidor usa o **GStreamer da sua
+máquina** (ou o ffmpeg, se o GStreamer não estiver lá) para extrair os quadros, codifica com `nvdrv_encode`, e o player
 toca no navegador. Um `.nvdrv` já codificado também pode ser arrastado —
 esse toca direto, sem passar pelo servidor.
 
-- Precisa de `ffmpeg` no PATH. Se estiver em outro lugar:
-  `NVDR_FFMPEG=/caminho/ffmpeg node server.js`. Sem ele, a página avisa.
-- O fps é lido do próprio arquivo (com `ffprobe` se houver, senão pela
-  descrição que o `ffmpeg` dá da entrada), e os quadros são extraídos
+- Precisa de `gst-launch-1.0` no PATH, com os plugins base, good e libav
+  (no Ubuntu/Debian: `sudo apt install gstreamer1.0-tools
+  gstreamer1.0-plugins-good gstreamer1.0-libav`; H.264 e HEVC vêm do
+  libav). Se estiver em outro lugar:
+  `NVDR_GST_LAUNCH=/caminho/gst-launch-1.0 node server.js`.
+- Sem GStreamer, ou se ele não tiver o plugin daquele formato, o servidor
+  tenta o `ffmpeg` (`NVDR_FFMPEG=/caminho/ffmpeg` para apontar). Sem
+  nenhum dos dois, a página avisa.
+- O fps é lido do próprio arquivo (pelo GStreamer; no ffmpeg, com
+  `ffprobe` se houver, senão pela descrição que o `ffmpeg` dá da entrada),
+  vídeo de celular gravado de pé sai de pé, e os quadros são extraídos
   **sem reamostrar** — reamostrar duplica quadros, e quadro duplicado é
   predição perfeita, o que faria o codec parecer melhor do que é.
 - **Duração** (3 a 20 s) e **largura máxima** limitam o trabalho: codificar

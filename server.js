@@ -11,15 +11,17 @@ const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 // before reaching the file system — protects shell, sanitize path.
 const ALLOWED_EXTS = new Set(['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tga']);
 
-// Video goes through ffmpeg, which is looked up on PATH unless these say
-// otherwise. It runs on the machine serving the page, not in the browser.
+// Video goes through GStreamer (gst-launch-1.0), or through ffmpeg when
+// GStreamer is not installed. Both are looked up on PATH unless these say
+// otherwise. They run on the machine serving the page, not in the browser.
 const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v']);
 const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+const GST_LAUNCH = process.env.NVDR_GST_LAUNCH || 'gst-launch-1.0';
+const FFMPEG = process.env.NVDR_FFMPEG || 'ffmpeg';
+const FFPROBE = process.env.NVDR_FFPROBE || 'ffprobe';
 
 // What /png accepts: an NVDR image, album or video, to dress as a PNG.
 const NVDR_EXTS = new Set(['.nvdr', '.nvda', '.nvdrv']);
-const FFMPEG = process.env.NVDR_FFMPEG || 'ffmpeg';
-const FFPROBE = process.env.NVDR_FFPROBE || 'ffprobe';
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const STATIC_TYPES = {
@@ -269,12 +271,103 @@ function probeFps(input, done) {
     });
 }
 
+function ffmpegFrames(input, framesDir, seconds, maxWidth, done) {
+    probeFps(input, (fps) => {
+        const args = ['-hide_banner', '-loglevel', 'error', '-i', input,
+                      '-map', '0:v:0', '-t', String(seconds), '-frames:v', '900',
+                      '-vf', `scale='min(${maxWidth},iw)':-2`,
+                      '-f', 'image2', path.join(framesDir, 'f%04d.png')];
+        execFile(FFMPEG, args, { timeout: 300000 }, (err, _out, stderr) => {
+            if (err && err.code === 'ENOENT') return done(err);
+            if (err) return done(new Error((stderr || err.message).trim()));
+            done(null, fps);
+        });
+    });
+}
+
 /*
- * Video in, sequence out: ffmpeg cuts the upload into frames, nvdrv_encode
- * codes them, and the container goes back to the page.
+ * gst-launch-1.0 joins its arguments into one pipeline description and
+ * parses that, so a path with a space or a '!' in it would break the
+ * pipeline. Paths go in relative to the directory it runs in, where the
+ * server names every file itself.
  *
- * Frames are taken as the source has them. Asking ffmpeg for a frame rate
- * makes it duplicate or drop frames to hit it, and a duplicated frame is a
+ * There is no ffprobe to ask, so a first pipeline decodes one frame and
+ * prints its caps (-v): size and rate are read from the last ones, which
+ * come after videoflip has turned the picture the way a phone tagged it.
+ */
+function gstProbe(input, cwd, done) {
+    execFile(GST_LAUNCH, ['-v', 'filesrc', `location=${input}`, '!', 'decodebin', '!',
+                          'videoconvert', '!', 'videoflip', 'video-direction=auto', '!',
+                          'identity', 'eos-after=1', '!', 'fakesink'],
+             { cwd, timeout: 30000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err && err.code === 'ENOENT') return done(err);
+        const caps = (stdout || '').split('\n')
+            .filter(l => l.includes('GstFakeSink:fakesink0.GstPad:sink: caps')).pop() || '';
+        const w = /width=\(int\)(\d+)/.exec(caps), h = /height=\(int\)(\d+)/.exec(caps);
+        if (!w || !h) return done(new Error((stderr || (err && err.message) || 'nenhum quadro de vídeo').trim()));
+        const r = /framerate=\(fraction\)(\d+)\/(\d+)/.exec(caps);
+        done(null, { width: Number(w[1]), height: Number(h[1]), rate: r && +r[2] ? r[1] / r[2] : 0 });
+    });
+}
+
+/*
+ * The same cut as ffmpeg's: the first video stream, frames as the source
+ * has them, at most `seconds` of them and never wider than maxWidth, the
+ * height following at an even number. A variable rate reads as 0/1 and
+ * is taken as 24.
+ *
+ * identity's eos-after stops the decode, but its count lands a few frames
+ * off either way depending on the decoder's threads, so it gets headroom
+ * and the frames past the cap are deleted here.
+ */
+function gstFrames(input, framesDir, seconds, maxWidth, done) {
+    const cwd = path.dirname(input);
+    const rel = (p) => path.relative(cwd, p).split(path.sep).join('/');
+    gstProbe(rel(input), cwd, (err, src) => {
+        if (err) return done(err);
+        const width = Math.min(maxWidth, src.width);
+        const height = Math.max(2, Math.round(src.height * width / src.width / 2) * 2);
+        const rate = src.rate >= 1 && src.rate <= 255 ? src.rate : 24;
+        const cap = Math.min(900, Math.max(1, Math.round(seconds * rate)));
+        const args = ['-q', 'filesrc', `location=${rel(input)}`, '!', 'decodebin', '!',
+                      'videoconvert', '!', 'videoflip', 'video-direction=auto', '!',
+                      'videoscale', '!', `video/x-raw,width=${width},height=${height}`, '!',
+                      'identity', `eos-after=${cap + 8}`, '!',
+                      'videoconvert', '!', 'video/x-raw,format=RGB', '!',
+                      'pngenc', 'compression-level=1', '!',
+                      'multifilesink', `location=${rel(framesDir)}/f%04d.png`];
+        execFile(GST_LAUNCH, args, { cwd, timeout: 300000 }, (err2, _out, stderr) => {
+            if (err2) return done(new Error((stderr || err2.message).trim()));
+            for (const n of fs.readdirSync(framesDir).filter(n => n.endsWith('.png')).sort().slice(cap))
+                fs.rmSync(path.join(framesDir, n), { force: true });
+            done(null, Math.round(rate));
+        });
+    });
+}
+
+/*
+ * GStreamer first. When it is missing, or lacks the plugin for this
+ * format (H.264 and HEVC need gst-libav), ffmpeg gets a go if there is
+ * one; with neither, GStreamer's own error is the one reported.
+ */
+function extractFrames(input, framesDir, seconds, maxWidth, done) {
+    gstFrames(input, framesDir, seconds, maxWidth, (err, fps) => {
+        if (!err) return done(null, fps, 'GStreamer');
+        for (const n of fs.readdirSync(framesDir)) fs.rmSync(path.join(framesDir, n), { force: true });
+        ffmpegFrames(input, framesDir, seconds, maxWidth, (err2, fps2) => {
+            if (!err2) return done(null, fps2, 'ffmpeg');
+            if (err2.code !== 'ENOENT') return done(err2, 0, 'ffmpeg');
+            done(err, 0, 'GStreamer');
+        });
+    });
+}
+
+/*
+ * Video in, sequence out: GStreamer (or ffmpeg) cuts the upload into
+ * frames, nvdrv_encode codes them, and the container goes back to the page.
+ *
+ * Frames are taken as the source has them. Asking for a frame rate makes
+ * the cutter duplicate or drop frames to hit it, and a duplicated frame is a
  * perfect prediction — it would make the codec look better than it is.
  * Duration and width are capped because encoding is the slow direction and
  * the frames sit on disk as PNG while it runs.
@@ -384,44 +477,39 @@ function handleVideo(req, res) {
         const encoder = findExecutable(__dirname, 'nvdrv_encode');
         if (!encoder) return fail(500, `nvdrv_encode não encontrado em ${__dirname}. Rode \`make\`.`);
 
-        probeFps(inputPath, (fps) => {
-            const args = ['-hide_banner', '-loglevel', 'error', '-i', inputPath,
-                          '-map', '0:v:0', '-t', String(seconds), '-frames:v', '900',
-                          '-vf', `scale='min(${maxWidth},iw)':-2`,
-                          '-f', 'image2', path.join(framesDir, 'f%04d.png')];
-            console.log(`Video: extracting up to ${seconds}s at <=${maxWidth}px, ${fps} fps...`);
-            execFile(FFMPEG, args, { timeout: 300000 }, (err, _out, stderr) => {
-                if (err && err.code === 'ENOENT') {
-                    return fail(501, 'ffmpeg não encontrado no PATH do servidor. Instale o ffmpeg ' +
-                                     'ou aponte NVDR_FFMPEG para o executável.');
-                }
-                if (err) return fail(422, `ffmpeg não conseguiu ler o vídeo: ${(stderr || err.message).trim()}`);
+        console.log(`Video: extracting up to ${seconds}s at <=${maxWidth}px...`);
+        extractFrames(inputPath, framesDir, seconds, maxWidth, (err, fps, tool) => {
+            if (err && err.code === 'ENOENT') {
+                return fail(501, 'Nem GStreamer nem ffmpeg encontrados no PATH do servidor. Instale o ' +
+                                 'GStreamer (gst-launch-1.0) ou o ffmpeg, ou aponte NVDR_GST_LAUNCH ' +
+                                 'ou NVDR_FFMPEG para o executável.');
+            }
+            if (err) return fail(422, `${tool} não conseguiu ler o vídeo: ${err.message}`);
 
-                const frames = fs.readdirSync(framesDir).filter(n => n.endsWith('.png')).length;
-                if (!frames) return fail(422, 'ffmpeg não extraiu nenhum quadro.');
-                console.log(`Video: ${frames} frames, encoding...`);
+            const frames = fs.readdirSync(framesDir).filter(n => n.endsWith('.png')).length;
+            if (!frames) return fail(422, `${tool} não extraiu nenhum quadro.`);
+            console.log(`Video: ${frames} frames at ${fps} fps via ${tool}, encoding...`);
 
-                execFile(encoder, [framesDir, outPath, '--fps', String(fps), '--q', String(q)],
-                         { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, (err2, stdout, stderr2) => {
-                    if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
-                    fs.readFile(outPath, (err3, data) => {
-                        if (err3) return fail(500, 'nvdrv_encode não produziu saída');
-                        // The per-frame report runs a line per frame; keep
-                        // its head and its summary so the header stays small.
-                        let lines = (stdout || '').trim().split('\n');
-                        if (lines.length > 60)
-                            lines = [...lines.slice(0, 42), `  … ${lines.length - 50} quadros …`, ...lines.slice(-8)];
-                        res.writeHead(200, {
-                            'Content-Type': 'application/octet-stream',
-                            'Content-Length': data.length,
-                            'X-Encoder-Report': Buffer.from(lines.join('\n'), 'utf8').toString('base64'),
-                            'X-Frames': String(frames),
-                            'X-Fps': String(fps)
-                        });
-                        res.end(data);
-                        console.log(`Video: sent ${data.length} bytes for ${frames} frames.`);
-                        cleanup();
+            execFile(encoder, [framesDir, outPath, '--fps', String(fps), '--q', String(q)],
+                     { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, (err2, stdout, stderr2) => {
+                if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
+                fs.readFile(outPath, (err3, data) => {
+                    if (err3) return fail(500, 'nvdrv_encode não produziu saída');
+                    // The per-frame report runs a line per frame; keep
+                    // its head and its summary so the header stays small.
+                    let lines = (stdout || '').trim().split('\n');
+                    if (lines.length > 60)
+                        lines = [...lines.slice(0, 42), `  … ${lines.length - 50} quadros …`, ...lines.slice(-8)];
+                    res.writeHead(200, {
+                        'Content-Type': 'application/octet-stream',
+                        'Content-Length': data.length,
+                        'X-Encoder-Report': Buffer.from(lines.join('\n'), 'utf8').toString('base64'),
+                        'X-Frames': String(frames),
+                        'X-Fps': String(fps)
                     });
+                    res.end(data);
+                    console.log(`Video: sent ${data.length} bytes for ${frames} frames.`);
+                    cleanup();
                 });
             });
         });
