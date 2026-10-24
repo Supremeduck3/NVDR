@@ -106,7 +106,10 @@ esse toca direto, sem passar pelo servidor.
   libav). No Windows, o instalador do GStreamer (pacote "runtime",
   MSVC 64-bit, instalação completa) não põe nada no PATH, mas o servidor
   acha sozinho pela variável `GSTREAMER_1_0_ROOT_MSVC_X86_64` que ele cria
-  — abra um terminal novo depois de instalar. No macOS, o pacote oficial
+  — abra um terminal novo depois de instalar. Ou deixe o
+  `scripts\setup_gstreamer.ps1` fazer isso: ele roda o instalador que
+  estiver em Downloads, põe o GStreamer no PATH e confere os plugins
+  (`powershell -ExecutionPolicy Bypass -File scripts\setup_gstreamer.ps1`). No macOS, o pacote oficial
   também é achado sem PATH. Ao subir, o servidor mostra qual
   `gst-launch-1.0` vai usar. Se estiver em outro lugar:
   `NVDR_GST_LAUNCH=/caminho/gst-launch-1.0 node server.js`.
