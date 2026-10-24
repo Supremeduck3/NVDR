@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
                 double p = nvdr_psnr(&src, &f);
                 psnr_sum += p; psnr_n++;
                 printf("  %5d  %-6s %6.2f dB%s\n", shown,
-                       kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : "bi", p,
+                       kind == NVDRV_INTRA ? "INTRA" : kind == NVDRV_PRED ? "pred" : kind == NVDRV_PRED2 ? "pred2" : "bi", p,
                        partial ? "   (quadro parcial)" : "");
                 nvdr_image_free(&src);
             }

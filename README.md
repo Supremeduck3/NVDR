@@ -1147,6 +1147,59 @@ macarrão +22.0%, the clip +3.2%), but it only moved bytes from colour
 to luma: PSNR-YUV did not change (+15.3% and -2.4%), nor the sequences'
 PSNR-RGB. It stays at 0.12.
 
+### P frames from two anchors (sequence v20)
+
+A P frame sees one anchor, eight frames back with the default B frames.
+Sequence format 20 adds a fourth frame kind, PRED2, that sees two: that
+anchor and the one before it, per unit either or the mean of both, with
+the B frames' field, modes and direct units. This is multihypothesis
+prediction from more than one reference frame (Flierl, Wiegand and
+Girod, "Rate-constrained multihypothesis prediction for
+motion-compensated video compression", IEEE Trans. CSVT, 2002), which
+H.264 and AV1 also do with their lists of references. The mean of two
+predictions halves the noise either carries, and the older anchor still
+shows what the newer one had covered.
+
+Both sides now hold, besides the frames still to be shown, the two
+latest anchors. The second reference is the frame held just before the
+first, and never across an intra frame, so a stream can still be joined
+at any of them.
+
+Coding every P frame as PRED2 lost: +0.6% on the clean pan and +0.4% on
+the noisy one, against -0.4% on the clip with three objects (BD-rate on
+PSNR-Y, 25 frames, `--fast`). Half or more of the units took the mean,
+which saved less residual than the second list of vectors cost. So the
+encoder codes each P frame both ways and keeps the one cheaper in
+squared error plus lambda times bits, the lambda the still coder weighs
+its own choices with:
+
+                    PSNR-Y    PSNR-RGB
+    clean           0.0%      -0.1%
+    noisy           0.0%       0.0%
+    multi          -0.5%      -0.8%
+    long (49)      -0.2%      -0.5%
+
+It costs 6.5% more encoding time (the P frames, an eighth of the frames,
+coded twice) and nothing to decode; `--refs 1` codes P frames as before,
+byte for byte. The JS decoder reads PRED2 and matches the C pixels,
+whole and cut. A P frame's references are far apart with seven B frames
+between anchors, which is where the gain stays small.
+
+Without B frames (`--bframes 0`, every frame a P frame, as a live or
+low-delay stream codes) the two references are one and two frames back,
+every frame but the first two can use them, and the gain is the one the
+literature reports:
+
+                    PSNR-Y    PSNR-RGB   encoding time
+    clean          -2.0%      -2.3%      +58%
+    noisy          -4.7%      -4.8%      +63%
+    multi          -5.8%      -5.0%      +56%
+
+(25 frames, `--fast`, against `--refs 1`.) The noisy clip gains most of
+the pans: there the mean of two neighbouring frames is a mean over two
+draws of the noise, which with B frames the anchors' temporal filter had
+already taken.
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

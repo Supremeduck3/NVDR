@@ -469,6 +469,18 @@ function handleAlbum(req, res) {
     });
 }
 
+/* The page's video options, as nvdrv_encode's arguments: B frames
+ * between anchors (0 for a live-style stream of P frames), the anchors a
+ * P frame may predict from, and --fast. Headers are untrusted, so each is
+ * read as a bounded integer or a fixed word. */
+function videoOptions(req) {
+    const args = [];
+    if (req.headers['x-bframes']) args.push('--bframes', String(intHeader(req, 'x-bframes', 7, 0, 15)));
+    if (req.headers['x-refs']) args.push('--refs', String(intHeader(req, 'x-refs', 2, 1, 2)));
+    if (req.headers['x-fast'] === '1') args.push('--fast');
+    return args;
+}
+
 function handleVideo(req, res) {
     const seconds = intHeader(req, 'x-seconds', 5, 1, 30);
     const maxWidth = intHeader(req, 'x-max-width', 1280, 64, 3840);
@@ -510,7 +522,7 @@ function handleVideo(req, res) {
             if (!frames) return fail(422, `${tool} não extraiu nenhum quadro.`);
             console.log(`Video: ${frames} frames at ${fps} fps via ${tool}, encoding...`);
 
-            execFile(encoder, [framesDir, outPath, '--fps', String(fps), '--q', String(q)],
+            execFile(encoder, [framesDir, outPath, '--fps', String(fps), '--q', String(q), ...videoOptions(req)],
                      { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, (err2, stdout, stderr2) => {
                 if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
                 fs.readFile(outPath, (err3, data) => {
@@ -572,8 +584,12 @@ const server = http.createServer((req, res) => {
                 return;
             }
             const args = [inputPath, outPng];
-            // nvdr_png sizes the preview to its budget unless told a size.
-            if (req.headers['x-preview']) args.push('--preview', String(intHeader(req, 'x-preview', 640, 0, 4096)));
+            // nvdr_png sizes the preview to its budget unless told a size,
+            // which then holds (no budget).
+            if (req.headers['x-preview']) {
+                args.push('--preview', String(intHeader(req, 'x-preview', 640, 0, 4096)), '--budget', '0');
+            }
+            if (req.headers['x-dither']) args.push('--dither', String(intHeader(req, 'x-dither', 75, 0, 100)));
             runConverter(res, { exePath, args, resultPath: outPng, artifacts, label: 'PNG' });
         }, { exts: NVDR_EXTS });
         return;
@@ -603,6 +619,12 @@ const server = http.createServer((req, res) => {
             // a header is untrusted input, and these reach argv directly.
             if (/^[1-9]\d{0,3}$/.test(quality || '')) args.push('--q', quality);
             if (['off', 'auto', 'on'].includes(grain)) args.push('--grain', grain);
+            // Directional prediction: the smaller file, shown whole rather
+            // than built up layer by layer; --fast only means anything there.
+            if (req.headers['x-mode'] === 'directional') {
+                args.push('--directional');
+                if (req.headers['x-fast'] === '1') args.push('--fast');
+            }
 
             console.log(`PRS encode for ${inputPath}...`);
             runConverter(res, {

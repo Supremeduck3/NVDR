@@ -201,6 +201,11 @@ NvdrvConfig nvdrv_default_config(void) {
     c.tf_radius = 7;
     c.tf_strength = 4.0f;
     c.tf_levels = 0;
+    /* P frames coded from one anchor and from two, keeping the cheaper
+     * (MORE REFERENCES): -0.5 to -0.8% on the clip with three objects,
+     * -0.2 to -0.5% on the long one, nothing either way on the pans, for
+     * 6.5% more encoding time. */
+    c.refs = 2;
     c.fps = 24;
     return c;
 }
@@ -2106,6 +2111,7 @@ struct NvdrvEncoder {
      * order (see code_frame()): the encoder's, and the decoder's as
      * reconstruct() rebuilds them. */
     NvdrContext *ctx[4], *dctx[4];
+    NvdrContext *tctx[2], *tdctx[2];   /* scratch, when two ways are compared (code_frame()) */
     /* Searched vectors at block size (s) and half size (h), the chosen
      * field (v), the models' vectors (m) and modes on the half-size grid,
      * and which blocks split. */
@@ -2130,7 +2136,7 @@ static int alloc_image(NvdrImage* img, int w, int h) {
  * gap between its references, which is its level in the group. */
 static int frame_class(int kind, int before, int after) {
     if (kind == NVDRV_INTRA) return -1;
-    if (kind == NVDRV_PRED) return 0;
+    if (kind == NVDRV_PRED || kind == NVDRV_PRED2) return 0;
     int gap = after - before;
     return gap >= 8 ? 1 : gap >= 4 ? 2 : 3;
 }
@@ -2165,6 +2171,46 @@ static void find_refs(const Slot* dpb, int n, int display, int* before, int* aft
     }
 }
 
+/*
+ * MORE REFERENCES
+ * ---------------
+ * A P frame predicted from one anchor sees only what that anchor shows.
+ * A PRED2 frame has two: the anchor before it, as a P frame, and the
+ * anchor before that, and per unit takes either or the mean of both, the
+ * way a B frame takes the frames on either side of it (multihypothesis
+ * prediction: Flierl, Wiegand and Girod, "Rate-constrained multihypothesis
+ * prediction for motion-compensated video compression", IEEE Trans.
+ * CSVT, 2002; H.264 and AV1 keep several references for the same end).
+ * The mean of two predictions of the same content has about half the
+ * noise of either, and the older anchor still shows what the newer one
+ * had covered.
+ *
+ * Both sides hold, besides the frames still to be shown, the two latest
+ * anchors (intra and P frames), so the older one is there when the next
+ * anchor is coded. A PRED2 frame's second reference is the latest frame
+ * held before its first, and it is never across an intra frame, so a
+ * stream can still be joined at any intra frame.
+ */
+
+/* The frame held just before dpb[before], -1 when there is none. */
+static int find_older(const Slot* dpb, int n, int before) {
+    int k = -1;
+    for (int i = 0; i < n; i++)
+        if (dpb[i].display < dpb[before].display && (k < 0 || dpb[i].display > dpb[k].display)) k = i;
+    return k;
+}
+
+/* Whether dpb[i] is still held once everything before display `from` has
+ * been shown: anything from there on, and the two latest anchors. */
+static int still_held(const Slot* dpb, int n, int i, int from) {
+    if (dpb[i].display >= from) return 1;
+    if (dpb[i].kind == NVDRV_BI) return 0;
+    int later = 0;
+    for (int j = 0; j < n; j++)
+        if (dpb[j].kind != NVDRV_BI && dpb[j].display > dpb[i].display) later++;
+    return later < 2;
+}
+
 int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
                       int width, int height, const NvdrvConfig* cfg) {
     *out = NULL;
@@ -2193,7 +2239,9 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
         !(e->ctx[0] = nvdr_context_new()) || !(e->ctx[1] = nvdr_context_new()) ||
         !(e->ctx[2] = nvdr_context_new()) || !(e->ctx[3] = nvdr_context_new()) ||
         !(e->dctx[0] = nvdr_context_new()) || !(e->dctx[1] = nvdr_context_new()) ||
-        !(e->dctx[2] = nvdr_context_new()) || !(e->dctx[3] = nvdr_context_new())) {
+        !(e->dctx[2] = nvdr_context_new()) || !(e->dctx[3] = nvdr_context_new()) ||
+        !(e->tctx[0] = nvdr_context_new()) || !(e->tctx[1] = nvdr_context_new()) ||
+        !(e->tdctx[0] = nvdr_context_new()) || !(e->tdctx[1] = nvdr_context_new())) {
         nvdrv_encode_close(e); return -1;
     }
     if (e->cfg.block > 0) {
@@ -2262,7 +2310,7 @@ static size_t write_frame(NvdrvEncoder* e, int kind, int hc, int display, int bl
     /* What differs from the last frame of this class (COMPACT FRAMES). */
     if (kind == NVDRV_INTRA) for (int i = 0; i < HDR_CLASSES; i++) e->hs[i].known = 0;
     HdrState* st = &e->hs[hc];
-    int ng = kind == NVDRV_BI ? 4 : 2, g[4] = { dx, dy, dx1, dy1 };
+    int ng = kind == NVDRV_BI || kind == NVDRV_PRED2 ? 4 : 2, g[4] = { dx, dy, dx1, dy1 };
     unsigned which = (st->known ^ HDR_ALL) & ~(block ? 0u : (unsigned)HDR_BLOCK);
     if (block && st->block != block) which |= HDR_BLOCK;
     for (int k = 0; k < ng; k++) if (st->g[k] != g[k]) which |= HDR_GLOBAL;
@@ -2380,7 +2428,7 @@ static int q_for(const NvdrvEncoder* e, int kind, int level) {
      * 1.0). */
     int pq = e->cfg.pred_q > 0 ? e->cfg.pred_q
            : e->cfg.bframes > 0 ? (q * 7 + 2) / 5 : (q * 6 + 2) / 5;
-    if (kind == NVDRV_PRED) return pq;
+    if (kind == NVDRV_PRED || kind == NVDRV_PRED2) return pq;
     return (int)(pq * (1.0f + e->cfg.b_q_step * (float)level) + 0.5f);
 }
 
@@ -2424,16 +2472,34 @@ static int obmc_choose(NvdrvEncoder* e, VfDecide* D, const Motion* M, const Nvdr
     return use;
 }
 
-/* Code the source frame `src`, shown at `display`, and keep what the
- * decoder will hold. */
-static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int force_intra, int level) {
-    size_t npx = (size_t)e->width * e->height * 3;
-    int before, after;
-    find_refs(e->dpb, e->ndpb, display, &before, &after);
-    int kind = force_intra || before < 0 ? NVDRV_INTRA
-             : (after >= 0 && e->cfg.block > 0 ? NVDRV_BI : NVDRV_PRED);
-    if (e->ndpb >= NVDRV_MAX_DPB) return -1;
+/* A frame coded one way, not yet written: what code_frame() writes and
+ * keeps when it is the way chosen. */
+typedef struct {
+    int kind, after, block, flags, dx, dy, dx1, dy1, fc, q;
+    uint8_t* field;
+    size_t field_len;
+    uint8_t* blob;
+    size_t len;
+    Slot slot;               /* the frame as the decoder will hold it, and its field */
+    /* When ways are compared, the models each leaves, so the one not
+     * chosen leaves none: the encoder's and the decoder's for class fc. */
+    NvdrContext *ctx, *dctx;
+    double cost;             /* squared error and bits, see code_frame() */
+} Coded;
 
+static void coded_free(Coded* c) {
+    free(c->field); free(c->blob);
+    c->field = c->blob = NULL;
+    slot_free(&c->slot);
+}
+
+/* Codes `src` as `kind` (`after` its second reference, -1 for none) into
+ * `out`. Returns 1, coding nothing, when a predicted frame would go intra
+ * while ways are being compared (out->ctx set). */
+static int code_as(NvdrvEncoder* e, const NvdrImage* src, int display, int kind, int before, int after,
+                   int level, Coded* out) {
+    size_t npx = (size_t)e->width * e->height * 3;
+    int two = kind == NVDRV_BI || kind == NVDRV_PRED2;
     int block = 0, dx = 0, dy = 0, dx1 = 0, dy1 = 0, obmc = 0;
     uint8_t* field = NULL;
     size_t field_len = 0;
@@ -2449,10 +2515,9 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     /* Each list's temporal prediction, see TEMPORAL PREDICTION. */
     const uint8_t *t0ok = NULL, *t1ok = NULL;
     if (kind != NVDRV_INTRA && e->cfg.block > 0) {
-        const Slot* ts = temporal_source(e->dpb, before, after);
+        const Slot* ts = temporal_source(e->dpb, before, kind == NVDRV_BI ? after : -1);
         if (temporal_pred(&G, ts, display - e->dpb[before].display, e->t0x, e->t0y, e->t0ok)) t0ok = e->t0ok;
-        if (kind == NVDRV_BI &&
-            temporal_pred(&G, ts, display - e->dpb[after].display, e->t1x, e->t1y, e->t1ok)) t1ok = e->t1ok;
+        if (two && temporal_pred(&G, ts, display - e->dpb[after].display, e->t1x, e->t1y, e->t1ok)) t1ok = e->t1ok;
     }
 
     if (kind == NVDRV_PRED) {
@@ -2476,27 +2541,25 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
             if (dx || dy) { shift_into(r0, &e->pred, dx, dy); ref = &e->pred; }
             else ref = r0;
         }
-        /* A cut, or anything else the bias to 128 would clip, goes intra. */
-        double acc = 0.0;
-        for (size_t i = 0; i < npx; i++) {
-            int d = (int)src->pixels[i] - (int)ref->pixels[i];
-            acc += d < 0 ? -d : d;
-        }
-        if (acc / (double)npx > e->cfg.intra_threshold) {
-            kind = NVDRV_INTRA; block = 0; dx = dy = 0;
-        }
-    } else if (kind == NVDRV_BI) {
+    } else if (two) {
         block = e->cfg.block;
         Slot* a = &e->dpb[before];
         Slot* c = &e->dpb[after];
         int c0x, c0y, c1x, c1y;
         group_motion(e, display, a->display, &c0x, &c0y);
-        group_motion(e, display, c->display, &c1x, &c1y);
         Subpel sp0, sp1;
         memset(&sp1, 0, sizeof(sp1));
         if (motion_list(e, src, a, display - a->display, lambda, c0x, c0y, &dx, &dy,
                         e->s0x, e->s0y, e->h0x, e->h0y, &model0, &aff0, e->m0x, e->m0y, &sp0) != 0) return -1;
-        if (motion_list(e, src, c, c->display - display, lambda, c1x, c1y, &dx1, &dy1,
+        if (kind == NVDRV_BI) group_motion(e, display, c->display, &c1x, &c1y);
+        else {
+            /* The older anchor is outside the group the summed motion
+             * covers: the newer one's global motion, carried on as far. */
+            c1x = scale_round(dx, display - c->display, display - a->display);
+            c1y = scale_round(dy, display - c->display, display - a->display);
+        }
+        int dist1 = c->display > display ? c->display - display : display - c->display;
+        if (motion_list(e, src, c, dist1, lambda, c1x, c1y, &dx1, &dy1,
                         e->s1x, e->s1y, e->h1x, e->h1y, &model1, &aff1, e->m1x, e->m1y, &sp1) != 0) return -1;
         VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
         VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
@@ -2507,13 +2570,25 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         obmc = obmc_choose(e, &D, &M, src);
         ref = &e->pred;
     }
+    if (kind == NVDRV_PRED || kind == NVDRV_PRED2) {
+        /* A cut, or anything else the bias to 128 would clip, goes intra. */
+        double acc = 0.0;
+        for (size_t i = 0; i < npx; i++) {
+            int d = (int)src->pixels[i] - (int)ref->pixels[i];
+            acc += d < 0 ? -d : d;
+        }
+        if (acc / (double)npx > e->cfg.intra_threshold) {
+            if (out->ctx) return 1;
+            kind = NVDRV_INTRA; two = 0; block = 0; dx = dy = dx1 = dy1 = 0; aff0 = aff1 = 0;
+        }
+    }
 
     if (kind != NVDRV_INTRA) {
         if (kind == NVDRV_PRED && block) {
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             field = with_models(aff0 ? &model0 : NULL, NULL,
                                 pack_vfield(&G, e->split, NULL, &l0, NULL, &field_len), &field_len);
-        } else if (kind == NVDRV_BI) {
+        } else if (two) {
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
             field = with_models(aff0 ? &model0 : NULL, aff1 ? &model1 : NULL,
@@ -2549,8 +2624,6 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
                                                     ? NVDR_CHROMA_444 : e->cfg.frame.chroma420);
     }
 
-    uint8_t* blob = NULL;
-    size_t len = 0;
     NvdrHeader fh;
     /*
      * The models carry over from frame to frame in coding order, as an
@@ -2565,43 +2638,104 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     int fc = frame_class(kind, before >= 0 ? e->dpb[before].display : 0, after >= 0 ? e->dpb[after].display : 0);
     if (kind == NVDRV_INTRA)
         for (int i = 0; i < 4; i++) { nvdr_context_reset(e->ctx[i]); nvdr_context_reset(e->dctx[i]); }
-    if (nvdr_encode_mem_ctx(&blob, &len, src, &fcfg, &fh, fc >= 0 ? e->ctx[fc] : NULL) != 0) { free(field); return -1; }
+    NvdrContext *ectx = fc >= 0 ? e->ctx[fc] : NULL, *dctx = fc >= 0 ? e->dctx[fc] : NULL;
+    if (out->ctx && fc >= 0) {
+        nvdr_context_copy(out->ctx, ectx); ectx = out->ctx;
+        nvdr_context_copy(out->dctx, dctx); dctx = out->dctx;
+    }
+    out->field = field;
+    out->field_len = field_len;
+    out->blob = NULL;
+    if (nvdr_encode_mem_ctx(&out->blob, &out->len, src, &fcfg, &fh, ectx) != 0) return -1;
     if (kind == NVDRV_INTRA) e->chroma420 = (fh.flags & NVDR_FLAG_CHROMA420) != 0;
 
-    int flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (kind == NVDRV_BI && aff1 ? FRAME_MODEL1 : 0) |
-                (block && obmc ? FRAME_OBMC : 0);
-    size_t written = write_frame(e, kind, fc + 1, display, block, flags, dx, dy, dx1, dy1, field, field_len, blob, len);
-    if (!written) { free(blob); free(field); return -1; }
-    free(field);
-
-    /* Carry the decoder's state forward by decoding what was just written,
-     * so the two sides hold the same bytes from here on. */
-    Slot* s = &e->dpb[e->ndpb];
-    s->fvx = s->fvy = NULL; s->fd = NULL; s->sp_ok = 0;
-    if (alloc_image(&s->img, e->width, e->height) != 0) { free(blob); return -1; }
-    int rc = reconstruct(blob, len, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? e->dctx[fc] : NULL);
-    free(blob);
-    if (rc != 0) { nvdr_image_free(&s->img); return -1; }
+    /* What the decoder will hold, decoded from the bytes, so the two sides
+     * hold the same from here on. */
+    Slot* s = &out->slot;
+    memset(s, 0, sizeof(*s));
+    if (alloc_image(&s->img, e->width, e->height) != 0) return -1;
+    if (reconstruct(out->blob, out->len, kind == NVDRV_INTRA ? NULL : ref, &s->img, dctx) != 0) return -1;
     s->display = display;
     s->kind = kind;
-    if (block && slot_store_field(s, &G, kind == NVDRV_BI ? e->mode : NULL, e->v0x, e->v0y,
+    if (block && slot_store_field(s, &G, two ? e->mode : NULL, e->v0x, e->v0y,
                                   display - e->dpb[before].display, e->v1x, e->v1y,
-                                  kind == NVDRV_BI ? display - e->dpb[after].display : 0) != 0) {
-        slot_free(s); return -1;
+                                  two ? display - e->dpb[after].display : 0) != 0) return -1;
+    out->kind = kind; out->after = after; out->block = block;
+    out->flags = kind == NVDRV_INTRA ? 0 : (aff0 ? FRAME_MODEL0 : 0) | (two && aff1 ? FRAME_MODEL1 : 0) |
+                 (block && obmc ? FRAME_OBMC : 0);
+    out->dx = dx; out->dy = dy; out->dx1 = dx1; out->dy1 = dy1;
+    out->fc = fc; out->q = fcfg.q;
+    if (out->ctx) {
+        double sse = 0.0;
+        for (size_t i = 0; i < npx; i++) {
+            int d = (int)src->pixels[i] - (int)s->img.pixels[i];
+            sse += d * d;
+        }
+        /* lambda per bit on the error of a sample, as nvdr.c weighs its
+         * own choices (lambda_k q^2), on the mean of the three colours. */
+        out->cost = sse / 3.0 + e->cfg.frame.lambda_k * (double)fcfg.q * fcfg.q * 8.0 * (double)(out->len + field_len);
     }
-    e->ndpb++;
+    return 0;
+}
+
+/* Code the source frame `src`, shown at `display`, and keep what the
+ * decoder will hold. */
+static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int force_intra, int level) {
+    int before, after;
+    find_refs(e->dpb, e->ndpb, display, &before, &after);
+    int kind = force_intra || before < 0 ? NVDRV_INTRA
+             : (after >= 0 && e->cfg.block > 0 ? NVDRV_BI : NVDRV_PRED);
+    if (e->ndpb >= NVDRV_MAX_DPB) return -1;
+    /* With a second anchor held and not across an intra frame, a P frame
+     * is coded both as itself and as a PRED2 frame (MORE REFERENCES), and
+     * whichever costs less in squared error and bits is kept. */
+    int older = -1;
+    if (kind == NVDRV_PRED && e->cfg.refs > 1 && e->cfg.block > 0 && e->dpb[before].kind != NVDRV_INTRA)
+        older = find_older(e->dpb, e->ndpb, before);
+    Coded c[2];
+    memset(c, 0, sizeof(c));
+    int pick = 0, rc;
+    if (older >= 0) {
+        c[0].ctx = e->tctx[0]; c[0].dctx = e->tdctx[0];
+        c[1].ctx = e->tctx[1]; c[1].dctx = e->tdctx[1];
+        rc = code_as(e, src, display, NVDRV_PRED2, before, older, level, &c[1]);
+        if (rc == 0) rc = code_as(e, src, display, NVDRV_PRED, before, -1, level, &c[0]);
+        if (rc < 0) { coded_free(&c[0]); coded_free(&c[1]); return -1; }
+        if (rc == 0) pick = c[1].cost < c[0].cost;
+        else {
+            /* Either way it would go intra: coded once, as a P frame. */
+            coded_free(&c[0]); coded_free(&c[1]);
+            memset(c, 0, sizeof(c));
+            older = -1;
+        }
+    }
+    if (older < 0 && code_as(e, src, display, kind, before, after, level, &c[0]) != 0) {
+        coded_free(&c[0]); return -1;
+    }
+    Coded* w = &c[pick];
+    if (older >= 0) {
+        nvdr_context_copy(e->ctx[w->fc], w->ctx);
+        nvdr_context_copy(e->dctx[w->fc], w->dctx);
+        coded_free(&c[!pick]);
+    }
+    size_t written = write_frame(e, w->kind, w->fc + 1, display, w->block, w->flags, w->dx, w->dy, w->dx1, w->dy1,
+                                 w->field, w->field_len, w->blob, w->len);
+    if (!written) { coded_free(w); return -1; }
+    e->dpb[e->ndpb++] = w->slot;
     e->coded++;
 
     if (e->report) {
         NvdrvFrameReport r;
-        r.display = display; r.kind = kind; r.level = kind == NVDRV_BI ? level : 0;
-        r.q = fcfg.q; r.dx = dx; r.dy = dy;
+        r.display = display; r.kind = w->kind; r.level = w->kind == NVDRV_BI ? level : 0;
+        r.q = w->q; r.dx = w->dx; r.dy = w->dy;
         r.bytes = written;
-        r.field_bytes = field_len;
+        r.field_bytes = w->field_len;
         e->report(e->user, &r);
     }
+    free(w->field); free(w->blob);
     return 0;
 }
+
 
 /*
  * LOOKING AHEAD
@@ -2818,9 +2952,10 @@ static int code_between(NvdrvEncoder* e, int lo, int hi, int level) {
 }
 
 static void drop_before(NvdrvEncoder* e, int display) {
-    int k = 0;
+    int k = 0, keep[NVDRV_MAX_DPB];
+    for (int i = 0; i < e->ndpb; i++) keep[i] = still_held(e->dpb, e->ndpb, i, display);
     for (int i = 0; i < e->ndpb; i++) {
-        if (e->dpb[i].display < display) slot_free(&e->dpb[i]);
+        if (!keep[i]) slot_free(&e->dpb[i]);
         else e->dpb[k++] = e->dpb[i];
     }
     e->ndpb = k;
@@ -3100,6 +3235,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     free(e->t0x); free(e->t0y); free(e->t1x); free(e->t1y); free(e->t0ok); free(e->t1ok);
     free(e->tile_q);
     for (int i = 0; i < 4; i++) { nvdr_context_free(e->ctx[i]); nvdr_context_free(e->dctx[i]); }
+    for (int i = 0; i < 2; i++) { nvdr_context_free(e->tctx[i]); nvdr_context_free(e->tdctx[i]); }
     free(e);
     return rc;
 }
@@ -3182,10 +3318,10 @@ static int decode_one(NvdrvDecoder* d) {
     if (n < 0) return -1;
     at += (size_t)n;
     long display_l = (long)d->last_display + unzigzag(u);
-    if (kind != NVDRV_INTRA && kind != NVDRV_PRED && kind != NVDRV_BI) return -1;
+    int two = kind == NVDRV_BI || kind == NVDRV_PRED2;
     if (kind == NVDRV_INTRA && has_field) return -1;
-    if (flags && (!has_field || (kind != NVDRV_BI && (flags & FRAME_MODEL1)))) return -1;
-    if (kind == NVDRV_BI && !has_field) return -1;
+    if (flags && (!has_field || (!two && (flags & FRAME_MODEL1)))) return -1;
+    if (two && !has_field) return -1;
     if (display_l < 0 || display_l > INT_MAX / 2) return -1;
     int display = (int)display_l;
     d->last_display = display;
@@ -3197,6 +3333,9 @@ static int decode_one(NvdrvDecoder* d) {
     find_refs(d->dpb, d->ndpb, display, &before, &after);
     if (kind != NVDRV_INTRA && before < 0) return -1;
     if (kind == NVDRV_BI && after < 0) return -1;
+    /* A PRED2 frame's second reference: the frame held before its first
+     * (MORE REFERENCES). */
+    if (kind == NVDRV_PRED2 && (after = find_older(d->dpb, d->ndpb, before)) < 0) return -1;
     int fc = frame_class(kind, before >= 0 ? d->dpb[before].display : 0, after >= 0 ? d->dpb[after].display : 0);
 
     /* What differs from the last frame of this class (COMPACT FRAMES). */
@@ -3208,7 +3347,7 @@ static int decode_one(NvdrvDecoder* d) {
         which = h[at++];
         if (!which || (which & ~(unsigned)HDR_ALL) || ((which & HDR_BLOCK) && !has_field)) return -1;
     }
-    int ng = kind == NVDRV_BI ? 4 : 2;
+    int ng = two ? 4 : 2;
     if (which & HDR_BLOCK) {
         if (at >= avail) return 0;
         st->block = h[at++];
@@ -3247,7 +3386,7 @@ static int decode_one(NvdrvDecoder* d) {
     unsigned need = (HDR_ALL & ~(unsigned)HDR_BLOCK) | (has_field ? HDR_BLOCK : 0);
     if ((st->known & need) != need) return -1;
     int block = has_field ? st->block : 0;
-    int dx = st->g[0], dy = st->g[1], dx1 = kind == NVDRV_BI ? st->g[2] : 0, dy1 = kind == NVDRV_BI ? st->g[3] : 0;
+    int dx = st->g[0], dy = st->g[1], dx1 = two ? st->g[2] : 0, dy1 = two ? st->g[3] : 0;
     n = get_varint(h + at, avail - at, &u);
     if (n == 0) return 0;
     if (n < 0) return -1;
@@ -3293,10 +3432,10 @@ static int decode_one(NvdrvDecoder* d) {
             const uint8_t* mp = fp;
             if (flags & FRAME_MODEL0) { model_get(&m0, mp); mp += MODEL_BYTES; }
             if (flags & FRAME_MODEL1) model_get(&m1, mp);
-            const Slot* ts = temporal_source(d->dpb, before, after);
+            const Slot* ts = temporal_source(d->dpb, before, kind == NVDRV_BI ? after : -1);
             int dist0 = display - d->dpb[before].display, dist1 = after >= 0 ? display - d->dpb[after].display : 0;
             const uint8_t* t0ok = temporal_pred(&G, ts, dist0, tv, tv + nb, tok) ? tok : NULL;
-            const uint8_t* t1ok = kind == NVDRV_BI && temporal_pred(&G, ts, dist1, tv + 2 * nb, tv + 3 * nb, tok + nb)
+            const uint8_t* t1ok = two && temporal_pred(&G, ts, dist1, tv + 2 * nb, tv + 3 * nb, tok + nb)
                                 ? tok + nb : NULL;
             VfList l0 = { &G, &m0, v, v + nb, mv, mv + nb, NULL, NULL, tv, tv + nb, t0ok };
             VfList l1 = { &G, &m1, v + 2 * nb, v + 3 * nb, mv + 2 * nb, mv + 3 * nb, NULL, NULL,
@@ -3320,9 +3459,9 @@ static int decode_one(NvdrvDecoder* d) {
         }
         /* sp0 and sp1 are the slots' own planes: nothing to free. */
         /* The field as decoded, for the frames after this one. */
-        if (rc == 0 && slot_store_field(&field, &G, kind == NVDRV_BI ? mode : NULL, v, v + nb,
+        if (rc == 0 && slot_store_field(&field, &G, two ? mode : NULL, v, v + nb,
                                         display - d->dpb[before].display, v + 2 * nb, v + 3 * nb,
-                                        kind == NVDRV_BI ? display - d->dpb[after].display : 0) != 0) rc = -1;
+                                        two ? display - d->dpb[after].display : 0) != 0) rc = -1;
         free(v); free(mode);
         if (rc != 0) return -1;
         ref = &d->pred;
@@ -3379,10 +3518,12 @@ int nvdrv_decode_next(NvdrvDecoder* d, NvdrImage* out, int* kind_out, int* parti
             if (partial_out) *partial_out = d->dpb[i].partial;
             d->shown = d->next_out++;
             /* Every frame still to come is shown after this one, so it
-             * predicts from this one or something later. */
-            int k = 0;
+             * predicts from this one or something later, or from the
+             * anchor before the last (MORE REFERENCES). */
+            int k = 0, keep[NVDRV_MAX_DPB];
+            for (int j = 0; j < d->ndpb; j++) keep[j] = still_held(d->dpb, d->ndpb, j, d->shown);
             for (int j = 0; j < d->ndpb; j++) {
-                if (d->dpb[j].display < d->shown) slot_free(&d->dpb[j]);
+                if (!keep[j]) slot_free(&d->dpb[j]);
                 else d->dpb[k++] = d->dpb[j];
             }
             d->ndpb = k;
