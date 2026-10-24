@@ -121,6 +121,17 @@ esse toca direto, sem passar pelo servidor.
   do próprio encoder, e deixava grama e pele visivelmente moles em 720p.
   Num clipe de teste de 960×540 com panorâmica, zoom e um objeto se
   movendo, Alta dá 36,7 dB a ~1,1 Mbit/s e Média 34,6 dB a ~0,6 Mbit/s.
+- **Estrutura**: com quadros B (padrão, arquivo menor) ou **ao vivo**, sem
+  quadros B (`--bframes 0`): cada quadro só depende dos anteriores, como
+  numa transmissão.
+- **Referências**: duas (padrão, `--refs 2`) deixa cada quadro P prever
+  das duas âncoras anteriores, e o encoder fica com o que custar menos;
+  economiza 2 a 6% ao vivo e até 0,8% com quadros B, por uns 6% (com B)
+  a 60% (ao vivo) a mais de tempo. Uma (`--refs 1`) é o comportamento
+  antigo.
+- **Velocidade** rápida é o `--fast`.
+- **Prévia do PNG** e **Pontilhado** valem para o botão "Baixar como PNG"
+  (veja "Compartilhar como PNG"); são as mesmas nas duas abas.
 
 O player mostra, por quadro, quanto custou **decodificar** e **exibir**
 contra o orçamento do fps do vídeo, e quantas vezes travou. A faixa embaixo
@@ -130,9 +141,19 @@ arquivo é um prefixo do filme, e o quadro onde o corte cai ainda aparece.
 
 ### Imagem
 
-Arrasta uma imagem e pronto:
+Arrasta uma imagem e pronto. Antes, dá para escolher:
 
-- as duas camadas lado a lado (só cor, e cor + textura), com bytes acumulados
+- **Qualidade**: Máxima (`--q 12`), Alta (17), **Média (24, padrão)**, Leve (34).
+- **Modo**: **Direcional** (padrão na página, `--directional`): cada bloco
+  é previsto dos vizinhos já decodificados, e o arquivo sai bem menor;
+  **Progressivo**: chega em camadas, cor primeiro e detalhe depois.
+- **Velocidade**: rápida é o `--fast` (só no direcional), 2 a 3 vezes mais
+  rápida por ~1% a mais de bytes.
+- **Grão de sensor**, como no `--grain`.
+
+Depois aparecem:
+
+- as camadas lado a lado (só cor, e cor + textura), com bytes acumulados
 - um slider que corta o arquivo para simular download interrompido
 - o relatório do encoder embaixo
 

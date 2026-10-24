@@ -87,7 +87,7 @@ export function wrapPng(nvdr, preview) {
 
 /* ---------------------------------------------- previews, as nvdr_png's */
 
-const PREVIEW_MAX = 640, PREVIEW_MIN = 128, REFINE = 5, DITHER = 0.75;
+const PREVIEW_MAX = 640, PREVIEW_MIN = 128, REFINE = 5, DITHER = 75;
 
 /* `rgb` (3 bytes a pixel, w x h) averaged down so the longer side is
  * `side`: shrink() in nvdr_png.c. */
@@ -177,8 +177,9 @@ function palette(rgb, colours) {
     return pal;
 }
 
-/* Palette indices, Floyd-Steinberg dithered, serpentine: map_pixels(). */
-function indices(rgb, w, h, pal) {
+/* Palette indices, Floyd-Steinberg dithered at `dither` percent,
+ * serpentine: map_pixels(). */
+function indices(rgb, w, h, pal, dither) {
     const memo = new Int16Array(1 << 18).fill(-1), out = new Uint8Array(w * h);
     const nearest = (r, g, b) => {
         const k = (r >> 2) << 12 | (g >> 2) << 6 | b >> 2;
@@ -200,7 +201,7 @@ function indices(rgb, w, h, pal) {
             const k = nearest(v[0], v[1], v[2]);
             out[y * w + x] = k;
             for (let c = 0; c < 3; c++) {
-                const e = (v[c] - pal[k][c]) * DITHER;
+                const e = (v[c] - pal[k][c]) * dither / 100;
                 cur[(x + 1 + dx) * 3 + c] += e * 7 / 16;
                 next[(x + 1 - dx) * 3 + c] += e * 3 / 16;
                 next[(x + 1) * 3 + c] += e * 5 / 16;
@@ -223,8 +224,8 @@ function chunk(type, data) {
 
 /* A palette PNG of `rgb` at `side`, deflated by the browser (zlib's
  * format is what IDAT holds). */
-async function palettePng(rgb, w, h, side) {
-    const s = shrinkTo(rgb, w, h, side), pal = palette(s.rgb, 256), idx = indices(s.rgb, s.w, s.h, pal);
+async function palettePng(rgb, w, h, side, dither) {
+    const s = shrinkTo(rgb, w, h, side), pal = palette(s.rgb, 256), idx = indices(s.rgb, s.w, s.h, pal, dither);
     const raw = new Uint8Array((s.w + 1) * s.h);
     for (let y = 0; y < s.h; y++) raw.set(idx.subarray(y * s.w, (y + 1) * s.w), y * (s.w + 1) + 1);
     const idat = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
@@ -242,32 +243,46 @@ async function palettePng(rgb, w, h, side) {
  * A PNG carrying `bytes` (an NVDR image, album or video), for a page to
  * offer as a download, with `rgb` (w x h, the decoded picture) as its
  * preview. The page's server makes it with nvdr_png when it has /png;
- * served as plain files, it is made here the same way: the largest
- * preview, to 8 pixels and at most 640, whose picture data costs no more
- * than the NVDR file, in 256 dithered colours.
+ * served as plain files, it is made here the same way. By default
+ * (opts.preview 'auto') the preview is the largest, to 8 pixels and at
+ * most 640, whose picture data costs no more than the NVDR file; a
+ * number fixes its longer side instead (0 whole). opts.dither is the
+ * percent of colour error diffused, 75 by default.
  */
-export async function pngFor(bytes, rgb, w, h) {
+export async function pngFor(bytes, rgb, w, h, opts = {}) {
     const kind = kindOf(bytes);
     const ext = { NVDR: '.nvdr', NVDA: '.nvda', NVDV: '.nvdrv' }[kind];
     if (!ext) throw new Error('not an NVDR file');
+    const fixed = opts.preview !== undefined && opts.preview !== 'auto' ? Number(opts.preview) : null;
+    const dither = opts.dither ?? DITHER;
     try {
-        const res = await fetch('/png', { method: 'POST', headers: { 'x-file-ext': ext }, body: bytes });
+        const headers = { 'x-file-ext': ext, 'x-dither': String(dither) };
+        if (fixed !== null) headers['x-preview'] = String(fixed);
+        const res = await fetch('/png', { method: 'POST', headers, body: bytes });
         if (res.ok) {
             const png = new Uint8Array(await res.arrayBuffer());
             if (nvdrFromPng(png)) return png;
         }
     } catch { /* no server: made here */ }
+    if (fixed !== null) return wrapPng(bytes, (await palettePng(rgb, w, h, fixed || Math.max(w, h), dither)).png);
     const budget = bytes.byteLength;
-    let hi = Math.min(PREVIEW_MAX, Math.max(w, h)), best = await palettePng(rgb, w, h, hi);
+    let hi = Math.min(PREVIEW_MAX, Math.max(w, h)), best = await palettePng(rgb, w, h, hi, dither);
     if (best.idat > budget && hi > PREVIEW_MIN) {
         let lo = PREVIEW_MIN;
-        best = await palettePng(rgb, w, h, lo);
+        best = await palettePng(rgb, w, h, lo, dither);
         while (best.idat <= budget && hi - lo > 8) {
-            const mid = (lo + hi) >> 1, t = await palettePng(rgb, w, h, mid);
+            const mid = (lo + hi) >> 1, t = await palettePng(rgb, w, h, mid, dither);
             if (t.idat <= budget) { best = t; lo = mid; } else hi = mid;
         }
     }
     return wrapPng(bytes, best.png);
+}
+
+/* The page's PNG options, from its first `.png-preview` and `.png-dither`
+ * selects (the page keeps every copy of them in step). */
+export function pngOptions() {
+    const p = document.querySelector('.png-preview'), d = document.querySelector('.png-dither');
+    return { preview: p ? p.value : 'auto', dither: d ? Number(d.value) : DITHER };
 }
 
 /* Hands `bytes` to the browser as a download named `name`. */
