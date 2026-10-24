@@ -157,12 +157,15 @@ static void to_ycc(const unsigned char* p, double* o) {
 /* The orthonormal 8-point DCT, as a matrix. */
 static double dct8[8][8];
 static void dct8_init(void) {
-    static int done = 0;
+    static volatile int done = 0;
     if (done) return;
-    for (int u = 0; u < 8; u++)
-        for (int x = 0; x < 8; x++)
-            dct8[u][x] = (u ? sqrt(2.0 / 8) : sqrt(1.0 / 8)) * cos((2 * x + 1) * u * 3.14159265358979 / 16);
-    done = 1;
+#pragma omp critical(nvdr_dct8)
+    if (!done) {
+        for (int u = 0; u < 8; u++)
+            for (int x = 0; x < 8; x++)
+                dct8[u][x] = (u ? sqrt(2.0 / 8) : sqrt(1.0 / 8)) * cos((2 * x + 1) * u * 3.14159265358979 / 16);
+        done = 1;
+    }
 }
 
 static void fdct8x8(const double* in, int stride, double* out) {

@@ -1,7 +1,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const os = require('os');
 const crypto = require('crypto');
 
 const PORT = 3000;
@@ -528,6 +529,63 @@ function handleVideo(req, res) {
     }, { exts: VIDEO_EXTS, limit: MAX_VIDEO_BYTES });
 }
 
+/*
+ * A whole folder, coded on this machine by nvdr_batch: the body is JSON,
+ * { dir, out, recursive, as }, the coding options come as the image tab's
+ * headers, and the answer is nvdr_batch's report, a line per image as it
+ * finishes, which the page turns into a progress bar. It reads and writes
+ * folders of the machine serving the page, so it answers only requests
+ * from that machine. Closing the request stops the run; what was done
+ * stays done, and a new run skips it.
+ */
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+function handleBatch(req, res) {
+    const refuse = (code, text) => {
+        if (!res.writableEnded) {
+            res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end(text);
+        }
+    };
+    if (!LOOPBACK.has(req.socket.remoteAddress)) {
+        return refuse(403, 'Codificar uma pasta só funciona com a página aberta na própria máquina (localhost).');
+    }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 65536) req.destroy(); });
+    req.on('end', () => {
+        let job;
+        try { job = JSON.parse(body); } catch { return refuse(400, 'Pedido inválido.'); }
+        const home = (p) => typeof p === 'string' && p.trim()
+            ? path.resolve(p.trim().replace(/^~(?=$|[\/\\])/, os.homedir())) : null;
+        const dir = home(job.dir), out = home(job.out);
+        if (!dir) return refuse(400, 'Indique o caminho da pasta.');
+        let st;
+        try { st = fs.statSync(dir); } catch { return refuse(400, `A pasta ${dir} não existe.`); }
+        if (!st.isDirectory()) return refuse(400, `${dir} não é uma pasta.`);
+        const exe = findExecutable(__dirname, 'nvdr_batch');
+        if (!exe) return refuse(500, `nvdr_batch não encontrado em ${__dirname}. Rode \`make\`.`);
+
+        const args = [dir];
+        if (out) args.push(out);
+        if (job.recursive) args.push('-r');
+        if (['nvdr', 'png', 'both'].includes(job.as)) args.push('--as', job.as);
+        if (req.headers['x-q']) args.push('--q', String(intHeader(req, 'x-q', 24, 1, 4095)));
+        if (req.headers['x-mode'] === 'progressive') args.push('--progressive');
+        else if (req.headers['x-fast'] === '1') args.push('--fast');
+        if (['off', 'auto', 'on'].includes(req.headers['x-grain'])) args.push('--grain', req.headers['x-grain']);
+
+        console.log(`Batch: ${exe} ${args.join(' ')}`);
+        const child = spawn(exe, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        child.stdout.on('data', (c) => res.write(c));
+        child.stderr.on('data', (c) => res.write(c));
+        child.on('error', (err) => res.end(`ERRO: ${err.message}\n`));
+        child.on('close', (code) => res.end(code === 0 ? '' : `(nvdr_batch terminou com código ${code})\n`));
+        // The page stopped it, or went away.
+        res.on('close', () => { if (child.exitCode === null) child.kill(); });
+    });
+}
+
 const server = http.createServer((req, res) => {
     if (req.method === 'GET') {
         serveStatic(req, res);
@@ -547,6 +605,11 @@ const server = http.createServer((req, res) => {
 
     if (req.url === '/video') {
         handleVideo(req, res);
+        return;
+    }
+
+    if (req.url === '/batch') {
+        handleBatch(req, res);
         return;
     }
 

@@ -5,6 +5,7 @@ nvdrv_decode
 nvdr_decode
 nvdr_album
 nvdr_png
+nvdr_batch
 *.exe
 *.o
 *.out
