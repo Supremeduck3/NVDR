@@ -87,6 +87,17 @@
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 3px 6px; font: inherit; margin-left: 6px;
   }
+  .opts input[type=text] {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font: inherit; margin-left: 6px; width: min(340px, 70vw);
+  }
+  /* The folder's progress: one bar, filled by images done. */
+  .bar { height: 10px; border-radius: 5px; background: var(--bg); border: 1px solid var(--border);
+         overflow: hidden; margin-top: 14px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .25s ease; }
+  .bar.done > div { background: #3fb950; }
+  .bar.failed > div { background: #f85149; }
+  #batchLog { max-height: 220px; overflow: auto; margin-top: 12px; }
   .player-bar { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; flex-wrap: wrap; }
   .player-bar button {
     background: var(--accent); color: #fff; border: 0; border-radius: 8px;
@@ -168,6 +179,36 @@
       </label>
     </div>
     <div id="status"></div>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin:0 0 4px;font-size:.95rem">Pasta inteira</h3>
+    <p class="note" style="margin:0">
+      Codifica todas as imagens de uma pasta do computador que roda o servidor, com a qualidade,
+      o modo, a velocidade e o grão escolhidos acima, uma imagem por núcleo. Só funciona com a página
+      aberta na própria máquina (localhost). Imagens já feitas são puladas: dá para parar e continuar depois.
+    </p>
+    <div class="opts">
+      <label>Pasta <input type="text" id="batchDir" placeholder="/home/voce/Fotos ou ~/Fotos"></label>
+      <label>Salvar em <input type="text" id="batchOut" placeholder="(padrão: dentro dela, em nvdr/)"></label>
+    </div>
+    <div class="opts">
+      <label><input type="checkbox" id="batchDeep"> Incluir subpastas</label>
+      <label>Gravar como
+        <select id="batchAs">
+          <option value="nvdr" selected>.nvdr</option>
+          <option value="png">PNG com o NVDR dentro</option>
+          <option value="both">Os dois</option>
+        </select>
+      </label>
+    </div>
+    <div class="player-bar">
+      <button id="batchGo">Codificar pasta</button>
+      <button id="batchStop" class="ghost" disabled>Parar</button>
+      <span class="hud" id="batchHud"></span>
+    </div>
+    <div class="bar hidden" id="batchBar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div></div></div>
+    <pre id="batchLog" class="hidden"></pre>
   </div>
 
   <section id="album" class="hidden">
@@ -427,6 +468,81 @@ document.getElementById('albumSavePng').onclick = async () => {
     try { download(await pngFor(albumBuffer, rgb, width, height, pngOptions()), `${stem(albumName)}.png`, 'image/png'); }
     catch (e) { setStatus(`Não foi possível fazer o PNG: ${e.message}`, true); }
 };
+
+/* --- a whole folder (server.js /batch, nvdr_batch) ------------------- */
+let batchRun = null;   // the AbortController of the run in progress
+const batchBar = document.getElementById('batchBar'), batchLog = document.getElementById('batchLog');
+const batchHud = document.getElementById('batchHud');
+const batchGo = document.getElementById('batchGo'), batchStop = document.getElementById('batchStop');
+const fmtTime = (s) => s >= 3600 ? `${Math.floor(s / 3600)} h ${Math.round(s % 3600 / 60)} min`
+                     : s >= 60 ? `${Math.floor(s / 60)} min ${Math.round(s % 60)} s` : `${Math.round(s)} s`;
+
+function batchProgress(done, total, t0, note) {
+    const pct = total ? 100 * done / total : 0;
+    batchBar.firstElementChild.style.width = `${pct}%`;
+    batchBar.setAttribute('aria-valuenow', pct.toFixed(0));
+    const el = (performance.now() - t0) / 1000;
+    const left = done && done < total ? ` · faltam ~${fmtTime(el / done * (total - done))}` : '';
+    batchHud.innerHTML = total ? `<b>${done}</b> de ${total} imagens · ${pct.toFixed(0)}% · ${fmtTime(el)}${left}${note || ''}` : note || '';
+}
+
+batchGo.onclick = async () => {
+    const dir = document.getElementById('batchDir').value.trim();
+    if (!dir) { batchHud.textContent = 'Indique o caminho da pasta.'; return; }
+    batchRun = new AbortController();
+    batchGo.disabled = true; batchStop.disabled = false;
+    batchBar.classList.remove('hidden', 'done', 'failed');
+    batchLog.classList.remove('hidden');
+    batchLog.textContent = '';
+    const t0 = performance.now();
+    let total = 0, done = 0, errors = 0, summary = '';
+    batchProgress(0, 0, t0, 'procurando imagens…');
+    try {
+        const res = await fetch('/batch', {
+            method: 'POST', signal: batchRun.signal,
+            headers: { 'Content-Type': 'application/json',
+                       'x-q': document.getElementById('iquality').value,
+                       'x-mode': document.getElementById('imode').value,
+                       'x-fast': document.getElementById('ifast').value,
+                       'x-grain': document.getElementById('grain').value },
+            body: JSON.stringify({ dir, out: document.getElementById('batchOut').value,
+                                   recursive: document.getElementById('batchDeep').checked,
+                                   as: document.getElementById('batchAs').value })
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const reader = res.body.getReader(), text = new TextDecoder();
+        let rest = '';
+        for (;;) {
+            const { done: end, value } = await reader.read();
+            if (end) break;
+            rest += text.decode(value, { stream: true });
+            const lines = rest.split('\n');
+            rest = lines.pop();
+            for (const line of lines) {
+                batchLog.textContent += line + '\n';
+                batchLog.scrollTop = batchLog.scrollHeight;
+                let m;
+                if ((m = line.match(/^(\d+) imagens de /))) total = +m[1];
+                else if ((m = line.match(/^\[(\d+)\/(\d+)\]/))) {
+                    done = +m[1]; total = +m[2];
+                    if (/ERRO/.test(line)) errors++;
+                } else if (/^total:|^nenhuma imagem/.test(line)) summary = line;
+            }
+            batchProgress(done, total, t0, errors ? ` · <span class="bad">${errors} com erro</span>` : '');
+        }
+        batchBar.classList.add(errors ? 'failed' : 'done');
+        if (!total) batchBar.firstElementChild.style.width = '100%';
+        batchHud.innerHTML = summary ? summary.replace(/^total: /, 'Pronto: ') : 'Pronto.';
+    } catch (e) {
+        batchBar.classList.add('failed');
+        batchHud.textContent = batchRun.signal.aborted
+            ? `Parado em ${done} de ${total}. O que já foi feito fica; rodar de novo continua daí.`
+            : `Erro: ${e.message}`;
+    }
+    batchRun = null;
+    batchGo.disabled = false; batchStop.disabled = true;
+};
+batchStop.onclick = () => { if (batchRun) batchRun.abort(); };
 
 // The PNG options appear on both tabs: a change to one copy is a change
 // to all.

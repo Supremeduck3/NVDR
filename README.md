@@ -1459,6 +1459,36 @@ networks and chat apps, drop ancillary chunks, and what arrives is the
 preview alone. E-mail, file hosting, and anything that passes a file as a
 file keep it whole.
 
+### A whole folder
+
+`nvdr_batch <folder> [out-folder]` codes every image in a folder (JPEG,
+PNG, BMP, TGA, GIF, PPM; not a PNG already carrying an NVDR file) into
+out-folder, `<folder>/nvdr` unless given, and with `-r` the folders
+under it too, in the same tree. It codes directionally (`--progressive`
+for the layered mode), takes `--q`, `--fast`, `--grain` and `--chroma`
+as `nvdr_encode` does, and writes `.nvdr` files, the PNGs that carry
+them (`--as png`), or both. Two images whose names differ only by
+extension keep it (`foto.jpg.nvdr`).
+
+It codes one image per core at once. The still coder's scratch buffers
+are per thread and its tables are built once under a lock, so the
+output is byte for byte what one image at a time gives, and what
+`nvdr_encode --directional` gives for each: checked on a folder of
+eight, nested, both ways. On four cores it ran 2.8 times faster.
+
+A run can stop and start again: an image whose output is newer is
+skipped (`--force` codes it anyway), and each file is written under a
+temporary name and renamed when whole. It reports a line per image as
+each finishes, which the page reads: its "Pasta inteira" panel takes a
+folder's path on the machine serving the page, uses the image tab's
+options, and shows a progress bar with the time left, and a button that
+stops the run. The server's `/batch` answers only requests from that
+machine, since it reads and writes its folders.
+
+Small, heavily compressed web JPEGs can come out bigger at q 24, which
+keeps more than they had; a camera's photos come out a fraction of
+their size.
+
 ### Frequency bands (format v11)
 
 Texture used to travel as one layer, tile by tile from the top. Half of
@@ -2971,8 +3001,8 @@ B frames came later: see "B frames (sequence format 7)".
 
     src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
                 nvdrv.c for sequences
-    tools/      six CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
-                nvdr_png
+    tools/      seven CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
+                nvdr_png, nvdr_batch
     public/     the browser decoders (nvdr.js, nvdrv.js) and the page
     scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
     samples/    the images every number in this file was measured on
@@ -2993,6 +3023,7 @@ B frames came later: see "B frames (sequence format 7)".
     ./nvdr_album unpack album.nvda out/ --compare .
     ./nvdr_png out.nvdr out.png         # any of the three, as a PNG
     ./nvdr_png --extract out.png back.nvdr
+    ./nvdr_batch ~/Fotos -r --fast       # every image in a folder (and under it)
     make check          # the regression gate
     make fuzz           # the decoders under ASan and UBSan
 

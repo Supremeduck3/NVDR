@@ -398,6 +398,32 @@ node server.js     # abra http://localhost:3000/galeria.html
 
 ---
 
+## Uma pasta inteira
+
+```bash
+./nvdr_batch ~/Fotos                 # as imagens da pasta, em ~/Fotos/nvdr/
+./nvdr_batch ~/Fotos /mnt/backup -r  # e as das subpastas, em outra pasta
+```
+
+Codifica todas as imagens (JPEG, PNG, BMP, TGA, GIF, PPM) de uma pasta,
+no modo direcional (o de arquivo menor), **uma imagem por núcleo**, e
+mantém a árvore de pastas na saída.
+
+- `-r` inclui as subpastas; `--as png` grava o PNG com o NVDR dentro, e
+  `--as both` os dois; `--q`, `--fast`, `--grain` e `--progressive` como
+  no `nvdr_encode`.
+- **Dá para parar e continuar**: imagem cuja saída já é mais nova é pulada
+  (`--force` refaz), e nenhum arquivo fica pela metade.
+- Na página, o painel **Pasta inteira** (aba Imagem) faz o mesmo: digite o
+  caminho da pasta, escolha as opções acima dele e acompanhe pela **barra
+  de progresso**, com o tempo que falta e um botão **Parar**. Só funciona
+  com a página aberta na própria máquina (`localhost`), porque mexe nas
+  pastas dela.
+- JPEGs pequenos e muito comprimidos (fotos de site) podem sair maiores em
+  q24; foto de câmera sai uma fração do tamanho.
+
+---
+
 ## Compartilhar como PNG
 
 ```bash

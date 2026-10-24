@@ -15,7 +15,7 @@ CODEC   = src/nvdr.c src/entropy.c src/grain.c src/restore.c
 HEADERS = src/nvdr.h src/entropy.h src/grain.h src/restore.h
 SEQ     = $(CODEC) src/nvdrv.c
 SEQ_H   = $(HEADERS) src/nvdrv.h
-TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album nvdr_png
+TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album nvdr_png nvdr_batch
 
 all: $(TOOLS)
 
@@ -28,8 +28,11 @@ nvdr_decode: tools/nvdr_decode.c $(CODEC) $(HEADERS)
 nvdr_album: tools/nvdr_album.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
 	$(CC) $(CFLAGS) -o $@ tools/nvdr_album.c src/nvda.c $(SEQ) $(LDLIBS)
 
-nvdr_png: tools/nvdr_png.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
-	$(CC) $(CFLAGS) -o $@ tools/nvdr_png.c src/nvda.c $(SEQ) $(LDLIBS)
+nvdr_batch: tools/nvdr_batch.c src/pngwrap.c src/pngwrap.h $(CODEC) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_batch.c src/pngwrap.c $(CODEC) $(LDLIBS)
+
+nvdr_png: tools/nvdr_png.c src/pngwrap.c src/pngwrap.h src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
+	$(CC) $(CFLAGS) -o $@ tools/nvdr_png.c src/pngwrap.c src/nvda.c $(SEQ) $(LDLIBS)
 
 nvdrv_encode: tools/nvdrv_encode.c $(SEQ) $(SEQ_H)
 	$(CC) $(CFLAGS) -o $@ tools/nvdrv_encode.c $(SEQ) $(LDLIBS)

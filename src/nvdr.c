@@ -281,9 +281,7 @@ static int cos_entry(int j) {
 
 /* Built once, the same way the JS decoder builds them; nothing here
  * depends on floating point. */
-static void tables_init(void) {
-    static int done = 0;
-    if (done) return;
+static void tables_build(void) {
     for (int s = 0; s < NSIZES; s++) {
         int n = NVDR_MIN_BLOCK << s, unit = NVDR_MAX_BLOCK / n;
         for (int k = 0; k < n; k++)
@@ -334,7 +332,15 @@ static void tables_init(void) {
     }
 #endif
     bitcost[0][0] = bitcost[1][0] = 16.0;
-    done = 1;
+}
+
+/* Several pictures may be coded at once (nvdr_batch codes one per core):
+ * the tables are built by the first, and the others wait for them. */
+static void tables_init(void) {
+    static volatile int done = 0;
+    if (done) return;
+#pragma omp critical(nvdr_tables)
+    if (!done) { tables_build(); done = 1; }
 }
 
 /* Encoder only: orthonormal coefficients of a block of shape `s`, w
@@ -1637,7 +1643,7 @@ static void keep_estimate(Enc* e, double j, int mode, int tx) {
  * models; `best` is the mode's cost with the DCT. *tx becomes whichever
  * type costs least, and the cost is returned. */
 static double choose_tx(Enc* e, int x, int y, int w, int h, int mode, double best, int* tx) {
-    static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    static _Thread_local int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int sh = shape_of(w, h);
     *tx = TX_DCT;
     if (!has_tx(&e->p->cv, w, h, mode)) return best;
@@ -1667,7 +1673,7 @@ static double choose_tx(Enc* e, int x, int y, int w, int h, int mode, double bes
  * ITU-T VCEG-AH21, 2008), applied here to the choice of mode and type. */
 static double try_modes(Enc* e, int x, int y, int w, int h, const int* cand, int nc, double best,
                         int* mode, int* tx) {
-    static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    static _Thread_local int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int sh = shape_of(w, h);
     double jd[1 + DIR_TRIED];
     e->estimate = 1;
@@ -1700,7 +1706,7 @@ static double try_modes(Enc* e, int x, int y, int w, int h, const int* cand, int
 }
 
 static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int w, int h, int* textured) {
-    static int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
+    static _Thread_local int dl[3], lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
     int sh = shape_of(w, h);
     int skip = 0, mode = 0, tx = TX_DCT;
     double skip_lambda = e->p->skip_lambda;
