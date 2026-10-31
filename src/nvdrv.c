@@ -571,7 +571,13 @@ static int subpel_build_seq(Subpel* s, const NvdrImage* ref) {
     s->Q[0] = s->F;
     const unsigned char* p = ref->pixels;
     int W = s->w, Hh = s->h;
+    /* Rows are independent in both passes, so they are shared among the
+     * threads: the planes are a sixth of encoding a sequence and were
+     * built on one core while the motion search used all of them. */
 #define P(X, Y, C) p[((size_t)clampi((Y), 0, Hh - 1) * W + clampi((X), 0, W - 1)) * 3 + (C)]
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int r = 0; r < rows; r++) {
         int y = r - SP_PAD - 3;
         for (int x = -SP_PAD; x < W + SP_PAD; x++)
@@ -584,6 +590,9 @@ static int subpel_build_seq(Subpel* s, const NvdrImage* ref) {
     }
 #undef P
     long rs = (long)s->sw * 3;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int y = -SP_PAD; y < Hh + SP_PAD; y++)
         for (int x = -SP_PAD; x < W + SP_PAD; x++)
             for (int c = 0; c < 3; c++) {
