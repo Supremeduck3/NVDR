@@ -12,6 +12,7 @@
  * frame 1 is a different reference at frame 2 and the error compounds
  * down the clip. scripts/crosscheck_seq.mjs checks every frame.
  */
+import { wasmPredict } from './nvdr-wasm.js';
 import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext, VERSION as CONTAINER_VERSION } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
@@ -1002,8 +1003,12 @@ export class SequenceDecoder {
             if (kind === PRED) {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, null, l0, null))
                     throw new Error('motion field is damaged');
-                blockPredict(ref, this.pred, width, height, G.g, v0x, v0y, null, -1, predictRegionSeq);
-                if (flags & FRAME_OBMC) obmcApply(G, this.pred, width, height, ref, null, v0x, v0y, null, null, null);
+                // The C decoder's prediction in WebAssembly when it is
+                // loaded (src/mc.c), the same pixels made here otherwise.
+                if (!wasmPredict(ref, null, this.pred, width, height, G, v0x, v0y, null, null, null, flags & FRAME_OBMC)) {
+                    blockPredict(ref, this.pred, width, height, G.g, v0x, v0y, null, -1, predictRegionSeq);
+                    if (flags & FRAME_OBMC) obmcApply(G, this.pred, width, height, ref, null, v0x, v0y, null, null, null);
+                }
                 field = storeField(G, null, v0x, v0y, dist0, null, null, 0);
             } else {
                 const v1x = new Int16Array(nb), v1y = new Int16Array(nb), mode = new Uint8Array(nb);
@@ -1012,6 +1017,9 @@ export class SequenceDecoder {
                 if (!unpackVfield(bytes, fp + head, fieldLen - head, G, split, mode, l0, l1))
                     throw new Error('motion field is damaged');
                 const P0 = this.pred, P1 = this.pred1;
+                if (wasmPredict(ref, this.dpb[r1].pixels, P0, width, height, G, v0x, v0y, v1x, v1y, mode, flags & FRAME_OBMC)) {
+                    field = storeField(G, mode, v0x, v0y, dist0, v1x, v1y, dist1);
+                } else {
                 blockPredict(ref, P0, width, height, G.g, v0x, v0y, mode, MODE_BWD, predictRegionSeq);
                 blockPredict(this.dpb[r1].pixels, P1, width, height, G.g, v1x, v1y, mode, MODE_FWD, predictRegionSeq);
                 // Backward blocks take the second prediction, the mean
@@ -1029,6 +1037,7 @@ export class SequenceDecoder {
                 }
                 if (flags & FRAME_OBMC) obmcApply(G, P0, width, height, ref, this.dpb[r1].pixels, v0x, v0y, v1x, v1y, mode);
                 field = storeField(G, mode, v0x, v0y, dist0, v1x, v1y, dist1);
+                }
             }
             ref = this.pred;
             this.pos += fk + fieldLen;

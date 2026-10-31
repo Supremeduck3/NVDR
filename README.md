@@ -2769,6 +2769,27 @@ display is the larger half. The seam blend runs in JS over every pixel,
 after a copy from RGB to RGBA, on the main thread. The decoder in C runs
 at about 28 ms per megapixel, which is 38 fps at 720p and 17 at 1080p.
 
+Those numbers are from an older format. With sequence format 20 (32x32
+blocks, quarter pixels through HEVC's 8-tap filters, overlapped blocks,
+in-loop restoration) the player had slipped to about 120 ms a 960x540
+frame, three times its budget at 24 fps, and the C decoder to 130 ms:
+
+- The C decoder built, for every reference, all sixteen quarter-pixel
+  phases of the whole frame before predicting from it, as the encoder
+  does for its searches: 88% of its time. It now filters only the
+  region each block reads (`src/mc.c`), with the same sums and rounding,
+  so the pixels are the planes' to the bit. 25 frames: 3.2 s to 0.87 s.
+- The page's video tab never loaded the WebAssembly decoder (only the
+  image tab's workers did), so every frame was decoded in JavaScript,
+  57% of it in motion compensation. The tab now loads it, and
+  `src/mc.c` is compiled into it, so containers and predictions both run
+  as C: 125 ms a frame to 35 ms in Node, and in Chromium 37 ms to decode
+  and 4 ms to show against 41.7: real time, no frame dropped.
+
+`scripts/crosscheck_seq.mjs --wasm` holds the WebAssembly path to the C
+pixels as the plain run holds the JavaScript one: identical on three
+clips, whole and cut at seven points, one of them with PRED2 frames.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files

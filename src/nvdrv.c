@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "entropy.h"
+#include "mc.h"
 
 /* ---------------------------------------------------------------- bytes */
 
@@ -3422,8 +3423,6 @@ static int decode_one(NvdrvDecoder* d) {
         uint8_t* mode = (uint8_t*)malloc(nb * 4);
         uint8_t* split = mode + nb;
         uint8_t* tok = mode + 2 * nb;
-        Subpel sp0, sp1;
-        memset(&sp0, 0, sizeof(sp0)); memset(&sp1, 0, sizeof(sp1));
         int rc = -1;
         const uint8_t* fp = d->data + d->pos + fk;
         size_t head = MODEL_BYTES * (!!(flags & FRAME_MODEL0) + !!(flags & FRAME_MODEL1));
@@ -3440,24 +3439,22 @@ static int decode_one(NvdrvDecoder* d) {
             VfList l0 = { &G, &m0, v, v + nb, mv, mv + nb, NULL, NULL, tv, tv + nb, t0ok };
             VfList l1 = { &G, &m1, v + 2 * nb, v + 3 * nb, mv + 2 * nb, mv + 3 * nb, NULL, NULL,
                           tv + 2 * nb, tv + 3 * nb, t1ok };
+            /* The prediction block by block from the references (mc.c),
+             * not from their subpixel planes as the encoder makes it:
+             * the same pixels, for a fraction of the work. */
             if (kind == NVDRV_PRED) {
-                if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0 &&
-                    slot_subpel(&d->dpb[before], &sp0) == 0) {
-                    block_predict(&sp0, &d->pred, G.g, v, v + nb);
-                    Motion M = { &sp0, NULL, v, v + nb, NULL, NULL, NULL };
-                    if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
+                if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0) {
+                    mc_predict_frame(d->dpb[before].img.pixels, NULL, d->pred.pixels, NULL, d->width, d->height,
+                                     G.g, G.nfx, G.nfy, v, v + nb, NULL, NULL, NULL, (flags & FRAME_OBMC) != 0);
                     rc = 0;
                 }
-            } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1) == 0 &&
-                       slot_subpel(&d->dpb[before], &sp0) == 0 &&
-                       slot_subpel(&d->dpb[after], &sp1) == 0) {
-                block_predict_bi(&sp0, &sp1, &d->pred, G.g, v, v + nb, v + 2 * nb, v + 3 * nb, mode);
-                Motion M = { &sp0, &sp1, v, v + nb, v + 2 * nb, v + 3 * nb, mode };
-                if (flags & FRAME_OBMC) obmc_apply(&G, &M, &d->pred);
+            } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1) == 0) {
+                mc_predict_frame(d->dpb[before].img.pixels, d->dpb[after].img.pixels, d->pred.pixels, d->err.pixels,
+                                 d->width, d->height, G.g, G.nfx, G.nfy, v, v + nb, v + 2 * nb, v + 3 * nb, mode,
+                                 (flags & FRAME_OBMC) != 0);
                 rc = 0;
             }
         }
-        /* sp0 and sp1 are the slots' own planes: nothing to free. */
         /* The field as decoded, for the frames after this one. */
         if (rc == 0 && slot_store_field(&field, &G, two ? mode : NULL, v, v + nb,
                                         display - d->dpb[before].display, v + 2 * nb, v + 3 * nb,

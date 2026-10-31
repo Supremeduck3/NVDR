@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nvdr.h"
+#include "mc.h"
 
 uintptr_t nvdr_heap_top(void);
 void nvdr_heap_rewind(uintptr_t to);
@@ -99,3 +100,50 @@ Result* nvdr_wasm_decode(uint32_t n, int32_t max_layer) {
 
 __attribute__((export_name("nvdr_wasm_release")))
 void nvdr_wasm_release(void) { nvdr_heap_rewind(after_input); }
+
+/*
+ * A sequence frame's motion-compensated prediction (src/mc.c), for
+ * public/nvdrv.js:
+ *
+ *   p = nvdr_wasm_mc_alloc(w, h, cells)  room for the references, the
+ *                                        field and the prediction; p
+ *                                        points at five pointers: r0, r1,
+ *                                        the vectors (4 * cells int16,
+ *                                        v0x v0y v1x v1y), the modes, and
+ *                                        the prediction, w * h * 3 bytes
+ *   nvdr_wasm_mc(w, h, g, nfx, nfy, two, obmc)
+ *
+ * The room is the heap a decode's input takes, so the next
+ * nvdr_wasm_input() takes it back.
+ */
+static uint32_t mc_at[5];
+static uint8_t* mc_tmp;
+
+__attribute__((export_name("nvdr_wasm_mc_alloc")))
+uint32_t* nvdr_wasm_mc_alloc(int32_t w, int32_t h, int32_t cells) {
+    nvdr_heap_rewind(0);
+    input = NULL;
+    base.pixels = NULL;
+    size_t n = (size_t)w * h * 3;
+    uint8_t* r0 = (uint8_t*)malloc(n);
+    uint8_t* r1 = (uint8_t*)malloc(n);
+    int16_t* v = (int16_t*)malloc((size_t)cells * 4 * sizeof(int16_t));
+    uint8_t* mode = (uint8_t*)malloc((size_t)cells);
+    uint8_t* dst = (uint8_t*)malloc(n);
+    mc_tmp = (uint8_t*)malloc(n);
+    if (!r0 || !r1 || !v || !mode || !dst || !mc_tmp) return 0;
+    mc_at[0] = (uint32_t)(uintptr_t)r0; mc_at[1] = (uint32_t)(uintptr_t)r1;
+    mc_at[2] = (uint32_t)(uintptr_t)v; mc_at[3] = (uint32_t)(uintptr_t)mode;
+    mc_at[4] = (uint32_t)(uintptr_t)dst;
+    return mc_at;
+}
+
+__attribute__((export_name("nvdr_wasm_mc")))
+void nvdr_wasm_mc(int32_t w, int32_t h, int32_t g, int32_t nfx, int32_t nfy, int32_t two, int32_t obmc) {
+    size_t cells = (size_t)nfx * nfy;
+    const int16_t* v = (const int16_t*)(uintptr_t)mc_at[2];
+    mc_predict_frame((const uint8_t*)(uintptr_t)mc_at[0], two ? (const uint8_t*)(uintptr_t)mc_at[1] : NULL,
+                     (uint8_t*)(uintptr_t)mc_at[4], mc_tmp, w, h, g, nfx, nfy,
+                     v, v + cells, v + 2 * cells, v + 3 * cells,
+                     two ? (const uint8_t*)(uintptr_t)mc_at[3] : NULL, obmc);
+}

@@ -1389,6 +1389,7 @@ typedef struct {
 } Part;
 
 #define EST_KEEP 2   /* see try_modes() */
+#define PC_SLOTS 12  /* modes a leaf's prediction cache holds: flat and DIR_TRIED tried, and room */
 
 typedef struct {
     Part           part[2];
@@ -1415,6 +1416,16 @@ typedef struct {
     double         top_j[EST_KEEP];
     int            top_m[EST_KEEP], top_t[EST_KEEP];
     int            last_mode;   /* the mode code_leaf() chose last */
+    /* A leaf's directional predictions while its modes and transform
+     * types are tried (pred_cached()): a prediction reads only the decoded
+     * pixels around the leaf, which trying the leaf does not change, and
+     * computing it again for every transform type was a tenth of the
+     * encoding. Keyed by the leaf; pc_part NULL when off. */
+    const Part*    pc_part;
+    int            pc_x, pc_y, pc_w, pc_h, pc_n;
+    int            pc_mode[PC_SLOTS];
+    uint8_t        pc_have[PC_SLOTS];   /* bit c: plane c is there */
+    int*           pc;                  /* PC_SLOTS x 3 x NVDR_MAX_BLOCK^2 */
     double         plane_bits[3];   /* what the coded leaves cost, per component */
 } Enc;
 
@@ -1450,6 +1461,28 @@ static int quantise(double v, double dz) {
 static void rdoq(const TextureModels* m, int sc, int c, const double* v, int* lv,
                  int start, int end, double lam, int keep);
 
+/* dir_predict(), from the leaf's cache when it is the leaf being tried. */
+static void pred_cached(Enc* e, const Canvas* cv, int c, int x, int y, int w, int h, int mode, int* pr) {
+    if (!e->pc || e->pc_part != e->p || e->pc_x != x || e->pc_y != y || e->pc_w != w || e->pc_h != h) {
+        dir_predict(cv, c, x, y, w, h, mode, pr);
+        return;
+    }
+    int k = 0;
+    while (k < e->pc_n && e->pc_mode[k] != mode) k++;
+    if (k == e->pc_n) {
+        if (k == PC_SLOTS) { dir_predict(cv, c, x, y, w, h, mode, pr); return; }
+        e->pc_mode[k] = mode;
+        e->pc_have[k] = 0;
+        e->pc_n++;
+    }
+    int* slot = e->pc + ((size_t)k * 3 + (size_t)c) * NVDR_MAX_BLOCK * NVDR_MAX_BLOCK;
+    if (!(e->pc_have[k] >> c & 1)) {
+        dir_predict(cv, c, x, y, w, h, mode, slot);
+        e->pc_have[k] |= (uint8_t)(1 << c);
+    }
+    memcpy(pr, slot, sizeof(int) * (size_t)w * h);
+}
+
 static double leaf_levels(Enc* e, int x, int y, int w, int h, int skip, int mode, int tx,
                           int dl[3], int lv[3][NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], int* textured) {
     Part* P = e->p;
@@ -1482,7 +1515,7 @@ static double leaf_levels(Enc* e, int x, int y, int w, int h, int skip, int mode
              * so is any half leaf's, which nothing prepares. */
             int pr[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
             double blk[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK], co[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-            if (mode > 0) dir_predict(cv, c, x, y, w, h, mode, pr);
+            if (mode > 0) pred_cached(e, cv, c, x, y, w, h, mode, pr);
             else {
                 /* Flat in a picture with a base: its texture is not
                  * prepared, since the row's is the block minus the base. */
@@ -1678,6 +1711,10 @@ static double try_modes(Enc* e, int x, int y, int w, int h, const int* cand, int
     double jd[1 + DIR_TRIED];
     e->estimate = 1;
     e->ntop = 0;
+    /* The leaf's predictions are kept until code_leaf() has coded it. */
+    e->pc_part = e->p;
+    e->pc_x = x; e->pc_y = y; e->pc_w = w; e->pc_h = h;
+    e->pc_n = 0;
     for (int ci = 0; ci < nc; ci++) {
         Sink c0 = { NULL, 0 }, c1[2] = { { NULL, 0 }, { NULL, 0 } };
         double d = leaf_levels(e, x, y, w, h, 0, cand[ci], TX_DCT, dl, lv, NULL);
@@ -1784,6 +1821,7 @@ static double code_leaf(Enc* e, Sink* s0, Sink* s1, int x, int y, int w, int h, 
         }
     }
     double err = leaf_levels(e, x, y, w, h, skip, mode, tx, dl, lv, textured);
+    e->pc_part = NULL;
     leaf_emit(e, s0, s1, sh, mode, tx, dl, lv);
     e->last_mode = mode;
     return err;
@@ -2188,6 +2226,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     int use420 = cfg.chroma420 && cfg.max_block >= 8 && cfg.max_block <= NVDR_MAX_BLOCK &&
                  (cfg.max_block & (cfg.max_block - 1)) == 0;
     e.nparts = use420 ? 2 : 1;
+    if (dirpred && !(e.pc = (int*)malloc(sizeof(int) * PC_SLOTS * 3 * NVDR_MAX_BLOCK * NVDR_MAX_BLOCK))) goto done;
     if (canvas_init(&e.part[0].cv, img->width, img->height, cfg.max_block, cfg.min_block,
                     use420 ? 1 : 3, 0) != 0) goto done;
     if (use420 && canvas_init(&e.part[1].cv, (img->width + 1) / 2, (img->height + 1) / 2,
@@ -2404,6 +2443,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 done:
     nvdr_context_free(start);
     free(tq);
+    free(e.pc);
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
     nvdr_enc_free(&enc2);

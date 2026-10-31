@@ -13,8 +13,8 @@ LDLIBS  = -lm -lz
 
 CODEC   = src/nvdr.c src/entropy.c src/grain.c src/restore.c
 HEADERS = src/nvdr.h src/entropy.h src/grain.h src/restore.h
-SEQ     = $(CODEC) src/nvdrv.c
-SEQ_H   = $(HEADERS) src/nvdrv.h
+SEQ     = $(CODEC) src/nvdrv.c src/mc.c
+SEQ_H   = $(HEADERS) src/nvdrv.h src/mc.h
 TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album nvdr_png nvdr_batch
 
 all: $(TOOLS)
@@ -74,7 +74,7 @@ bench-photos: nvdr_encode nvdr_decode output/convert
 # The decoder for the browser, as WebAssembly: clang and wasm-ld only.
 wasm: public/nvdr.wasm
 
-public/nvdr.wasm: $(CODEC) $(HEADERS) wasm/api.c wasm/libc.c wasm/include/*.h wasm/build.sh
+public/nvdr.wasm: $(CODEC) $(HEADERS) src/mc.c src/mc.h wasm/api.c wasm/libc.c wasm/include/*.h wasm/build.sh
 	./wasm/build.sh
 
 # The example files public/galeria.html shows: one image, and an album
