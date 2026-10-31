@@ -2177,7 +2177,10 @@ What changed, in order, and what each did:
     motion search reads subpixel samples by rows    identical
     a leaf's transform types share each row pass    identical
     modes and types ranked on estimated error       BD 0.0%
+    a leaf's predictions kept while it is tried     identical
+    a sequence's subpixel planes built on all cores identical
     --fast: other types on the 2 cheapest modes     +0.8% bytes
+    --fast: modes ranked without RDOQ               +0.1% Y, +0.4% RGB
 
 Encoding time, one machine, 4 cores (stills run on one):
 
@@ -2197,6 +2200,21 @@ multi clips it is within 0.3% either way; video gains less time, since a
 predicted frame's leaves mostly stop at INTER. RDOQ weighs each level the
 same way (Karczewicz, Ye and Chong, "Rate distortion optimized
 quantization", ITU-T VCEG-AH21, 2008).
+
+With --fast the ranking also leaves RDOQ out: a candidate's levels are
+rounded with the dead zone, and RDOQ runs only on the two finalists. On
+the six samples that is 26% less time for +0.1% on PSNR-Y and +0.4% on
+PSNR-RGB; on the clean and multi clips 13 and 15% less, for +0.1 and
+0.0% on Y, +0.4% on RGB. Without --fast it would save 35% for +0.5% and
++0.8% (three finalists instead of two: +0.3% and +0.7%), so the default
+keeps RDOQ in the ranking. Measured and left out: the forward transform
+in single precision, BD 0.0% but only 3 to 4% faster.
+
+Kept per leaf while its modes and types are tried, its directional
+predictions (they read only the decoded pixels around it) took 5 to 8%
+off a still; built on all cores, a sequence's subpixel planes took 3.1
+s down to 0.95 s over 9 frames, 2 to 5% of the encode. Both leave every
+byte where it was.
 
 ### v11, and albums of large photos
 
