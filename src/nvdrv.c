@@ -50,9 +50,10 @@ static int clamp255v(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
  * Whatever a header leaves out is as the last frame of the same class had
  * it: intra frames, P frames, and B frames by the gap between their
  * references (frame_class()), which is what keeps their steps and global
- * vectors alike. Every class starts unknown again at each intra frame,
- * as the models do, so a stream can still be joined there; a frame that
- * leaves out what its class has no value for is damage.
+ * vectors alike. Every class starts unknown again in each group of
+ * pictures, as the models do (GROUPS OF PICTURES), so a stream can still
+ * be joined at an intra frame; a frame that leaves out what its class has
+ * no value for is damage.
  *
  * The decoder puts the 32-byte header back from these and the sequence's
  * size before handing the container to the still decoder, which is
@@ -97,6 +98,42 @@ typedef struct {
     uint32_t ql, qc;
     uint8_t flags, max_block, min_block, band, grain;
 } HdrState;
+
+/*
+ * GROUPS OF PICTURES (sequence format 21)
+ * ---------------------------------------
+ * A frame belongs to the group of the latest intra frame shown at or
+ * before it. The B frames shown just before an intra frame are coded after
+ * it, since they predict from it, but they belong to the group before:
+ * they carry on that group's models and headers, and the frames shown
+ * after the intra frame start both fresh. Up to format 20 everything
+ * started fresh at the intra frame itself, so those B frames handed what
+ * they had learned to the next group, and a group could not be coded
+ * until the one before it had been. Now nothing in a group depends on a
+ * frame shown before its intra frame, and the encoder codes groups side
+ * by side (STRETCHES).
+ *
+ * Both sides keep the display numbers of the latest intra frames, and a
+ * class's models and header start over when the frame about to use them
+ * belongs to another group than the frame that left them.
+ */
+#define GOP_HELD 32         /* more than a group of B frames can hold */
+typedef struct { int display[GOP_HELD]; int next, held; } Gops;
+
+static void gops_add(Gops* g, int display) {
+    g->display[g->next] = display;
+    g->next = (g->next + 1) % GOP_HELD;
+    if (g->held < GOP_HELD) g->held++;
+}
+
+/* The display number of the intra frame that `display` belongs to, -1
+ * before any. */
+static int gop_of(const Gops* g, int display) {
+    int best = -1;
+    for (int i = 0; i < g->held; i++)
+        if (g->display[i] <= display && g->display[i] > best) best = g->display[i];
+    return best;
+}
 
 /* The container `c` (len bytes, its 32-byte header first) in compact form
  * into `out`, which has room for len + 16 bytes; returns its length, 0
@@ -157,6 +194,7 @@ static uint8_t* expand_container(const uint8_t* p, size_t avail, size_t declared
 NvdrvConfig nvdrv_default_config(void) {
     NvdrvConfig c;
     c.frame = nvdr_default_config();
+    c.from = c.to = 0;
     /* Every frame's texture in one layer: nobody watches a video frame
      * arrive, and the split costs bytes. */
     c.frame.band = 0;
@@ -2086,6 +2124,7 @@ struct NvdrvEncoder {
     int         width, height;
     uint32_t    count;       /* frames received */
     uint32_t    coded;       /* frames written */
+    int         quiet;       /* the frame being coded is not written (STRETCHES) */
     int         chroma420;   /* the last intra frame halved its colour */
     /* What the decoder holds: the encoder predicts from these and never
      * from the source, because they are all the decoder will have;
@@ -2106,6 +2145,10 @@ struct NvdrvEncoder {
     int         anchor;      /* display number of the last anchor, -1 before any */
     int         last_display;   /* of the frame last written, see COMPACT FRAMES */
     HdrState    hs[HDR_CLASSES];
+    /* The latest intra frames, and the group each class's header and
+     * models were left in (GROUPS OF PICTURES). */
+    Gops        gops;
+    int         hs_gop[HDR_CLASSES], ctx_gop[4];
     NvdrImage   pred, error;
     NvdrImage   tf;          /* the anchor, filtered */
     /* The models the frames leave, carried from one to the next in coding
@@ -2212,6 +2255,38 @@ static int still_held(const Slot* dpb, int n, int i, int from) {
     return later < 2;
 }
 
+/*
+ * STRETCHES
+ * ---------
+ * A sequence can be coded in stretches, side by side, each from one of
+ * the intra frames the GOP places to the next, and the files joined
+ * (tools/nvdrv_encode.c does). The joined file is the one a single
+ * encoder writes, to the byte, because a stretch is coded from what the
+ * single encoder would hold at the same point:
+ *
+ *   - a stretch that ends at intra frame `to` codes it and the B frames
+ *     shown before it (which predict from it), reading the source frames
+ *     after it that its look-ahead and temporal filter read;
+ *   - the next stretch starts from the anchor before that intra frame,
+ *     as a source frame only, codes the intra frame again without writing
+ *     it, so the frames after it predict from the same picture, and skips
+ *     the B frames before it.
+ *
+ * Nothing after an intra frame depends on a frame shown before it: the
+ * models and headers start over in its group (GROUPS OF PICTURES), and a
+ * P frame never predicts across it (MORE REFERENCES). What the joiner has
+ * to mend is the first display number a stretch writes, which is a change
+ * from the frame written before it, and the frame count.
+ */
+
+/* The anchor just before the intra frame the GOP places at `display`:
+ * groups run from each such intra frame in steps of bframes + 1, the last
+ * cut short by the next one (group_end()). */
+static int anchor_before(const NvdrvConfig* c, int display) {
+    int p = display - c->gop, step = c->bframes + 1;
+    return p + (display - 1 - p) / step * step;
+}
+
 int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
                       int width, int height, const NvdrvConfig* cfg) {
     *out = NULL;
@@ -2220,6 +2295,8 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     e->cfg = cfg ? *cfg : nvdrv_default_config();
     e->width = width; e->height = height;
     e->anchor = -1;
+    for (int i = 0; i < HDR_CLASSES; i++) e->hs_gop[i] = -1;
+    for (int i = 0; i < 4; i++) e->ctx_gop[i] = -1;
 
     if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 32 : 8;
     if (e->cfg.block > 128) e->cfg.block = 0;
@@ -2234,6 +2311,13 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     /* B frames need per-block vectors; a GOP shorter than a group bounds
      * the group anyway. */
     if (e->cfg.block == 0) e->cfg.bframes = 0;
+    /* A stretch starts and ends on intra frames the GOP places. */
+    if (e->cfg.from < 0 || e->cfg.to < 0 ||
+        ((e->cfg.from || e->cfg.to) && (e->cfg.gop <= 0 || e->cfg.from % e->cfg.gop || e->cfg.to % e->cfg.gop ||
+                                        (e->cfg.to && e->cfg.to <= e->cfg.from)))) {
+        free(e); return -1;
+    }
+    if (e->cfg.from > 0) e->count = (uint32_t)anchor_before(&e->cfg, e->cfg.from);
     if (alloc_image(&e->pred, width, height) != 0 ||
         alloc_image(&e->error, width, height) != 0 ||
         alloc_image(&e->last_src, width, height) != 0 ||
@@ -2288,6 +2372,17 @@ void nvdrv_encode_set_report(NvdrvEncoder* e, NvdrvReportFn fn, void* user) {
     e->report = fn; e->user = user;
 }
 
+/* The frames ahead of an intra frame its group waits for (group_ready()). */
+static int intra_ahead(const NvdrvConfig* c) {
+    int ahead = c->tpl_strength > 0 ? c->lookahead : 0;
+    return ahead < c->tf_radius ? c->tf_radius : ahead;
+}
+
+void nvdrv_encode_span(const NvdrvEncoder* e, int* first, int* last) {
+    *first = e->cfg.from > 0 ? anchor_before(&e->cfg, e->cfg.from) : 0;
+    *last = e->cfg.to > 0 ? e->cfg.to + intra_ahead(&e->cfg) : -1;
+}
+
 /*
  * One frame, in the compact form described under COMPACT FRAMES: dx, dy
  * is the global vector toward the frame before, dx1, dy1 (B frames) the
@@ -2308,8 +2403,14 @@ static size_t write_frame(NvdrvEncoder* e, int kind, int hc, int display, int bl
     if (!clen) { free(c); return 0; }
     int fn = block ? put_varint(fl, (uint32_t)field_len) : 0;
     size_t body = clen + (block ? (size_t)fn + field_len : 0);
-    /* What differs from the last frame of this class (COMPACT FRAMES). */
-    if (kind == NVDRV_INTRA) for (int i = 0; i < HDR_CLASSES; i++) e->hs[i].known = 0;
+    /* What differs from the last frame of this class (COMPACT FRAMES), in
+     * this group (GROUPS OF PICTURES); an intra frame never leaves
+     * anything out. */
+    if (kind == NVDRV_INTRA) e->hs[0].known = 0;
+    else {
+        int g = gop_of(&e->gops, display);
+        if (e->hs_gop[hc] != g) { e->hs[hc].known = 0; e->hs_gop[hc] = g; }
+    }
     HdrState* st = &e->hs[hc];
     int ng = kind == NVDRV_BI || kind == NVDRV_PRED2 ? 4 : 2, g[4] = { dx, dy, dx1, dy1 };
     unsigned which = (st->known ^ HDR_ALL) & ~(block ? 0u : (unsigned)HDR_BLOCK);
@@ -2628,17 +2729,24 @@ static int code_as(NvdrvEncoder* e, const NvdrImage* src, int display, int kind,
     NvdrHeader fh;
     /*
      * The models carry over from frame to frame in coding order, as an
-     * album's do, and start fresh at every intra frame so the stream can
-     * still be joined there. Every frame used to start from even odds, and
-     * a 960x540 frame codes too few bits for its thousand-odd contexts to
-     * learn much before it ends. A frame inherits from the last frame of
-     * its own class (frame_class()): carried across every frame, the B
-     * frames gained 10 to 30% and the P frames lost 15%, taking over the
-     * statistics of the intra frame or of the finest B frames.
+     * album's do, and start fresh in every group of pictures (GROUPS OF
+     * PICTURES) so the stream can still be joined at an intra frame. Every
+     * frame used to start from even odds, and a 960x540 frame codes too
+     * few bits for its thousand-odd contexts to learn much before it ends.
+     * A frame inherits from the last frame of its own class
+     * (frame_class()): carried across every frame, the B frames gained 10
+     * to 30% and the P frames lost 15%, taking over the statistics of the
+     * intra frame or of the finest B frames. An intra frame starts from
+     * even odds itself.
      */
     int fc = frame_class(kind, before >= 0 ? e->dpb[before].display : 0, after >= 0 ? e->dpb[after].display : 0);
-    if (kind == NVDRV_INTRA)
-        for (int i = 0; i < 4; i++) { nvdr_context_reset(e->ctx[i]); nvdr_context_reset(e->dctx[i]); }
+    if (fc >= 0) {
+        int g = gop_of(&e->gops, display);
+        if (e->ctx_gop[fc] != g) {
+            nvdr_context_reset(e->ctx[fc]); nvdr_context_reset(e->dctx[fc]);
+            e->ctx_gop[fc] = g;
+        }
+    }
     NvdrContext *ectx = fc >= 0 ? e->ctx[fc] : NULL, *dctx = fc >= 0 ? e->dctx[fc] : NULL;
     if (out->ctx && fc >= 0) {
         nvdr_context_copy(out->ctx, ectx); ectx = out->ctx;
@@ -2719,13 +2827,14 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         nvdr_context_copy(e->dctx[w->fc], w->dctx);
         coded_free(&c[!pick]);
     }
-    size_t written = write_frame(e, w->kind, w->fc + 1, display, w->block, w->flags, w->dx, w->dy, w->dx1, w->dy1,
-                                 w->field, w->field_len, w->blob, w->len);
+    size_t written = e->quiet ? 1 : write_frame(e, w->kind, w->fc + 1, display, w->block, w->flags, w->dx, w->dy,
+                                                w->dx1, w->dy1, w->field, w->field_len, w->blob, w->len);
     if (!written) { coded_free(w); return -1; }
     e->dpb[e->ndpb++] = w->slot;
-    e->coded++;
+    if (!e->quiet) e->coded++;
+    if (w->kind == NVDRV_INTRA) gops_add(&e->gops, display);
 
-    if (e->report) {
+    if (e->report && !e->quiet) {
         NvdrvFrameReport r;
         r.display = display; r.kind = w->kind; r.level = w->kind == NVDRV_BI ? level : 0;
         r.q = w->q; r.dx = w->dx; r.dy = w->dy;
@@ -2962,6 +3071,11 @@ static void drop_before(NvdrvEncoder* e, int display) {
     e->ndpb = k;
 }
 
+/* Whether a stretch has coded the intra frame it ends with. */
+static int stretch_done(const NvdrvEncoder* e) {
+    return e->cfg.to > 0 && e->anchor >= e->cfg.to;
+}
+
 static int is_intra_slot(const NvdrvEncoder* e, int display) {
     return display == 0 || (e->cfg.gop > 0 && display % e->cfg.gop == 0);
 }
@@ -2982,7 +3096,7 @@ static int group_end(const NvdrvEncoder* e) {
  * have the frames an intra anchor looks ahead to, unless the stream is
  * closing. */
 static int group_ready(const NvdrvEncoder* e, int closing) {
-    if (e->npend == 0) return 0;
+    if (e->npend == 0 || stretch_done(e)) return 0;
     if (closing) return 1;
     int g = group_end(e), last = e->anchor + e->npend;
     int ahead = is_intra_slot(e, g) && e->cfg.tpl_strength > 0 ? e->cfg.lookahead : 0;
@@ -3164,10 +3278,17 @@ static int flush_group(NvdrvEncoder* e, int closing) {
      * arrived, for the B frames and for filtering the next anchor. */
     const NvdrImage* anchor_src = &e->pend[idx];
     if (e->cfg.tf_radius > 0 && temporal_filter(e, idx, &e->tf) == 0) anchor_src = &e->tf;
-    if (code_frame(e, anchor_src, g, intra, 0) != 0) return -1;
+    /* A stretch's first intra frame ends the stretch before it, which
+     * writes it, and the frames shown before it are that stretch's: here
+     * it is coded only for what the frames after it predict from. */
+    int first = e->cfg.from > 0 && g == e->cfg.from;
+    e->quiet = first;
+    int rc = code_frame(e, anchor_src, g, intra, 0);
+    e->quiet = 0;
+    if (rc != 0) return -1;
     e->use_tile_q = 0;
     e->intra_scale = 1.0f;
-    if (a >= 0 && code_between(e, a, g, 1) != 0) return -1;
+    if (a >= 0 && !first && code_between(e, a, g, 1) != 0) return -1;
     /* Frames before the new anchor are never a reference again. */
     drop_before(e, g);
     /* The frames after the anchor move to the front, their buffers with
@@ -3189,6 +3310,15 @@ int nvdrv_encode_frame(NvdrvEncoder* e, const NvdrImage* frame) {
     if (frame->width != e->width || frame->height != e->height) return -1;
     size_t npx = (size_t)e->width * e->height * 3;
     int display = (int)e->count;
+    if (e->cfg.from > 0 && e->anchor < 0) {
+        /* The anchor before a stretch, coded with the stretch before it:
+         * only the motion to the next frame is measured from it. */
+        memcpy(e->last_src.pixels, frame->pixels, npx);
+        e->anchor = display;
+        e->count++;
+        return 0;
+    }
+    if (stretch_done(e)) return 0;   /* only looked ahead to */
     int i = display - e->anchor;
     if (e->npend >= QCAP || i > QCAP) return -1;
 
@@ -3216,7 +3346,7 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     int rc = 0;
     if (!e) return 0;
     if (e->f) {
-        while (rc == 0 && e->npend > 0)
+        while (rc == 0 && e->npend > 0 && !stretch_done(e))
             if (flush_group(e, 1) != 0) rc = -1;
         if (fseek(e->f, 10, SEEK_SET) == 0) {
             uint8_t n[4];
@@ -3253,6 +3383,9 @@ struct NvdrvDecoder {
     int       shown;         /* display number of the frame last shown */
     int       last_display;  /* of the frame last read, see COMPACT FRAMES */
     HdrState  hs[HDR_CLASSES];
+    int       version;
+    Gops      gops;          /* see GROUPS OF PICTURES */
+    int       hs_gop[HDR_CLASSES], ctx_gop[4];
     int       ended;
     NvdrImage pred, err;
     NvdrContext* ctx[4];     /* the models frames left, per class: see code_frame() */
@@ -3272,13 +3405,16 @@ int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
     size_t got = fread(data, 1, (size_t)size, f);
     fclose(f);
     if (got < NVDRV_HEADER_SIZE ||
-        memcmp(data, NVDRV_MAGIC, 4) != 0 || data[4] != NVDRV_VERSION) {
+        memcmp(data, NVDRV_MAGIC, 4) != 0 || data[4] < 20 || data[4] > NVDRV_VERSION) {
         free(data); return -1;
     }
 
     NvdrvDecoder* d = (NvdrvDecoder*)calloc(1, sizeof(*d));
     if (!d) { free(data); return -1; }
     d->data = data; d->size = got; d->pos = NVDRV_HEADER_SIZE;
+    d->version = data[4];
+    for (int i = 0; i < HDR_CLASSES; i++) d->hs_gop[i] = -1;
+    for (int i = 0; i < 4; i++) d->ctx_gop[i] = -1;
     d->width = get_u16v(data + 6);
     d->height = get_u16v(data + 8);
     d->shown = -1;
@@ -3339,8 +3475,15 @@ static int decode_one(NvdrvDecoder* d) {
     if (kind == NVDRV_PRED2 && (after = find_older(d->dpb, d->ndpb, before)) < 0) return -1;
     int fc = frame_class(kind, before >= 0 ? d->dpb[before].display : 0, after >= 0 ? d->dpb[after].display : 0);
 
-    /* What differs from the last frame of this class (COMPACT FRAMES). */
-    if (kind == NVDRV_INTRA) for (int i = 0; i < HDR_CLASSES; i++) d->hs[i].known = 0;
+    /* What differs from the last frame of this class (COMPACT FRAMES), in
+     * this group (GROUPS OF PICTURES); format 20 started every class over
+     * at an intra frame. */
+    if (kind == NVDRV_INTRA)
+        for (int i = 0; i < (d->version < 21 ? HDR_CLASSES : 1); i++) d->hs[i].known = 0;
+    else if (d->version >= 21) {
+        int g = gop_of(&d->gops, display);
+        if (d->hs_gop[fc + 1] != g) { d->hs[fc + 1].known = 0; d->hs_gop[fc + 1] = g; }
+    }
     HdrState* st = &d->hs[fc + 1];
     unsigned which = 0;
     if (changed) {
@@ -3483,7 +3626,13 @@ static int decode_one(NvdrvDecoder* d) {
     if (alloc_image(&s->img, d->width, d->height) != 0) { slot_free(s); return -1; }
     /* A frame cut before its colour layer has no picture yet: the stream
      * ends there, it is not damaged. */
-    if (kind == NVDRV_INTRA) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
+    if (kind == NVDRV_INTRA) {
+        if (d->version < 21) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
+        gops_add(&d->gops, display);
+    } else if (d->version >= 21) {
+        int g = gop_of(&d->gops, display);
+        if (d->ctx_gop[fc] != g) { nvdr_context_reset(d->ctx[fc]); d->ctx_gop[fc] = g; }
+    }
     size_t clen = 0;
     int damaged = 0;
     uint8_t* cont = expand_container(d->data + d->pos, len, declared, st, d->width, d->height, &clen, &damaged);

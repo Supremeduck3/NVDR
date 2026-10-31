@@ -60,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      20
+#define NVDRV_VERSION      21
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
@@ -149,6 +149,11 @@ typedef struct {
      * kept. */
     int   refs;
     int   fps;             /* carried in the header, informational */
+    /* A stretch of a longer sequence, coded on its own so that stretches
+     * can be coded side by side (STRETCHES in nvdrv.c): the display
+     * numbers of the intra frames it starts and ends with, multiples of
+     * `gop`; 0 for the start and for the end of the sequence. */
+    int   from, to;
 } NvdrvConfig;
 
 NvdrvConfig nvdrv_default_config(void);
@@ -183,6 +188,10 @@ void nvdrv_encode_set_report(NvdrvEncoder* enc, NvdrvReportFn fn, void* user);
 int  nvdrv_encode_frame(NvdrvEncoder* enc, const NvdrImage* frame);
 /* Codes whatever is still held, and finishes the file. */
 int  nvdrv_encode_close(NvdrvEncoder* enc);
+/* The source frames a stretch reads: nvdrv_encode_frame takes them in
+ * order from display *first through *last, -1 meaning to the end of the
+ * sequence. */
+void nvdrv_encode_span(const NvdrvEncoder* enc, int* first, int* last);
 
 /* ------------------------------------------------------------- decoder */
 
