@@ -12,6 +12,7 @@
  */
 import { decode, shrinkRGB, fitSize } from './nvdr.js';
 import { AlbumReader, openAlbumImage } from './nvda.js';
+import { SequenceDecoder } from './nvdrv.js';
 import { loadWasm, wasmActive } from './nvdr-wasm.js';
 
 // The C decoder as WebAssembly, when it loads: from then on decode()
@@ -22,6 +23,7 @@ const wasm = loadWasm();
 
 const stored = new Map();   // key -> Uint8Array
 const albums = new Map();   // key -> AlbumReader
+const sequences = new Map();   // key -> SequenceDecoder, for the video tab's player
 
 function bytesOf(m) {
     if (m.bytes) return m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array(m.bytes);
@@ -99,6 +101,32 @@ const ops = {
         const reader = albums.get(m.key);
         if (!reader) throw new Error(`no album open as ${m.key}`);
         return image(reader.decode(m.index), m.fit);
+    },
+
+    /* A sequence to play (nvdrv.js), as the bytes the player keeps; its
+     * frames then come one at a time, in display order, from seqNext. */
+    seqOpen(m) {
+        if (sequences.has(m.key)) sequences.get(m.key).close();
+        sequences.set(m.key, new SequenceDecoder(m.bytes instanceof ArrayBuffer ? m.bytes : m.bytes.buffer));
+        return { result: true, transfer: [] };
+    },
+
+    /* The sequence's next frame, { index, kind, partial, pixels }, its
+     * pixels a copy of their own (the decoder keeps its references), or
+     * null at the end. */
+    async seqNext(m) {
+        const dec = sequences.get(m.key);
+        if (!dec) throw new Error(`no sequence open as ${m.key}`);
+        const f = await dec.next();
+        if (!f) return { result: null, transfer: [] };
+        const pixels = f.pixels.slice();
+        return { result: { index: f.index, kind: f.kind, partial: f.partial, pixels }, transfer: [pixels.buffer] };
+    },
+
+    seqClose(m) {
+        const dec = sequences.get(m.key);
+        if (dec) { dec.close(); sequences.delete(m.key); }
+        return { result: true, transfer: [] };
     },
 
     /* One photo of an album on a server, by range requests (see

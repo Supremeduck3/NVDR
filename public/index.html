@@ -817,11 +817,13 @@ async function showTruncated() {
  * shows it at the rate the source was shot, one decode per animation tick,
  * so the timing it reports is the real cost of playing the file here.
  */
-import { SequenceDecoder, readSequenceHeader, frameIndex, showRGB, INTRA, PRED, BI } from './nvdrv.js';
+import { readSequenceHeader, frameIndex, showRGB, INTRA, PRED, BI } from './nvdrv.js';
 import { loadWasm, wasmActive } from './nvdr-wasm.js';
-// The player decodes on this thread: with the C decoder as WebAssembly
-// (containers and motion compensation), a 960x540 frame took 35 ms
-// instead of 125 in JavaScript, inside 24 fps's 42.
+import { decoderFor } from './nvdr-decoder.js';
+// The player decodes in a worker (sequenceDecoder()), which loads the
+// WebAssembly decoder itself; this thread loads it too, for the status
+// line and for when the worker cannot start. A 960x540 frame takes 35 ms
+// with it instead of 125 in JavaScript, inside 24 fps's 42.
 const wasmReady = loadWasm();
 import { isPng, nvdrFromPng, kindOf, pngFor, download, pngOptions } from './nvdr-png.js';
 
@@ -930,7 +932,7 @@ async function loadFile(file) {
 let seq = null;           // { buffer, info, frames, name }
 const player = {
     kept: 0, dec: null, queue: [], ended: false, error: null, decoding: false,
-    playing: false, due: 0, shown: -1, current: null, stalled: false, stalls: 0,
+    playing: false, due: 0, shown: -1, current: null, stalled: false, stalls: 0, ahead: null,
     decodeMs: [], showMs: []
 };
 
@@ -953,7 +955,7 @@ function openSequence(buffer, name, sourceSize, report, seconds) {
     setStatus(
         `<b>${name}</b> · ${info.width}×${info.height} · ${frames.length} quadros a ${info.fps} fps ` +
         `(${intra} intra, ${bi} B) · ${formatBytes(buffer.byteLength)} ≈ ${bitrate.toFixed(0)} kbit/s` +
-        ` · decodificado em ${wasmActive() ? 'WebAssembly' : 'JavaScript'}` +
+        ` · decodificado em ${wasmActive() ? 'WebAssembly' : 'JavaScript'}${videoWorker.offThread ? ', fora da página' : ''}` +
         (sourceSize ? ` · ${(100 * buffer.byteLength / sourceSize).toFixed(0)}% do vídeo enviado` : '') +
         (seconds ? ` · codificado em ${seconds.toFixed(1)} s` : ''));
 
@@ -985,35 +987,81 @@ function setKept(bytes) {
     drawStrip();
 }
 
+/* The player's decoder: a SequenceDecoder in a worker (nvdr-tasks.js,
+ * with the WebAssembly decoder loaded there), so a frame's 35 ms of
+ * decoding never hold up the page; on the main thread when no module
+ * worker can start, the same answers. Each opening is a key of its own,
+ * so a frame still in flight from before a rewind is told apart. */
+const videoWorker = decoderFor('video');
+let openings = 0;
+function sequenceDecoder(bytes) {
+    const key = `seq${++openings}`;
+    videoWorker.run({ op: 'seqOpen', key, bytes }).catch(() => {});
+    return {
+        next: () => videoWorker.run({ op: 'seqNext', key }),
+        close: () => { videoWorker.run({ op: 'seqClose', key }).catch(() => {}); }
+    };
+}
+
+/* The next loop's start, decoded while the end of this one is shown: with
+ * B frames the first frame needs five decoded first, a stall at every
+ * loop otherwise. Null when there is none, or the cut changed. */
+function startAhead() {
+    if (player.ahead || !seq) return;
+    player.ahead = { dec: sequenceDecoder(seq.buffer.slice(0, player.kept)), kept: player.kept,
+                     queue: [], ended: false, decoding: false, error: null };
+}
+function dropAhead() {
+    if (player.ahead) player.ahead.dec.close();
+    player.ahead = null;
+}
+
 function rewind() {
     if (player.dec) player.dec.close();
-    player.dec = new SequenceDecoder(seq.buffer.slice(0, player.kept));
-    player.queue = [];
-    player.ended = false;
-    player.error = null;
+    const a = player.ahead && player.ahead.kept === player.kept ? player.ahead : null;
+    if (!a) dropAhead();
+    player.ahead = null;
+    player.dec = a ? a.dec : sequenceDecoder(seq.buffer.slice(0, player.kept));
+    player.queue = a ? a.queue : [];
+    player.ended = a ? a.ended : false;
+    player.error = a ? a.error : null;
+    player.decoding = a ? a.decoding : false;
     player.shown = -1;
     player.stalled = false;
 }
 
 /* --- decoding, one frame per tick ------------------------------------ */
-async function pump() {
-    if (player.decoding || player.ended || player.queue.length >= AHEAD) return;
-    player.decoding = true;
-    const dec = player.dec;
-    try {
-        const t0 = performance.now();
-        let f = null;
-        try { f = await dec.next(); }
-        catch (e) { if (dec === player.dec) { player.ended = true; player.error = e.message; } }
-        // A rewind while this was in flight makes the frame stale.
-        if (dec !== player.dec) return;
-        if (!f) { player.ended = true; return; }
+/* Decodes into `lane` (the player itself, or the next loop's start)
+ * until AHEAD frames wait, asking for each frame as the last arrives.
+ * A frame goes to whichever holds its decoder when it arrives: the next
+ * loop's start may have become the player's meanwhile. */
+async function pumpLane(lane) {
+    if (lane.decoding || lane.ended || lane.queue.length >= AHEAD) return;
+    lane.decoding = true;
+    const dec = lane.dec;
+    const owner = () => player.dec === dec ? player : player.ahead && player.ahead.dec === dec ? player.ahead : null;
+    const t0 = performance.now();
+    let f = null, error = null;
+    try { f = await dec.next(); } catch (e) { error = e.message; }
+    const o = owner();
+    if (!o) return;     // rewound or cut while in flight: stale
+    o.decoding = false;
+    if (error !== null || !f) { o.ended = true; o.error = error; }
+    else {
         remember(player.decodeMs, performance.now() - t0);
-        player.queue.push({ index: f.index, kind: f.kind, partial: f.partial,
-                            pixels: f.pixels.slice() });
-    } finally {
-        player.decoding = false;
+        // The worker's pixels are already a copy of their own.
+        o.queue.push({ index: f.index, kind: f.kind, partial: f.partial, pixels: f.pixels });
     }
+    // Ask for the next frame now, not at the next animation frame: the
+    // worker would otherwise sit idle up to 16 ms a frame, which at 37 ms
+    // of decoding is the difference between real time and stalling.
+    pump();
+}
+
+function pump() {
+    pumpLane(player);
+    if (player.ended && !player.error) startAhead();
+    if (player.ahead) pumpLane(player.ahead);
 }
 
 function remember(list, v) { list.push(v); if (list.length > WINDOW) list.shift(); }
@@ -1071,7 +1119,9 @@ function updateHud() {
     if (!f) { $('vhud').textContent = ''; return; }
     const dec = mean(player.decodeMs), show = mean(player.showMs);
     const budget = 1000 / seq.info.fps;
-    const realtime = dec + show <= budget;
+    // In a worker the next frame decodes while this one is shown: each
+    // has the whole budget. On this thread they take turns.
+    const realtime = videoWorker.offThread ? dec <= budget && show <= budget : dec + show <= budget;
     $('vhud').innerHTML =
         `quadro <b>${f.index + 1}</b>/${seq.frames.length} · ` +
         `${f.kind === INTRA ? 'intra' : f.kind === BI ? 'bidirecional (B)' : f.kind === PRED ? 'predito (P)' : 'predito de duas âncoras (P)'}` +

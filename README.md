@@ -2808,6 +2808,18 @@ frame, three times its budget at 24 fps, and the C decoder to 130 ms:
 pixels as the plain run holds the JavaScript one: identical on three
 clips, whole and cut at seven points, one of them with PRED2 frames.
 
+The player then moved off the page's thread: a SequenceDecoder runs in
+the image tab's workers (`seqOpen`, `seqNext` and `seqClose` in
+`nvdr-tasks.js`), with the WebAssembly decoder loaded there, and the
+page only shows frames. Two things had to follow. The page asks for the
+next frame as soon as one arrives, not at its next animation frame,
+which left the worker idle up to 16 ms of every 42. And the start of the
+next loop is decoded while the end of this one is shown, since with B
+frames the first frame needs five decoded before it: a stall at every
+loop otherwise. On the 49-frame clip in Chromium, 2 stalls in 12 s of
+looping (the cold start) where there had been 28, 37 ms to decode and 4
+to show, now in parallel, and no task on the page longer than 8 ms.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
