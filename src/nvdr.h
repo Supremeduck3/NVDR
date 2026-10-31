@@ -119,6 +119,12 @@ typedef struct {
      * on every mode tried. 2 encodes 2.7 times faster for 0.8% more bytes
      * (the samples, directional): what --fast sets. */
     int   tx_modes;
+    /* Rank a leaf's modes and types on levels rounded with the dead zone
+     * instead of chosen by RDOQ, which then runs only on the finalists
+     * coded in full (try_modes()): 26% faster with --fast for 0.1% more
+     * on PSNR-Y and 0.4% on PSNR-RGB, 35% faster without it for 0.5% and
+     * 0.8%. --fast sets it. */
+    int   fast_rank;
     /* lambda = lambda_k * q^2, the slope the split decision weighs bits
      * against squared error at. */
     float lambda_k;

@@ -184,6 +184,7 @@ NvdrConfig nvdr_default_config(void) {
     c.adaptive_tx = 1;
     c.halves = 1;
     c.tx_modes = 0;
+    c.fast_rank = 0;
     /* The split decision is flat across 0.06..0.3; this is the middle. */
     c.lambda_k = 0.12f;
     c.max_block = NVDR_MAX_BLOCK;
@@ -1407,6 +1408,7 @@ typedef struct {
     int            band_at[NSHAPES];   /* first high-band scan position per shape */
     int            try_halves;  /* whether the search cuts nodes in two (they are flagged anyway) */
     int            tx_modes;    /* see NvdrConfig */
+    int            fast_rank;   /* see NvdrConfig */
     /* While try_modes() ranks a leaf's modes and transform types,
      * leaf_levels() measures a directional leaf's error on its
      * coefficients and paints nothing; the EST_KEEP cheapest so measured
@@ -1533,7 +1535,7 @@ static double leaf_levels(Enc* e, int x, int y, int w, int h, int skip, int mode
             if (!e->estimate) paint_pred(cv, c, x, y, w, h, pr, dc_offset(clamp_coef((long)dl[c] * step), w, h));
             double v[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
             for (int i = t0; i < count; i++) v[i] = co[scan_pos[sh][i]] / step;
-            if (e->rdoq) {
+            if (e->rdoq && !(e->estimate && e->fast_rank)) {
                 double lam = P->lambda_base / ((double)e->base_step[cv->comp0 + c] * e->base_step[cv->comp0 + c]) * RDOQ_PICTURE;
                 rdoq(&e->tm, sh, cv->comp0 + c, v, lv[c], t0, count, lam, RDOQ_KEEP);
             } else
@@ -2290,6 +2292,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     e.deadzone = cfg.deadzone;
     e.try_halves = cfg.halves;
     e.tx_modes = cfg.tx_modes;
+    e.fast_rank = cfg.fast_rank;
     e.rdoq = cfg.rdoq;
     double lambda = cfg.lambda_k * (double)cfg.q * cfg.q;
     for (int k = 0; k < e.nparts; k++) {

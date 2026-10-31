@@ -207,7 +207,8 @@ static void usage(const char* a0) {
         "  --progressive    the layered mode instead of the directional one\n"
         "  --q N            quantiser step (default 24; smaller is better and larger)\n"
         "  --fast           try the other transform types only on the two cheapest\n"
-        "                   modes of a leaf: 2 to 3 times faster, ~1%% bigger\n"
+        "                   modes of a leaf, ranked without RDOQ: about 3.5 times\n"
+        "                   faster, ~1%% bigger\n"
         "  --grain M        off (default), auto or on, as nvdr_encode's\n"
         "  --chroma M       auto (default), 420 or 444, as nvdr_encode's\n", a0);
 }
@@ -227,7 +228,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--jobs") && i + 1 < argc) jobs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--progressive")) cfg.directional = 0;
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--fast")) cfg.tx_modes = 2;
+        else if (!strcmp(argv[i], "--fast")) { cfg.tx_modes = 2; cfg.fast_rank = 1; }
         else if (!strcmp(argv[i], "--as") && i + 1 < argc) {
             const char* v = argv[++i];
             as_nvdr = !strcmp(v, "nvdr") || !strcmp(v, "both");

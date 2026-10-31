@@ -41,7 +41,8 @@ static void usage(const char* argv0) {
         "                   instead of choosing its transform per leaf\n"
         "  --no-halves      with --directional, never cut a node in two\n"
         "  --fast           with --directional, try the other transform types only on\n"
-        "                   the two cheapest modes of a leaf (2.7x faster, ~0.8%% bigger)\n"
+        "                   the two cheapest modes of a leaf and rank them without\n"
+        "                   RDOQ (about 3.5x faster, ~1%% bigger)\n"
         "  --tx-modes N     the same with N modes (0, the default: all of them)\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
         "                   choosing them by rate-distortion\n"
@@ -75,7 +76,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--no-halves")) cfg.halves = 0;
-        else if (!strcmp(argv[i], "--fast")) cfg.tx_modes = 2;
+        else if (!strcmp(argv[i], "--fast")) { cfg.tx_modes = 2; cfg.fast_rank = 1; }
         else if (!strcmp(argv[i], "--tx-modes") && i + 1 < argc) cfg.tx_modes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];
