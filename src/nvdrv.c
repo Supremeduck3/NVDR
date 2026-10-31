@@ -2279,6 +2279,29 @@ static int still_held(const Slot* dpb, int n, int i, int from) {
  * from the frame written before it, and the frame count.
  */
 
+/* The settings as the encoder uses them, for a sequence of this size. */
+static void normalize_config(NvdrvConfig* c, int width, int height) {
+    if (c->block < 0) c->block = (long)width * height >= 200000 ? 32 : 8;
+    if (c->block > 128) c->block = 0;
+    if (c->mv_lambda < 0) c->mv_lambda = c->block >= 32 ? 24 : 16;
+    if (c->bframes < 0) c->bframes = 0;
+    if (c->bframes > NVDRV_MAX_B) c->bframes = NVDRV_MAX_B;
+    if (c->lookahead < 0) c->lookahead = 0;
+    if (c->lookahead > NVDRV_MAX_LOOKAHEAD) c->lookahead = NVDRV_MAX_LOOKAHEAD;
+    if (c->tf_radius < 0 || c->tf_strength <= 0) c->tf_radius = 0;
+    if (c->tf_radius > NVDRV_MAX_TF) c->tf_radius = NVDRV_MAX_TF;
+    /* B frames need per-block vectors; a GOP shorter than a group bounds
+     * the group anyway. */
+    if (c->block == 0) c->bframes = 0;
+}
+
+/* A stretch starts and ends on intra frames the GOP places. */
+static int stretch_valid(const NvdrvConfig* c) {
+    if (c->from < 0 || c->to < 0) return 0;
+    if (!c->from && !c->to) return 1;
+    return c->gop > 0 && c->from % c->gop == 0 && c->to % c->gop == 0 && (!c->to || c->to > c->from);
+}
+
 /* The anchor just before the intra frame the GOP places at `display`:
  * groups run from each such intra frame in steps of bframes + 1, the last
  * cut short by the next one (group_end()). */
@@ -2297,26 +2320,9 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
     e->anchor = -1;
     for (int i = 0; i < HDR_CLASSES; i++) e->hs_gop[i] = -1;
     for (int i = 0; i < 4; i++) e->ctx_gop[i] = -1;
-
-    if (e->cfg.block < 0) e->cfg.block = (long)width * height >= 200000 ? 32 : 8;
-    if (e->cfg.block > 128) e->cfg.block = 0;
-    if (e->cfg.mv_lambda < 0) e->cfg.mv_lambda = e->cfg.block >= 32 ? 24 : 16;
-    if (e->cfg.bframes < 0) e->cfg.bframes = 0;
-    if (e->cfg.bframes > NVDRV_MAX_B) e->cfg.bframes = NVDRV_MAX_B;
-    if (e->cfg.lookahead < 0) e->cfg.lookahead = 0;
-    if (e->cfg.lookahead > NVDRV_MAX_LOOKAHEAD) e->cfg.lookahead = NVDRV_MAX_LOOKAHEAD;
-    if (e->cfg.tf_radius < 0 || e->cfg.tf_strength <= 0) e->cfg.tf_radius = 0;
-    if (e->cfg.tf_radius > NVDRV_MAX_TF) e->cfg.tf_radius = NVDRV_MAX_TF;
     e->intra_scale = 1.0f;
-    /* B frames need per-block vectors; a GOP shorter than a group bounds
-     * the group anyway. */
-    if (e->cfg.block == 0) e->cfg.bframes = 0;
-    /* A stretch starts and ends on intra frames the GOP places. */
-    if (e->cfg.from < 0 || e->cfg.to < 0 ||
-        ((e->cfg.from || e->cfg.to) && (e->cfg.gop <= 0 || e->cfg.from % e->cfg.gop || e->cfg.to % e->cfg.gop ||
-                                        (e->cfg.to && e->cfg.to <= e->cfg.from)))) {
-        free(e); return -1;
-    }
+    normalize_config(&e->cfg, width, height);
+    if (!stretch_valid(&e->cfg)) { free(e); return -1; }
     if (e->cfg.from > 0) e->count = (uint32_t)anchor_before(&e->cfg, e->cfg.from);
     if (alloc_image(&e->pred, width, height) != 0 ||
         alloc_image(&e->error, width, height) != 0 ||
@@ -2378,9 +2384,13 @@ static int intra_ahead(const NvdrvConfig* c) {
     return ahead < c->tf_radius ? c->tf_radius : ahead;
 }
 
-void nvdrv_encode_span(const NvdrvEncoder* e, int* first, int* last) {
-    *first = e->cfg.from > 0 ? anchor_before(&e->cfg, e->cfg.from) : 0;
-    *last = e->cfg.to > 0 ? e->cfg.to + intra_ahead(&e->cfg) : -1;
+int nvdrv_stretch_span(const NvdrvConfig* cfg, int width, int height, int* first, int* last) {
+    NvdrvConfig c = *cfg;
+    normalize_config(&c, width, height);
+    if (!stretch_valid(&c)) return -1;
+    *first = c.from > 0 ? anchor_before(&c, c.from) : 0;
+    *last = c.to > 0 ? c.to + intra_ahead(&c) : -1;
+    return 0;
 }
 
 /*
@@ -2834,12 +2844,18 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     if (!e->quiet) e->coded++;
     if (w->kind == NVDRV_INTRA) gops_add(&e->gops, display);
 
-    if (e->report && !e->quiet) {
+    if (e->report) {
         NvdrvFrameReport r;
         r.display = display; r.kind = w->kind; r.level = w->kind == NVDRV_BI ? level : 0;
         r.q = w->q; r.dx = w->dx; r.dy = w->dy;
-        r.bytes = written;
+        r.written = !e->quiet;
+        r.bytes = e->quiet ? 0 : written;
         r.field_bytes = w->field_len;
+        /* FNV-1a of the container, which says whether two encoders coded
+         * the same picture. */
+        uint32_t h = 2166136261u;
+        for (size_t i = 0; i < w->len; i++) h = (h ^ w->blob[i]) * 16777619u;
+        r.check = h;
         e->report(e->user, &r);
     }
     free(w->field); free(w->blob);
@@ -3297,9 +3313,13 @@ static int flush_group(NvdrvEncoder* e, int closing) {
     NvdrImage keep[QCAP];
     for (int i = 0; i < e->npend; i++) keep[i] = e->pend[i];
     for (int i = 0; i < e->npend; i++) e->pend[i] = keep[(i + shift) % e->npend];
+    /* The new anchor's sum is read before the loop reaches it: it used to
+     * be read after, once more frames were held than the group shifted
+     * by, which made every later frame's motion the wrong sum. */
+    int bx = e->cumx[shift], by = e->cumy[shift];
     for (int i = 0; i + shift <= e->npend; i++) {
-        e->cumx[i] = e->cumx[i + shift] - e->cumx[shift];
-        e->cumy[i] = e->cumy[i + shift] - e->cumy[shift];
+        e->cumx[i] = e->cumx[i + shift] - bx;
+        e->cumy[i] = e->cumy[i + shift] - by;
     }
     e->npend -= shift;
     e->anchor = g;
