@@ -8,19 +8,26 @@
  * This decodes a sequence both ways, whole and cut at several points, and
  * reports the first frame and pixel where they part.
  *
- *     node scripts/crosscheck_seq.mjs file.nvdrv
+ *     node scripts/crosscheck_seq.mjs file.nvdrv [--wasm]
+ *
+ * With --wasm the JS decoder runs with public/nvdr.wasm loaded, as the
+ * page's player does: frames' containers and their motion-compensated
+ * predictions then go through the C code compiled to WebAssembly.
  */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SequenceDecoder } from '../public/nvdrv.js';
+import { loadWasmBytes } from '../public/nvdr-wasm.js';
 
 const [, , container] = process.argv;
 if (!container) {
-    console.error('usage: node scripts/crosscheck_seq.mjs <file.nvdrv>');
+    console.error('usage: node scripts/crosscheck_seq.mjs <file.nvdrv> [--wasm]');
     process.exit(2);
 }
+if (process.argv.includes('--wasm'))
+    await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
 const decoder = new URL('../nvdrv_decode', import.meta.url).pathname;
 
 function readPPM(path) {

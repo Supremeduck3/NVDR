@@ -89,3 +89,32 @@ export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = fal
         lowRgb: wantLow ? view(1).rgb : null
     };
 }
+
+/*
+ * A sequence frame's motion-compensated prediction (src/mc.c, the C
+ * decoder's) into `dst`: from r0 alone, or with `mode` from r0 and r1 per
+ * cell; vectors in quarter pixels on G's grid of G.g-pixel cells. False,
+ * with nothing done, when the WebAssembly decoder is not loaded; nvdrv.js
+ * then makes the same pixels itself.
+ */
+export function wasmPredict(r0, r1, dst, width, height, G, v0x, v0y, v1x, v1y, mode, obmc) {
+    const w = exports_;
+    if (!w || !w.nvdr_wasm_mc) return false;
+    const cells = G.nfx * G.nfy, two = mode ? 1 : 0;
+    const at = w.nvdr_wasm_mc_alloc(width, height, cells);
+    if (!at) return false;
+    // Views of memory after each call that may grow it.
+    const p = new Uint32Array(w.memory.buffer, at, 5);
+    const mem = w.memory.buffer;
+    new Uint8Array(mem, p[0], r0.length).set(r0);
+    const v = new Int16Array(mem, p[2], cells * 4);
+    v.set(v0x.subarray(0, cells), 0); v.set(v0y.subarray(0, cells), cells);
+    if (two) {
+        new Uint8Array(mem, p[1], r1.length).set(r1);
+        v.set(v1x.subarray(0, cells), 2 * cells); v.set(v1y.subarray(0, cells), 3 * cells);
+        new Uint8Array(mem, p[3], cells).set(mode.subarray(0, cells));
+    }
+    w.nvdr_wasm_mc(width, height, G.g, G.nfx, G.nfy, two, obmc ? 1 : 0);
+    dst.set(new Uint8Array(w.memory.buffer, p[4], width * height * 3));
+    return true;
+}
