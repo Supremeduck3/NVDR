@@ -562,6 +562,49 @@ A truncagem agora vale nos **dois eixos** — um prefixo do arquivo é um
 prefixo do filme, e o quadro em que o corte cai ainda aparece, na qualidade
 que os bytes dele pagaram.
 
+### Vários núcleos e vários computadores
+
+Um vídeo com mais de um GOP (48 quadros por padrão) é codificado em
+**trechos**, um por GOP, vários ao mesmo tempo, um por núcleo. Os trechos
+são juntados no mesmo arquivo que uma passada só escreveria, **byte a
+byte**. Não há opção para ligar isso: é o padrão. `--jobs N` limita
+quantos trechos rodam juntos, e `--jobs 1` faz uma passada só.
+
+Para usar **outros computadores da rede local**, em cada um deles:
+
+```bash
+make                 # o mesmo código do computador principal
+node worker.js       # escuta na porta 3001 (ou: node worker.js 3005)
+```
+
+E no computador que serve a página, liste os outros ao iniciar:
+
+```bash
+NVDR_WORKERS=192.168.0.20,192.168.0.21:3005 node server.js
+```
+
+No Windows (PowerShell): `$env:NVDR_WORKERS="192.168.0.20"; node server.js`.
+
+Ao subir, o servidor mostra os computadores que vai usar. Para cada vídeo,
+ele divide os trechos entre todos, incluindo ele mesmo: cada computador
+pega um trecho por núcleo. O relatório do vídeo diz quem codificou cada
+trecho.
+
+- **Sem senha:** o `worker.js` só atende endereços da rede local
+  (192.168.x.x, 10.x.x.x, 172.16–31.x.x e o próprio computador), mas
+  qualquer máquina dessa rede pode mandar trabalho para ele. Não o deixe
+  rodando numa rede em que você não confia.
+- **Mesmo formato:** um computador cujo `nvdrv_encode` escreve outro
+  formato de sequência (código de outra versão) é ignorado. Rode `make`
+  nos dois depois de atualizar o código.
+- **Conferência das emendas:** cada trecho codifica o quadro intra em que
+  começa, que o trecho anterior grava. Se dois computadores chegarem a
+  quadros diferentes ali (compiladores ou bibliotecas que arredondam
+  diferente), os trechos feitos fora são refeitos no computador principal.
+  O arquivo nunca sai emendado errado.
+- **Falhas:** um computador que cai ou não responde tem seus trechos
+  refeitos no principal.
+
 ---
 
 ## Conferindo que C e JS decodificam igual
