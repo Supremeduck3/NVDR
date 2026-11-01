@@ -2820,6 +2820,61 @@ loop otherwise. On the 49-frame clip in Chromium, 2 stalls in 12 s of
 looping (the cold start) where there had been 28, 37 ms to decode and 4
 to show, now in parallel, and no task on the page longer than 8 ms.
 
+## Over a bad link
+
+`scripts/analysis/badnet.mjs <image>` sends a photo over a simulated bad
+link and reports what the receiver sees, and when. Every format is first
+encoded to the NVDR file's PSNR-Y (q 24, progressive), then cut at
+growing lengths and decoded, which gives its quality for each number of
+bytes received; a model of the link turns bytes into seconds: 1200-byte
+packets at the link's rate, losses in bursts (Gilbert-Elliott), and
+either retransmission a round trip after a loss, the receiver using the
+bytes up to the first packet still missing (TCP-like), or none, the
+bytes before the first loss being all there is (UDP-like, 50 draws).
+
+montanha_pessoas, at 33.9 dB; with retransmission:
+
+    satellite / radio: 16 kbit/s, RTT 1.2 s, 5% loss in bursts of ~3
+    format             bytes   first picture   25 dB   complete   at 5 s    at 15 s
+    NVDR progressive   45772         1.2 s     7.8 s       25 s   22.3 dB   27.5 dB
+    NVDR directional   43300         1.2 s      23 s       23 s   11.4 dB   17.0 dB
+    JPEG               98128         1.2 s      52 s       52 s   12.5 dB   13.9 dB
+    JPEG progressive   92600         1.2 s     9.0 s       49 s   22.4 dB   27.9 dB
+    WebP               57554          30 s      30 s       30 s   nothing   nothing
+    AVIF               52933          28 s      28 s       28 s   nothing   nothing
+    JPEG XL            54659          29 s      29 s       29 s   nothing   nothing
+
+    without retransmission, 2G (40 kbit/s, 3% loss): something arrives
+    100% of the time for NVDR and JPEG (median 33.9 dB NVDR progressive,
+    30.5 progressive JPEG, 14.7 baseline JPEG), 44% for WebP, AVIF and
+    JPEG XL, which need every byte.
+
+On two more photos over the 2G link the order holds. What it says:
+
+- The progressive NVDR file shows a picture at once and reaches full
+  quality first among the progressive ones, being half the size of a
+  progressive JPEG; the whole-file formats show nothing until the last
+  byte, and over a lossy datagram link usually nothing at all.
+- Progressive JPEG keeps up with it early, and on two of the three
+  photos reaches 25 dB a little sooner: NVDR's order of bytes (colour,
+  then the low texture band, then the rest) is not better than JPEG's
+  spectral selection at the start. Ordering a cut by worth (see
+  "Measured but not built: ordering a cut by worth") is where to look.
+- Directional NVDR is the smallest but fills the picture from the top
+  down, which a bad link turns into a long wait for the bottom.
+- A packet lost without retransmission ends what NVDR can use: the
+  decoder has no point to pick up again after a gap. Restart points per
+  row of tiles, and more redundancy for the colour layer than for the
+  detail, are what a lossy link needs next.
+
+Caveats. One photo in detail and two in summary, PSNR-Y (what NVDR
+optimises). AVIF and JPEG XL come from ffmpeg's libaom (cpu-used 4) and
+libjxl, which here made bigger files than NVDR at the same PSNR-Y where
+avifenc and cjxl, in "Against AVIF, JPEG XL and HEIC", beat it: take
+their sizes as these tools' and not the formats' best. JPEG XL can
+decode progressively, but not through ffmpeg, so it counts as
+whole-file. The link has no slow start or congestion control.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
