@@ -16,7 +16,7 @@ import { wasmPredict } from './nvdr-wasm.js';
 import { decode, showRGB, ArithDecoder, newProbs, newDecodeContext, resetContext, freeContext, VERSION as CONTAINER_VERSION } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 20;
+const VERSION = 21;
 const HEADER_SIZE = 24;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
 const MV_MAX = 384;            // NVDRV_MV_MAX, quarter pixels
@@ -34,8 +34,9 @@ function clamp255(v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 export function readSequenceHeader(buffer) {
     if (buffer.byteLength < HEADER_SIZE) return null;
     const view = new DataView(buffer);
-    if (view.getUint32(0, true) !== MAGIC || view.getUint8(4) !== VERSION) return null;
+    if (view.getUint32(0, true) !== MAGIC || view.getUint8(4) < 20 || view.getUint8(4) > VERSION) return null;
     const info = {
+        version: view.getUint8(4),
         width: view.getUint16(6, true),
         height: view.getUint16(8, true),
         frameCount: view.getUint32(10, true),
@@ -828,7 +829,7 @@ export function frameIndex(buffer) {
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v20 file');
+        if (!this.info) throw new Error('not an NVDRV v20 or v21 file');
         this.bytes = new Uint8Array(buffer);
         this.pos = HEADER_SIZE;
         const n = this.info.width * this.info.height * 3;
@@ -844,7 +845,20 @@ export class SequenceDecoder {
         this.nextOut = 0;
         this.lastDisplay = 0;    // of the frame last read, for the compact headers
         this.hs = Array.from({ length: HDR_CLASSES }, newHdrState);    // each class's last header
+        // The latest intra frames, and the group each class's header and
+        // models were left in (GROUPS OF PICTURES in nvdrv.c).
+        this.intras = [];
+        this.hsGop = new Array(HDR_CLASSES).fill(-1);
+        this.ctxGop = [-1, -1, -1, -1];
         this.ended = false;
+    }
+
+    /* The display number of the intra frame `display` belongs to, -1
+     * before any (gop_of() in nvdrv.c). */
+    gopOf(display) {
+        let best = -1;
+        for (const d of this.intras) if (d <= display && d > best) best = d;
+        return best;
     }
 
     /* Gives the decoder's contexts back to the WebAssembly pool. */
@@ -910,8 +924,15 @@ export class SequenceDecoder {
                               after >= 0 ? this.dpb[after].display : 0);
 
         // Mirrors decode_one(): what differs from the last frame of this
-        // class (COMPACT FRAMES).
-        if (kind === INTRA) for (const h of this.hs) h.known = 0;
+        // class (COMPACT FRAMES), in this group (GROUPS OF PICTURES);
+        // format 20 started every class over at an intra frame.
+        const v21 = this.info.version >= 21;
+        if (kind === INTRA) {
+            for (let i = 0; i < (v21 ? 1 : HDR_CLASSES); i++) this.hs[i].known = 0;
+        } else if (v21) {
+            const g = this.gopOf(display);
+            if (this.hsGop[fc + 1] !== g) { this.hs[fc + 1].known = 0; this.hsGop[fc + 1] = g; }
+        }
         const st = this.hs[fc + 1];
         let which = 0;
         if (changed) {
@@ -1065,8 +1086,16 @@ export class SequenceDecoder {
         // A predicted frame's container is predicted from `ref`, block by
         // block, and decodes straight to the picture.
         // Mirrors code_frame() and decode_one(): the models carry on from
-        // the last frame of the same class, fresh again at an intra frame.
-        if (kind === INTRA) for (const c of this.ctxs) resetContext(c);
+        // the last frame of the same class, fresh again in each group of
+        // pictures (at each intra frame up to format 20).
+        if (kind === INTRA) {
+            if (!v21) for (const c of this.ctxs) resetContext(c);
+            this.intras.push(display);
+            if (this.intras.length > 32) this.intras.shift();
+        } else if (v21) {
+            const g = this.gopOf(display);
+            if (this.ctxGop[fc] !== g) { resetContext(this.ctxs[fc]); this.ctxGop[fc] = g; }
+        }
         if (!reconstruct(body, pixels, width, height, kind === INTRA ? null : ref, fc >= 0 ? this.ctxs[fc] : null)) {
             if (partial) return false;
             throw new Error('frame does not decode');

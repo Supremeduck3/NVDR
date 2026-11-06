@@ -60,7 +60,7 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      20
+#define NVDRV_VERSION      21
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
@@ -149,6 +149,11 @@ typedef struct {
      * kept. */
     int   refs;
     int   fps;             /* carried in the header, informational */
+    /* A stretch of a longer sequence, coded on its own so that stretches
+     * can be coded side by side (STRETCHES in nvdrv.c): the display
+     * numbers of the intra frames it starts and ends with, multiples of
+     * `gop`; 0 for the start and for the end of the sequence. */
+    int   from, to;
 } NvdrvConfig;
 
 NvdrvConfig nvdrv_default_config(void);
@@ -172,6 +177,11 @@ typedef struct {
     size_t bytes;          /* frame header included */
     size_t field_bytes;    /* of which the motion field */
     int    dx, dy;         /* global vector toward the frame before */
+    /* 0 for the intra frame a stretch starts with, which it codes and does
+     * not write (STRETCHES in nvdrv.c); a hash of the frame's container,
+     * the same for the same picture coded the same way. */
+    int    written;
+    uint32_t check;
 } NvdrvFrameReport;
 typedef void (*NvdrvReportFn)(void* user, const NvdrvFrameReport* r);
 
@@ -183,6 +193,11 @@ void nvdrv_encode_set_report(NvdrvEncoder* enc, NvdrvReportFn fn, void* user);
 int  nvdrv_encode_frame(NvdrvEncoder* enc, const NvdrImage* frame);
 /* Codes whatever is still held, and finishes the file. */
 int  nvdrv_encode_close(NvdrvEncoder* enc);
+/* The source frames the stretch `cfg` names (from, to) reads, at this
+ * size: nvdrv_encode_frame takes them in order from display *first
+ * through *last, -1 meaning to the end of the sequence. -1 when from and
+ * to are not a stretch. */
+int  nvdrv_stretch_span(const NvdrvConfig* cfg, int width, int height, int* first, int* last);
 
 /* ------------------------------------------------------------- decoder */
 

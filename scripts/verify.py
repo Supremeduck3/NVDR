@@ -181,6 +181,24 @@ def check_sequence(tmp, psnr_slack):
         results[name] = {"bytes": out.stat().st_size,
                          "psnr": round(sum(per_frame) / len(per_frame), 2),
                          "drift": round(drift, 2)}
+
+    # Stretches (STRETCHES in nvdrv.c): a GOP of 4 makes three, coded side
+    # by side, and the file has to be the one a single pass writes. Its B
+    # frames before each intra frame are coded after it, so the players
+    # are checked on it too.
+    one, many = tmp / "seq_gop_one.nvdrv", tmp / "seq_gop_many.nvdrv"
+    for out, jobs in ((one, "1"), (many, "3")):
+        r = subprocess.run([str(enc), str(srcdir), str(out), "--gop", "4", "--jobs", jobs],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not out.exists():
+            return None, [r.stderr.strip() or "sequence encode in stretches failed"]
+    if one.read_bytes() != many.read_bytes():
+        problems.append("sequence coded in stretches differs from one pass")
+    cc = subprocess.run(["node", str(ROOT / "scripts" / "crosscheck_seq.mjs"), str(many)],
+                        capture_output=True, text=True)
+    if cc.returncode != 0:
+        bad = [l for l in cc.stdout.splitlines() if "identical" not in l]
+        problems.append("stretches C vs JS " + (bad[0] if bad else cc.stderr.strip()[:80]))
     return results, problems
 
 
