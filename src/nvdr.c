@@ -204,6 +204,7 @@ NvdrConfig nvdr_default_config(void) {
     c.chroma420 = NVDR_CHROMA_AUTO;
     c.grain = NVDR_GRAIN_OFF;
     c.tile_q = NULL;
+    c.slices = 0;
     return c;
 }
 
@@ -883,6 +884,7 @@ typedef struct {
     int txsel;                   /* NVDR_FLAG_TXSEL: a transform type per leaf */
     int legacy_modes;            /* a version 13 container: fifteen intra modes */
     int halves;                  /* whole nodes may be cut in two (v15, directional) */
+    int slice_top;               /* the first row of the slice being coded (SLICES) */
     uint8_t* base[3];            /* with it, the base picture on this canvas */
     uint8_t* flat[3];
     uint8_t* full[3];
@@ -961,14 +963,15 @@ static int canvas_base(Canvas* cv, Canvas* cc, const NvdrImage* img) {
 /*
  * A leaf's predicted colour: the rounded mean of the flat colours in the
  * row just above it and the column just to its left, whichever exist on
- * the canvas; 128 at the top-left corner. Integer, and read only from
- * `flat`, so layer 0 needs nothing else to decode.
+ * the canvas and, above, in its slice; 128 at the top-left corner.
+ * Integer, and read only from `flat`, so layer 0 needs nothing else to
+ * decode.
  */
 static int predict(const Canvas* cv, int c, int x, int y, int w, int h) {
     if (cv->fixed_pred) return 128;
     const uint8_t* p = cv->dirpred ? cv->full[c] : cv->flat[c];
     int sum = 0, k = 0;
-    if (y > 0) {
+    if (y > cv->slice_top) {
         int x1 = x + w < cv->pw ? x + w : cv->pw;
         for (int i = x; i < x1; i++) sum += p[(size_t)(y - 1) * cv->pw + i];
         k += x1 - x;
@@ -1278,11 +1281,78 @@ static void restore_planes(const NvdrHeader* h, NvdrRestorePlane* g) {
     }
 }
 
+/*
+ * SLICES (container v17)
+ * ----------------------
+ * A file sent where packets are lost without being sent again (radio,
+ * satellite, a datagram link) loses whatever follows the first hole in a
+ * layer: a range decoder cannot pick up again in the middle of its
+ * stream, and the models and predictions after the hole depend on what
+ * was in it. Restart points bound that, as JPEG's restart markers and
+ * H.264's slices do. Every `slice_rows` rows of tiles start a slice; each
+ * layer's part of each slice is a stream of its own, coded from the
+ * models as they stood at the start of the picture (the step offsets'
+ * running value from 0), and a leaf's colour is predicted from nothing
+ * above its slice's first row. A slice then decodes on its own: a hole
+ * costs the rest of its slice's part of its layer, and for the colour
+ * layer, that part of the texture layers over the same tiles.
+ *
+ * The file stays progressive: the slices' parts of layer 0, top to
+ * bottom, then layer 1's, then layer 2's, so a prefix decodes as before.
+ * After the restoration parameters comes the slice table: one byte,
+ * `slice_rows` (0, no slices), then, layer by layer, the size in bytes of
+ * every slice's part but the last, as LEB128; the last is what the
+ * header's size for the layer leaves.
+ *
+ * What it costs is each part starting its models afresh and flushing its
+ * coder, and the colours along a slice's top edge predicted from the left
+ * alone: see README, "Over a bad link". Progressive pictures only.
+ */
+static int read_leb(const uint8_t* p, size_t size, size_t* at, uint32_t* v) {
+    uint32_t x = 0;
+    for (int sh = 0; sh < 32; sh += 7) {
+        if (*at >= size) return -1;
+        uint8_t b = p[(*at)++];
+        x |= (uint32_t)(b & 127) << sh;
+        if (!(b & 128)) { *v = x; return 0; }
+    }
+    return -1;
+}
+
+static int tiles_down(const NvdrHeader* h) { return (h->height + h->max_block - 1) / h->max_block; }
+static int slice_count(const NvdrHeader* h) {
+    int ty = tiles_down(h);
+    return h->slice_rows ? (ty + h->slice_rows - 1) / h->slice_rows : 1;
+}
+
+/* The slice table at `at` (the byte after the restoration parameters):
+ * sets h->slice_rows and h->table_len, and with `seg` every layer's part
+ * of every slice, [layer * slices + slice]. */
+static int slice_table(const uint8_t* data, size_t size, size_t at, NvdrHeader* h, uint32_t* seg) {
+    size_t first = at;
+    if (at >= size) return -1;
+    h->slice_rows = data[at++];
+    int ns = slice_count(h);
+    for (int k = 0; k < NVDR_LAYERS; k++) {
+        uint32_t left = h->stored_bytes[k];
+        for (int i = 0; i < ns - 1; i++) {
+            uint32_t v;
+            if (read_leb(data, size, &at, &v) != 0 || v > left) return -1;
+            left -= v;
+            if (seg) seg[k * ns + i] = v;
+        }
+        if (seg) seg[k * ns + ns - 1] = left;
+    }
+    h->table_len = (uint32_t)(at - first);
+    return 0;
+}
+
 static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
-    /* Version 15 differs only in having no deblocking levels, 14 also in
-     * having no half nodes, 13 also in having fifteen intra modes. */
+    /* Version 16 differs only in having no slice table, 15 also in having
+     * no deblocking levels, 14 also in having no half nodes, 13 also in
+     * having fifteen intra modes. */
     if (size < NVDR_HEADER_SIZE || memcmp(data, NVDR_MAGIC, 4) != 0 ||
-        data[4] < 13 || data[4] > NVDR_VERSION)
+        data[4] < 13 || data[4] > NVDR_VERSION_SLICES)
         return -1;
     memset(h, 0, sizeof(*h));
     h->version = data[4];
@@ -1340,6 +1410,11 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
         if ((h->flags & NVDR_FLAG_RESIDUAL) ||
             size < NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len ||
             nvdr_restore_parse(data + NVDR_HEADER_SIZE + h->grain_len, h->restore_len, g, &r) != 0) return -1;
+    }
+    if (h->version >= NVDR_VERSION_SLICES) {
+        if (slice_table(data, size, NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len, h, NULL) != 0)
+            return -1;
+        if (h->slice_rows && (h->flags & (NVDR_FLAG_DIRPRED | NVDR_FLAG_RESIDUAL))) return -1;
     }
     return 0;
 }
@@ -2182,11 +2257,48 @@ int nvdr_encode_mem(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     return nvdr_encode_mem_ctx(out_buf, out_len, img, cfg_in, hdr_out, NULL);
 }
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base,
-                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
-                       int careful, NvdrRestoreFit* fit);
+static int decode_once(const uint8_t* data, size_t size, const size_t* holes, int nholes, int max_layer,
+                       const NvdrImage* base, NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info,
+                       NvdrContext* ctx, int careful, NvdrRestoreFit* fit);
 static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc* e, const NvdrImage* img,
                            const NvdrImage* base, NvdrContext* start, int restore, int choose_deblock);
+
+/* A growing byte string: the layers' slices, end to end. */
+typedef struct { uint8_t* b; size_t n, cap; } Bytes;
+static int bytes_put(Bytes* o, const uint8_t* p, size_t n) {
+    if (o->n + n > o->cap) {
+        size_t cap = o->cap ? o->cap : 4096;
+        while (cap < o->n + n) cap *= 2;
+        uint8_t* g = (uint8_t*)realloc(o->b, cap);
+        if (!g) return -1;
+        o->b = g; o->cap = cap;
+    }
+    if (n) memcpy(o->b + o->n, p, n);
+    o->n += n;
+    return 0;
+}
+static int bytes_leb(Bytes* o, uint32_t v) {
+    uint8_t t[5];
+    int n = 0;
+    do { t[n] = (uint8_t)(v & 127); v >>= 7; if (v) t[n] |= 128; n++; } while (v);
+    return bytes_put(o, t, (size_t)n);
+}
+
+/* The end of a slice (SLICES): each layer's coder flushed onto its
+ * layer's bytes, its size noted, and a fresh coder for the next. With no
+ * high band the third layer holds no symbols, only the flush, and is left
+ * out. */
+static int slice_end(NvdrEncoder* enc[3], Bytes lay[3], uint32_t* seg, int ns, int s, int band) {
+    for (int k = 0; k < NVDR_LAYERS; k++) {
+        if (nvdr_enc_finish(enc[k]) != 0) return -1;
+        size_t n = (k == 2 && !band) ? 0 : enc[k]->count;
+        if (bytes_put(&lay[k], enc[k]->bytes, n) != 0) return -1;
+        seg[k * ns + s] = (uint32_t)n;
+        nvdr_enc_free(enc[k]);
+        if (nvdr_enc_init(enc[k], k ? 1 << 14 : 1 << 12) != 0) return -1;
+    }
+    return 0;
+}
 
 /* One encode in the mode cfg->chroma420 names (420 when nonzero). */
 static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
@@ -2204,6 +2316,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     memset(&e, 0, sizeof(e));
     int rc = -1;
     int8_t* tq = NULL;
+    uint32_t* seg = NULL;
+    Bytes lay[3];
+    memset(lay, 0, sizeof(lay));
     NvdrEncoder enc0, enc1, enc2;
     memset(&enc0, 0, sizeof(enc0));
     memset(&enc1, 0, sizeof(enc1));
@@ -2344,6 +2459,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0 ||
         nvdr_enc_init(&enc2, 1 << 16) != 0) goto done;
     Sink s0 = { &enc0, 0 }, s1[2] = { { &enc1, 0 }, { &enc2, 0 } };
+    NvdrEncoder* encs[3] = { &enc0, &enc1, &enc2 };
 
     /* Each tile is searched against the models as they stand, then coded
      * for real, which is what adapts them for the next. In 4:2:0 a tile is
@@ -2361,7 +2477,21 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     double lambda0[2], skip0[2];
     for (int k = 0; k < e.nparts; k++) { lambda0[k] = e.part[k].lambda; skip0[k] = e.part[k].skip_lambda; }
     int tq_prev = 0;
+    /* Slices: every one starts from the models the picture starts from. */
+    int srows = !dirpred && !cfg.residual && cfg.slices > 0 ? (cfg.slices > 255 ? 255 : cfg.slices) : 0;
+    int tiles_y = (cv->ph + cv->tile - 1) / cv->tile;
+    int nslices = srows ? (tiles_y + srows - 1) / srows : 1;
+    ColourModels cm0 = e.cm;
+    TextureModels tm0 = e.tm, tm20 = e.tm2;
+    if (srows && !(seg = (uint32_t*)calloc((size_t)NVDR_LAYERS * nslices, sizeof(uint32_t)))) goto done;
     for (int ty = 0; ty < cv->ph; ty += cv->tile) {
+        int row = ty / cv->tile;
+        if (srows && row % srows == 0) {
+            if (row && slice_end(encs, lay, seg, nslices, row / srows - 1, band) != 0) goto done;
+            e.cm = cm0; e.tm = tm0; e.tm2 = tm20;
+            tq_prev = 0;
+            for (int k = 0; k < e.nparts; k++) e.part[k].cv.slice_top = ty / (k + 1);
+        }
         for (int k = 0; k < e.nparts; k++) {
             e.p = &e.part[k];
             if (ty / (k + 1) < e.p->cv.ph) precompute_row(&e, ty / (k + 1));
@@ -2390,18 +2520,35 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         }
     }
     for (int c = 0; c < 3; c++) e.step[c] = e.base_step[c];
-    if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
-        nvdr_enc_finish(&enc2) != 0) goto done;
-    /* With no high band the stream holds no symbols, only the coder's
-     * flush: leave it out, and the layer is empty. */
-    size_t n2 = band ? enc2.count : 0;
+    const uint8_t* lp[3];
+    size_t ln[3];
+    Bytes table;
+    memset(&table, 0, sizeof(table));
+    if (srows) {
+        if (slice_end(encs, lay, seg, nslices, nslices - 1, band) != 0) goto done;
+        uint8_t r = (uint8_t)srows;
+        int bad = bytes_put(&table, &r, 1);
+        for (int k = 0; k < NVDR_LAYERS; k++)
+            for (int i = 0; i < nslices - 1; i++) bad |= bytes_leb(&table, seg[k * nslices + i]);
+        if (bad) { free(table.b); goto done; }
+        for (int k = 0; k < NVDR_LAYERS; k++) { lp[k] = lay[k].b; ln[k] = lay[k].n; }
+    } else {
+        if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
+            nvdr_enc_finish(&enc2) != 0) goto done;
+        /* With no high band the stream holds no symbols, only the coder's
+         * flush: leave it out, and the layer is empty. */
+        lp[0] = enc0.bytes; ln[0] = enc0.count;
+        lp[1] = enc1.bytes; ln[1] = enc1.count;
+        lp[2] = enc2.bytes; ln[2] = band ? enc2.count : 0;
+    }
+    size_t n2 = ln[2];
 
-    size_t total = NVDR_HEADER_SIZE + enc0.count + enc1.count + n2;
+    size_t total = NVDR_HEADER_SIZE + table.n + ln[0] + ln[1] + n2;
     uint8_t* buf = (uint8_t*)malloc(total);
-    if (!buf) goto done;
+    if (!buf) { free(table.b); goto done; }
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
-    buf[4] = NVDR_VERSION;
+    buf[4] = srows ? NVDR_VERSION_SLICES : NVDR_VERSION;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
                        (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0) |
                        (dirpred ? NVDR_FLAG_DIRPRED : 0) | (inter ? NVDR_FLAG_INTER : 0) |
@@ -2412,22 +2559,29 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     buf[11] = (uint8_t)cfg.min_block;
     put_u16(buf + 12, (uint32_t)e.step[0]);
     put_u16(buf + 14, (uint32_t)e.step[1]);
-    put_u32(buf + 16, (uint32_t)enc0.count);
-    put_u32(buf + 20, (uint32_t)enc1.count);
+    put_u32(buf + 16, (uint32_t)ln[0]);
+    put_u32(buf + 20, (uint32_t)ln[1]);
     put_u32(buf + 24, (uint32_t)n2);
     /* A directional picture's deblocking levels go where its band (0)
      * would; add_restoration() chooses them. */
     buf[28] = (uint8_t)(dirpred ? (cfg.deblock ? DB_LEVEL | DB_LEVEL << 4 : 0) : band);
-    memcpy(buf + NVDR_HEADER_SIZE, enc0.bytes, enc0.count);
-    memcpy(buf + NVDR_HEADER_SIZE + enc0.count, enc1.bytes, enc1.count);
-    if (n2) memcpy(buf + NVDR_HEADER_SIZE + enc0.count + enc1.count, enc2.bytes, n2);
+    {
+        uint8_t* at = buf + NVDR_HEADER_SIZE;
+        if (table.n) memcpy(at, table.b, table.n);
+        at += table.n;
+        for (int k = 0; k < NVDR_LAYERS; k++) { if (ln[k]) memcpy(at, lp[k], ln[k]); at += ln[k]; }
+    }
 
     h.width = (uint16_t)img->width; h.height = (uint16_t)img->height;
     h.max_block = (uint8_t)cfg.max_block; h.min_block = (uint8_t)cfg.min_block;
     h.q_luma = (uint16_t)e.step[0]; h.q_chroma = (uint16_t)e.step[1];
     h.flags = (uint8_t)buf[5];
-    h.stored_bytes[0] = (uint32_t)enc0.count;
-    h.stored_bytes[1] = (uint32_t)enc1.count;
+    h.version = buf[4];
+    h.slice_rows = (uint8_t)srows;
+    h.table_len = (uint32_t)table.n;
+    free(table.b);
+    h.stored_bytes[0] = (uint32_t)ln[0];
+    h.stored_bytes[1] = (uint32_t)ln[1];
     h.stored_bytes[2] = (uint32_t)n2;
     h.band = (uint8_t)band;
     h.deblock[0] = h.deblock[1] = dirpred && !cfg.deblock ? 0 : DB_LEVEL;
@@ -2446,6 +2600,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 done:
     nvdr_context_free(start);
     free(tq);
+    free(seg);
+    for (int k = 0; k < NVDR_LAYERS; k++) free(lay[k].b);
     free(e.pc);
     nvdr_enc_free(&enc0);
     nvdr_enc_free(&enc1);
@@ -2504,7 +2660,7 @@ static int add_restoration(uint8_t** buf, size_t* len, NvdrHeader* h, const Enc*
         fit.full_pw = cv->pw; fit.full_w = cv->w; fit.full_h = cv->h;
     }
     NvdrImage shown;
-    int rc = decode_once(*buf, *len, -1, base, &shown, NULL, NULL, start, 1, &fit);
+    int rc = decode_once(*buf, *len, NULL, 0, -1, base, &shown, NULL, NULL, start, 1, &fit);
     free(shown.pixels);
     free(full[1]); free(full[2]);
     if (rc != 0 || fit.failed) { nvdr_bits_free(&fit.out); return -1; }
@@ -2965,7 +3121,7 @@ static double plane_sse(const uint8_t* p, const double* src, int pw, int w, int 
  * are filtered at its level, or with `fit` choosing at the level that
  * leaves the least error against the source, recorded there. */
 static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const uint8_t* textured,
-                   size_t count, int first_missing_tile, int tiles_x, int tiles, const int* step,
+                   size_t count, const uint8_t* whole0, int tiles_x, int tiles, const int* step,
                    const int8_t* tq, const uint8_t level[2], NvdrRestoreFit* fit) {
     int gw = cv->pw / 4, gh = cv->ph / 4;
     uint8_t* vedge = (uint8_t*)calloc((size_t)gw * gh, 1);
@@ -2980,7 +3136,8 @@ static int deblock(const Canvas* cv, uint8_t** planes, const Leaf* leaves, const
         if (x > 0) for (int j = y; j < y + h && j < gh; j++) vedge[(size_t)j * gw + x] = 1;
         if (y > 0) for (int k = x; k < x + w && k < gw; k++) hedge[(size_t)y * gw + k] = 1;
     }
-    for (int t = first_missing_tile; t < tiles; t++) {
+    for (int t = 0; t < tiles; t++) {
+        if (whole0[t]) continue;
         int x = (t % tiles_x) * cv->tile / 4, y = (t / tiles_x) * cv->tile / 4, n = cv->tile / 4;
         for (int j = y; j < y + n && j < gh; j++)
             for (int k = x; k < x + n && k < gw; k++) cell[(size_t)j * gw + k] = (uint8_t)log2_int(n);
@@ -3035,39 +3192,73 @@ int nvdr_decode_mem_ctx(const uint8_t* data, size_t size, int max_layer, NvdrIma
      * to restore it (a tenth of the time); if one stops, the decode starts
      * over the careful way and gives what that gives. The context is only
      * written when a decode finishes, so starting over is safe. */
-    int rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 0, NULL);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, max_layer, NULL, out, hdr_out, info, ctx, 1, NULL);
+    int rc = decode_once(data, size, NULL, 0, max_layer, NULL, out, hdr_out, info, ctx, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, NULL, 0, max_layer, NULL, out, hdr_out, info, ctx, 1, NULL);
+    return rc;
+}
+
+int nvdr_decode_mem_lossy(const uint8_t* data, size_t size, const size_t* missing, int n,
+                          int max_layer, NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info) {
+    int rc = decode_once(data, size, missing, n, max_layer, NULL, out, hdr_out, info, NULL, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, missing, n, max_layer, NULL, out, hdr_out, info, NULL, 1, NULL);
     return rc;
 }
 
 int nvdr_decode_mem_base(const uint8_t* data, size_t size, const NvdrImage* base,
                          NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx) {
-    int rc = decode_once(data, size, -1, base, out, hdr_out, info, ctx, 0, NULL);
-    if (rc == DECODE_AGAIN) rc = decode_once(data, size, -1, base, out, hdr_out, info, ctx, 1, NULL);
+    int rc = decode_once(data, size, NULL, 0, -1, base, out, hdr_out, info, ctx, 0, NULL);
+    if (rc == DECODE_AGAIN) rc = decode_once(data, size, NULL, 0, -1, base, out, hdr_out, info, ctx, 1, NULL);
     return rc;
 }
 
-static int decode_once(const uint8_t* data, size_t size, int max_layer, const NvdrImage* base_img,
-                       NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info, NvdrContext* ctx,
-                       int careful, NvdrRestoreFit* fit) {
+/* How much of the `len` bytes at `off` can be read: up to the end of the
+ * data or the first byte of a hole, whichever comes first. */
+static size_t readable(size_t size, const size_t* holes, int nholes, size_t off, size_t len) {
+    size_t lim = off + len < size ? off + len : size;
+    for (int i = 0; i < nholes; i++) {
+        size_t a = holes[2 * i], b = holes[2 * i + 1];
+        if (a < lim && b > off) lim = a > off ? a : off;
+    }
+    return lim > off ? lim - off : 0;
+}
+
+static int decode_once(const uint8_t* data, size_t size, const size_t* holes, int nholes, int max_layer,
+                       const NvdrImage* base_img, NvdrImage* out, NvdrHeader* hdr_out, NvdrDecodeInfo* info,
+                       NvdrContext* ctx, int careful, NvdrRestoreFit* fit) {
     out->pixels = NULL; out->width = out->height = 0;
     tables_init();
     NvdrHeader h;
     if (read_header(data, size, &h) != 0) return -1;
     if (hdr_out) *hdr_out = h;
+    /* Everything before the first layer has to be there. */
+    size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len + h.restore_len + h.table_len;
+    if (readable(size, holes, nholes, 0, base) < base) return -1;
 
-    size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len + h.restore_len;
-    size_t avail0 = size - base;
-    if (avail0 > h.stored_bytes[0]) avail0 = h.stored_bytes[0];
+    /* Each layer's part of each slice (one slice without them): where it
+     * starts, how long it is, and how much of it can be read. */
+    int ns = slice_count(&h), srows = h.slice_rows ? h.slice_rows : tiles_down(&h);
+    uint32_t* seg = (uint32_t*)malloc(sizeof(uint32_t) * NVDR_LAYERS * ns);
+    size_t* seg_at = (size_t*)malloc(sizeof(size_t) * NVDR_LAYERS * ns);
+    size_t* seg_ok = (size_t*)malloc(sizeof(size_t) * NVDR_LAYERS * ns);
+    int* got = (int*)calloc((size_t)NVDR_LAYERS * ns, sizeof(int));   /* tiles each part carried */
+    if (!seg || !seg_at || !seg_ok || !got) { free(seg); free(seg_at); free(seg_ok); free(got); return -1; }
+    if (h.slice_rows) slice_table(data, size, base - h.table_len, &h, seg);
+    else for (int k = 0; k < NVDR_LAYERS; k++) seg[k] = h.stored_bytes[k];
+    size_t avail_layer[NVDR_LAYERS] = { 0, 0, 0 };
     /* The range decoder primes itself with five bytes; fewer than that
-     * and not one symbol of layer 0 can be read. */
-    if (avail0 < 5) return -1;
-    size_t off1 = base + (size_t)h.stored_bytes[0];
-    size_t avail1 = size > off1 ? size - off1 : 0;
-    if (avail1 > h.stored_bytes[1]) avail1 = h.stored_bytes[1];
-    size_t off2 = off1 + (size_t)h.stored_bytes[1];
-    size_t avail2 = size > off2 ? size - off2 : 0;
-    if (avail2 > h.stored_bytes[2]) avail2 = h.stored_bytes[2];
+     * and not one symbol of a part can be read. */
+    int any0 = 0;
+    for (size_t k = 0, at = base; k < NVDR_LAYERS; k++)
+        for (int i = 0; i < ns; i++) {
+            size_t j = k * ns + i;
+            seg_at[j] = at;
+            seg_ok[j] = readable(size, holes, nholes, at, seg[j]);
+            avail_layer[k] += seg_ok[j];
+            if (k == 0 && seg_ok[j] >= 5) any0 = 1;
+            at += seg[j];
+        }
+    if (!any0) { free(seg); free(seg_at); free(seg_ok); free(got); return -1; }
+    size_t avail1 = avail_layer[1], avail2 = avail_layer[2];
     int band_at[NSIZES];
     for (int s = 0; s < NSIZES; s++) band_at[s] = band_split(s, h.band);
 
@@ -3083,6 +3274,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     memset(L, 0, sizeof(L));
     uint8_t* up[2] = { NULL, NULL };
     uint8_t* saved = NULL;
+    uint8_t* whole0 = NULL;
     int8_t* tq = NULL;
     if (canvas_init(&cvs[0], h.width, h.height, h.max_block, h.min_block, np == 2 ? 1 : 3, 0) != 0) goto done;
     if (np == 2 && canvas_init(&cvs[1], (h.width + 1) / 2, (h.height + 1) / 2, h.max_block / 2,
@@ -3108,6 +3300,7 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
         tile_start[k] = (size_t*)malloc(sizeof(size_t) * (tiles + 1));
         if (!tile_start[k]) goto done;
     }
+    if (!(whole0 = (uint8_t*)calloc((size_t)tiles, 1))) goto done;
     int step[3] = { h.q_luma, h.q_chroma, h.q_chroma };
     int tstep[3] = { step[0], step[1], step[2] };
     /* The tiles' step offsets, as layer 0 delivers them; zero where it
@@ -3115,46 +3308,57 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     if ((h.flags & NVDR_FLAG_TILEQ) && !(tq = (int8_t*)calloc((size_t)tiles, 1))) goto done;
 
     /* Layer 0: every tile that arrives whole; the rest predicted. */
-    ColourModels cm;
-    TextureModels tms[2];
+    ColourModels cm, cm0;
+    TextureModels tms[2], tms0[2];
     if (ctx && ctx->valid) {
         cm = ctx->cm; tms[0] = ctx->tm; tms[1] = ctx->tm2;
     } else {
         models_fill((NvdrProb*)&cm, sizeof(cm) / sizeof(NvdrProb));
         for (int k = 0; k < 2; k++) models_fill((NvdrProb*)&tms[k], sizeof(TextureModels) / sizeof(NvdrProb));
     }
+    cm0 = cm; tms0[0] = tms[0]; tms0[1] = tms[1];
     NvdrDecoder d0;
-    nvdr_dec_init(&d0, data + base, avail0);
+    /* A directional picture has no slices: its texture is the one part of
+     * layer 1. */
     NvdrDecoder d1;
-    nvdr_dec_init(&d1, data + off1, avail1);
+    nvdr_dec_init(&d1, data + seg_at[ns], seg_ok[ns]);
     for (int k = 0; k < np; k++) {
         L[k].cv = &cvs[k]; L[k].d = &d0; L[k].cm = &cm; L[k].step = tstep;
         L[k].d1 = &d1; L[k].tm = &tms[0];
     }
-    int complete0 = 0, stopped = 0, tq_prev = 0;
-    for (int t = 0; t < tiles; t++) {
-        int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
-        for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
-        if (tq && !stopped) {
-            int d = tq_prev + get_tq(&d0, &cm);
-            if (d0.overrun || d < -TQ_MAX || d > TQ_MAX) stopped = 1;
-            else {
-                tq[t] = (int8_t)d; tq_prev = d;
-                for (int c = 0; c < 3; c++) tstep[c] = tq_step(step[c], d);
+    int complete0 = 0;
+    for (int sl = 0; sl < ns; sl++) {
+        /* Every slice from the models the picture starts with (SLICES). */
+        int t0 = sl * srows * tiles_x, t1 = (sl + 1) * srows * tiles_x;
+        if (t1 > tiles) t1 = tiles;
+        cm = cm0;
+        int stopped = seg_ok[sl] < 5, tq_prev = 0;
+        if (!stopped) nvdr_dec_init(&d0, data + seg_at[sl], seg_ok[sl]);
+        for (int k = 0; k < np; k++) cvs[k].slice_top = t0 / tiles_x * cvs[k].tile;
+        for (int t = t0; t < t1; t++) {
+            int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
+            for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
+            if (tq && !stopped) {
+                int d = tq_prev + get_tq(&d0, &cm);
+                if (d0.overrun || d < -TQ_MAX || d > TQ_MAX) stopped = 1;
+                else {
+                    tq[t] = (int8_t)d; tq_prev = d;
+                    for (int c = 0; c < 3; c++) tstep[c] = tq_step(step[c], d);
+                }
             }
-        }
-        for (int k = 0; k < np && !stopped; k++) {
-            int x = tx / (k + 1), y = ty / (k + 1);
-            if (!node_exists(&cvs[k], x, y)) continue;
-            if (read_node(&L[k], x, y, cvs[k].tile) != 0) goto done;
-            if (d0.overrun || L[k].corrupt) stopped = 1;
-        }
-        if (stopped) {
-            for (int k = 0; k < np; k++) {
-                L[k].count = tile_start[k][t];
-                tile_fallback(&cvs[k], tx / (k + 1), ty / (k + 1));
+            for (int k = 0; k < np && !stopped; k++) {
+                int x = tx / (k + 1), y = ty / (k + 1);
+                if (!node_exists(&cvs[k], x, y)) continue;
+                if (read_node(&L[k], x, y, cvs[k].tile) != 0) goto done;
+                if (d0.overrun || L[k].corrupt) stopped = 1;
             }
-        } else complete0++;
+            if (stopped) {
+                for (int k = 0; k < np; k++) {
+                    L[k].count = tile_start[k][t];
+                    tile_fallback(&cvs[k], tx / (k + 1), ty / (k + 1));
+                }
+            } else { complete0++; got[sl]++; whole0[t] = 1; }
+        }
     }
     for (int k = 0; k < np; k++) tile_start[k][tiles] = L[k].count;
 
@@ -3173,17 +3377,20 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     saved = (uint8_t*)malloc((size_t)cv->tile * cv->tile * 9);   /* full and acc, 3 planes */
     if (!saved) goto done;
     for (int layer = 1; layer < NVDR_LAYERS; layer++) {
-        const uint8_t* stream = data + (layer == 1 ? off1 : off2);
-        size_t avail = layer == 1 ? avail1 : avail2;
-        if (dirpred || (max_layer >= 0 && max_layer < layer) || avail < 5 || complete[layer - 1] == 0) break;
-        if (layer == 2 && h.band == 0) break;
+      if (dirpred || (max_layer >= 0 && max_layer < layer)) break;
+      if (layer == 2 && h.band == 0) break;
+      for (int sl = 0; sl < ns; sl++) {
+        size_t j = (size_t)layer * ns + sl, avail = seg_ok[j];
+        int t0 = sl * srows * tiles_x, before = got[(layer - 1) * ns + sl];
+        if (avail < 5 || before == 0) continue;
         TextureModels* tm = &tms[layer - 1];
+        *tm = tms0[layer - 1];
         NvdrDecoder d;
-        nvdr_dec_init(&d, stream, avail);
+        nvdr_dec_init(&d, data + seg_at[j], avail);
         int corrupt = 0;
         int lv[NVDR_MAX_BLOCK * NVDR_MAX_BLOCK];
-        int guard = careful || avail < h.stored_bytes[layer];
-        for (int t = 0; t < complete[layer - 1]; t++) {
+        int guard = careful || avail < seg[j];
+        for (int t = t0; t < t0 + before; t++) {
             /* Every plane of both trees saved, luma's then colour's, in
              * one buffer: a colour tile is a quarter of a luma tile. */
             uint8_t* keep = saved;
@@ -3243,7 +3450,9 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
                 break;
             }
             complete[layer]++;
+            got[j]++;
         }
+      }
     }
 
     out->pixels = (unsigned char*)malloc((size_t)h.width * h.height * 3);
@@ -3264,8 +3473,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
     for (int k = 0; k < np; k++) {
         uint8_t** pl = (max_layer == 0) ? cvs[k].flat : cvs[k].full;
         if ((h.flags & NVDR_FLAG_DEBLOCK) &&
-            deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][complete0],
-                    complete0, tiles_x, tiles, step, tq, h.deblock, fit) != 0) {
+            deblock(&cvs[k], pl, L[k].leaves, max_layer == 0 ? NULL : textured[k], tile_start[k][tiles],
+                    whole0, tiles_x, tiles, step, tq, h.deblock, fit) != 0) {
             free(out->pixels); out->pixels = NULL; goto done;
         }
         for (int c = 0; c < cvs[k].np; c++) {
@@ -3324,6 +3533,8 @@ static int decode_once(const uint8_t* data, size_t size, int max_layer, const Nv
 
 done:
     free(saved);
+    free(whole0);
+    free(seg); free(seg_at); free(seg_ok); free(got);
     free(tq);
     for (int k = 0; k < 2; k++) {
         free(L[k].leaves);

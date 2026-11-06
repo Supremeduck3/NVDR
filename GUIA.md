@@ -155,6 +155,12 @@ Arrasta uma imagem e pronto. Antes, dá para escolher:
 - **Modo**: **Direcional** (padrão na página, `--directional`): cada bloco
   é previsto dos vizinhos já decodificados, e o arquivo sai bem menor;
   **Progressivo**: chega em camadas, cor primeiro e detalhe depois.
+- **Pontos de ressincronização** (só no progressivo, `--slices N`): para
+  mandar a foto por uma rede que perde pacotes sem reenviar (rádio,
+  satélite). A cada N linhas de blocos o arquivo recomeça, e um pacote
+  perdido estraga só até o próximo ponto, não o resto da camada. "A cada
+  64 px" (`--slices 2`) custa ~3% de tamanho; "a cada 128 px", ~1,4%.
+  Veja "Mandar por rede ruim" abaixo.
 - **Velocidade**: rápida é o `--fast` (só no direcional), 2 a 3 vezes mais
   rápida por ~1% a mais de bytes.
 - **Grão de sensor**, como no `--grain`.
@@ -423,6 +429,42 @@ mantém a árvore de pastas na saída.
   q24; foto de câmera sai uma fração do tamanho.
 
 ---
+
+## Mandar por rede ruim
+
+Numa rede que perde pacotes e não pede de novo (rádio, satélite, um
+canal só de ida), o que chega é o arquivo com buracos. Três peças
+trabalham juntas:
+
+1. **Fatias** no encoder: `--slices 2` (ou "Pontos de ressincronização"
+   na página). Um buraco estraga só até o próximo ponto.
+2. **Buracos** no decoder: diga quais bytes não chegaram e ele decodifica
+   o resto. Cada camada de cada fatia vai até o primeiro byte faltando.
+
+   ```bash
+   ./nvdr_encode samples/montanha_pessoas.jpg /tmp/m.nvdr --slices 2
+   ./nvdr_decode /tmp/m.nvdr /tmp/saida.png --missing 1500-2700,20000-21200
+   ```
+
+   No navegador é o último argumento de `decode()` em `nvdr.js`: uma lista
+   de pares `[início, fim)`.
+3. **FEC** em `public/nvdr-fec.js`: `packetize(arquivo)` corta em pacotes
+   numerados e acrescenta paridade Reed-Solomon, mais na cor (0,5) que na
+   textura (0,25 e 0,1); `reassemble(pacotesQueChegaram)` recompõe o que
+   der e devolve `{ data, holes }` para o `decode()`. Custa ~20% a mais de
+   bytes.
+
+No satélite simulado (5% de perda em rajadas), os 10% piores casos sobem
+de 23 dB (sem nada) para 28 dB (fatias + FEC), e a foto chega inteira em
+80% das vezes em vez de 49%. Para medir com outras fotos e redes:
+
+```bash
+node scripts/analysis/badnet.mjs samples/montanha_pessoas.jpg --scenario sat,2g \
+     --slices 2 --protect 0.5,0.25,0.1 --runs 200
+```
+
+Se há como pedir de novo (TCP, HTTP), isso continua mais rápido: o FEC é
+para quando não há volta, ou a volta demora demais.
 
 ## Compartilhar como PNG
 

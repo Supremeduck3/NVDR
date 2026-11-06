@@ -40,6 +40,8 @@ static void usage(const char* argv0) {
         "  --no-adaptive-tx with --directional, keep every leaf on the DCT\n"
         "                   instead of choosing its transform per leaf\n"
         "  --no-halves      with --directional, never cut a node in two\n"
+        "  --slices N       a restart point every N rows of tiles (32 px each): a lost\n"
+        "                   packet then costs only the rest of its slice (0 none, default)\n"
         "  --fast           with --directional, try the other transform types only on\n"
         "                   the two cheapest modes of a leaf and rank them without\n"
         "                   RDOQ (about 3.5x faster, ~1%% bigger)\n"
@@ -77,6 +79,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--no-halves")) cfg.halves = 0;
         else if (!strcmp(argv[i], "--fast")) { cfg.tx_modes = 2; cfg.fast_rank = 1; }
+        else if (!strcmp(argv[i], "--slices") && i + 1 < argc) cfg.slices = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tx-modes") && i + 1 < argc) cfg.tx_modes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--grain") && i + 1 < argc) {
             const char* v = argv[++i];

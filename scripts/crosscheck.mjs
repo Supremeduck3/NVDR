@@ -3,12 +3,14 @@
  * something the container does not contain. This decodes the same
  * container both ways — each layer, cuts that land inside either layer,
  * and copies with a few bits flipped, whole length, which is where the JS
- * decoder starts over (see decode() in nvdr.js) — and reports the first
- * pixel where they differ.
+ * decoder starts over (see decode() in nvdr.js), and copies with holes
+ * (packets that never arrived, filled with noise the decoders must not
+ * read: nvdr_decode --missing, decode()'s `holes`) — and reports the
+ * first pixel where they differ.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { decodeJs as decode } from '../public/nvdr.js';
+import { decodeJs as decode, readHeader, sliceParts } from '../public/nvdr.js';
 import { loadWasmBytes, decodeWasm } from '../public/nvdr-wasm.js';
 
 // The WebAssembly build of the C decoder is held to the same pixels, when
@@ -41,15 +43,16 @@ function readPPM(path) {
 const decoder = new URL('../nvdr_decode', import.meta.url).pathname;
 let failures = 0;
 
-function check(label, file, layer) {
+function check(label, file, layer, holes = null) {
     const bytes = readFileSync(file);
     let cDecoded = true;
+    const missing = holes ? ['--missing', holes.map(([a, b]) => `${a}-${b}`).join(',')] : [];
     try {
-        execFileSync(decoder, [file, '/tmp/cc.ppm', '--layer', String(layer)], { stdio: 'ignore' });
+        execFileSync(decoder, [file, '/tmp/cc.ppm', '--layer', String(layer), ...missing], { stdio: 'ignore' });
     } catch {
         cDecoded = false;
     }
-    const result = decode(new Uint8Array(bytes), layer);
+    const result = decode(new Uint8Array(bytes), layer, false, null, false, null, holes);
     const jsDecoded = !!result;
     if (!cDecoded || !jsDecoded) {
         if (cDecoded !== jsDecoded) {
@@ -62,7 +65,7 @@ function check(label, file, layer) {
         return;
     }
     const ref = readPPM('/tmp/cc.ppm');
-    if (wasm) {
+    if (wasm && !holes) {
         const w = decodeWasm(new Uint8Array(bytes), layer);
         for (let i = 0; i < ref.pixels.length; i++)
             if (!w || w.rgb[i] !== ref.pixels[i]) {
@@ -79,7 +82,7 @@ function check(label, file, layer) {
             failures++;
             return;
         }
-    console.log(`${label}: identical${wasm ? ' (C, JS, WASM)' : ''} (${result.header.width}x${result.header.height}, ` +
+    console.log(`${label}: identical${wasm && !holes ? ' (C, JS, WASM)' : ' (C, JS)'} (${result.header.width}x${result.header.height}, ` +
                 `tiles ${result.tilesComplete.join('/')} of ${result.tiles})`);
 }
 
@@ -103,5 +106,31 @@ for (let k = 0; k < 12; k++) {
     const damaged = `/tmp/cc_damaged_${k}.nvdr`;
     writeFileSync(damaged, b);
     check(`damaged ${k}`, damaged, 2);
+}
+// Holes: one to three lost packets of 1200 bytes past what precedes the
+// first layer, their bytes replaced with noise.
+const hdr = readHeader(new Uint8Array(whole));
+const first = hdr ? sliceParts(hdr)[0].at : 32;
+for (let k = 0; k < 8 && whole.length > first + 64; k++) {
+    const b = Buffer.from(whole), holes = [];
+    for (let j = 0, n = 1 + Math.floor(rnd() * 3); j < n; j++) {
+        const a = first + Math.floor(rnd() * (b.length - first));
+        holes.push([a, Math.min(b.length, a + 1200)]);
+    }
+    holes.sort((x, y) => x[0] - y[0]);
+    for (const [a, e] of holes) for (let i = a; i < e; i++) b[i] = Math.floor(rnd() * 256);
+    const holed = `/tmp/cc_holes_${k}.nvdr`;
+    writeFileSync(holed, b);
+    const label = `holes ${k} (${holes.map(([a, e]) => `${a}-${e}`).join(',')})`;
+    check(label, holed, 2, holes);
+    // What lies in a hole must make no difference: noise against zeros.
+    for (const [a, e] of holes) b.fill(0, a, e);
+    writeFileSync(holed + '0', b);
+    const js = decode(new Uint8Array(b), 2, false, null, false, null, holes);
+    const ref = readPPM('/tmp/cc.ppm');
+    if (js && js.rgb.some((v, i) => v !== ref.pixels[i])) {
+        console.log(`${label}: the bytes in a hole change the picture`);
+        failures++;
+    }
 }
 process.exit(failures ? 1 : 0);

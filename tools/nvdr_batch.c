@@ -205,6 +205,8 @@ static void usage(const char* a0) {
         "  --jobs N         images coded at once (default: one per core)\n"
         "  --force          code images whose output is already newer than them\n"
         "  --progressive    the layered mode instead of the directional one\n"
+        "  --slices N       with --progressive, a restart point every N rows of tiles,\n"
+        "                   for links that lose packets (0 none, the default)\n"
         "  --q N            quantiser step (default 24; smaller is better and larger)\n"
         "  --fast           try the other transform types only on the two cheapest\n"
         "                   modes of a leaf, ranked without RDOQ: about 3.5 times\n"
@@ -227,6 +229,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--force")) force = 1;
         else if (!strcmp(argv[i], "--jobs") && i + 1 < argc) jobs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--progressive")) cfg.directional = 0;
+        else if (!strcmp(argv[i], "--slices") && i + 1 < argc) cfg.slices = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fast")) { cfg.tx_modes = 2; cfg.fast_rank = 1; }
         else if (!strcmp(argv[i], "--as") && i + 1 < argc) {

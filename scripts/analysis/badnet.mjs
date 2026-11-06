@@ -1,5 +1,6 @@
 // node scripts/analysis/badnet.mjs <image> [--q 24] [--scenario name,...] [--kbps N --rtt MS --loss P --burst L]
 //                                  [--runs 50] [--seed S] [--json out.json] [--svg out.svg]
+//                                  [--formats jpeg-prog,avif,...] [--slices 2] [--protect 0.5,0.25,0.1]
 //
 // Sending a photo over a bad link: what the receiver sees, and when.
 //
@@ -14,6 +15,14 @@
 //     still missing;
 //   without (UDP-like): what arrived before the first lost packet is all
 //     there is, over --runs draws of the losses.
+//
+// Then NVDR alone, without retransmission but made for it: every packet
+// numbered (public/nvdr-fec.js), the receiver decoding the file with its
+// holes (nvdr.js's `holes`), with and without slices (--slices rows of
+// tiles per slice, default 2) and parity (--protect, the share of parity
+// for the colour, the low band and the high band; default 0.5,0.25,0.1),
+// against the same parity spread evenly. All of it sent at the link's
+// rate, so it is complete when the last packet lands.
 //
 // Losses come in bursts (Gilbert-Elliott: --loss the mean rate, --burst
 // the mean run of lost packets). No slow start, no congestion control,
@@ -30,6 +39,8 @@ import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readPPM } from './addnoise.mjs';
+import { decodeJs } from '../../public/nvdr.js';
+import { packetize, reassemble } from '../../public/nvdr-fec.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const args = process.argv.slice(2);
@@ -183,7 +194,9 @@ function udpPrefix(size, sc, rand) {
 /* ------------------------------------------------------------------ run */
 
 const q = +opt('--q', 24);
-const fmts = FORMATS.map(f => ({ ...f }));
+/* --formats limits the comparison (NVDR progressive is always in it). */
+const only = opt('--formats', '') ? opt('--formats').split(',') : null;
+const fmts = FORMATS.filter(f => !only || f.key === 'nvdr-prog' || only.includes(f.key)).map(f => ({ ...f }));
 console.error(`${basename(image)}: ${REF.width}x${REF.height}`);
 const base = encodeAt.call(null, { ...fmts[0], lo: q, hi: q }, 0);
 const target = base.q;
@@ -255,6 +268,60 @@ for (const sc of scenarios) {
                     `${fmtQ(m < 0 ? null : m).padStart(19)}   ${String(Math.round(100 * whole / RUNS) + '%').padStart(13)}`);
     }
     report.push(scr);
+}
+
+/* ----------------------------------------- NVDR made for a lossy link */
+
+const SLICES = +opt('--slices', 2);
+const PROTECT = opt('--protect', '0.5,0.25,0.1').split(',').map(Number);
+const sliced = join(tmp, 'sliced.nvdr');
+run(join(root, 'nvdr_encode'), [refPath, sliced, '--q', String(q), '--slices', String(SLICES), '--quiet']);
+const plainFile = new Uint8Array(readFileSync(base.path)), slicedFile = new Uint8Array(readFileSync(sliced));
+const jsImage = r => r && { width: r.header.width, height: r.header.height, rgb: r.rgb };
+const parityOf = pk => pk.reduce((n, p) => n + p.length, 0);
+const uep = packetize(slicedFile, { mtu: MTU, protect: PROTECT });
+/* The same bytes of parity spread evenly, found by bisection. */
+let lo = 0, hi = 2;
+for (let i = 0; i < 30; i++) {
+    const mid = (lo + hi) / 2;
+    if (parityOf(packetize(slicedFile, { mtu: MTU, protect: [mid, mid, mid] })) > parityOf(uep)) hi = mid; else lo = mid;
+}
+const flat = lo;
+const LOSSY = [
+    { name: 'sem fatias', file: plainFile, pk: packetize(plainFile, { mtu: MTU, protect: [0] }) },
+    { name: `fatias de ${SLICES}`, file: slicedFile, pk: packetize(slicedFile, { mtu: MTU, protect: [0] }) },
+    { name: `fatias + FEC igual`, file: slicedFile, pk: packetize(slicedFile, { mtu: MTU, protect: [flat, flat, flat] }) },
+    { name: `fatias + FEC desigual`, file: slicedFile, pk: uep },
+];
+const fullQ = LOSSY.map(v => psnrY(jsImage(decodeJs(v.file, 2))));
+for (const [i, v] of LOSSY.entries())
+    console.error(`${v.name.padEnd(22)} ${v.file.length} B em ${v.pk.length} pacotes (${parityOf(v.pk)} B), ${fullQ[i].toFixed(2)} dB`);
+for (const [si, sc] of scenarios.entries()) {
+    console.log(`\n== ${sc.name}, NVDR sem reenvio, ${RUNS} sorteios: buracos decodificados, fatias, FEC ` +
+                `(desigual ${PROTECT.join('/')}, igual ${flat.toFixed(2)})`);
+    console.log('  variante                  bytes   chega algo   mediana   pior 10%   inteiro   completo em');
+    report[si].lossy = [];
+    for (const v of LOSSY) {
+        const qs = [];
+        let whole = 0;
+        const sent = parityOf(v.pk);
+        for (let s = 0; s < RUNS; s++) {
+            const lost = losses(sc, rng(+opt('--seed', 1) * 104729 + s + 1));
+            const got = v.pk.filter(() => !lost());
+            const r = reassemble(got);
+            const img = r ? decodeJs(r.data, 2, false, null, false, null, r.holes) : null;
+            const y = img ? psnrY(jsImage(img)) : null;
+            qs.push(y === null ? -1 : y);
+            if (r && !r.holes.length) whole++;
+        }
+        qs.sort((a, b) => a - b);
+        const any = qs.filter(x => x >= 0).length, med = qs[RUNS >> 1], p10 = qs[Math.floor(RUNS / 10)];
+        const t = v.pk.length * MTU * 8 / (sc.kbps * 1000) + sc.rtt / 2000;
+        report[si].lossy.push({ name: v.name, bytes: sent, any: any / RUNS, median: med, p10, whole: whole / RUNS, time: t });
+        console.log(`  ${v.name.padEnd(22)} ${String(sent).padStart(8)}   ${String(Math.round(100 * any / RUNS) + '%').padStart(10)}   ` +
+                    `${fmtQ(med < 0 ? null : med).padStart(7)}   ${fmtQ(p10 < 0 ? null : p10).padStart(8)}   ` +
+                    `${String(Math.round(100 * whole / RUNS) + '%').padStart(7)}   ${fmtT(t).padStart(11)}`);
+    }
 }
 
 if (opt('--json')) writeFileSync(opt('--json'), JSON.stringify({ image: basename(image), target, formats: results, report }, null, 1));

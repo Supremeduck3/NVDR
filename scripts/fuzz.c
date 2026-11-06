@@ -69,6 +69,11 @@ static int decode_still(const uint8_t* d, size_t n) {
         nvdr_image_free(&img);
         ok = 1;
     }
+    /* And with holes, where the decoder reads each slice's part up to the
+     * first: three ranges from the length, overlapping or not. */
+    size_t holes[6] = { n / 3, n / 3 + 700, n / 2, n / 2 + 1, n - n / 5, n + 50 };
+    NvdrImage img;
+    if (nvdr_decode_mem_lossy(d, n, holes, 3, -1, &img, NULL, NULL) == 0) { nvdr_image_free(&img); ok = 1; }
     /* A container predicted from a base decodes only against one, so it
      * gets one: a ramp of the size its header claims, while that is sane. */
     if (n >= 10 && (d[5] & NVDR_FLAG_INTER)) {
@@ -153,8 +158,9 @@ int main(int argc, char** argv) {
          * (large coefficients, escapes), a coarse one (mostly flat
          * leaves), a tree held to 8..16 px, with film grain (its
          * parameters after the header, its synthesis over the picture),
-         * with a step offset per tile, and with directional prediction
-         * (colour and texture read together, leaf by leaf).
+         * with a step offset per tile, with directional prediction
+         * (colour and texture read together, leaf by leaf), and in
+         * slices (a table after the header, every part its own stream).
          * A path no seed reaches is a path the fuzzer never attacks. */
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
@@ -162,7 +168,7 @@ int main(int argc, char** argv) {
         size_t ntiles = (size_t)((img.width + 31) / 32) * ((img.height + 31) / 32);
         int8_t* tq = (int8_t*)malloc(ntiles);
         for (size_t t = 0; tq && t < ntiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
-        for (int variant = 0; variant < 8 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 9 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 5) { if (!tq) continue; c.tile_q = tq; }
             if (variant == 6) { c.directional = 1; c.q = 30; }
@@ -172,6 +178,7 @@ int main(int argc, char** argv) {
             if (variant == 3) { c.min_block = 8; c.max_block = 16; c.band = 0; }
             if (variant == 2) c.band = 32;
             if (variant == 4) { c.grain = NVDR_GRAIN_ON; c.q = 40; }
+            if (variant == 8) { c.slices = 1; c.tile_q = tq; c.q = 30; }
             if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) == 0) nseeds++;
         }
         free(tq);
@@ -234,6 +241,8 @@ int main(int argc, char** argv) {
          * parameters after it, whose lengths it gives. */
         size_t head = NVDR_HEADER_SIZE;
         if (!do_seq && n >= NVDR_HEADER_SIZE) head += (size_t)src[29] + ((size_t)src[30] | ((size_t)src[31] << 8));
+        /* and from version 17 the slice table: its first byte, at least */
+        if (!do_seq && n > head && src[4] >= NVDR_VERSION_SLICES) head++;
         if (head > n) head = n;
         mutate(buf, &len, do_seq ? NVDRV_HEADER_SIZE + NVDRV_FRAME_HEADER : head);
 

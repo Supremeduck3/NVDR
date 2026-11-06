@@ -169,6 +169,16 @@ typedef struct {
      * of a doubling, -12 to 12; NULL for none. Carried in layer 0 at the
      * start of each tile, flagged in the header. */
     const int8_t* tile_q;
+    /* Restart points: every `slices` rows of tiles start a slice, whose
+     * part of each layer is a stream of its own, coded from the models as
+     * they stood at the start of the picture, with colours predicted
+     * from nothing above the slice's first row. A slice then decodes
+     * without any other, so bytes lost in the middle of a layer cost the
+     * rest of that slice's part of the layer and no more (see SLICES in
+     * nvdr.c, and nvdr_decode_mem_lossy()). 0 (the default) codes each
+     * layer as one stream. Progressive pictures only: a directional or
+     * residual picture ignores it. Container v17. */
+    int   slices;
 } NvdrConfig;
 
 #define NVDR_GRAIN_OFF   0
@@ -198,7 +208,10 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_MAX_PIXELS  ((size_t)1 << 27)
 
 #define NVDR_MAGIC       "NVDR"
+/* What a container without slices is written as (sequences rebuild
+ * their frames' headers with it), and one with them. */
 #define NVDR_VERSION     16
+#define NVDR_VERSION_SLICES 17
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -214,8 +227,8 @@ typedef struct {
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
-    uint8_t  version;                   /* 16; 15 had no deblocking levels, 14 no half nodes,
-                                           13 also fifteen intra modes */
+    uint8_t  version;                   /* 16, or 17 with slices; 15 had no deblocking levels,
+                                           14 no half nodes, 13 also fifteen intra modes */
     uint8_t  band;
     /* How hard leaf seams are deblocked, luma's and colour's: 8 is the
      * filter as tuned, 0 none, each step an eighth of its thresholds. A
@@ -225,6 +238,11 @@ typedef struct {
     uint8_t  grain_len;                 /* bytes of grain parameters after the header */
     NvdrGrain grain;
     uint16_t restore_len;               /* bytes of restoration parameters after those */
+    /* Container 17: rows of tiles per slice (0, the whole picture), and
+     * the bytes of the slice table after the restoration parameters, the
+     * byte that holds `slice_rows` included (0 before version 17). */
+    uint8_t  slice_rows;
+    uint32_t table_len;
     uint32_t stored_bytes[NVDR_LAYERS];
     /* Filled by the encoder only: leaves of 4, 8, 16 and 32 pixels, and
      * how many of them carry texture. */
@@ -257,6 +275,20 @@ int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
                     NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 int nvdr_decode_file(const char* path, int max_layer,
                      NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
+
+/*
+ * Decode a file some of whose bytes never arrived: `missing` holds `n`
+ * ranges of byte offsets, [missing[2i], missing[2i+1]), whose bytes are
+ * not to be read (whatever `data` holds there), and everything from
+ * `size` on is missing too. Each layer's part of each slice decodes up to
+ * its first missing byte, so a file with slices loses only the slices a
+ * hole falls in, and from the hole on; one without loses the rest of the
+ * layer it falls in. The header, and the grain, restoration and slice
+ * parameters after it, must have arrived. Returns -1 when there is no
+ * picture: no header, or not one tile of colour.
+ */
+int nvdr_decode_mem_lossy(const uint8_t* data, size_t size, const size_t* missing, int n,
+                          int max_layer, NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 
 /*
  * The fluid context: the adaptive models one container leaves behind,

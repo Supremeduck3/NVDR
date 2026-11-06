@@ -17,10 +17,18 @@
  * A short buffer is a normal outcome, not an error: every tile that
  * arrived whole is decoded, a colour tile that did not is painted grey, a
  * texture tile that did not shows what the layer before gave it.
+ *
+ * Version 17 adds slices (SLICES in nvdr.c): after the restoration
+ * parameters a table, one byte of tile rows per slice and the size of
+ * every layer's part of every slice but the last, as LEB128. Each part is
+ * a stream of its own, from the picture's starting models, so a file
+ * with holes (decode()'s `holes`) loses only the rest of the parts they
+ * fall in.
  */
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-export const VERSION = 16;
+export const VERSION = 16;          // what a container without slices is written as
+export const VERSION_SLICES = 17;
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -496,9 +504,10 @@ export function readHeader(buffer) {
     const v = ArrayBuffer.isView(buffer)
         ? new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
         : new DataView(buffer);
-    // Version 15 differs only in having no deblocking levels, 14 also in
-    // having no half nodes, 13 also in having fifteen intra modes.
-    if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) < 13 || v.getUint8(4) > VERSION) return null;
+    // Version 16 differs only in having no slice table, 15 also in having
+    // no deblocking levels, 14 also in having no half nodes, 13 also in
+    // having fifteen intra modes.
+    if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) < 13 || v.getUint8(4) > VERSION_SLICES) return null;
     const h = {
         version: v.getUint8(4),
         width: v.getUint16(6, true),
@@ -549,13 +558,60 @@ export function readHeader(buffer) {
         h.restore = restoreParse(u8, HEADER_SIZE + h.grainLen, h.restoreLen, restorePlanes(h));
         if (!h.restore) return null;
     }
+    // Mirrors slice_table(): every layer's part of every slice, [layer * slices + slice].
+    h.sliceRows = 0;
+    h.tableLen = 0;
+    h.slices = 1;
+    h.seg = h.storedBytes.slice();
+    if (h.version >= VERSION_SLICES) {
+        let at = HEADER_SIZE + h.grainLen + h.restoreLen;
+        const first = at, n = buffer.byteLength;
+        if (at >= n) return null;
+        h.sliceRows = v.getUint8(at++);
+        const ty = Math.ceil(h.height / h.maxBlock);
+        const ns = h.sliceRows ? Math.ceil(ty / h.sliceRows) : 1;
+        h.slices = ns;
+        h.seg = new Array(LAYERS * ns);
+        for (let k = 0; k < LAYERS; k++) {
+            let left = h.storedBytes[k];
+            for (let i = 0; i < ns - 1; i++) {
+                let x = 0, ok = false;
+                for (let sh = 0; sh < 32; sh += 7) {
+                    if (at >= n) return null;
+                    const b = v.getUint8(at++);
+                    x += (b & 127) * 2 ** sh;
+                    if (!(b & 128)) { ok = true; break; }
+                }
+                if (!ok || x > left || x > 0xffffffff) return null;
+                left -= x;
+                h.seg[k * ns + i] = x;
+            }
+            h.seg[k * ns + ns - 1] = left;
+        }
+        h.tableLen = at - first;
+        if (h.sliceRows && (h.flags & (FLAG_DIRPRED | FLAG_RESIDUAL))) return null;
+    }
     return h;
 }
 
 /** Bytes needed before each layer is complete. */
 export function layerThresholds(header) {
-    const a = HEADER_SIZE + header.grainLen + header.restoreLen + header.storedBytes[0], b = a + header.storedBytes[1];
+    const a = HEADER_SIZE + header.grainLen + header.restoreLen + (header.tableLen || 0) + header.storedBytes[0],
+          b = a + header.storedBytes[1];
     return [a, b, b + header.storedBytes[2]];
+}
+
+/** Where each layer's part of each slice lies in the file: [{ layer, slice, at, len }]. */
+export function sliceParts(header) {
+    const out = [];
+    let at = HEADER_SIZE + header.grainLen + header.restoreLen + (header.tableLen || 0);
+    for (let k = 0; k < LAYERS; k++)
+        for (let i = 0; i < header.slices; i++) {
+            const len = header.seg[k * header.slices + i];
+            out.push({ layer: k, slice: i, at, len });
+            at += len;
+        }
+    return out;
 }
 
 /* --- in-loop restoration, mirroring src/restore.c ---------------------- */
@@ -738,27 +794,31 @@ export function freeContext(ctx) {
     if (ctx.slot !== undefined) { fastContexts.free(ctx.slot); ctx.slot = undefined; ctx.valid = false; }
 }
 
-export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null) {
-    if (fastDecoder && (!ctx || ctx.slot !== undefined))
+/* `holes`, when given, lists byte ranges that never arrived, as
+ * [start, end) pairs (mirrors nvdr_decode_mem_lossy()). */
+export function decode(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null,
+                       holes = null) {
+    if (fastDecoder && (!ctx || ctx.slot !== undefined) && !(holes && holes.length))
         return fastDecoder(buffer, maxLayer, wantFlat, wantLow, base, ctx ? ctx.slot : -1);
-    return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow, base);
+    return decodeJs(buffer, maxLayer, wantFlat, ctx, wantLow, base, holes);
 }
 
 /* The JavaScript decoder itself, whichever decode() uses. */
 /* A container with FLAG_INTER needs `base`, the picture it was predicted
  * from, as RGB of its size ({ width, height, rgb }); without it, it does
  * not decode. */
-export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null) {
+export function decodeJs(buffer, maxLayer = LAYERS - 1, wantFlat = false, ctx = null, wantLow = false, base = null,
+                         holes = null) {
     // A texture layer that arrived whole cannot stop inside a tile unless
     // the file is damaged, so the first attempt does not save each tile to
     // restore it, a fifth of the time on a large image. If it does stop,
     // the decode starts over the careful way and gives what that gives. A
     // warm context is changed in place and cannot be started over.
     if (!(ctx && ctx.valid)) {
-        const r = decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, false, base);
+        const r = decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, false, base, holes);
         if (r !== RETRY) return r;
     }
-    return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true, base);
+    return decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, true, base, holes);
 }
 
 /*
@@ -802,11 +862,12 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
             for (let at = j * pw + x, end = at + ww; at < end; at++) { f[at] = v; o[at] = v; a[at] = 0; }
     };
     P.dirpred = dirpred;
+    P.sliceTop = 0;   // the first row of the slice being decoded
     P.predict = (c, x, y, bw, bh) => {
         if (fixedPred) return 128;
         const p = dirpred ? P.full[c] : P.flat[c];
         let sum = 0, k = 0;
-        if (y > 0) {
+        if (y > P.sliceTop) {
             const x1 = Math.min(x + bw, pw);
             for (let i = x; i < x1; i++) sum += p[(y - 1) * pw + i];
             k += x1 - x;
@@ -1044,19 +1105,52 @@ function grainTemplates(g) {
     return out;
 }
 
-function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) {
+/* Mirrors readable(). */
+function readable(size, holes, off, len) {
+    let lim = Math.min(off + len, size);
+    if (holes) for (const [a, b] of holes) if (a < lim && b > off) lim = Math.max(a, off);
+    return lim > off ? lim - off : 0;
+}
+
+/* Copies adaptive models in place, so the closures that hold them see it. */
+function copyModels(dst, src) {
+    for (const k of Object.keys(src)) {
+        const a = src[k];
+        if (ArrayBuffer.isView(a)) dst[k].set(a);
+        else if (Array.isArray(a)) a.forEach((x, i) => {
+            if (ArrayBuffer.isView(x)) dst[k][i].set(x); else copyModels(dst[k][i], x);
+        });
+    }
+}
+
+function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, holes) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const h = readHeader(bytes);
     if (!h) return null;
     const size = bytes.length;
+    // Holes as [start, end) pairs, from a flat list or a list of pairs.
+    if (holes && holes.length && !Array.isArray(holes[0]))
+        holes = Array.from({ length: holes.length >> 1 }, (_, i) => [holes[2 * i], holes[2 * i + 1]]);
 
-    const base = HEADER_SIZE + h.grainLen + h.restoreLen;
-    let avail0 = Math.min(size - base, h.storedBytes[0]);
-    if (avail0 < 5) return null;
-    const off1 = base + h.storedBytes[0];
-    const avail1 = Math.min(size > off1 ? size - off1 : 0, h.storedBytes[1]);
-    const off2 = off1 + h.storedBytes[1];
-    const avail2 = Math.min(size > off2 ? size - off2 : 0, h.storedBytes[2]);
+    // Mirrors decode_once(): everything before the first layer has to be
+    // there; then each layer's part of each slice, as far as it can be read.
+    const base = HEADER_SIZE + h.grainLen + h.restoreLen + h.tableLen;
+    if (readable(size, holes, 0, base) < base) return null;
+    const ns = h.slices, srows = h.sliceRows || Math.ceil(h.height / h.maxBlock);
+    const segAt = new Array(LAYERS * ns), segOk = new Array(LAYERS * ns), got = new Int32Array(LAYERS * ns);
+    const availLayer = [0, 0, 0];
+    let any0 = false;
+    for (let k = 0, at = base; k < LAYERS; k++)
+        for (let i = 0; i < ns; i++) {
+            const j = k * ns + i;
+            segAt[j] = at;
+            segOk[j] = readable(size, holes, at, h.seg[j]);
+            availLayer[k] += segOk[j];
+            if (k === 0 && segOk[j] >= 5) any0 = true;
+            at += h.seg[j];
+        }
+    if (!any0) return null;
+    const avail1 = availLayer[1], avail2 = availLayer[2];
     const bandAt = [0, 1, 2, 3].map(sc => bandSplit(sc, h.band));
 
     // One tree in 4:4:4; in 4:2:0 luma's, then colour's at half size,
@@ -1091,7 +1185,9 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
     const tstep = step.slice();
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
-    const d0 = new ArithDecoder(bytes, base, avail0);
+    // Every slice starts from the models the picture starts with.
+    const cm0 = ns > 1 ? structuredClone(cm) : null, tms0 = ns > 1 ? structuredClone(tms) : null;
+    let d0 = null;
     const s0 = { corrupt: false };
 
     // Mirrors texture_residual() + add_residual(): texture levels in
@@ -1122,7 +1218,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
     }
     // With directional prediction a leaf's texture comes from the first
     // texture layer as soon as its colour does.
-    const d1 = dirpred ? new ArithDecoder(bytes, off1, avail1) : null;
+    const d1 = dirpred ? new ArithDecoder(bytes, segAt[ns], segOk[ns]) : null;
     const lvd = new Int32Array(MAX_BLOCK * MAX_BLOCK), prd = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     for (const P of parts) P.ltex = [];
 
@@ -1197,30 +1293,38 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         readLeaf(P, x, y, n, n);
     }
 
-    let complete0 = 0, stopped = false, tqPrev = 0;
-    for (let t = 0; t < tiles; t++) {
-        const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
-        for (const P of parts) P.tileStart[t] = P.lx.length;
-        if (tq && !stopped) {
-            const dq = tqPrev + getTq(d0, cm);
-            if (d0.overrun || dq < -TQ_MAX || dq > TQ_MAX) stopped = true;
-            else {
-                tq[t] = dq; tqPrev = dq;
-                for (let c = 0; c < 3; c++) tstep[c] = tqStep(step[c], dq);
+    let complete0 = 0;
+    const whole0 = new Uint8Array(tiles);
+    for (let sl = 0; sl < ns; sl++) {
+        const t0 = sl * srows * tilesX, t1 = Math.min(tiles, (sl + 1) * srows * tilesX);
+        if (sl) copyModels(cm, cm0);
+        let stopped = segOk[sl] < 5, tqPrev = 0;
+        if (!stopped) d0 = new ArithDecoder(bytes, segAt[sl], segOk[sl]);
+        for (const P of parts) P.sliceTop = t0 / tilesX * P.tile;
+        for (let t = t0; t < t1; t++) {
+            const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
+            for (const P of parts) P.tileStart[t] = P.lx.length;
+            if (tq && !stopped) {
+                const dq = tqPrev + getTq(d0, cm);
+                if (d0.overrun || dq < -TQ_MAX || dq > TQ_MAX) stopped = true;
+                else {
+                    tq[t] = dq; tqPrev = dq;
+                    for (let c = 0; c < 3; c++) tstep[c] = tqStep(step[c], dq);
+                }
             }
+            for (let k = 0; k < parts.length && !stopped; k++) {
+                const P = parts[k], x = tx / (k + 1), y = ty / (k + 1);
+                if (!P.exists(x, y)) continue;
+                readNode(P, x, y, P.tile);
+                if (d0.overrun || s0.corrupt) stopped = true;
+            }
+            if (stopped) {
+                parts.forEach((P, k) => {
+                    P.lx.length = P.ly.length = P.lw.length = P.lh.length = P.ltex.length = P.tileStart[t];
+                    P.tileFallback(tx / (k + 1), ty / (k + 1));
+                });
+            } else { complete0++; got[sl]++; whole0[t] = 1; }
         }
-        for (let k = 0; k < parts.length && !stopped; k++) {
-            const P = parts[k], x = tx / (k + 1), y = ty / (k + 1);
-            if (!P.exists(x, y)) continue;
-            readNode(P, x, y, P.tile);
-            if (d0.overrun || s0.corrupt) stopped = true;
-        }
-        if (stopped) {
-            parts.forEach((P, k) => {
-                P.lx.length = P.ly.length = P.lw.length = P.lh.length = P.ltex.length = P.tileStart[t];
-                P.tileFallback(tx / (k + 1), ty / (k + 1));
-            });
-        } else complete0++;
     }
     for (const P of parts) P.tileStart[tiles] = P.lx.length;
 
@@ -1244,14 +1348,17 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
         return { tx, ty, tw: tx + P.tile < P.pw ? P.tile : P.pw - tx, th: ty + P.tile < P.ph ? P.tile : P.ph - ty };
     };
     for (let layer = 1; layer < LAYERS; layer++) {
-        const avail = layer === 1 ? avail1 : avail2, off = layer === 1 ? off1 : off2;
-        if (dirpred || (maxLayer >= 0 && maxLayer < layer) || avail < 5 || complete[layer - 1] === 0) break;
-        if (layer === 2 && h.band === 0) break;
+      if (dirpred || (maxLayer >= 0 && maxLayer < layer)) break;
+      if (layer === 2 && h.band === 0) break;
+      for (let sl = 0; sl < ns; sl++) {
+        const j = layer * ns + sl, avail = segOk[j], t0 = sl * srows * tilesX, before = got[(layer - 1) * ns + sl];
+        if (avail < 5 || before === 0) continue;
         const tm = tms[layer - 1];
-        const d = new ArithDecoder(bytes, off, avail);
-        const guard = careful || avail < h.storedBytes[layer];
+        if (sl) copyModels(tm, tms0[layer - 1]);
+        const d = new ArithDecoder(bytes, segAt[j], avail);
+        const guard = careful || avail < h.seg[j];
         const st = { corrupt: false };
-        for (let t = 0; t < complete[layer - 1]; t++) {
+        for (let t = t0; t < t0 + before; t++) {
             // Copied by hand: a subarray per row would be millions of
             // short-lived objects on a large image.
             if (guard) for (const P of parts) {
@@ -1317,10 +1424,12 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
                 break;
             }
             complete[layer]++;
+            got[j]++;
         }
-        // What decode(buffer, 1) would show, without a second pass.
-        if (layer === 1 && wantLow)
-            low = { planes: parts.map(P => P.full.map(p => p.slice())), tex: parts.map(P => P.textured.slice()) };
+      }
+      // What decode(buffer, 1) would show, without a second pass.
+      if (layer === 1 && wantLow)
+          low = { planes: parts.map(P => P.full.map(p => p.slice())), tex: parts.map(P => P.textured.slice()) };
     }
 
     /* Mirrors deblock() and deblock_plane(); `tex` is null for colours only. */
@@ -1334,10 +1443,10 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg) 
             if (x > 0) for (let j = y; j < y + bh && j < gh; j++) vedge[j * gw + x] = 1;
             if (y > 0) for (let k = x; k < x + bw && k < gw; k++) hedge[y * gw + k] = 1;
         };
-        const kept = P.tileStart[complete0];
+        const kept = P.lx.length;
         for (let i = 0; i < kept; i++) mark(P.lx[i] >> 2, P.ly[i] >> 2, P.lw[i] >> 2, P.lh[i] >> 2, tex ? tex[i] : 0);
-        for (let t = complete0; t < tiles; t++)
-            mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, ptile >> 2, 0);
+        for (let t = 0; t < tiles; t++)
+            if (!whole0[t]) mark(((t % tilesX) * ptile) >> 2, (Math.floor(t / tilesX) * ptile) >> 2, ptile >> 2, ptile >> 2, 0);
         for (let c = 0; c < P.np; c++) {
             const p = planes[c], base = step[P.comp0 + c], level = h.deblock[P.comp0 + c ? 1 : 0];
             if (!level) continue;

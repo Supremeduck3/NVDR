@@ -604,8 +604,10 @@ function handleBatch(req, res) {
         if (job.recursive) args.push('-r');
         if (['nvdr', 'png', 'both'].includes(job.as)) args.push('--as', job.as);
         if (req.headers['x-q']) args.push('--q', String(intHeader(req, 'x-q', 24, 1, 4095)));
-        if (req.headers['x-mode'] === 'progressive') args.push('--progressive');
-        else if (req.headers['x-fast'] === '1') args.push('--fast');
+        if (req.headers['x-mode'] === 'progressive') {
+            args.push('--progressive');
+            if (/^[1-9]\d{0,2}$/.test(req.headers['x-slices'] || '')) args.push('--slices', req.headers['x-slices']);
+        } else if (req.headers['x-fast'] === '1') args.push('--fast');
         if (['off', 'auto', 'on'].includes(req.headers['x-grain'])) args.push('--grain', req.headers['x-grain']);
 
         console.log(`Batch: ${exe} ${args.join(' ')}`);
@@ -701,6 +703,9 @@ const server = http.createServer((req, res) => {
             if (req.headers['x-mode'] === 'directional') {
                 args.push('--directional');
                 if (req.headers['x-fast'] === '1') args.push('--fast');
+            } else if (/^[1-9]\d{0,2}$/.test(req.headers['x-slices'] || '')) {
+                // Restart points, for links that lose packets: progressive only.
+                args.push('--slices', req.headers['x-slices']);
             }
 
             console.log(`PRS encode for ${inputPath}...`);

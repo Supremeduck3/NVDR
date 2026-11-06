@@ -2862,10 +2862,9 @@ On two more photos over the 2G link the order holds. What it says:
   "Measured but not built: ordering a cut by worth") is where to look.
 - Directional NVDR is the smallest but fills the picture from the top
   down, which a bad link turns into a long wait for the bottom.
-- A packet lost without retransmission ends what NVDR can use: the
-  decoder has no point to pick up again after a gap. Restart points per
-  row of tiles, and more redundancy for the colour layer than for the
-  detail, are what a lossy link needs next.
+- A packet lost without retransmission ends what NVDR can use in that
+  model: the decoder had no point to pick up again after a gap. Restart
+  points and parity, below, are what came of it.
 
 Caveats. One photo in detail and two in summary, PSNR-Y (what NVDR
 optimises). AVIF and JPEG XL come from ffmpeg's libaom (cpu-used 4) and
@@ -2874,6 +2873,85 @@ avifenc and cjxl, in "Against AVIF, JPEG XL and HEIC", beat it: take
 their sizes as these tools' and not the formats' best. JPEG XL can
 decode progressively, but not through ffmpeg, so it counts as
 whole-file. The link has no slow start or congestion control.
+
+### Restart points and parity
+
+Where packets are lost and not sent again, three things now work
+together.
+
+**Holes.** `nvdr_decode_mem_lossy()` (and `nvdr_decode --missing A-B,...`,
+and `decode()`'s `holes` in nvdr.js) takes the byte ranges that never
+arrived. Every layer starts where the header says, so a hole in one layer
+leaves the others readable; each decodes up to its first missing byte.
+
+**Slices** (container v17, `--slices N`, "Pontos de ressincronização" in
+the page). Every N rows of tiles start a slice. Each layer's part of each
+slice is a stream of its own, coded from the picture's starting models,
+and a leaf's colour is predicted from nothing above its slice. A hole
+then costs the rest of the slice's part of that layer, where it cost the
+rest of the layer. This is what JPEG's restart markers and H.264's slices
+do. The file stays progressive, and a file without slices is still
+version 16, byte for byte what it was. What the restarts cost, by
+BD-rate on the six samples:
+
+    rows per slice     1       2       4       8
+    PSNR-Y           +5.5%   +2.9%   +1.4%   +0.4%
+    PSNR-RGB         +4.6%   +2.4%   +1.2%   +0.3%
+
+Most of it is the models learning again from even odds in every slice.
+
+**Parity** (`public/nvdr-fec.js`). The file goes out as numbered packets.
+Each layer is cut into blocks of k data packets, and each block gets m
+packets of Reed-Solomon parity over GF(2^8), applied across packets
+(Rizzo 1997) with a Cauchy matrix (Blömer et al. 1995). Any k of the
+k + m packets give back the block, so a burst of loss is no harder than
+scattered loss. The share of parity follows what the bytes are worth, as
+Priority Encoding Transmission does (Albanese et al. 1996): 0.5 for the
+header and colour layer, which are a few kilobytes and without which
+there is no picture, 0.25 for the low texture band, 0.1 for the high.
+Whatever cannot be filled in reaches the decoder as holes.
+
+montanha_pessoas at q 24, slices of 2 rows, 200 draws of the losses,
+1200-byte packets, all sent at the link's rate with no retransmission:
+
+    satellite / radio: 16 kbit/s, 5% loss in bursts of ~3
+    variant                  bytes sent   median    worst 10%   whole   complete at
+    no slices                   46532     33.0 dB    23.3 dB     49%       25 s
+    slices                      46785     32.6 dB    25.8 dB     49%       25 s
+    slices + even parity        56385     33.7 dB    27.1 dB     80%       30 s
+    slices + parity by layer    56385     33.7 dB    28.3 dB     80%       30 s
+
+    2G: 40 kbit/s, 3% loss in bursts of ~2
+    no slices                   46532     33.9 dB    23.7 dB     53%       10 s
+    slices                      46785     33.7 dB    26.0 dB     52%       10 s
+    slices + even parity        56385     33.7 dB    31.1 dB     90%       12 s
+    slices + parity by layer    56385     33.7 dB    33.7 dB     91%       12 s
+
+"Even parity" is the same bytes of parity spread evenly (0.19 of every
+layer). For the same cost, parity by layer keeps the worst draws 1.2 to
+2.6 dB higher. Across the 0.5/0.25/0.1 split, 1/0.4/0.15 and 1/0.25/0.05,
+and slices of 1, 2 and 4 rows, putting more on the colour and less on
+the high band did worse: on 2G its worst draws lost 3.6 dB to the even
+spread, and on both links fewer draws arrived whole (74% against 80% on
+the satellite). The high band is most of the file, so most of the
+packets that are lost.
+
+What it says:
+
+- On its own a slice helps most where a hole falls in the texture: the
+  rest of the picture keeps its detail. A hole in the colour layer still
+  greys a band of the picture, because one 1200-byte packet carries a
+  third of that layer across many slices. That is what the colour
+  layer's parity is for.
+- Retransmission, where there is a way back, still completes sooner: 25 s
+  on the satellite link and 9.8 s on 2G, against 30 s and 12 s. Parity is
+  for links with no way back (broadcast, one-way radio) or a round trip
+  too long to wait on, and it never waits.
+- Next would be concealment: filling a grey band from the slices above
+  and below it instead of leaving it grey.
+
+`scripts/analysis/badnet.mjs` measures all of this (`--slices`,
+`--protect`), against the same picture sent whole.
 
 ## Damaged input
 

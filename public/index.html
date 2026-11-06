@@ -149,6 +149,13 @@
           <option value="progressive">Progressivo (em camadas)</option>
         </select>
       </label>
+      <label title="Para enviar por rede que perde pacotes (rádio, satélite): a cada N linhas de blocos o arquivo recomeça, e um pacote perdido estraga só até o próximo ponto. Só no modo progressivo. A cada 64 px custa ~3% de tamanho; a cada 128 px, ~1,4%.">Pontos de ressincronização
+        <select id="islices">
+          <option value="0" selected>nenhum</option>
+          <option value="2">a cada 64 px (rede ruim)</option>
+          <option value="4">a cada 128 px</option>
+        </select>
+      </label>
       <label title="Rápido testa os outros tipos de transformada só nos dois modos mais baratos de cada bloco: 2 a 3 vezes mais rápido, arquivo ~1% maior.">Velocidade
         <select id="ifast">
           <option value="0">Normal</option><option value="1">Rápida</option>
@@ -373,9 +380,17 @@
 </main>
 
 <script type="module">
-import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION } from './nvdr.js';
+import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION_SLICES } from './nvdr.js';
 import { decoderFor } from './nvdr-decoder.js';
 import { isPng, nvdrFromPng, kindOf, pngFor, download, pngOptions } from './nvdr-png.js';
+
+// Restart points only mean something in the layered mode.
+{
+    const mode = document.getElementById('imode'), slices = document.getElementById('islices');
+    const sync = () => { slices.disabled = mode.value !== 'progressive'; };
+    mode.addEventListener('change', sync);
+    sync();
+}
 
 // Decoding runs in workers (nvdr-decoder.js): a large photo takes seconds,
 // and the page stays responsive meanwhile. `shown` counts what the page
@@ -504,6 +519,7 @@ batchGo.onclick = async () => {
                        'x-q': document.getElementById('iquality').value,
                        'x-mode': document.getElementById('imode').value,
                        'x-fast': document.getElementById('ifast').value,
+                       'x-slices': document.getElementById('islices').value,
                        'x-grain': document.getElementById('grain').value },
             body: JSON.stringify({ dir, out: document.getElementById('batchOut').value,
                                    recursive: document.getElementById('batchDeep').checked,
@@ -668,7 +684,8 @@ async function handleFile(file) {
             headers: { 'x-file-ext': ext, 'x-grain': document.getElementById('grain').value,
                        'x-q': document.getElementById('iquality').value,
                        'x-mode': document.getElementById('imode').value,
-                       'x-fast': document.getElementById('ifast').value },
+                       'x-fast': document.getElementById('ifast').value,
+                       'x-slices': document.getElementById('islices').value },
             body: file
         });
     } catch (err) {
@@ -740,8 +757,8 @@ async function showLevels() {
         // A container of another version is the encoder and this page out
         // of step: one rebuilt and the other not, or the page cached.
         const v = container && container.byteLength > 4 ? new Uint8Array(container)[4] : 0;
-        setStatus(v && (v < 13 || v > VERSION)
-            ? `Contêiner da versão ${v}; esta página lê da 13 à ${VERSION}. Recompile o encoder (make) ` +
+        setStatus(v && (v < 13 || v > VERSION_SLICES)
+            ? `Contêiner da versão ${v}; esta página lê da 13 à ${VERSION_SLICES}. Recompile o encoder (make) ` +
               `e recarregue a página sem cache (Ctrl+Shift+R).`
             : 'Container ilegível.', true);
         return;
