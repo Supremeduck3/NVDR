@@ -589,7 +589,7 @@ export function readHeader(buffer) {
             h.seg[k * ns + ns - 1] = left;
         }
         h.tableLen = at - first;
-        if (h.sliceRows && (h.flags & (FLAG_DIRPRED | FLAG_RESIDUAL))) return null;
+        if (h.sliceRows && (h.flags & (FLAG_INTER | FLAG_RESIDUAL))) return null;
     }
     return h;
 }
@@ -897,7 +897,7 @@ function makePart(w, h, tile, minBlock, np, comp0, fixedPred, dirpred = false) {
                 for (let i = 0; i < bw; i++) out[j * bw + i] = b[(y + j) * pw + x + i];
             return;
         }
-        const f = P.full[c], top = y > 0, left = x > 0, ne = bw + bh;
+        const f = P.full[c], top = y > P.sliceTop, left = x > 0, ne = bw + bh;
         T.fill(0); L.fill(0);
         let tr = top, bl = left;
         for (let i = 0; i < ne; i++) {
@@ -1218,7 +1218,7 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, 
     }
     // With directional prediction a leaf's texture comes from the first
     // texture layer as soon as its colour does.
-    const d1 = dirpred ? new ArithDecoder(bytes, segAt[ns], segOk[ns]) : null;
+    let d1 = dirpred ? new ArithDecoder(bytes, segAt[ns], segOk[ns]) : null;
     const lvd = new Int32Array(MAX_BLOCK * MAX_BLOCK), prd = new Int32Array(MAX_BLOCK * MAX_BLOCK);
     for (const P of parts) P.ltex = [];
 
@@ -1300,7 +1300,12 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, 
         if (sl) copyModels(cm, cm0);
         let stopped = segOk[sl] < 5, tqPrev = 0;
         if (!stopped) d0 = new ArithDecoder(bytes, segAt[sl], segOk[sl]);
+        if (dirpred && sl) {
+            copyModels(tms[0], tms0[0]);
+            d1 = new ArithDecoder(bytes, segAt[ns + sl], segOk[ns + sl]);
+        }
         for (const P of parts) P.sliceTop = t0 / tilesX * P.tile;
+        s0.corrupt = false;   // damage in one slice is not damage in the next
         for (let t = t0; t < t1; t++) {
             const tx = (t % tilesX) * tile, ty = Math.floor(t / tilesX) * tile;
             for (const P of parts) P.tileStart[t] = P.lx.length;
@@ -1332,7 +1337,10 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, 
     // loop: each band as far as its bytes reach and no further than the
     // layer before it; a tile cut short is restored to what it showed.
     const complete = [complete0, 0, 0];
-    if (dirpred) { complete[1] = complete0; maxLayer = LAYERS - 1; wantLow = false; }
+    if (dirpred) {
+        complete[1] = complete0; maxLayer = LAYERS - 1; wantLow = false;
+        for (let sl = 0; sl < ns; sl++) got[ns + sl] = got[sl];
+    }
     for (const P of parts) {
         P.textured = dirpred ? Uint8Array.from(P.ltex) : new Uint8Array(P.lx.length);
         P.saved = Array.from({ length: P.np }, () => new Uint8Array(P.tile * P.tile));
@@ -1431,6 +1439,51 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, 
       if (layer === 1 && wantLow)
           low = { planes: parts.map(P => P.full.map(p => p.slice())), tex: parts.map(P => P.textured.slice()) };
     }
+
+    // Mirrors conceal(): a tile whose colour never arrived, between tiles
+    // that did, above and below in its column, runs from one to the other.
+    // `planes` is one tree's: its flat ones, its full ones, or the low
+    // band's snapshot of them.
+    const CONCEAL_R = 16;
+    // Mirrors conceal_edge(): the mean of row y around x, over the pixels
+    // whose tile in row r of tiles arrived.
+    const concealEdge = (P, p, r, y, x) => {
+        let sum = 0, n = 0;
+        for (let i = x - CONCEAL_R; i <= x + CONCEAL_R; i++) {
+            if (i < 0 || i >= P.pw || !whole0[r * tilesX + Math.floor(i / P.tile)]) continue;
+            sum += p[y * P.pw + i];
+            n++;
+        }
+        return Math.floor((sum + (n >> 1)) / n);
+    };
+    const conceal = (P, planes) => {
+        const ppw = P.pw;
+        for (let tx = 0; tx < tilesX; tx++) {
+            const x0 = tx * P.tile, x1 = Math.min(x0 + P.tile, ppw);
+            if (x0 >= ppw) continue;
+            for (let r0 = 0; r0 < tilesY; r0++) {
+                if (whole0[r0 * tilesX + tx]) continue;
+                let r1 = r0;
+                while (r1 < tilesY && !whole0[r1 * tilesX + tx]) r1++;
+                const y0 = r0 * P.tile, y1 = r1 * P.tile;
+                if (r0 > 0 && r1 < tilesY && y1 < P.ph) {
+                    const n = y1 - y0;
+                    for (const p of planes)
+                        for (let x = x0; x < x1; x++) {
+                            const a = concealEdge(P, p, r0 - 1, y0 - 1, x), b = concealEdge(P, p, r1, y1, x);
+                            for (let j = 0; j < n; j++)
+                                p[(y0 + j) * ppw + x] = Math.floor((a * (n - j) + b * (j + 1) + ((n + 1) >> 1)) / (n + 1));
+                        }
+                }
+                r0 = r1;
+            }
+        }
+    };
+    if (complete0 < tiles && !inter) parts.forEach((P, k) => {
+        conceal(P, P.flat);
+        conceal(P, P.full);
+        if (low) conceal(P, low.planes[k]);
+    });
 
     /* Mirrors deblock() and deblock_plane(); `tex` is null for colours only. */
     function deblock(P, planes, tex) {

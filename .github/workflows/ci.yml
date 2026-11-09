@@ -1,0 +1,37 @@
+# The checks that are otherwise run by hand: the regression gate (which
+# builds on determinism, the recorded baseline, truncation and the C and
+# JS decoders agreeing), the decoders against each other on files with
+# slices and holes, and a short run of the fuzzer under the sanitizers.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev clang lld
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: WebAssembly decoder
+        run: make wasm
+      - name: Regression gate
+        run: python3 scripts/verify.py
+      - name: Slices and holes, C against JS and WebAssembly
+        run: |
+          ./nvdr_encode samples/OIP-4140498144.jpg /tmp/prog.nvdr --slices 2 --quiet
+          ./nvdr_encode samples/OIP-4140498144.jpg /tmp/dir.nvdr --directional --fast --slices auto --quiet
+          node scripts/crosscheck.mjs /tmp/prog.nvdr
+          node scripts/crosscheck.mjs /tmp/dir.nvdr
+      - name: Fuzz, briefly
+        run: |
+          make fuzz
+          ./fuzz_nvdr samples/OIP-4140498144.jpg --iters 3000

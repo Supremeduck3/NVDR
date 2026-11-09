@@ -2884,8 +2884,7 @@ and `decode()`'s `holes` in nvdr.js) takes the byte ranges that never
 arrived. Every layer starts where the header says, so a hole in one layer
 leaves the others readable; each decodes up to its first missing byte.
 
-**Slices** (container v17, `--slices N`, "Pontos de ressincronização" in
-the page). Every N rows of tiles start a slice. Each layer's part of each
+**Slices** (container v17, `--slices N`, "Fatias" in the page). Every N rows of tiles start a slice. Each layer's part of each
 slice is a stream of its own, coded from the picture's starting models,
 and a leaf's colour is predicted from nothing above its slice. A hole
 then costs the rest of the slice's part of that layer, where it cost the
@@ -2916,16 +2915,16 @@ montanha_pessoas at q 24, slices of 2 rows, 200 draws of the losses,
 
     satellite / radio: 16 kbit/s, 5% loss in bursts of ~3
     variant                  bytes sent   median    worst 10%   whole   complete at
-    no slices                   46532     33.0 dB    23.3 dB     49%       25 s
-    slices                      46785     32.6 dB    25.8 dB     49%       25 s
-    slices + even parity        56385     33.7 dB    27.1 dB     80%       30 s
-    slices + parity by layer    56385     33.7 dB    28.3 dB     80%       30 s
+    no slices                   46612     32.8 dB    23.3 dB     49%       25 s
+    slices                      46867     32.6 dB    25.8 dB     49%       25 s
+    slices + even parity        56467     33.7 dB    27.1 dB     80%       30 s
+    slices + parity by layer    56467     33.7 dB    28.3 dB     80%       30 s
 
     2G: 40 kbit/s, 3% loss in bursts of ~2
-    no slices                   46532     33.9 dB    23.7 dB     53%       10 s
-    slices                      46785     33.7 dB    26.0 dB     52%       10 s
-    slices + even parity        56385     33.7 dB    31.1 dB     90%       12 s
-    slices + parity by layer    56385     33.7 dB    33.7 dB     91%       12 s
+    no slices                   46612     33.9 dB    23.7 dB     53%       10 s
+    slices                      46867     33.7 dB    26.0 dB     52%       10 s
+    slices + even parity        56467     33.7 dB    31.0 dB     90%       12 s
+    slices + parity by layer    56467     33.7 dB    33.7 dB     91%       12 s
 
 "Even parity" is the same bytes of parity spread evenly (0.19 of every
 layer). For the same cost, parity by layer keeps the worst draws 1.2 to
@@ -2947,11 +2946,60 @@ What it says:
   on the satellite link and 9.8 s on 2G, against 30 s and 12 s. Parity is
   for links with no way back (broadcast, one-way radio) or a round trip
   too long to wait on, and it never waits.
-- Next would be concealment: filling a grey band from the slices above
-  and below it instead of leaving it grey.
-
 `scripts/analysis/badnet.mjs` measures all of this (`--slices`,
 `--protect`), against the same picture sent whole.
+
+**Concealment.** A tile whose colour never arrived, with tiles that did
+both above and below it in its column, is no longer left grey: each
+column of pixels runs in a straight line from the row above the gap to
+the row below it, each taken as its mean over 16 pixels either side (one
+row's texture drawn down the gap showed as stripes). In the picture the
+band reads as out of focus instead of missing; on the draw where a lost
+colour packet greyed a third of the picture, 16.6 dB became 19.0. In
+the tables above it changes nothing to a tenth of a dB: their worst
+draws lose the bottom or the top of the picture, where there is nothing
+on the other side to run to, and filling from one side alone is what
+`tile_fallback()` gives its reason against. A file cut short never has
+anything below what is missing, so truncation shows what it always did.
+
+**Over a real socket.** `tools/nvdr_send.mjs file host [port]` sends the
+packets over UDP, paced at `--kbps`; `tools/nvdr_recv.mjs prefix [port]`
+collects them per sender and file number, fills in what the parity
+allows, and writes the file and the picture decoded around its holes.
+`--drop P --burst L` on the sender loses packets on purpose.
+
+### Slices side by side
+
+A slice needs nothing from another, so the encoder codes them at the
+same time, one per core: each from a copy of the state the picture
+starts with, with its own row buffers, sharing the canvas (each writes
+its own rows and reads nothing above them). Slices are therefore also
+allowed in directional pictures (not in a sequence's frames, yet), where
+they are what makes one picture quick to encode: the search of one
+768x512 photo took 9.4 s on one core of four.
+
+`--slices auto` (the page's default in the directional mode) picks
+about sixteen slices of 4 to 16 rows of tiles by the picture's height,
+never by the machine, so the file is the same on one core or sixteen.
+The six samples, directional, auto against none, on four cores:
+
+                        PSNR-Y   PSNR-RGB   time
+    default             +2.2%     +2.2%     x0.46
+    --fast              +2.1%     +2.0%     x0.46
+
+    montanha_pessoas (768x512, four slices): 9.4 s to 3.0 s, +1.1% bytes
+
+The samples are 300 to 500 pixels tall, three or four slices each. A
+taller picture has more slices than cores and more bytes per slice, so
+more of the speed for less of the cost; what does not shrink is the
+restoration fit at the end, which is not in slices. The cost is, again,
+mostly every slice's models starting from even odds.
+
+**EXIF orientation.** A camera stores a photo as its sensor lies and
+says in EXIF which way is up. `nvdr_image_load()` now turns the pixels
+that way (all eight orientations, checked against ImageMagick's
+-auto-orient), where a phone photo taken upright used to come out lying
+on its side.
 
 ## Damaged input
 

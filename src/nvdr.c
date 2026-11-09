@@ -25,10 +25,83 @@
 /* ================================================================ image */
 
 #ifndef NVDR_WASM
+/*
+ * A camera stores a photo the way its sensor lies and says in EXIF which
+ * way is up; stb_image decodes the pixels and does not read that. The
+ * orientation of a JPEG, 1 to 8 as EXIF numbers them (1: as stored), from
+ * tag 0x0112 of the first directory in its APP1 segment.
+ */
+static int exif_orientation(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 1;
+    uint8_t b[65536 + 4];
+    int found = 1;
+    if (fread(b, 1, 2, f) == 2 && b[0] == 0xff && b[1] == 0xd8) {
+        for (;;) {
+            if (fread(b, 1, 4, f) != 4 || b[0] != 0xff) break;
+            size_t len = ((size_t)b[2] << 8 | b[3]);
+            if (len < 2 || b[1] == 0xda) break;   /* the scan: no APP1 before it */
+            len -= 2;
+            if (b[1] != 0xe1) { if (fseek(f, (long)len, SEEK_CUR) != 0) break; continue; }
+            if (fread(b, 1, len, f) != len) break;
+            if (len < 14 || memcmp(b, "Exif\0\0", 6) != 0) continue;   /* XMP is an APP1 too */
+            const uint8_t* t = b + 6;
+            size_t n = len - 6;
+            int le = t[0] == 'I' && t[1] == 'I';
+            if (!le && !(t[0] == 'M' && t[1] == 'M')) break;
+            #define EX16(p) (le ? (unsigned)((p)[0] | (p)[1] << 8) : (unsigned)((p)[0] << 8 | (p)[1]))
+            #define EX32(p) (le ? (size_t)EX16(p) | (size_t)EX16((p) + 2) << 16 : (size_t)EX16(p) << 16 | EX16((p) + 2))
+            size_t ifd = EX32(t + 4);
+            if (ifd + 2 > n) break;
+            unsigned count = EX16(t + ifd);
+            for (unsigned i = 0; i < count && ifd + 2 + (size_t)(i + 1) * 12 <= n; i++) {
+                const uint8_t* e = t + ifd + 2 + (size_t)i * 12;
+                if (EX16(e) == 0x0112 && EX16(e + 2) == 3) {
+                    unsigned v = EX16(e + 8);
+                    if (v >= 1 && v <= 8) found = (int)v;
+                }
+            }
+            #undef EX16
+            #undef EX32
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* The picture turned the way orientation `o` says it is seen. */
+static int orient(NvdrImage* img, int o) {
+    if (o <= 1) return 0;
+    int w = img->width, h = img->height, W = o >= 5 ? h : w, H = o >= 5 ? w : h;
+    unsigned char* out = (unsigned char*)malloc((size_t)W * H * 3);
+    if (!out) return -1;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            int sx, sy;
+            switch (o) {
+                case 2: sx = w - 1 - x; sy = y; break;           /* mirrored */
+                case 3: sx = w - 1 - x; sy = h - 1 - y; break;   /* upside down */
+                case 4: sx = x; sy = h - 1 - y; break;
+                case 5: sx = y; sy = x; break;
+                case 6: sx = y; sy = h - 1 - x; break;           /* held upright, the usual one */
+                case 7: sx = w - 1 - y; sy = h - 1 - x; break;
+                default: sx = w - 1 - y; sy = x; break;          /* 8 */
+            }
+            memcpy(out + ((size_t)y * W + x) * 3, img->pixels + ((size_t)sy * w + sx) * 3, 3);
+        }
+    free(img->pixels);
+    img->pixels = out; img->width = W; img->height = H;
+    return 0;
+}
+
 int nvdr_image_load(NvdrImage* img, const char* path) {
     int channels;
     img->pixels = stbi_load(path, &img->width, &img->height, &channels, 3);
-    return img->pixels ? 0 : -1;
+    if (!img->pixels) return -1;
+    /* As a viewer shows it: the way up its EXIF says. */
+    if (orient(img, exif_orientation(path)) != 0) { free(img->pixels); img->pixels = NULL; return -1; }
+    return 0;
 }
 
 int nvdr_image_write_ppm(const NvdrImage* img, const char* path) {
@@ -1094,7 +1167,7 @@ static void dir_predict(const Canvas* cv, int c, int x, int y, int w, int h, int
     }
     const uint8_t* f = cv->full[c];
     int pw = cv->pw, ne = w + h, T[2 * NVDR_MAX_BLOCK + 1] = { 0 }, L[2 * NVDR_MAX_BLOCK + 1] = { 0 };
-    int top = y > 0, left = x > 0;
+    int top = y > cv->slice_top, left = x > 0;   /* nothing above its slice (SLICES) */
     /* T[0] and L[0] are the corner, then w + h samples: the row above and
      * on past the leaf while it has been decoded, then its last repeated;
      * the column to the left likewise down. */
@@ -1212,6 +1285,63 @@ static void tile_fallback(Canvas* cv, int tx, int ty) {
                     size_t at = (size_t)j * cv->pw + i;
                     cv->flat[c][at] = cv->full[c][at] = cv->base[c][at];
                 }
+    }
+}
+
+/*
+ * CONCEALMENT
+ * -----------
+ * A tile whose colour never arrived, with tiles that did arrive both
+ * above and below it in its column (a hole in the middle of a file with
+ * slices), is filled in from them instead of left grey: each column of
+ * pixels runs in a straight line from the last row above to the first
+ * row below, each of the two taken as its mean over CONCEAL_R pixels
+ * either side (those of tiles that arrived), since a single row's
+ * texture drawn down the gap shows as stripes. A file cut short never has anything below what is
+ * missing, so tile_fallback()'s guarantee stands: more bytes never show
+ * a worse picture. Nothing is filled from one side alone, for the reason
+ * given there. `flat` is filled from the flat rows and `full` from the
+ * full ones, so each layer shown has its own. Integer, and the same in
+ * nvdr.js.
+ */
+#define CONCEAL_R 16
+/* The mean of row y around x, over the pixels whose tile in row `r` of
+ * tiles arrived. */
+static int conceal_edge(const Canvas* cv, const uint8_t* p, const uint8_t* whole0, int tiles_x, int r, int y, int x) {
+    int sum = 0, n = 0;
+    for (int i = x - CONCEAL_R; i <= x + CONCEAL_R; i++) {
+        if (i < 0 || i >= cv->pw || !whole0[r * tiles_x + i / cv->tile]) continue;
+        sum += p[(size_t)y * cv->pw + i];
+        n++;
+    }
+    return (sum + n / 2) / n;
+}
+
+static void conceal(Canvas* cv, const uint8_t* whole0, int tiles_x, int tiles_y) {
+    for (int tx = 0; tx < tiles_x; tx++) {
+        int x0 = tx * cv->tile, x1 = x0 + cv->tile < cv->pw ? x0 + cv->tile : cv->pw;
+        if (x0 >= cv->pw) continue;
+        for (int r0 = 0; r0 < tiles_y; r0++) {
+            if (whole0[r0 * tiles_x + tx]) continue;
+            int r1 = r0;
+            while (r1 < tiles_y && !whole0[r1 * tiles_x + tx]) r1++;
+            int y0 = r0 * cv->tile, y1 = r1 * cv->tile;
+            if (r0 > 0 && r1 < tiles_y && y1 < cv->ph) {
+                int n = y1 - y0;
+                for (int c = 0; c < cv->np; c++)
+                    for (int k = 0; k < 2; k++) {
+                        uint8_t* p = k ? cv->full[c] : cv->flat[c];
+                        for (int x = x0; x < x1; x++) {
+                            int a = conceal_edge(cv, p, whole0, tiles_x, r0 - 1, y0 - 1, x);
+                            int b = conceal_edge(cv, p, whole0, tiles_x, r1, y1, x);
+                            for (int j = 0; j < n; j++)
+                                p[(size_t)(y0 + j) * cv->pw + x] =
+                                    (uint8_t)((a * (n - j) + b * (j + 1) + (n + 1) / 2) / (n + 1));
+                        }
+                    }
+            }
+            r0 = r1;
+        }
     }
 }
 
@@ -1414,7 +1544,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
     if (h->version >= NVDR_VERSION_SLICES) {
         if (slice_table(data, size, NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len, h, NULL) != 0)
             return -1;
-        if (h->slice_rows && (h->flags & (NVDR_FLAG_DIRPRED | NVDR_FLAG_RESIDUAL))) return -1;
+        if (h->slice_rows && (h->flags & (NVDR_FLAG_INTER | NVDR_FLAG_RESIDUAL))) return -1;
     }
     return 0;
 }
@@ -2284,20 +2414,125 @@ static int bytes_leb(Bytes* o, uint32_t v) {
     return bytes_put(o, t, (size_t)n);
 }
 
-/* The end of a slice (SLICES): each layer's coder flushed onto its
- * layer's bytes, its size noted, and a fresh coder for the next. With no
- * high band the third layer holds no symbols, only the flush, and is left
- * out. */
-static int slice_end(NvdrEncoder* enc[3], Bytes lay[3], uint32_t* seg, int ns, int s, int band) {
-    for (int k = 0; k < NVDR_LAYERS; k++) {
-        if (nvdr_enc_finish(enc[k]) != 0) return -1;
-        size_t n = (k == 2 && !band) ? 0 : enc[k]->count;
-        if (bytes_put(&lay[k], enc[k]->bytes, n) != 0) return -1;
-        seg[k * ns + s] = (uint32_t)n;
-        nvdr_enc_free(enc[k]);
-        if (nvdr_enc_init(enc[k], k ? 1 << 14 : 1 << 12) != 0) return -1;
+/* A tree's buffers for the row of tiles being searched (precompute_row()). */
+static int part_scratch(Part* P) {
+    Canvas* pc = &P->cv;
+    for (int s = 0; s < NSIZES; s++)
+        for (int c = 0; c < 3; c++)
+            P->pre[s][c] = P->pre_lo[s][c] = P->pre_hi[s][c] = NULL, P->pre_sum[s][c] = NULL, P->pre_nz[s][c] = NULL;
+    for (int s = 0; s < NSIZES; s++) {
+        int n = NVDR_MIN_BLOCK << s;
+        if (n < pc->min_block || n > pc->tile) continue;
+        for (int c = 0; c < pc->np; c++) {
+            size_t blocks = (size_t)(pc->pw / n) * (pc->tile / n);
+            if (!blocks) blocks = 1;
+            P->pre[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            P->pre_lo[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            P->pre_hi[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
+            P->pre_sum[s][c] = (double*)malloc(sizeof(double) * blocks);
+            P->pre_nz[s][c] = (uint8_t*)malloc(blocks);
+            if (!P->pre[s][c] || !P->pre_lo[s][c] || !P->pre_hi[s][c] || !P->pre_sum[s][c] || !P->pre_nz[s][c])
+                return -1;
+        }
     }
     return 0;
+}
+static void part_scratch_free(Part* P) {
+    for (int s = 0; s < NSIZES; s++)
+        for (int c = 0; c < 3; c++) {
+            free(P->pre[s][c]); free(P->pre_lo[s][c]); free(P->pre_hi[s][c]);
+            free(P->pre_sum[s][c]); free(P->pre_nz[s][c]);
+        }
+}
+
+static void precompute_row(Enc* e, int ty);
+static double search(Enc* e, int x, int y, int n, double budget);
+static void emit(Enc* e, Sink* s0, Sink* s1, int x, int y, int n, NvdrHeader* h);
+
+/* The rows of tiles from ty0 up to ty1 (luma's rows), searched and coded.
+ * Each tile is searched against the models as they stand, then coded for
+ * real, which is what adapts them for the next. In 4:2:0 a tile is
+ * luma's tree, then colour's over the same area at half size. */
+static void code_rows(Enc* e, int ty0, int ty1, Sink* s0, Sink* s1, NvdrHeader* h,
+                      const double* lambda0, const double* skip0) {
+    Canvas* cv = &e->part[0].cv;
+    int tq_prev = 0;
+    for (int ty = ty0; ty < ty1; ty += cv->tile) {
+        for (int k = 0; k < e->nparts; k++) {
+            e->p = &e->part[k];
+            if (ty / (k + 1) < e->p->cv.ph) precompute_row(e, ty / (k + 1));
+        }
+        for (int tx = 0; tx < cv->pw; tx += cv->tile) {
+            if (e->tq) {
+                /* The tile's offset, then its trees at its step; lambda
+                 * follows the step squared, as it does across q. */
+                int d = e->tq[(ty / cv->tile) * e->tiles_x + tx / cv->tile];
+                put_tq(s0, &e->cm, d - tq_prev);
+                tq_prev = d;
+                for (int c = 0; c < 3; c++) e->step[c] = tq_step(e->base_step[c], d);
+                double r = TQ_SCALE[d + TQ_MAX] / 1024.0;
+                for (int k = 0; k < e->nparts; k++) {
+                    e->part[k].lambda = lambda0[k] * r * r;
+                    e->part[k].skip_lambda = skip0[k] * r * r;
+                }
+            }
+            for (int k = 0; k < e->nparts; k++) {
+                e->p = &e->part[k];
+                int x = tx / (k + 1), y = ty / (k + 1);
+                if (!node_exists(&e->p->cv, x, y)) continue;
+                search(e, x, y, e->p->cv.tile, 1e300);
+                emit(e, s0, s1, x, y, e->p->cv.tile, h);
+            }
+        }
+    }
+}
+
+/* What coding one slice leaves (SLICES): its part of each layer, and its
+ * share of the header's counts. */
+typedef struct {
+    NvdrEncoder enc[NVDR_LAYERS];
+    NvdrHeader  h;
+    double      plane_bits[3];
+    int         failed;
+} SliceOut;
+
+/*
+ * One slice, coded on its own from the models the picture starts with:
+ * a copy of the encoder's state with its own row buffers, so slices are
+ * coded side by side, one per core. They share the canvas, each writing
+ * its own rows and reading nothing above them, and the tree's decisions,
+ * each its own nodes. `end` takes the models the slice leaves.
+ */
+static void code_slice(const Enc* start, int ty0, int ty1, SliceOut* o, const double* lambda0,
+                       const double* skip0, Enc* end) {
+    Enc* w = (Enc*)malloc(sizeof(Enc));
+    if (!w) { o->failed = 1; return; }
+    *w = *start;
+    w->pc = NULL;
+    w->pc_part = NULL;
+    for (int k = 0; k < 2; k++)
+        for (int s = 0; s < NSIZES; s++)
+            for (int c = 0; c < 3; c++)
+                w->part[k].pre[s][c] = w->part[k].pre_lo[s][c] = w->part[k].pre_hi[s][c] = NULL,
+                w->part[k].pre_sum[s][c] = NULL, w->part[k].pre_nz[s][c] = NULL;
+    int bad = 0;
+    for (int k = 0; k < w->nparts; k++) {
+        bad |= part_scratch(&w->part[k]);
+        w->part[k].cv.slice_top = ty0 / (k + 1);
+    }
+    if (start->pc && !(w->pc = (int*)malloc(sizeof(int) * PC_SLOTS * 3 * NVDR_MAX_BLOCK * NVDR_MAX_BLOCK))) bad = 1;
+    for (int k = 0; k < NVDR_LAYERS; k++) bad |= nvdr_enc_init(&o->enc[k], k ? 1 << 14 : 1 << 12);
+    if (!bad) {
+        Sink s0 = { &o->enc[0], 0 }, s1[2] = { { &o->enc[1], 0 }, { &o->enc[2], 0 } };
+        code_rows(w, ty0, ty1, &s0, s1, &o->h, lambda0, skip0);
+        for (int k = 0; k < NVDR_LAYERS; k++) bad |= nvdr_enc_finish(&o->enc[k]);
+        for (int c = 0; c < 3; c++) o->plane_bits[c] = w->plane_bits[c];
+        if (end) { end->cm = w->cm; end->tm = w->tm; end->tm2 = w->tm2; }
+    }
+    o->failed = bad;
+    for (int k = 0; k < 2; k++) part_scratch_free(&w->part[k]);
+    free(w->pc);
+    free(w);
 }
 
 /* One encode in the mode cfg->chroma420 names (420 when nonzero). */
@@ -2317,6 +2552,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     int rc = -1;
     int8_t* tq = NULL;
     uint32_t* seg = NULL;
+    SliceOut* so = NULL;
+    int nslices_done = 0;   /* how many of `so` hold coders to free */
     Bytes lay[3];
     memset(lay, 0, sizeof(lay));
     NvdrEncoder enc0, enc1, enc2;
@@ -2431,22 +2668,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
             nodes += (size_t)P->grid_w[s] * ((pc->ph + n - 1) / n);
         }
         P->split = (int*)calloc(nodes, sizeof(int));
-        if (!P->split) goto done;
-        for (int s = 0; s < NSIZES; s++) {
-            int n = NVDR_MIN_BLOCK << s;
-            if (n < pc->min_block || n > pc->tile) continue;
-            for (int c = 0; c < pc->np; c++) {
-                size_t blocks = (size_t)(pc->pw / n) * (pc->tile / n);
-                if (!blocks) blocks = 1;
-                P->pre[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-                P->pre_lo[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-                P->pre_hi[s][c] = (int*)malloc(sizeof(int) * blocks * n * n);
-                P->pre_sum[s][c] = (double*)malloc(sizeof(double) * blocks);
-                P->pre_nz[s][c] = (uint8_t*)malloc(blocks);
-                if (!P->pre[s][c] || !P->pre_lo[s][c] || !P->pre_hi[s][c] || !P->pre_sum[s][c] || !P->pre_nz[s][c])
-                    goto done;
-            }
-        }
+        if (!P->split || part_scratch(P) != 0) goto done;
     }
 
     if (ctx && ctx->valid) {
@@ -2459,11 +2681,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (nvdr_enc_init(&enc0, 1 << 14) != 0 || nvdr_enc_init(&enc1, 1 << 16) != 0 ||
         nvdr_enc_init(&enc2, 1 << 16) != 0) goto done;
     Sink s0 = { &enc0, 0 }, s1[2] = { { &enc1, 0 }, { &enc2, 0 } };
-    NvdrEncoder* encs[3] = { &enc0, &enc1, &enc2 };
 
-    /* Each tile is searched against the models as they stand, then coded
-     * for real, which is what adapts them for the next. In 4:2:0 a tile is
-     * luma's tree, then colour's over the same area at half size. */
     Canvas* cv = &e.part[0].cv;
     e.tiles_x = (cv->pw + cv->tile - 1) / cv->tile;
     if (cfg.tile_q) {
@@ -2476,63 +2694,57 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     }
     double lambda0[2], skip0[2];
     for (int k = 0; k < e.nparts; k++) { lambda0[k] = e.part[k].lambda; skip0[k] = e.part[k].skip_lambda; }
-    int tq_prev = 0;
-    /* Slices: every one starts from the models the picture starts from. */
-    int srows = !dirpred && !cfg.residual && cfg.slices > 0 ? (cfg.slices > 255 ? 255 : cfg.slices) : 0;
+    /* Slices, each from the models the picture starts from, side by side;
+     * a picture predicted from a base, or a residual, has none. */
     int tiles_y = (cv->ph + cv->tile - 1) / cv->tile;
-    int nslices = srows ? (tiles_y + srows - 1) / srows : 1;
-    ColourModels cm0 = e.cm;
-    TextureModels tm0 = e.tm, tm20 = e.tm2;
-    if (srows && !(seg = (uint32_t*)calloc((size_t)NVDR_LAYERS * nslices, sizeof(uint32_t)))) goto done;
-    for (int ty = 0; ty < cv->ph; ty += cv->tile) {
-        int row = ty / cv->tile;
-        if (srows && row % srows == 0) {
-            if (row && slice_end(encs, lay, seg, nslices, row / srows - 1, band) != 0) goto done;
-            e.cm = cm0; e.tm = tm0; e.tm2 = tm20;
-            tq_prev = 0;
-            for (int k = 0; k < e.nparts; k++) e.part[k].cv.slice_top = ty / (k + 1);
-        }
-        for (int k = 0; k < e.nparts; k++) {
-            e.p = &e.part[k];
-            if (ty / (k + 1) < e.p->cv.ph) precompute_row(&e, ty / (k + 1));
-        }
-        for (int tx = 0; tx < cv->pw; tx += cv->tile) {
-            if (e.tq) {
-                /* The tile's offset, then its trees at its step; lambda
-                 * follows the step squared, as it does across q. */
-                int d = e.tq[(ty / cv->tile) * e.tiles_x + tx / cv->tile];
-                put_tq(&s0, &e.cm, d - tq_prev);
-                tq_prev = d;
-                for (int c = 0; c < 3; c++) e.step[c] = tq_step(e.base_step[c], d);
-                double r = TQ_SCALE[d + TQ_MAX] / 1024.0;
-                for (int k = 0; k < e.nparts; k++) {
-                    e.part[k].lambda = lambda0[k] * r * r;
-                    e.part[k].skip_lambda = skip0[k] * r * r;
-                }
-            }
-            for (int k = 0; k < e.nparts; k++) {
-                e.p = &e.part[k];
-                int x = tx / (k + 1), y = ty / (k + 1);
-                if (!node_exists(&e.p->cv, x, y)) continue;
-                search(&e, x, y, e.p->cv.tile, 1e300);
-                emit(&e, &s0, s1, x, y, e.p->cv.tile, &h);
-            }
-        }
+    int srows = cfg.slices;
+    if (srows == NVDR_SLICES_AUTO) {
+        /* About sixteen slices, of 4 to 16 rows: by the picture's height,
+         * never by the machine, so the file is the same everywhere. */
+        srows = tiles_y / 16;
+        srows = tiles_y < 8 ? 0 : srows < 4 ? 4 : srows > 16 ? 16 : srows;
     }
-    for (int c = 0; c < 3; c++) e.step[c] = e.base_step[c];
+    srows = !inter && !cfg.residual && srows > 0 ? (srows > 255 ? 255 : srows) : 0;
+    int nslices = srows ? (tiles_y + srows - 1) / srows : 1;
     const uint8_t* lp[3];
     size_t ln[3];
     Bytes table;
     memset(&table, 0, sizeof(table));
     if (srows) {
-        if (slice_end(encs, lay, seg, nslices, nslices - 1, band) != 0) goto done;
+        if (!(seg = (uint32_t*)calloc((size_t)NVDR_LAYERS * nslices, sizeof(uint32_t))) ||
+            !(so = (SliceOut*)calloc((size_t)nslices, sizeof(SliceOut)))) goto done;
+        nslices_done = nslices;
+        Enc* end = (Enc*)malloc(sizeof(Enc));
+        if (!end) goto done;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < nslices; i++) {
+            int ty0 = i * srows * cv->tile, ty1 = ty0 + srows * cv->tile;
+            code_slice(&e, ty0, ty1 < cv->ph ? ty1 : cv->ph, &so[i], lambda0, skip0, i == nslices - 1 ? end : NULL);
+        }
+        int bad = 0;
+        for (int i = 0; i < nslices; i++) bad |= so[i].failed;
+        if (!bad) { e.cm = end->cm; e.tm = end->tm; e.tm2 = end->tm2; }
+        free(end);
         uint8_t r = (uint8_t)srows;
-        int bad = bytes_put(&table, &r, 1);
+        bad |= bytes_put(&table, &r, 1);
+        for (int i = 0; i < nslices && !bad; i++) {
+            /* With no high band the third layer holds no symbols, only
+             * the coder's flush, and is left out. */
+            for (int k = 0; k < NVDR_LAYERS; k++) {
+                size_t n = (k == 2 && !band) ? 0 : so[i].enc[k].count;
+                bad |= bytes_put(&lay[k], so[i].enc[k].bytes, n);
+                seg[k * nslices + i] = (uint32_t)n;
+            }
+            for (int k = 0; k < 4; k++) h.leaves[k] += so[i].h.leaves[k];
+            h.textured += so[i].h.textured;
+            for (int c = 0; c < 3; c++) e.plane_bits[c] += so[i].plane_bits[c];
+        }
         for (int k = 0; k < NVDR_LAYERS; k++)
             for (int i = 0; i < nslices - 1; i++) bad |= bytes_leb(&table, seg[k * nslices + i]);
         if (bad) { free(table.b); goto done; }
         for (int k = 0; k < NVDR_LAYERS; k++) { lp[k] = lay[k].b; ln[k] = lay[k].n; }
     } else {
+        code_rows(&e, 0, cv->ph, &s0, s1, &h, lambda0, skip0);
         if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
             nvdr_enc_finish(&enc2) != 0) goto done;
         /* With no high band the stream holds no symbols, only the coder's
@@ -2541,6 +2753,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         lp[1] = enc1.bytes; ln[1] = enc1.count;
         lp[2] = enc2.bytes; ln[2] = band ? enc2.count : 0;
     }
+    for (int c = 0; c < 3; c++) e.step[c] = e.base_step[c];
     size_t n2 = ln[2];
 
     size_t total = NVDR_HEADER_SIZE + table.n + ln[0] + ln[1] + n2;
@@ -2601,6 +2814,8 @@ done:
     nvdr_context_free(start);
     free(tq);
     free(seg);
+    if (so) for (int i = 0; i < nslices_done; i++) for (int k = 0; k < NVDR_LAYERS; k++) nvdr_enc_free(&so[i].enc[k]);
+    free(so);
     for (int k = 0; k < NVDR_LAYERS; k++) free(lay[k].b);
     free(e.pc);
     nvdr_enc_free(&enc0);
@@ -2610,11 +2825,7 @@ done:
         Part* P = &e.part[k];
         for (int c = 0; c < 3; c++) free(P->src[c]);
         free(P->split);
-        for (int s = 0; s < NSIZES; s++)
-            for (int c = 0; c < 3; c++) {
-                free(P->pre[s][c]); free(P->pre_lo[s][c]); free(P->pre_hi[s][c]);
-                free(P->pre_sum[s][c]); free(P->pre_nz[s][c]);
-            }
+        part_scratch_free(P);
         canvas_free(&P->cv);
     }
     return rc;
@@ -3318,8 +3529,8 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
     }
     cm0 = cm; tms0[0] = tms[0]; tms0[1] = tms[1];
     NvdrDecoder d0;
-    /* A directional picture has no slices: its texture is the one part of
-     * layer 1. */
+    /* A directional picture's texture comes with its colours, from the
+     * slice's part of layer 1. */
     NvdrDecoder d1;
     nvdr_dec_init(&d1, data + seg_at[ns], seg_ok[ns]);
     for (int k = 0; k < np; k++) {
@@ -3334,7 +3545,12 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
         cm = cm0;
         int stopped = seg_ok[sl] < 5, tq_prev = 0;
         if (!stopped) nvdr_dec_init(&d0, data + seg_at[sl], seg_ok[sl]);
-        for (int k = 0; k < np; k++) cvs[k].slice_top = t0 / tiles_x * cvs[k].tile;
+        if (dirpred) {
+            tms[0] = tms0[0];
+            nvdr_dec_init(&d1, data + seg_at[ns + sl], seg_ok[ns + sl]);
+        }
+        /* Damage in one slice is not damage in the next. */
+        for (int k = 0; k < np; k++) { cvs[k].slice_top = t0 / tiles_x * cvs[k].tile; L[k].corrupt = 0; }
         for (int t = t0; t < t1; t++) {
             int tx = (t % tiles_x) * cv->tile, ty = (t / tiles_x) * cv->tile;
             for (int k = 0; k < np; k++) tile_start[k][t] = L[k].count;
@@ -3373,7 +3589,10 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
         if (dirpred) for (size_t i = 0; i < L[k].count; i++) textured[k][i] = L[k].leaves[i].tex;
     }
     /* With directional prediction the texture came with the colours. */
-    if (dirpred) { complete[1] = complete0; max_layer = -1; }
+    if (dirpred) {
+        complete[1] = complete0; max_layer = -1;
+        for (int sl = 0; sl < ns; sl++) got[ns + sl] = got[sl];
+    }
     saved = (uint8_t*)malloc((size_t)cv->tile * cv->tile * 9);   /* full and acc, 3 planes */
     if (!saved) goto done;
     for (int layer = 1; layer < NVDR_LAYERS; layer++) {
@@ -3454,6 +3673,10 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
         }
       }
     }
+
+    /* Tiles that never arrived, between tiles that did (CONCEALMENT). */
+    if (complete0 < tiles && !(h.flags & NVDR_FLAG_INTER))
+        for (int k = 0; k < np; k++) conceal(&cvs[k], whole0, tiles_x, tiles_y);
 
     out->pixels = (unsigned char*)malloc((size_t)h.width * h.height * 3);
     if (!out->pixels) goto done;

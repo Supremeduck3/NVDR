@@ -149,9 +149,10 @@
           <option value="progressive">Progressivo (em camadas)</option>
         </select>
       </label>
-      <label title="Para enviar por rede que perde pacotes (rádio, satélite): a cada N linhas de blocos o arquivo recomeça, e um pacote perdido estraga só até o próximo ponto. Só no modo progressivo. A cada 64 px custa ~3% de tamanho; a cada 128 px, ~1,4%.">Pontos de ressincronização
+      <label title="O arquivo em fatias independentes. O encoder codifica uma fatia por núcleo (o modo direcional fica umas 3 vezes mais rápido em 4 núcleos, ~1% maior), e numa rede que perde pacotes (rádio, satélite) um pacote perdido estraga só até a próxima fatia. Automático escolhe umas 16 fatias pela altura da imagem.">Fatias
         <select id="islices">
-          <option value="0" selected>nenhum</option>
+          <option value="auto" selected>automático (vários núcleos)</option>
+          <option value="0">nenhuma (arquivo menor)</option>
           <option value="2">a cada 64 px (rede ruim)</option>
           <option value="4">a cada 128 px</option>
         </select>
@@ -384,10 +385,14 @@ import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION_SLICES }
 import { decoderFor } from './nvdr-decoder.js';
 import { isPng, nvdrFromPng, kindOf, pngFor, download, pngOptions } from './nvdr-png.js';
 
-// Restart points only mean something in the layered mode.
+// Slices by default where they buy time: the directional mode takes
+// seconds on one core, the layered one a fraction of a second. A choice
+// the user made stays.
 {
     const mode = document.getElementById('imode'), slices = document.getElementById('islices');
-    const sync = () => { slices.disabled = mode.value !== 'progressive'; };
+    let chosen = false;
+    slices.addEventListener('change', () => { chosen = true; });
+    const sync = () => { if (!chosen) slices.value = mode.value === 'directional' ? 'auto' : '0'; };
     mode.addEventListener('change', sync);
     sync();
 }

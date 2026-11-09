@@ -43,6 +43,8 @@
  *   bytes 13-16  the file's length
  *   bytes 17-18  the block's packet payload: every data packet's but the
  *                last's, and every parity packet's
+ *   bytes 19-20  the file's number, the sender's choice: what tells one
+ *                file's packets from the next's on the same link
  *   then the payload: a data packet's share of the block (the last one
  *   short), or a parity packet's, as long as the longest data packet
  *
@@ -53,7 +55,7 @@
 import { readHeader, layerThresholds } from './nvdr.js';
 
 const MAGIC = 0xd7;
-export const PACKET_HEADER = 19;
+export const PACKET_HEADER = 21;
 
 /* GF(2^8) with the polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11d). */
 const EXP = new Uint8Array(512), LOG = new Uint8Array(256);
@@ -93,7 +95,7 @@ export function classesOf(file) {
  * data. A class's block holds at most as many packets as k + m <= 255
  * allows.
  */
-export function packetize(file, { mtu = 1200, protect = [0.5, 0.25, 0.1] } = {}) {
+export function packetize(file, { mtu = 1200, protect = [0.5, 0.25, 0.1], id = 0 } = {}) {
     const pay = mtu - PACKET_HEADER, out = [];
     let blockNo = 0;
     classesOf(file).forEach(([start, end], c) => {
@@ -109,6 +111,7 @@ export function packetize(file, { mtu = 1200, protect = [0.5, 0.25, 0.1] } = {})
                 p[0] = MAGIC; p[1] = blockNo; p[2] = k; p[3] = m; p[4] = idx;
                 v.setUint32(5, bs, true); v.setUint32(9, be - bs, true); v.setUint32(13, file.length, true);
                 v.setUint16(17, pay, true);
+                v.setUint16(19, id, true);
                 return p;
             };
             const data = [];
@@ -155,9 +158,11 @@ function solve(A, b, len) {
  * What a receiver makes of the packets that arrived, in any order: the
  * file as far as it is known, every block that got k of its packets
  * filled in whole, and the byte ranges still missing, as decode() takes
- * them. Null when nothing arrived.
+ * them. Null when nothing arrived. Packets of another file (another
+ * number than the first packet's, or than `id` when given) are left out.
  */
-export function reassemble(packets) {
+export const packetId = p => (p.length >= PACKET_HEADER && p[0] === MAGIC ? p[19] | p[20] << 8 : -1);
+export function reassemble(packets, id = -1) {
     const blocks = new Map();
     let size = -1;
     for (const p of packets) {
@@ -165,6 +170,8 @@ export function reassemble(packets) {
         const v = new DataView(p.buffer, p.byteOffset, p.byteLength);
         const no = p[1], k = p[2], m = p[3], idx = p[4];
         if (!k || idx >= k + m) continue;
+        if (id < 0) id = packetId(p);
+        if (packetId(p) !== id) continue;
         size = v.getUint32(13, true);
         let b = blocks.get(no);
         if (!b) blocks.set(no, b = { k, m, at: v.getUint32(5, true), len: v.getUint32(9, true),
@@ -210,5 +217,5 @@ export function reassemble(packets) {
         at = Math.max(at, e);
     }
     if (at < size) holes.push([at, size]);
-    return { data, holes, size, recovered };
+    return { data, holes, size, recovered, id };
 }

@@ -93,6 +93,10 @@ node server.js
 
 Abre `http://localhost:3000`. A página tem duas abas, **Imagem** e **Vídeo**.
 
+O servidor só atende a própria máquina: a página codifica o que mandarem
+e não tem senha. Para abrir do celular ou de outro computador da rede,
+rode `node server.js --lan` (ou `NVDR_HOST=0.0.0.0 node server.js`).
+
 ### Vídeo
 
 Arrasta um MP4, WebM, MOV, MKV ou AVI. O servidor usa o **GStreamer da sua
@@ -155,12 +159,18 @@ Arrasta uma imagem e pronto. Antes, dá para escolher:
 - **Modo**: **Direcional** (padrão na página, `--directional`): cada bloco
   é previsto dos vizinhos já decodificados, e o arquivo sai bem menor;
   **Progressivo**: chega em camadas, cor primeiro e detalhe depois.
-- **Pontos de ressincronização** (só no progressivo, `--slices N`): para
-  mandar a foto por uma rede que perde pacotes sem reenviar (rádio,
-  satélite). A cada N linhas de blocos o arquivo recomeça, e um pacote
-  perdido estraga só até o próximo ponto, não o resto da camada. "A cada
-  64 px" (`--slices 2`) custa ~3% de tamanho; "a cada 128 px", ~1,4%.
-  Veja "Mandar por rede ruim" abaixo.
+- **Fatias** (`--slices N` ou `--slices auto`): o arquivo em faixas
+  independentes de N linhas de blocos. Servem para duas coisas:
+  - **velocidade**: o encoder codifica uma fatia por núcleo. No modo
+    direcional, que leva segundos, "automático" (o padrão da página
+    nesse modo; umas 16 fatias pela altura da imagem) codifica em
+    metade do tempo ou menos em 4 núcleos, por ~2% a mais de bytes. O
+    arquivo é o mesmo em qualquer máquina, com 1 ou 16 núcleos.
+  - **rede ruim**: um pacote perdido estraga só até a próxima fatia, não
+    o resto da camada. "A cada 64 px" (`--slices 2`) custa ~3% no
+    progressivo. Veja "Mandar por rede ruim" abaixo.
+
+  "Nenhuma" dá o menor arquivo.
 - **Velocidade**: rápida é o `--fast` (só no direcional), 2 a 3 vezes mais
   rápida por ~1% a mais de bytes.
 - **Grão de sensor**, como no `--grain`.
@@ -466,6 +476,21 @@ node scripts/analysis/badnet.mjs samples/montanha_pessoas.jpg --scenario sat,2g 
 Se há como pedir de novo (TCP, HTTP), isso continua mais rápido: o FEC é
 para quando não há volta, ou a volta demora demais.
 
+Para mandar de verdade, por UDP, de uma máquina para outra:
+
+```bash
+# na máquina que recebe (grava /tmp/rx<id>.nvdr e /tmp/rx<id>.png)
+node tools/nvdr_recv.mjs /tmp/rx 5004
+
+# na máquina que envia
+node tools/nvdr_send.mjs /tmp/m.nvdr 192.168.0.20 5004 --kbps 64
+```
+
+`--drop 0.05 --burst 3` no envio joga pacotes fora de propósito, para
+ver o que acontece. O que a paridade não recupera, o receptor decodifica
+com buracos; uma faixa que ficou sem cor, entre duas que chegaram, é
+preenchida com um degradê entre elas em vez de ficar cinza.
+
 ## Compartilhar como PNG
 
 ```bash
@@ -694,6 +719,14 @@ Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
   `git pull`, rode `make` (o encoder é C) e recarregue a página sem cache
   (Ctrl+Shift+R), porque o navegador pode continuar com o `nvdr.js` ou o
   `nvdr.wasm` antigos.
+
+**Foto de celular tirada em pé saía deitada.** A câmera grava a foto
+como o sensor está e anota no EXIF qual lado fica para cima; o encoder
+ignorava a anotação. Agora ele gira a foto ao carregar, como qualquer
+visualizador faz, e o `.nvdr` já sai em pé.
+
+**A página não abre do celular.** O servidor só atende a própria máquina
+por padrão; rode `node server.js --lan`.
 
 **Arquivos antigos (`.nvdr` v9 e v10, `.nvdrv` antes da versão 6) não abrem mais.** O formato mudou de
 retângulos chapados para quadtree + DCT; recodifique a imagem. O codec

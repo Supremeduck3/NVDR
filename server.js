@@ -604,10 +604,10 @@ function handleBatch(req, res) {
         if (job.recursive) args.push('-r');
         if (['nvdr', 'png', 'both'].includes(job.as)) args.push('--as', job.as);
         if (req.headers['x-q']) args.push('--q', String(intHeader(req, 'x-q', 24, 1, 4095)));
-        if (req.headers['x-mode'] === 'progressive') {
-            args.push('--progressive');
-            if (/^[1-9]\d{0,2}$/.test(req.headers['x-slices'] || '')) args.push('--slices', req.headers['x-slices']);
-        } else if (req.headers['x-fast'] === '1') args.push('--fast');
+        if (req.headers['x-mode'] === 'progressive') args.push('--progressive');
+        else if (req.headers['x-fast'] === '1') args.push('--fast');
+        // A folder already takes one image per core: slices there are for lossy links only.
+        if (/^[1-9]\d{0,2}$/.test(req.headers['x-slices'] || '')) args.push('--slices', req.headers['x-slices']);
         if (['off', 'auto', 'on'].includes(req.headers['x-grain'])) args.push('--grain', req.headers['x-grain']);
 
         console.log(`Batch: ${exe} ${args.join(' ')}`);
@@ -703,10 +703,10 @@ const server = http.createServer((req, res) => {
             if (req.headers['x-mode'] === 'directional') {
                 args.push('--directional');
                 if (req.headers['x-fast'] === '1') args.push('--fast');
-            } else if (/^[1-9]\d{0,2}$/.test(req.headers['x-slices'] || '')) {
-                // Restart points, for links that lose packets: progressive only.
-                args.push('--slices', req.headers['x-slices']);
             }
+            // Slices: restart points for links that lose packets, and what
+            // lets the encoder use every core on one picture.
+            if (/^(auto|[1-9]\d{0,2})$/.test(req.headers['x-slices'] || '')) args.push('--slices', req.headers['x-slices']);
 
             console.log(`PRS encode for ${inputPath}...`);
             runConverter(res, {
@@ -720,10 +720,16 @@ const server = http.createServer((req, res) => {
     res.end('Not found');
 });
 
-server.listen(PORT, () => {
+// This machine only, unless asked: the page encodes whatever it is sent
+// and has no password. `node server.js --lan` (or NVDR_HOST=0.0.0.0)
+// opens it to the network, for a phone or another computer.
+const HOST = process.env.NVDR_HOST || (process.argv.includes('--lan') ? '0.0.0.0' : '127.0.0.1');
+server.listen(PORT, HOST, () => {
     console.log(`\n==========================================`);
     console.log(`🚀 NVDR server running!`);
     console.log(`➡️  http://localhost:${PORT}/`);
+    console.log(HOST === '127.0.0.1' ? `🔒 só nesta máquina (para abrir na rede: node server.js --lan)`
+                                     : `🌐 aberto na rede em ${HOST}:${PORT}, sem senha`);
     console.log(`🎞️  vídeo: ${GST_LAUNCH} (ou ${FFMPEG})`);
     if (cluster.WORKERS.length) console.log(`🖥️  trechos de vídeo também em: ${cluster.WORKERS.join(', ')}`);
     console.log(`==========================================\n`);

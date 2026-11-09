@@ -176,10 +176,15 @@ typedef struct {
      * without any other, so bytes lost in the middle of a layer cost the
      * rest of that slice's part of the layer and no more (see SLICES in
      * nvdr.c, and nvdr_decode_mem_lossy()). 0 (the default) codes each
-     * layer as one stream. Progressive pictures only: a directional or
-     * residual picture ignores it. Container v17. */
+     * layer as one stream. The encoder codes slices side by side, one
+     * per core, which is what makes a directional picture quick to
+     * encode: NVDR_SLICES_AUTO picks about sixteen slices of 4 to 16
+     * rows by the picture's height (none under 8 rows). A residual, or a
+     * picture predicted from a base, ignores it. Container v17. */
     int   slices;
 } NvdrConfig;
+
+#define NVDR_SLICES_AUTO (-1)
 
 #define NVDR_GRAIN_OFF   0
 #define NVDR_GRAIN_AUTO  1
