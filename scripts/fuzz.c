@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
         size_t head = NVDR_HEADER_SIZE;
         if (!do_seq && n >= NVDR_HEADER_SIZE) head += (size_t)src[29] + ((size_t)src[30] | ((size_t)src[31] << 8));
         /* and from version 17 the slice table: its first byte, at least */
-        if (!do_seq && n > head && src[4] >= NVDR_VERSION_SLICES) head++;
+        if (!do_seq && n > head && src[4] >= 17) head++;
         if (head > n) head = n;
         mutate(buf, &len, do_seq ? NVDRV_HEADER_SIZE + NVDRV_FRAME_HEADER : head);
 

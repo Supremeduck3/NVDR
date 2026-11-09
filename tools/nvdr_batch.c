@@ -221,6 +221,7 @@ int main(int argc, char** argv) {
     const char* out_root = NULL;
     int deep = 0, force = 0, jobs = 0, as_nvdr = 1, as_png = 0;
     NvdrConfig cfg = nvdr_default_config();
+    cfg.priors = 1;
     cfg.directional = 1;
     int first = 2;
     if (argc > 2 && argv[2][0] != '-') { out_root = argv[2]; first = 3; }

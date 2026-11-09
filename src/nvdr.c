@@ -278,6 +278,7 @@ NvdrConfig nvdr_default_config(void) {
     c.grain = NVDR_GRAIN_OFF;
     c.tile_q = NULL;
     c.slices = 0;
+    c.priors = 0;
     return c;
 }
 
@@ -619,6 +620,35 @@ typedef struct {
 
 static void models_fill(NvdrProb* p, size_t count) {
     for (size_t i = 0; i < count; i++) p[i] = NVDR_PROB_INIT;
+}
+
+/*
+ * PRIORS (container v18)
+ * ----------------------
+ * A slice cannot start from what the slice before it learnt, and from
+ * even odds every slice pays again for the slow start: that was most of
+ * what slices cost. From version 18 a slice starts from what pictures
+ * in general teach instead: priors.h holds, per context, the probability
+ * it ended at averaged over a set of photographs (scripts/analysis/
+ * priors.c), one table for progressive pictures and one for directional.
+ * Each context takes its probability with a count of PRIOR_SEEN, so it
+ * moves an eighth of the way per symbol at first, not a quarter: it is a
+ * better guess than even odds and still only a guess. A file with a
+ * fluid context starts from that instead, as it always did.
+ *
+ * A picture without slices can start from them too (NvdrConfig.priors):
+ * it is then version 18 with a slice table of one byte, 0.
+ */
+#include "priors.h"
+#define PRIOR_SEEN 12
+_Static_assert(NVDR_PRIOR_COUNT == (sizeof(ColourModels) + 2 * sizeof(TextureModels)) / sizeof(NvdrProb),
+               "priors.h was made for other models: run scripts/analysis/priors.c again");
+static void models_prior(ColourModels* cm, TextureModels* tm, TextureModels* tm2, int directional) {
+    const uint8_t* p = NVDR_PRIORS[directional ? 1 : 0];
+    NvdrProb* dst[3] = { (NvdrProb*)cm, (NvdrProb*)tm, (NvdrProb*)tm2 };
+    size_t n[3] = { sizeof(*cm) / sizeof(NvdrProb), sizeof(*tm) / sizeof(NvdrProb), sizeof(*tm2) / sizeof(NvdrProb) };
+    for (int k = 0; k < 3; k++)
+        for (size_t i = 0; i < n[k]; i++) dst[k][i] = ((NvdrProb)*p++ << 7 | 64) | (NvdrProb)PRIOR_SEEN << 16;
 }
 
 /*
@@ -1541,7 +1571,7 @@ static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
             size < NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len ||
             nvdr_restore_parse(data + NVDR_HEADER_SIZE + h->grain_len, h->restore_len, g, &r) != 0) return -1;
     }
-    if (h->version >= NVDR_VERSION_SLICES) {
+    if (h->version >= 17) {
         if (slice_table(data, size, NVDR_HEADER_SIZE + (size_t)h->grain_len + h->restore_len, h, NULL) != 0)
             return -1;
         if (h->slice_rows && (h->flags & (NVDR_FLAG_INTER | NVDR_FLAG_RESIDUAL))) return -1;
@@ -2710,6 +2740,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     size_t ln[3];
     Bytes table;
     memset(&table, 0, sizeof(table));
+    /* Version 18: in slices, or starting from the priors, or both. */
+    int v18 = srows || (cfg.priors && !inter && !cfg.residual);
+    if (v18 && !(ctx && ctx->valid)) models_prior(&e.cm, &e.tm, &e.tm2, dirpred);
     if (srows) {
         if (!(seg = (uint32_t*)calloc((size_t)NVDR_LAYERS * nslices, sizeof(uint32_t))) ||
             !(so = (SliceOut*)calloc((size_t)nslices, sizeof(SliceOut)))) goto done;
@@ -2744,6 +2777,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         if (bad) { free(table.b); goto done; }
         for (int k = 0; k < NVDR_LAYERS; k++) { lp[k] = lay[k].b; ln[k] = lay[k].n; }
     } else {
+        uint8_t none = 0;
+        if (v18 && bytes_put(&table, &none, 1) != 0) goto done;
         code_rows(&e, 0, cv->ph, &s0, s1, &h, lambda0, skip0);
         if (nvdr_enc_finish(&enc0) != 0 || nvdr_enc_finish(&enc1) != 0 ||
             nvdr_enc_finish(&enc2) != 0) goto done;
@@ -2761,7 +2796,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (!buf) { free(table.b); goto done; }
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
-    buf[4] = srows ? NVDR_VERSION_SLICES : NVDR_VERSION;
+    buf[4] = v18 ? NVDR_VERSION_SLICES : NVDR_VERSION;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
                        (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0) |
                        (dirpred ? NVDR_FLAG_DIRPRED : 0) | (inter ? NVDR_FLAG_INTER : 0) |
@@ -3527,6 +3562,7 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
         models_fill((NvdrProb*)&cm, sizeof(cm) / sizeof(NvdrProb));
         for (int k = 0; k < 2; k++) models_fill((NvdrProb*)&tms[k], sizeof(TextureModels) / sizeof(NvdrProb));
     }
+    if (h.version >= 18 && !(ctx && ctx->valid)) models_prior(&cm, &tms[0], &tms[1], dirpred);
     cm0 = cm; tms0[0] = tms[0]; tms0[1] = tms[1];
     NvdrDecoder d0;
     /* A directional picture's texture comes with its colours, from the

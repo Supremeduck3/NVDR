@@ -2884,7 +2884,8 @@ and `decode()`'s `holes` in nvdr.js) takes the byte ranges that never
 arrived. Every layer starts where the header says, so a hole in one layer
 leaves the others readable; each decodes up to its first missing byte.
 
-**Slices** (container v17, `--slices N`, "Fatias" in the page). Every N rows of tiles start a slice. Each layer's part of each
+**Slices** (container v17, `--slices N`, "Fatias" in the page; version 18
+since "Priors", below, which takes most of this cost away). Every N rows of tiles start a slice. Each layer's part of each
 slice is a stream of its own, coded from the picture's starting models,
 and a leaf's colour is predicted from nothing above its slice. A hole
 then costs the rest of the slice's part of that layer, where it cost the
@@ -2994,6 +2995,44 @@ taller picture has more slices than cores and more bytes per slice, so
 more of the speed for less of the cost; what does not shrink is the
 restoration fit at the end, which is not in slices. The cost is, again,
 mostly every slice's models starting from even odds.
+
+### Priors: what a slice starts from (container v18)
+
+Both tables of costs above have the same cause: every slice's models
+start from even odds, since a slice cannot start from what the slice
+before it learnt. From version 18 it starts from what pictures in
+general teach instead. `scripts/analysis/priors.c` codes a set of
+pictures whole (the six samples and a frame of each bench clip,
+progressive and directional, q 16, 24 and 40) and averages, context by
+context, the probability each ended at; `src/priors.h` and
+`public/nvdr-priors.js` hold the result, 2105 probabilities for each of
+the two modes, to 8 bits. A context starts there with a count of 12, so
+it still moves an eighth of the way per symbol.
+
+Measured on pictures the priors did not see (trained on three samples,
+tested on the other three, both ways), BD-rate on PSNR-Y against a file
+without slices and from even odds:
+
+                                        even odds    priors
+    progressive, slices of 2 rows         +2.9%       +0.5%
+    progressive, slices of 4 rows         +1.4%       -0.2%
+    directional --fast, --slices auto     +2.1%       +0.6%
+    progressive, no slices                  0         -0.8%
+    directional --fast, no slices           0         -0.9%
+
+So slices now cost about half a percent, and the directional mode's
+speed with them (0.46 of the time on four cores) comes nearly free. A
+file without slices gains too, which `nvdr_encode` and `nvdr_batch` now
+take by default (`--no-priors` writes version 16 as before): 0.2 to
+0.8% on the photographs and about 3% on macarrão, 5 KB, where the slow
+start is a larger share. The library's default stays off, since a
+sequence rebuilds its frames' headers as version 16, and an album or a
+sequence carries its own models from one picture to the next.
+
+What it costs: the gate's three synthetic pictures, which are nothing
+like photographs, are 0.5 to 2.2% bigger (2 to 18 bytes), a decoder
+carries 4 KB of tables, and version 17 files (slices from even odds,
+written for a few days) still decode.
 
 **EXIF orientation.** A camera stores a photo as its sensor lies and
 says in EXIF which way is up. `nvdr_image_load()` now turns the pixels

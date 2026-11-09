@@ -18,7 +18,9 @@
  * arrived whole is decoded, a colour tile that did not is painted grey, a
  * texture tile that did not shows what the layer before gave it.
  *
- * Version 17 adds slices (SLICES in nvdr.c): after the restoration
+ * Version 18 starts the models from nvdr-priors.js instead of even odds
+ * (PRIORS in nvdr.c), with or without slices. Version 17 adds slices
+ * (SLICES in nvdr.c): after the restoration
  * parameters a table, one byte of tile rows per slice and the size of
  * every layer's part of every slice but the last, as LEB128. Each part is
  * a stream of its own, from the picture's starting models, so a file
@@ -26,9 +28,11 @@
  * fall in.
  */
 
+import { PRIORS } from './nvdr-priors.js';
+const PRIOR_SEEN = 12;
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
-export const VERSION = 16;          // what a container without slices is written as
-export const VERSION_SLICES = 17;
+export const VERSION = 16;          // what a container without slices or priors is written as
+export const VERSION_SLICES = 18;   // slices, priors or both; 17 was slices from even odds
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -563,7 +567,7 @@ export function readHeader(buffer) {
     h.tableLen = 0;
     h.slices = 1;
     h.seg = h.storedBytes.slice();
-    if (h.version >= VERSION_SLICES) {
+    if (h.version >= 17) {
         let at = HEADER_SIZE + h.grainLen + h.restoreLen;
         const first = at, n = buffer.byteLength;
         if (at >= n) return null;
@@ -1185,6 +1189,18 @@ function decodeOnce(buffer, maxLayer, wantFlat, ctx, wantLow, careful, baseImg, 
     const tq = (h.flags & FLAG_TILEQ) ? new Int8Array(tiles) : null;
     const tstep = step.slice();
     const tms = warm ? [ctx.tm, ctx.tm2] : [textureModels(), textureModels()];
+    // Mirrors models_prior(): from version 18 the models start from the
+    // priors, unless a fluid context brought its own.
+    if (h.version >= 18 && !warm) {
+        const p = PRIORS[dirpred ? 1 : 0];
+        let at = 0;
+        const put = a => { for (let i = 0; i < a.length; i++) a[i] = ((p[at++] << 7 | 64) | PRIOR_SEEN << 16) >>> 0; };
+        const all = m => m.forEach(put);
+        put(cm.split); put(cm.splitC); all(cm.half); all(cm.halfDir); all(cm.dcZero); put(cm.dcSign); all(cm.dcMag);
+        put(cm.tqZero); put(cm.tqSign); put(cm.tqMag); put(cm.modeFlat); put(cm.modeTree); put(cm.modeInter);
+        all(cm.txDct); all(cm.txTree);
+        for (const tm of tms) { all(tm.cbf); tm.sig.forEach(all); tm.last.forEach(all); all(tm.gt1); all(tm.mag); }
+    }
     // Every slice starts from the models the picture starts with.
     const cm0 = ns > 1 ? structuredClone(cm) : null, tms0 = ns > 1 ? structuredClone(tms) : null;
     let d0 = null;

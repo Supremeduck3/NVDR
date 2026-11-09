@@ -48,6 +48,8 @@ static void usage(const char* argv0) {
         "                   the two cheapest modes of a leaf and rank them without\n"
         "                   RDOQ (about 3.5x faster, ~1%% bigger)\n"
         "  --tx-modes N     the same with N modes (0, the default: all of them)\n"
+        "  --no-priors      start the models from even odds, as before container 18,\n"
+        "                   instead of from the built-in priors (up to 3%% bigger)\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
         "                   choosing them by rate-distortion\n"
         "  --tile-q-test    give every tile a step offset from a fixed pattern,\n"
@@ -62,6 +64,7 @@ int main(int argc, char** argv) {
     const char* in_path  = argv[1];
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
+    cfg.priors = 1;
     int quiet = 0, tile_q_test = 0;
 
     for (int i = 3; i < argc; i++) {
@@ -77,6 +80,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
         else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
+        else if (!strcmp(argv[i], "--no-priors")) cfg.priors = 0;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--no-halves")) cfg.halves = 0;

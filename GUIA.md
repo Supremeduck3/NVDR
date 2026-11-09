@@ -164,10 +164,10 @@ Arrasta uma imagem e pronto. Antes, dá para escolher:
   - **velocidade**: o encoder codifica uma fatia por núcleo. No modo
     direcional, que leva segundos, "automático" (o padrão da página
     nesse modo; umas 16 fatias pela altura da imagem) codifica em
-    metade do tempo ou menos em 4 núcleos, por ~2% a mais de bytes. O
+    metade do tempo ou menos em 4 núcleos, por ~0,6% a mais de bytes. O
     arquivo é o mesmo em qualquer máquina, com 1 ou 16 núcleos.
   - **rede ruim**: um pacote perdido estraga só até a próxima fatia, não
-    o resto da camada. "A cada 64 px" (`--slices 2`) custa ~3% no
+    o resto da camada. "A cada 64 px" (`--slices 2`) custa ~0,5% no
     progressivo. Veja "Mandar por rede ruim" abaixo.
 
   "Nenhuma" dá o menor arquivo.
@@ -377,7 +377,7 @@ isso vem desligado.
 ### Usando num site
 
 O arquivo continua com as propriedades quando vai para um site. Coloque
-o `nvdr-img.js` (e `nvdr.js`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
+o `nvdr-img.js` (e `nvdr.js`, `nvdr-priors.js`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
 `nvdr-worker.js`, `nvdr-tasks.js`, `nvdr-wasm.js` e `nvdr.wasm`) junto do
 site e use o
 elemento no lugar do `<img>`:
