@@ -1,0 +1,3363 @@
+# NVDR: the notebook
+
+Every measurement the codec was built on, in the order it was made: what
+was tried, what it gave on which pictures, and what was left out and
+why. `README.md` is the short way in and `GUIA.md` (in Portuguese) the
+how-to; this file is the record they point to. Sections describe the
+format as it was when they were written, so an early one may be about
+something a later one replaced: the first lines of each say which
+version it is about.
+
+# Progressive Residual Stack
+
+An implementation of the Progressive Residual Stack from NVDR spec
+v0.14.1 §1.2, built for still images.
+
+The spec describes a neural video codec: diffusion latents synthesised by a
+TensorRT UNet, streamed over QUIC, read from NVMe through io_uring. None of
+that is here, and none of it can be built or measured without a GPU and a
+trained model. What *is* here is the part the spec is actually about — the
+residual decomposition and the guarantee it provides — implemented on the
+one domain that can be built and measured today.
+
+## Format v10: the quadtree as the partition of a transform
+
+Everything from "The decomposition" down to "The anchor palette" below
+describes v9: flat rectangles in three levels. v9 was measured 6 to 11 dB
+behind a DCT at the same size on every sample, because a flat rectangle
+cannot hold texture (see "A texture layer, measured" and "The quadtree as
+the transform's partition"). v10 keeps the quadtree and changes what a
+leaf carries. The v9 codec is kept in `reference/nvdr_v9` so the numbers
+measured on it stay reproducible. The decoders no longer read v9 files.
+
+A v10 image is a quadtree of square leaves, 4 to 32 pixels, on 32x32
+tiles. Every leaf carries:
+
+- **a colour**, predicted as the rounded mean of the flat colours just
+  above and to its left, plus a quantised correction. A leaf with nothing
+  else is a v9 rectangle.
+- **texture, if it pays**: the DCT of what the flat colour misses, at the
+  leaf's own size, quantised with one step `q` and coded with the same
+  adaptive arithmetic coder as everything else (a coded-block flag;
+  significance and last flags by diagonal position; adaptive magnitudes).
+
+The encoder picks the tree by rate and distortion. Each node is coded
+whole and as four children against the live models, and the cheaper
+in squared error + 0.12 q^2 * bits wins.
+
+**Two layers, one guarantee.** Layer 0 is the tree and the colours, a
+whole picture of flat blocks on its own. Layer 1 is the texture. Each is
+one arithmetic stream coded tile by tile, and a cut stream decodes every
+tile that arrived whole. A colour tile that did not arrive is grey. A
+texture tile that did not arrive keeps its flat colours. Grey rather than
+a predicted colour: on the `degrade` probe the predicted colour carried
+the top rows down the image and a longer prefix scored worse, 12.5 dB to
+9.1. Colour is predicted from flat colours only, never from texture, so
+layer 0 never needs layer 1. Predicting from the full picture would save
+0.3 to 2% of the bytes.
+
+**Exact in C and in JS.** Everything the decoder computes is an integer:
+HEVC's integer DCT (every matrix entry one of 33 values, shifts of 6 and
+6 + log2 n, a 16-bit clip between the passes), 16-bit fixed-point
+YCbCr to RGB, integer means. `scripts/crosscheck.mjs` finds the two
+decoders identical at both layers and at cuts landing anywhere in either,
+for q from 1 to 4000 and block limits down to 8..16.
+
+At the default `q` 24, against v9 at its defaults (v9 PSNR as its
+decoder showed it, seams blended):
+
+    image                 v9                 v10
+    OIP-1304511485     18126 B 25.51 dB    17345 B 34.95 dB
+    OIP-3451121336     39852 B 21.85 dB    39947 B 31.47 dB
+    OIP-3786546191     38501 B 24.38 dB    34025 B 32.16 dB
+    OIP-4140498144     29253 B 25.71 dB    21696 B 33.62 dB
+    macarrão           10826 B 30.71 dB     6222 B 39.55 dB
+    montanha_pessoas   51765 B 27.00 dB    52809 B 33.28 dB
+    degrade (probe)      598 B 33.83 dB      486 B 46.15 dB
+    blocos (probe)       160 B 34.84 dB      315 B 56.34 dB
+    circulos (probe)    2230 B 29.15 dB     3462 B 39.98 dB
+
+The same size or smaller, and 6 to 10 dB better on every photograph.
+Blocks and circles come out larger at the default only because the
+default takes them to 40-56 dB. At equal quality v10 is smaller there
+too: `blocos` 159 B at 38.4 dB (`--q 255`), `circulos` 1175 B at 29.7 dB
+(`--q 96`). The codec lands 0.3 dB and about 3% short of the float
+prototype in `scripts/analysis/qtdct`, the price of predicting from flat
+colours and of the integer transform.
+
+Two things got worse, and both are on the list:
+
+- **the middle of the truncation curve.** Texture arrives tile by tile
+  from the top, so half of montanha_pessoas shows its top half sharp and
+  its bottom half flat, 24.0 dB against v9's 25.8. v9 spread its
+  refinement over the whole picture. Sending the low frequencies of the
+  whole image first would fix it.
+- **decode speed in the browser.** A 960x540 video frame takes 63 ms to
+  decode in JS, against 21 ms before. The display, which no longer blends
+  seams, went from 26 ms to 3. The inverse DCT runs as plain matrix
+  products; a butterfly and skipping all-zero rows are the obvious fixes.
+
+Sequences use it as is. Every frame, intra or predicted, is a v10
+container. Predicted frames set the header's residual flag, so their
+colours are predicted as 128 rather than from neighbours. A residual's
+neighbours say nothing about it, and predicting from them cost 13% more
+colour bytes and 5% more texture bytes.
+
+### Quarter-pixel motion (sequence format 5)
+
+With whole-pixel vectors a predicted frame on the clean clip was 2.4 KB
+of motion field and 9 KB of residual. VP8's whole predicted frame there
+is 1.1 KB. The residual was the gap, and `scripts/analysis/subpel` found
+why. A whole-pixel vector cannot follow a 1.12 px pan or a slow zoom, and
+with a transform coding the residual, the misalignment it leaves is fine
+texture across the whole frame, the most expensive thing there is to
+code. Against the source frame, refining 16x16 vectors to half and then
+quarter pixels took the residual from 4343 bytes to 1515 and PSNR from
+40.0 to 43.2 dB.
+
+Block vectors are now in quarter pixels, bilinear between whole pixels,
+in integers the same way in C and JS: weights (4 - a) and a per axis,
+rounded with + 8 >> 4, edges held. The search stays whole-pixel, then
+refines each block to half and quarter pixels. The rate-aware pass that
+weighs vectors against their bits runs on quarter-pixel SAD.
+
+With quarter pixels the better block size became resolution-dependent.
+On the 960x540 clip 16x16 wins: 591 bytes of field a frame against 2386,
+for 0.16 dB. On the 128x128 gate sequence, whose moving object is 30 px,
+8x8 wins both ways. So 16 from 0.2 Mpx up, 8 below. The vector's bit
+weight rose from 8 to 16, since quarter-pixel deltas cost more bits.
+Predicted frames default to a step 1.2 times the intra frames': across q
+16 to 40 that was 0.1 dB better at equal rate.
+
+The clean clip, 125 frames:
+
+    NVDRV, v4 (whole pixels, q 24)             2400 kbit/s   34.35 dB
+    NVDRV, format 5, q 20                      1013 kbit/s   37.80 dB
+    NVDRV, format 5, q 24 (default)             822 kbit/s   36.86 dB
+    NVDRV, format 5, q 32                       616 kbit/s   35.52 dB
+    VP8                                         605 kbit/s   37.19 dB
+    VP8                                         309 kbit/s   33.52 dB
+
+At VP8's quality NVDRV needs about 1.5 times its rate, down from 11
+times at the start of this work. The gate's 12-frame sequence is 15%
+smaller at -0.42 dB, and at equal bytes it is 0.66 dB better. It is
+encoded with equal quantisers now, so its drift check measures the
+prediction loop and not the 1.2 ratio. The JS decoder takes 43 ms per
+960x540 frame in Node, against a 40 ms budget at 25 fps.
+
+### A sharper interpolation filter (sequence format 6)
+
+Quarter pixels were first built with bilinear interpolation. Measured
+between two source frames, H.264's 6-tap filter promised only 5 to 7%
+less residual. Built into the loop it was worth far more, because
+bilinear interpolation is a blur, and in a closed loop the blur
+compounds. Each predicted frame is interpolated from a reference that
+was itself interpolated from the one before. On the clean clip:
+
+    interpolation        q     kbit/s    PSNR
+    bilinear            24       690   36.22 dB
+    bilinear            20       841   37.16 dB
+    6-tap               24       532   36.03 dB
+    6-tap               20       622   36.80 dB
+    VP8                            605   37.19 dB
+
+At equal rate the 6-tap filter is about 1 dB ahead of bilinear. It is
+H.264's luma filter exactly, in integers, over the reference with its
+edges held:
+
+- half pixels across (B) and down (H): (1, -5, 20, 20, -5, 1) / 32,
+  clipped;
+- the centre (J): the same filter down a column of the unrounded
+  horizontal sums, (sum + 512) >> 10;
+- quarter pixels: the rounded mean of the two nearest whole or half
+  samples.
+
+The C side builds the three half-pixel planes once per reference, over
+the frame plus a margin as wide as the field's largest vector.
+
+The browser cannot afford whole planes per frame. `nvdrv.js` computes
+per block only the samples that block's phase reads, over its own
+region, gathered once into a contiguous buffer. The numbers are the
+same, and the cross-check holds on every sequence. A 960x540 frame of
+the panning clip, where every block has a fractional vector, decodes in
+31 ms in Node, against 21 ms with bilinear and a 40 ms budget.
+
+### Leaving still regions alone
+
+A predicted frame used to correct every block: whatever small error the
+reference carried, it was re-coded, and a little differently each
+frame. On a background that does not move, that is visible as shimmer.
+`scripts/analysis/flicker` measures it. Of the pixels whose source is the
+same in two consecutive frames, it counts how many changed in the
+decode. On a 40-frame clip with a still background and a moving subject,
+5.5% of them changed every frame; with sensor noise added to the source,
+8.7%.
+
+Now, in a residual, the encoder also costs each leaf left uncorrected:
+no colour correction and no texture, so the decoder shows exactly what
+the previous frame held there. It picks that whenever it costs less in
+error + skip_k * lambda * bits. The decoder needed no change, because an
+uncorrected leaf was already a legal one.
+
+    still background, moving subject     shimmer   bytes
+    every leaf corrected                   5.47%   60622
+    skip_k 0.25 (default)                  1.26%   48938   -19%
+    same, sensor noise in the source       8.66% -> 2.05%   -26%
+
+Leaving a block alone carries its reference's error forward, so the
+weight matters on content where everything moves. On the panning clip,
+0.25 sits 0.1 to 0.2 dB above the plain quantiser curve at equal rate.
+1 falls 0.1 dB below it. The error a skipped block carries is bounded by
+the same rule that skips it: once correcting pays, the block is
+corrected. Per-frame PSNR falls about 0.2 dB over the first 25 frames of
+a GOP and then holds flat.
+
+The regression gate now encodes its sequence twice. The loop run uses
+equal quantisers and no skipping, and holds drift to 0.25 dB, because
+drift is how a reference that walks away from the source shows up. The
+default run holds the encoder as it ships to the baseline, 25% smaller
+than the loop run.
+
+### Colour and seams in predicted frames
+
+A predicted frame's residual was coded 4:4:4 and without the deblocking
+filter, whatever the picture. Both were decided on the regression gate's
+128x128 sequence, whose sawtooth texture is exactly the kind of picture
+that wants neither. Now, when the intra frame chose 4:2:0 (every
+photograph measured does), the residuals are coded 4:2:0 and filtered
+too. The reference's colour is already smooth, so a residual coded whole
+spends its bytes on colour detail and colour noise nobody sees. Over a
+continuous prediction a residual's leaf seams show in the picture as
+they are. The filter is the still decoder's, switched by the container's
+own flag, so neither decoder changes. A sequence whose intra frame keeps
+4:4:4 (a drawing, a screen, the gate) keeps both off.
+
+BD-rate against the previous encoder, 48 frames, q 12 to 48
+(`scripts/bench_video.mjs`'s NVDR half):
+
+    clip                                        PSNR-Y   PSNR-RGB
+    pan over a photo, whole pixels, clean        -8.2%     -5.1%
+    subpixel pan, zoom, object crossing, clean   -6.2%     -0.3%
+    the same with sensor noise every frame      -22.8%    -19.9%
+
+The filter alone is 1.6% on luma and 2.4 to 3.1% on RGB. The rest is the
+colour, which is worth most where the noise is: colour noise costs a
+residual as much as detail does.
+
+### B frames (sequence format 7)
+
+Every eighth frame is now an anchor, an I or a P frame, and the seven
+between are B frames. The encoder holds them until the anchor arrives,
+codes the anchor from the anchor before it, then the frame halfway
+between the two, then the frame halfway through each half. Each B frame
+is predicted per block from the nearest decoded frame before it, the
+nearest after it, or the rounded mean of both. The mean is what makes
+them cheap: two independent guesses at the same content average their
+noise and interpolation error down, and the background a moving object
+uncovers, which one reference cannot see, the other usually can.
+
+Nothing in the file names a reference. Every frame header carries its
+display number (the header grew to 20 bytes), and a P frame predicts
+from the decoded frame nearest before it in display order, a B frame
+from the nearest before and after. The coding order above makes that
+rule pick the frames it means. Decoders keep the decoded frames from the
+one last shown onward (never more than NVDRV_MAX_DPB) and show a frame
+once every frame before it has been shown.
+
+The field of a B frame codes, per block, its mode as two adaptive bits
+("not the mean", then "backward"), each conditioned on the left and top
+neighbours, then the vector of each list it uses against that list's own
+median prediction. A list the block does not use takes its prediction as
+its vector, for free, so the next blocks' predictions stay continuous.
+The encoder searches each list like a P frame's field, then walks the
+blocks in coding order and picks mode and vectors by error plus bits.
+
+Four more things were needed before B frames paid off:
+
+- **Vectors of 16 bits.** An anchor eight frames from its reference
+  under a pan moves 25 px or more, past the int8 field's 32 px limit for
+  anything faster. Sequence fields now hold +-96 px (NVDRV_MV_MAX); album
+  fields keep int8 and their 8-bit escape, so albums are unchanged.
+- **A coarse search.** At eight frames an object crossing at 5 px a frame
+  is 40 px off, far outside the +-4 px window around the global vector.
+  Each block also searches a 4x4-averaged copy of both frames over 8 px
+  per frame of distance, and the full-resolution search looks around the
+  coarse winner too. On the 25-frame clips that took B frames from -1.7%
+  and +42% to -29% and -8%.
+- **Lambda that follows q.** A bit of field is worth more error the
+  coarser the residual that would fix it: the vector weight is now
+  `mv_lambda * q / 24`. Before, B frames at q 80 spent more on their
+  field than on their residual, picking modes by one-level differences.
+- **Mode switches priced higher.** A mode unlike its neighbours' costs
+  more than its own bits; weighing a mismatch as 4 bits was 1.5 to 2%.
+
+The steps: P frames 1.4 times the intra step when B frames are on, and
+each B level 1 + 0.5 x level times the P step (so 1.5, 2 and 2.5 times).
+Within a group the luma PSNR swings about 0.5 dB between levels.
+
+BD-rate against format 6 (P frames only), luma, q 12 to 48, 25 frames:
+
+    clip                                      bframes 7   bframes 3   15
+    pan over a photo, whole pixels, clean       -11.4%      -8.9%   -12.2%
+    subpixel pan, zoom, object, clean           -31.5%     -29.2%   -29.8%
+    the same with sensor noise                  -29.1%     -25.3%   -27.9%
+
+And the full 48 frames against the browser's own encoders
+(`scripts/bench_video.mjs`, WebCodecs, BD-rate on PSNR-Y, negative means
+NVDRV is smaller):
+
+    clip                                   vs VP8    vs VP9    vs AV1
+    subpixel pan, zoom, object, clean      -44.3%    -25.6%    -18.9%
+    the same with sensor noise             -40.3%    -15.7%     -0.6%
+
+Before B frames the same clips stood at +18 to +22% against VP9 and AV1.
+WebCodecs' encoders are built for real time; an offline encoder at its
+slow settings is the harder comparison, measured below.
+
+A cut file now loses the B frames of the group it lands in: the prefix
+shows every group before the cut, then the next anchor (partial if the
+cut is inside it) and whichever of its B frames arrived.
+
+### The motion model (sequence format 8)
+
+With B frames in, the motion field was most of every predicted frame:
+on the clean realistic clip at q 24, 1036 of an anchor's 2140 bytes and
+340 to 660 of a B frame's 480 to 1200. That clip zooms, and under a zoom
+every block moves by a slightly different vector, varying smoothly
+across the frame; a median of neighbours pays for every step of that
+gradient.
+
+Each list of each predicted frame now has an affine model of the
+frame's motion,
+
+    mx = a0 + (a1 * cx + a2 * cy + 32768) >> 16
+    my = b0 + (b1 * cx + b2 * cy + 32768) >> 16
+
+in quarter pixels at the block's centre, with a0, b0 in quarter pixels
+and the slopes in 65536ths of a quarter pixel per pixel (computed in 64
+bits, so a damaged size cannot overflow it). A vector is predicted as
+the model at its block plus the median of how far the left, top and
+top-right neighbours stray from the model there. With a model that is
+one translation this is exactly the old prediction, which is what albums
+keep using.
+
+The encoder fits the model to its searched vectors by least squares,
+then twice more on the blocks within 2.5 times the median deviation of
+the last fit, so a moving object does not drag the camera's motion with
+it. On a field of noise, flat or periodic texture where every offset
+matches about as well, least squares finds slopes that are not there, so
+the model is kept only when it predicts clearly more blocks to within a
+quarter pixel than the global translation does. When it is not kept, the
+list's model is its header's global vector and costs nothing: a flag in
+the frame header (byte 18) says which lists carry the 12 bytes.
+
+BD-rate against P frames only, luma, 25 frames:
+
+    clip                                      B frames   + model
+    pan over a photo, whole pixels, clean       -10.5%    -11.4%
+    subpixel pan, zoom, object, clean           -30.9%    -36.6%
+    the same with sensor noise                  -28.6%    -35.1%
+
+The regression gate's sequence, which does not zoom, comes out byte for
+byte as it did.
+
+### Looking ahead of the intra frame
+
+An intra frame was coded as if nothing came after it, but the frames that
+follow copy it: a background that stays on screen is paid for once and
+inherited by every frame of the group. Before an intra frame the encoder
+now holds up to `--lookahead` (16) source frames and estimates, as x264's
+macroblock tree and AV1's temporal dependency model do, how much of each
+16x16 block the frames after it reuse. Each block has an intra cost (the
+Hadamard sum of its detail) and an inter cost (the Hadamard sum of its
+error against its best whole-pixel match in the frame before); walking
+back from the last frame, a block passes (intra + inherited) x (1 -
+inter/intra) to the blocks its match overlaps.
+
+What reaches the intra frame becomes a step offset per 32x32 tile:
+`--tpl` (1) sixths of a doubling for each doubling of (intra +
+inherited) / intra, finer only, down to -12. The offsets needed a new
+still flag, 0x10 (TILEQ): each tile's offset is coded at its start in
+layer 0 as the difference from the tile before, so truncation keeps
+working, and every decoder scales the tile's step by the integer table
+1024 x 2^(d/6) for its colours, textures and deblocking thresholds. The
+4:2:0 choice is made without the offsets: with them, the gate's
+saturated drawing came out 4:2:0 and lost 5 dB of RGB.
+
+BD-rate on PSNR-Y against the same encoder without it:
+
+    clip                                           --tpl 1   --tpl 2   --tpl 3
+    pan over a photo, whole pixels, clean            -0.1%    +1.2%    +6.4%
+    subpixel pan, zoom, object, clean                -1.9%    -2.9%    -2.6%
+    the same with sensor noise                       -0.3%    -0.3%    +0.2%
+    still camera, object crossing, clean             -1.8%    +1.7%    +9.0%
+    still camera, object crossing, noisy             -3.4%    -4.6%    -4.4%
+
+Small, because the P and B frames are already coded far coarser than the
+intra frame (up to 3.5 times its step), which does most of what the
+tree would at the level of whole frames; where every bit is in the intra
+frame (a still scene) there is nothing to move. Stronger settings make
+the intra frame finer than the frames after it can use. The remaining
+distance to AV1's intra frame is in coding it, not in how its bits are
+spread.
+
+### Choosing levels by rate-distortion
+
+Every texture level used to be the coefficient rounded with a fixed dead
+zone of 0.1. That spends bits wherever a level barely clears a half: a 1
+that costs eight bits buys less error than eight bits are worth. The
+encoder now decides the levels of each band of each block the way HEVC's
+reference encoder does (rdoq() in nvdr.c), against the texture models as
+they stand when the row is prepared: front to back, each coefficient
+takes its rounded level or one less, whichever costs less error plus
+lambda times the bits the models charge (significance, the "not last"
+flag, magnitude, sign); then every nonzero position is tried as the
+block's last, against dropping the band. Lambda is the tree's, over the
+step squared, times 0.6. Nothing in the format changes.
+
+In a picture the four lowest-frequency positions stay with the dead
+zone: they draw ramps, and choosing them by rate-distortion turned the
+gate's gradient into bands. (A first version also emptied a block's low
+band whenever its high band came out empty, which is what the gradient
+first showed.)
+
+Intra frames, BD-rate on PSNR-Y, mean of five photographs:
+
+                             vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    dead zone                       +21.0%                  +6.7%
+    rate-distortion levels          +18.5%                  +3.9%
+
+On the sequences, on top of the look-ahead: 2.5, 2.1 and 4.4 points more
+on the three 25-frame clips, most where the noise is.
+
+### Texture contexts from the neighbourhood (format v12)
+
+More than 90% of an intra frame's bits are luma texture, so its
+contexts were next. A coefficient is likelier to be significant, and
+large, when the ones next to it in frequency are. Significance is now
+conditioned on the position's class (its diagonal: 1, 2, 3-4, 5-7, 8 on)
+and on what is already coded around it: the levels at (u-1, v),
+(u, v-1), (u-1, v-1), (u-2, v) and (u, v-2), each counted up to 3, the
+template AV1 and VVC use. All five lie on earlier diagonals, so the
+diagonal scan has decoded them; one in the other band counts as zero, so
+the layers stay decodable on their own. The "more than 1" flag of a
+magnitude takes the same sum and whether a level over 1 has been seen.
+
+Intra frames, mean of five photographs, BD-rate on PSNR-Y:
+
+                                 vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    RDOQ, contexts by position          +18.5%                  +3.9%
+    + neighbourhood contexts            +17.2%                  +2.9%
+
+Tried and left out, each within a tenth of a point: conditioning the
+larger magnitudes and the "last" flag on the neighbourhood as well, and
+an adaptation rate that starts fast and slows with a per-context count
+(what AV1 does), worth 0.4 points for touching every stream the codec
+writes. The remaining distance is not in the entropy coder: it is in
+what the texture has to carry, a block minus its flat colour, where AV1
+first predicts the block along a direction and from its luma.
+
+### Directional prediction for intra frames (flag 0x20)
+
+This was measured once before and not built, because predicting a leaf
+from its neighbours' full reconstruction ties every layer to the ones
+after it and gives up the truncation guarantee. A sequence's intra
+frame is never shown half-arrived, though, so there it costs nothing.
+With NVDR_FLAG_DIRPRED (`--directional`, on for a sequence's intra
+frames, off for stills) the picture has one texture layer, read in step
+with layer 0: each leaf's mode and colours, then its texture straight
+away, since the next leaf predicts from it. A texture layer that runs
+out is damage.
+
+A leaf takes one of 15 modes: flat (the mean of the row above and the
+column to the left, now of the full reconstruction), HEVC's planar, and
+13 of HEVC's angular modes, seven from above (angles -32 -17 -9 0 9 17
+32 in 32nds of a pixel per row) and six from the left. They are HEVC's
+exactly: interpolation in 32nds, the other side projected round the
+corner with the inverse angles for negative angles, and the references
+filtered [1 2 1] for leaves of 8 and up. The row above runs on past the
+leaf while those pixels have been decoded (an earlier tile, or earlier
+in this tile's quadtree, by the z-order of their 4x4 cells) and then
+repeats its last pixel; the left column likewise down. The DC level
+moves the whole prediction by a constant and the texture is the DCT of
+what is left, so the transform, the RDOQ and the contexts are as before.
+The mode is a "flat or not" bit by size, then four bits down a tree of
+contexts. The encoder screens the 14 other modes by the Hadamard sum of
+their error, as HEVC's reference encoder does, and tries flat and the
+best five in full.
+
+Intra frames, mean of five photographs, BD-rate on PSNR-Y:
+
+                                     vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    neighbourhood contexts (v12)            +17.2%                  +2.9%
+    + 7 modes (4 directions, planar)        +13.7%                  +0.0%
+    + 15 modes, HEVC's angles               +12.6%                  -1.0%
+    + filtered references                   +11.2%                  -2.2%
+    + references past the leaf              +11.0%                  -2.4%
+    screening, 5 of 14 in full (default)    +11.2%                  -2.2%
+
+Trying all 15 modes in full took a 960x540 frame from 0.1 to 2.9
+seconds; screening brings it to 1.5 for 0.2 points. Coding the mode
+against a likeliest one, the left or upper leaf's, was worse either way
+tried (13.5% and 13.2%): neighbours seldom share a direction, and flat,
+the commonest answer, lost its cheap bit.
+
+In the sequences, together with the contexts, on the three 25-frame
+clips against P frames only: -14.0/-40.6/-39.8% before, -19.6/-45.1/-43.9%
+after; the two still-camera clips go from -5.1 and -8.0% to -13.3 and
+-15.2%.
+
+### Variable block size (sequence format 9)
+
+A field of 16x16 blocks follows the camera cheaply and an object's edge
+badly: the block that straddles the edge takes one vector for two
+motions. Each block of a sequence's field may now split into its four
+halves, each with its own vector and, in a B frame, its own mode. The
+field lives on the half-size grid; a whole block writes one vector into
+its four cells.
+
+Per block, in raster order: a split bit, conditioned on whether the left
+and upper blocks split; then its units (the block, or its halves in
+z-order), each coded as a block was. A unit's vector is predicted as the
+motion model at the unit's centre plus the median of its neighbours'
+deviations: left of its top-left cell, above it, and above-right of the
+unit, or above-left when that is not coded yet (the lower right half,
+whose above-right is in the next block), as H.264 does. Each cell keeps
+the deviation of its unit from the model at the unit's own centre, so a
+field that follows a zoom is predicted exactly; measuring it against
+the model at the cell's centre instead lost 3 to 4 points, from
+rounding.
+
+The encoder searches every list at both sizes and smooths both fields
+against their bits, then walks the blocks in coding order and codes each
+whole or split, whichever costs less error plus lambda times its bits
+(3 extra bits charged to a split; 0 and 8 measured the same). Blocks of
+8 split into 4.
+
+BD-rate on PSNR-Y against format 8, 25 frames:
+
+    clip                                             format 9
+    pan over a photo, whole pixels, clean              +0.5%
+    subpixel pan, zoom, one object, clean              -0.1%
+    the same with sensor noise                         -0.1%
+    slow pan, three elliptical objects each moving
+      its own way, one turning, light noise            -2.5%
+
+These clips move mostly with the camera, and splitting pays only where
+motions meet; footage with people in it has far more such edges than a
+rectangle crossing a pan. The regression gate's sequence (8x8 blocks
+splitting into 4x4) comes out 4.9% smaller in the closed loop and 0.8%
+smaller and 0.15 dB better by default.
+
+### Intra prediction inside predicted frames (sequence format 10, flag 0x40)
+
+A predicted frame was the error against its motion-compensated
+prediction, coded as a residual: every leaf's colour predicted as 128,
+nothing else possible. Where the prediction fails, in what an object
+uncovers or a new thing brings in, the residual has to draw the picture
+from nothing, while the frame's own decoded neighbours sit right there.
+
+With NVDR_FLAG_INTER the container codes the frame itself, not its
+error, and is decoded against a base picture the caller supplies: in a
+sequence, the frame's motion-compensated prediction
+(`nvdr_decode_mem_base()`, and `decode(..., base)` in nvdr.js). Every
+leaf gets one more mode, INTER, the base's pixels under it; the 15
+directional modes of the intra frames are still there, so the flag
+implies 0x20. The mode is an "INTER or not" bit by size before the
+others. The base goes onto the canvases in integers every decoder
+computes alike (JPEG's YCbCr in 16-bit fixed point, and in 4:2:0 the
+rounded mean of each 2x2), and a tile that never arrived shows it.
+
+The encoder tries INTER first. Only a leaf whose mean squared error
+under it is over 16 tries flat and the five best directions by Hadamard
+sum as well, which keeps the encode time where it was; trying them at
+4 and over 60 measured within 0.8 points either way. INTER's texture is
+prepared with the row, like flat's used to be, so the common case costs
+no more than the residual did.
+
+BD-rate on PSNR-Y, 25 frames, against P frames only (format 6):
+
+    clip                               format 9       format 10
+    pan over a photo, clean              -19.2%          -22.7%
+    subpixel pan, zoom, clean            -45.2%          -45.1%
+    the same with sensor noise           -44.0%          -44.0%
+
+and 1.7 points more on the clip with three objects (-4.2% against
+format 8). Clips that move with the camera have little uncovered; the
+gain is where things come into view.
+
+### Filtering the anchors in time
+
+Sensor noise is new in every frame, so no prediction can use it: an
+anchor coded with its noise pays for it once, and every frame predicted
+from it pays again to swap that noise for its own. On the noisy clip
+this was the whole gap to x265, far more than on the clean one.
+
+Before an anchor (an I or P frame) is coded, the encoder now averages it
+along the motion with the 7 source frames on either side, as libaom
+does for its alternate references. Each neighbour is matched to the
+anchor in 16x16 blocks (the sequence's own searches, to quarter pixels)
+and every pixel blends the anchor with each aligned neighbour, weighted
+by exp(-d / (4 * noise)): d is the squared difference over the 3x3
+around the pixel and over its block, and `noise` the median block's
+difference against the nearest neighbour, which is what noise alone
+makes it. A neighbour that differs by an edge, a moving object or a bad
+match drops out. Only the encoder changes; the format does not.
+
+Measuring the noise in space first, by Immerkaer's method, failed: the
+noise here is slightly blurred, as a camera's is, and the clean clip's
+detail looked noisier to it than the noisy clip did. In time the two
+are 96 against 8 to 12.
+
+BD-rate on PSNR-Y against the same encoder without the filter, 25 frames:
+
+    subpixel pan, zoom, one object, noisy               -21.3%
+    still camera, noisy                                 -18.9%
+    three objects, light noise                           -9.0%
+    the same pan, clean                                  -0.5%
+    pan over a photo, clean                              -0.5%
+
+Encoding takes 8% longer. The strength and radius were swept (see
+nvdrv.c); filtering the B frame halfway between anchors too measured
+nothing.
+
+On a clean clip the filter did next to nothing, while libaom without
+its filtered alternate references comes out 4.9% bigger on the same pan:
+its noise is the interpolation's small mismatch, and four times that let
+a neighbour count only where it matched almost exactly. A clean clip
+wants a far larger allowance, a noisy one no more than its own, so the
+threshold is now 4 times the noise raised to 32 times it, but never
+past 600 (the noise is 8 on the clean pan, 47 on the three objects, 97
+on the noisy pan). Against the filter as it was, sequence format 19,
+25 frames:
+
+    pan, zoom, one object, clean        -1.3% (PSNR-RGB -1.4%)
+    three objects, light noise          -2.0% (-2.2%)
+    the same pan, noisy                 -0.2% (-0.1%)
+
+### Overlapped blocks (sequence format 11)
+
+A block's vector is right for its middle and less so at its edges,
+where the next block's motion begins: the prediction steps at every
+edge between two vectors, and the frame has to code the step. As in
+H.263 and AV1, each cell of the field (half a block) is now blended near
+its edges with what its neighbours' motion predicts for the same pixels:
+first the rows toward the cells above and below, then the columns toward
+the cells left and right, each over half the cell, with AV1's masks (the
+cell's own weight in 64ths, 39 50 59 64 from the edge in for a cell of
+8). In a B frame a neighbour's motion is its mode and the vectors that
+mode uses. A neighbour moving exactly as the cell does is skipped, so
+nothing inside an unsplit block changes. All integer, identical in the
+C, JavaScript and WebAssembly decoders; the album's predicted photos do
+not use it. A flag in each frame's header says
+whether its blocks overlap, and the encoder keeps whichever prediction
+is nearer the source: on the regression gate's 128x128 clip, whose 4x4
+cells put nearly half the pixels next to an edge around an object with
+sharp edges, overlapping every frame cost 27% more bytes, and there the
+encoder now turns it off. On the clips below it stays on.
+
+BD-rate on PSNR-Y against format 10, 25 frames:
+
+    subpixel pan, zoom, one object, noisy                -2.2%
+    the same, clean                                      -2.1%
+    three objects, light noise                           -2.1%
+    still camera, noisy                                  -0.7%
+    whole-pixel pan over a photo, clean                  +0.2%
+
+A quarter-cell overlap gave less (-0.8% and -1.5% where half gives
+-2.1), a whole-cell one blurred too much (+2.9% on the photo pan), and
+skipping neighbours whose vectors differ by one or two quarter pixels
+lost most of the gain. The encoder still chooses vectors as if the
+blocks did not overlap; choosing them knowing the blend is what AV1
+does next.
+
+### Adaptive transforms (flag 0x80)
+
+A directional prediction misses least next to the pixels it copies and
+more the further a pixel is from them, and the DCT, whose first basis
+function is flat, is the wrong shape for that. With NVDR_FLAG_TXSEL (on
+wherever directional prediction is, `--no-adaptive-tx` turns it off)
+each leaf of 4, 8 or 16 pixels predicted along a direction, or flat in a
+picture with a base, chooses one of seven separable transforms, as VVC
+and AV1 do: the DCT both ways; the DST-VII (AV1's ADST) down, across or
+both, whose first basis function starts near zero at the reference and
+rises away from it; the identity both ways, which codes pixels as they
+are, for edges and text where a DCT rings; and the identity down with
+the DCT across, or the other way round, for stripes along one axis.
+Leaves of 32 and INTER leaves stay on the DCT.
+
+The DST-VII's integer matrices are 64 sqrt(N) times the orthonormal one,
+like the DCT's, so every type shares its shifts: each entry is one of N
+magnitudes (for 4, VVC's 29 55 74 84) with the sign the sine gives it,
+and the identity is 128, 181 and 256 on the diagonal. A leaf with any
+type but the DCT has no DC level, since no other basis has a constant
+function, so its texture is coded from scan position 0 against the same
+models as the DCT's. The type is a "DCT or not" bit by size and by the
+mode's direction (flat or planar, from above, from the left), then three
+bits down a tree by direction, after the mode. The encoder tries every
+type for each of the modes it tries in full and keeps the cheapest by
+error plus lambda times bits.
+
+Intra frames (`--directional`), BD-rate on PSNR-Y (and PSNR-RGB) against
+the build before, six photographs, q 12 to 48:
+
+    5 types, for the best DCT mode only, own models    -0.2%  (-0.8%)
+    the same, the DCT's models                         -0.4%  (-0.9%)
+    5 types, tried with every mode                     -1.6%  (-2.1%)
+    the same, keeping the DC level for the others      +0.6%  (-0.1%)
+    7 types, tried with every mode (default)           -2.3%  (-2.6%)
+    9 types (adding DST-VII with the identity)         -2.2%  (-2.5%)
+
+Per photograph, the default: -7.7% on the graphic (OIP-1304511485),
+-2.6% on macarrão, -2.1% on montanha_pessoas, -0.9% on OIP-4140498144
+and -0.2% on the two dense photographs. The type follows the mode
+closely: with the best DCT mode alone the gain mostly disappears, and
+trying the other types only for the best one, two or three modes by
+their DCT cost gives -1.0, -1.6 and -2.0% for 1.14, 1.34 and 1.51 times
+the encoding time. Trying them with every mode costs 2.1 times the
+encoding time of an intra frame. On 4x4 leaves of a photograph the DST-
+VII both ways is chosen more often than the DCT, as HEVC found when it
+made it the only 4x4 intra transform; the identity is chosen mostly on
+the graphic.
+
+On the sequences, where it applies to every intra frame and to the intra
+leaves of predicted ones: -2.2% on a pan over montanha_pessoas, -1.9% on
+the mixed clip with noise, -1.7% on a zoom (24 synthetic frames from
+`scripts/analysis/frames.c`, q 16 to 48, on PSNR-RGB), nearly all of it
+from the intra frame. Choosing the type for INTER leaves too, whose
+texture the encoder now transforms before the search, is the next step,
+at the cost of doing that per leaf.
+
+### Choosing vectors for overlapped blocks
+
+The encoder chose each unit's vector by the error of its own
+prediction, and then blended it with its neighbours' anyway. It now
+scores each candidate by what the decoder will show: its prediction
+blended toward the cells above and to the left, already decided, with
+the same masks (the cells below and to the right are not decided yet
+and are left out, as in AV1's encoder). BD-rate on PSNR-Y, 25 frames,
+against the same encoder without it: -0.2 to -0.8% on the five clips.
+On the regression gate's small clip, whose frames turn overlapping off,
+it costs 1.3% in the closed loop: the vectors were chosen for a blend
+that then does not happen.
+
+### In-loop restoration
+
+Deblocking fixes one artefact, the step at a leaf's edge, by a rule
+fixed in advance. What quantisation leaves inside a leaf (ringing along
+an edge, texture flattened, a ramp turned into steps) is left, and it
+differs from one picture to the next. So the encoder, which holds the
+source, now fits a filter to the picture it has just decoded and sends
+it: the least-squares filter that takes the decoded picture closest to
+the source. The decoder applies it after deblocking. In a sequence the
+restored picture is the one later frames predict from, so the filter is
+in the loop, and a frame's gain is also every later frame's.
+
+The filter is VVC's adaptive loop filter, simplified (`src/restore.c`):
+a 7x7 diamond for luma and a 5x5 one for colour, each neighbour entering
+as its difference from the centre clipped to one of four bounds, so a
+neighbour across a strong edge counts no more than one across a weak
+one. Luma's 4x4 blocks fall into 25 classes by the direction and
+strength of their gradient, which the encoder merges greedily into as
+many filters as pay for themselves at the picture's lambda. Each 64x64
+unit is filtered or not, and each component carries a filter only where
+that removes more error than its bits cost. Coefficients are in 128ths,
+Exp-Golomb coded after the grain parameters; bytes 30 and 31 of the
+header give their length, 0 when there are none (the flag byte is
+full: 0x80 is the transform types'). Everything is integer, and C, JavaScript and
+WebAssembly decode identically. Only a picture decoded whole is
+restored: the filter was fitted to that picture, not to a prefix of it.
+
+Colour at half size has to be judged where it is seen. Fitted against
+the 2x2 means it was coded from, the filter brought each half-size plane
+closer to them and made the full-size colour worse on all six samples,
+by up to 8%. The encoder now measures colour after the decoder's
+upsampling, against the full-size source, and solves for the filter in
+that domain (the upsampling is linear, so each tap's contribution is
+too). There the filter undoes much of what halving and bilinear
+upsampling blur: on OIP-1304511485 the squared error of Cb falls from
+8.4 to 5.5 and of Cr from 14.6 to 6.1, and the picture gains 1.7 dB for
+51 bytes.
+
+BD-rate on RGB PSNR against the same build without the filter, q 12 to
+56 (stills) and 10 to 56 (sequences):
+
+    image                 BD-rate     at q 24
+    OIP-1304511485        -11.2%      13023 B 33.11 dB -> 13074 B 34.78 dB
+    OIP-3451121336         -1.9%      36346 B 31.12 dB -> 36380 B 31.35 dB
+    OIP-3786546191         -2.8%      28988 B 31.68 dB -> 29029 B 32.02 dB
+    OIP-4140498144         -1.3%      19262 B 33.21 dB -> 19308 B 33.30 dB
+    macarrão               -2.2%       4942 B 38.68 dB ->  4996 B 38.91 dB
+    montanha_pessoas       -2.1%      45508 B 32.74 dB -> 45638 B 32.92 dB
+
+    25 frames, from scripts/analysis/frames.c          BD-rate
+    pan and a moving object over montanha, clean         -3.8%
+    the same, noise 6                                    -3.0%
+    whole-pixel pan over OIP-3786546191                  -9.5%
+    still camera over OIP-3451121336, noise 6            -8.6%
+    zoom into OIP-4140498144                             -1.0%
+
+Swept and left at the first choice: the clip bounds (255 32 12 4 against
+255 64 16 6 and 255 24 8 3) and the activity levels (3 8 16 32 against
+2 5 10 20 and 4 12 24 48) all measured within 0.1 point. Encoding a still
+takes about twice as long (0.11 s to 0.27 s for montanha_pessoas), a
+sequence about 10% longer; the statistics come from a sixteenth of the
+pixels for the clip bound and half of them for the filter.
+
+**A learned filter goes in beside it, not instead.** Each component's
+parameters start with a kind: 0 none, 1 this filter, 2 reserved for a
+network whose weights both sides hold, named by an id, with its
+per-picture parameters (a strength, a class map) in its payload. A new
+kind is a parse and an apply in the decoders and a fit in
+`nvdr_restore_fit()`, which already keeps the cheapest candidate per
+component, so a network that only wins on some pictures costs nothing
+on the others. The fit receives the decoded plane and the source, the
+same inputs a learned filter's encoder side needs. Two next steps before
+that: a cross-component filter (VVC's CC-ALF, colour refined from luma),
+given how much the colour alone gained here, and giving the 4:2:0
+upsampling a filter of its own.
+
+### Adapting faster at first (container v13, sequence v12)
+
+Every context starts at even odds and learns only from the bits it
+codes, so the start of every picture is coded with raw probabilities.
+LZMA moves a probability 1/32 of the way toward each bit: slow to
+learn, and a little jittery once learned. Each context now also counts
+the bits it has coded and moves by 1/4 over its first 12, 1/8 up to 40,
+1/16 up to 96 and 1/64 after, as AV1's per-context counter does; the
+probability is kept at 15 bits so the slow steps still move it, and
+coded at 11 as before. Both sides count the same bits, so nothing is
+sent. It changes what every bit means, so the container version went
+to 13 (and the sequence's to 12): a decoder of the other kind refuses
+the file instead of reading noise from it. Mixing a fast and a slow estimate at fixed rates (VVC's way) was
+tried first and gave about a third as much.
+
+    intra, five photos, BD-rate       vs AV1 (libaom, still)   vs HEVC (x265 intra)
+    before                                    +7.0%                  -5.7%
+    counting                                  +6.5%                  -6.2%
+
+On the five 25-frame clips, BD-rate on PSNR-Y: -4.4% (noisy pan),
+-4.1% (clean pan), -4.3% (photo pan), -5.1% (still camera, noisy) and
+-2.7% (three objects). A sequence's frames are coded against fresh
+models each, so every frame pays for the slow start.
+
+The small pictures gain most, having the fewest bits to learn from:
+the regression gate's synthetic blocks and gradient 25 and 27% smaller,
+its 128x128 sequence 7.7% smaller at 0.08 dB more, a burst album 5.6%.
+
+### Models carried from frame to frame (sequence v13)
+
+A sequence coded every frame against fresh models, while an album
+already carried them from one photo to the next. A predicted frame of
+960x540 is a few hundred bytes; its contexts learn little before it
+ends. The models now carry over in coding order and start fresh at each
+intra frame, so a stream can still be joined there. Carried across all
+frames, the B frames came out 10 to 30% smaller but the P frames 15%
+larger: they took over the statistics of the intra frame or of the
+finest B frames. So each frame carries on from the last frame of its
+own class: the P frames from the P frames, the B frames of each level
+(1 to 3, by the gap between their references) from their own level.
+BD-rate on PSNR-Y, 25 frames: -0.1 to -0.7% on the five clips, small
+because the intra frame, which starts fresh, is most of their bytes.
+
+The WebAssembly decoder keeps a pool of 64 contexts outside the heap it
+rewinds between decodes, so a sequence decoded through it keeps its
+speed (`newDecodeContext()` in nvdr.js; `SequenceDecoder.close()`
+gives them back).
+
+### The motion field: larger blocks, predicted in time (sequence v14)
+
+With everything else smaller, the motion field had become the largest
+part of a predicted frame: in the clean pan at q 24, 320 of a B frame's
+410 bytes and half of a P frame's, a quarter of the whole file. Each of
+a 960x540 frame's 2,040 units of 16x16 cost about a bit and a half,
+mostly the flag saying whether its vector was the one predicted from its
+neighbours, and the one unit in six that strayed paid for its vector in
+full.
+
+Two things cut it. Blocks of 32, halving to 16 where motions meet,
+quarter the units: -4.9, -4.9 and -6.5% on the clean pan, the clip with
+three objects and the noisy pan, against 16 halving to 8. Blocks of 64
+halving to 32 did better still on the pans (-5.3 and -7.0%) but lost
+2.3% on the objects, which need the finer motion. So 32 from 0.2 Mpx up;
+small pictures keep 8.
+
+And vectors are now predicted in time as well as in space. A frame
+decoded already has moved the same things: the frame after a B frame
+(for a P frame, the frame before) carries a field of its own, and a
+vector divided by the frames it spans is a velocity. Scaled by the
+frames between this frame and each of its references, the velocity of
+the cell in the same place predicts this frame's vectors there, as
+H.264's temporal direct mode does. A vector that is not its spatial
+prediction gets one more flag, "it is the temporal one", and then costs
+nothing more; the encoder offers the temporal vectors as candidates.
+With blocks of 16: -3.6% (noisy pan), -3.1% (clean pan), -1.7% (photo
+pan), -5.0% (still camera, noisy) and -8.1% (three objects); with
+blocks of 32, on top of them, -3.6, -5.7 and -3.8% on the three clips
+measured. Projecting each cell along its own motion to where its
+content lands in this frame, as AV1 does, came out the same on the
+whole: better on the objects, worse on the pans.
+
+Raising the weight of a field bit against block error helped the pans
+and hurt the objects (24: -2.9, -0.6 and -3.4%; 32: -3.5, +1.0 and
+-4.3%). With blocks of 32 and temporal prediction the objects no longer
+need it so low, and 24 gains on all five clips.
+
+Together, against the encoder before, BD-rate on PSNR-Y over 25 frames:
+
+                                           field weight 16   weight 24
+    noisy pan, one object                       -10.1%         -11.1%
+    clean pan, one object                        -8.6%          -9.3%
+    whole-pixel pan over a photo                 -1.4%          -1.8%
+    still camera, noisy                          -5.4%          -6.1%
+    three objects, light noise                  -10.3%         -10.3%
+
+The weight is now 24 with blocks of 32 and up; the regression gate's
+128x128 clip, on blocks of 8, lost 0.15 dB with it and keeps 16.
+
+### Compact frame headers (sequence v15)
+
+Set side by side with AV1's, frame by frame, the B frames of a clean pan
+were 250 to 700 bytes where AV1's are 5 to 100, and 56 of those bytes
+were headers: 20 for the frame, 4 for its field's length and 32 for its
+container's, which repeats in every frame the magic, the version and
+the size of the sequence. A frame now carries only what varies, in
+variable-length integers: its kind and flags in a byte, its block size,
+its display number as the change from the frame before it, its global
+vectors, its lengths, and of its container's header the flags, block
+sizes, steps, layer lengths, band and side information. The decoder
+puts the 32-byte header back before handing the container to the still
+decoder, which does not change. Headers go from 56 bytes to 15 to 20,
+pictures stay identical to the byte. On the clean pan the file comes
+out 0.9% smaller at q 12, 1.8% at q 24 and 4.2% at q 56, the gain
+growing as the frames shrink; the regression gate's 128x128 sequence,
+whose frames are tiny, 8.3%.
+
+### Direct units, predicted headers, HEVC's interpolation (sequence v16)
+
+Frame by frame against AV1, the B frames were still the gap. Counted
+in a clean pan at q 24, a B frame of the finest level was about 150
+bytes: 80 of field, 20 of headers, 15 of restoration and 35 of residual.
+Three changes, one format:
+
+**Direct units.** In a B frame, a unit both of whose lists have a
+temporal prediction (see the motion field, v14) first codes one flag:
+set, it takes both predictions, averaged, with no mode and no vector.
+Its context is the left and upper units' flags. In the clean pan 85 to
+90% of a B frame's units come out direct, and the field of the finest B
+frames halves, 155 bytes to 80. The encoder prices the flag by how often
+the units it has decided so far set it, which is what it will cost:
+priced like any other choice of mode and vectors the candidate lost to
+them and the clip came out 4% bigger. On the regression gate's 128x128
+sequence, with blocks of 8, direct units cost 0.13 to 0.2 dB for the
+same bytes: the smaller the unit, the less a flag saved is worth. The
+"same as predicted" flag's
+context also learnt whether the temporal prediction agrees with the
+spatial one, which is worth 0.4% alone.
+
+**Predicted headers.** A frame header now leaves out whatever is as the
+last frame of its class had it (intra, P, and B by the gap between its
+references, as the carried models are classed): block size, global
+vectors, the container's flags, block sizes, steps, band and grain. One
+bit in the frame's first byte says something changed, and a byte then
+says what. Layer 0's length is what the frame's length leaves. Every
+class starts unknown at each intra frame, as the models do. A B frame's
+headers go from about 21 bytes to 8, pictures identical to the byte:
+0.5 to 0.8% of the file over 25 frames, more over a longer group.
+
+**HEVC's interpolation.** Quarter pixels were H.264's: a 6-tap half
+pixel, and each quarter the rounded mean of two 8-bit samples. Now every
+one of the sixteen positions has HEVC's own 8-tap filter, across and
+then down with the sums kept unrounded between the two passes (see
+QUARTER-PIXEL MOTION in nvdrv.c). A quarter-pixel vector, the most
+common kind, no longer blurs nor rounds twice. On the clean pan at q 24
+the predicted frames came out 10% smaller and the clip 0.2 dB better;
+-5.6 to -6.5% BD-rate on the three clips, the largest of the three
+changes. Albums keep H.264's filter and their format.
+
+BD-rate on PSNR-Y over 25 frames, each against the one before:
+
+                                     clean pan   three objects   noisy pan
+    same-flag context                    -0.4%         -0.4%          -0.4%
+    + direct units                       -2.9%         -2.6%          -3.9%
+    + predicted headers                  -0.7%         -0.5%          -0.8%
+    + HEVC's interpolation               -6.3%         -5.6%          -6.5%
+    all four, against format 15         -10.0%         -8.9%         -11.1%
+
+Over the 48 frames of the clean pan at q 20, frame by frame against AV1
+at crf 54 (AV1's bytes counted per temporal unit): the 47 frames after the intra
+frame went from 31.3 KB at 35.62 dB to 23.2 KB at 35.85 dB, where AV1's
+are 18.5 KB at 36.09 dB. The P frames are now 61% of that: 2.4 KB each,
+the quality falling 0.3 dB from one to the next across the group.
+
+Things tried that did not pay: a transform type for INTER leaves too
+(the seven of intra leaves, chosen by error plus bits, with a context of
+their own) came out the same to 0.01%, the residuals of predicted frames
+at their steps being too small for the shape of the transform to matter;
+HEVC's interpolation in albums, whose residual is coded differently, was
+0.4% smaller for 0.07 dB less; a P frame predicted from the two
+anchors before it as well as the one (the older one sixteen frames off,
+blended per unit like a B frame's lists) was 0.7% bigger for 0.03 dB on
+the clean pan; and a larger weight on the vectors' bits in P frames
+(1.5x: -1.3% bytes for -0.06 dB) or B frames (1.5x: -1.0% for -0.04 dB)
+sits on the same curve.
+
+The steps between frame kinds, against this format on the three clips:
+P frames at 1.6 times the intra step instead of 1.4 were 0.4 to 0.9%
+smaller, and 1.8 gave it back, but the regression gate's 128x128
+sequence lost 0.34 dB for 1.1% fewer bytes at 1.6, so 1.4 stays; B
+levels closer together (each 1 + 0.3 x level times the P step instead
+of 1 + 0.5) were 1.1 to 2.5% bigger; refining the intra frame three
+times as hard for its reuse (`--tpl 3`) was 0 to 3.3% bigger; groups of
+16 instead of 8 went either way (+0.9, -2.2 and +1.4%).
+
+### More intra modes: every HEVC angle, AV1's smooth and filters (container v14)
+
+Measured as a still against libaom's (cpu-used 3, still picture), PSNR-Y
+on I420, the intra frame was 0.2 to 9.6% bigger on five photographs and
+35% on a small, smooth one (macarrão). To find what AV1 has that NVDR
+lacks, its tools were turned off one at a time, which is the cost of
+lacking each (BD-rate of libaom without the tool, against libaom whole):
+
+    tool off                      macarrão   clip frame   montanha
+    smooth modes                    +0.5%       +1.0%       +0.6%
+    Paeth                           -0.1%        0.0%        0.0%
+    chroma from luma                +0.6%       +0.1%        0.0%
+    recursive filter modes          -0.3%       +1.7%       +0.6%
+    fine angles (56, not 8)        +12.0%       +0.9%       +1.1%
+    edge filter                     +1.0%       +0.7%       +0.1%
+    all six together               +15.7%       +9.0%       +4.3%
+    rectangular partitions          +5.6%       +2.0%       +1.3%
+    64x64 blocks, 64 transforms     ~0           ~0          ~0
+    palette                          0            0           0
+
+The intra tools together are about the whole gap on the clip's frame,
+though no one of them is much, since each stands in for the others. Chroma
+is 8% of an intra frame's bits, so chroma from luma could not be worth
+more; neighbour contexts for the mode, tried on the leaves' modes, saved
+1% of the mode's bits.
+
+So a leaf now has 43 modes where it had 15 (see DIRECTIONAL PREDICTION
+in nvdr.c): all 33 of HEVC's angles with its inverse angles, AV1's three
+smooth modes with its weights, and AV1's five recursive filters, which
+predict 4x2 patches in raster order from the patch's corner, the four
+pixels above it and the two to its left, already predicted or not, with
+AV1's taps. The mode is the "flat or not" bit, then six bits down the
+tree. The encoder screens the 42 by the Hadamard sum and tries 9 in full
+instead of 5. Version 13 containers still decode: their fifteen modes
+are the same angles under other numbers.
+
+Against AV1 as a still, BD-rate on PSNR-Y:
+
+                          before    + 33 angles,   + smooth   + filters
+                                    9 tried
+    clip frame, clean      +9.6%       +8.9%         +7.9%       +5.9%
+    clip frame, noisy      +8.9%                                 +5.6%
+    montanha_pessoas       +6.7%       +6.1%         +6.2%       +5.7%
+    OIP-4140498144         +5.5%                                 +4.6%
+    OIP-3451121336         +0.2%                                 +0.0%
+    macarrão              +35.0%      +29.1%        +29.6%      +29.7%
+
+Encoding an intra frame takes 1.7 times as long; decoding is unchanged.
+Sequences are format 17 for it, their containers being version 14. Over
+25 frames, BD-rate on PSNR-Y against format 16: -2.4% on the clean pan,
+-1.7% on the three objects, -2.0% on the noisy pan.
+
+### Half nodes: rectangular leaves (container v15)
+
+After the modes, the next of AV1's tools by what lacking it costs was
+rectangular partitions: libaom without them was 2.0% bigger on the
+clip's frame, 1.3% on montanha and 5.6% on macarrão. In a directional
+picture (a sequence's frames, `--directional` stills) a whole node of 8
+to 32 that does not split in four may now be cut in two, across into
+n x n/2 leaves or down into n/2 x n, as AV1's PARTITION_HORZ and
+PARTITION_VERT; the halves are leaves (see HALF NODES in nvdr.c). It
+took a leaf that need not be square everywhere a leaf is:
+
+- **Prediction** over w x h: the row above and the column to the left
+  run on to w + h; the angles, planar (VVC's form, which is HEVC's for a
+  square), the smooth modes with a weight table per axis, and the
+  recursive filters all take any shape.
+- **Transform**: the h-point transform down, the w-point one across, for
+  any of the seven types up to 16. The integer matrices are 64 sqrt(N)
+  times orthonormal, so w x h needs 4096 sqrt(w h), which for halves is
+  4096 sqrt(2) min(w, h): the columns are scaled by 181/256 (sqrt(2)/2 to
+  0.01%) and the rows shifted by 6 + log2 min(w, h). The DC level moves
+  the leaf by the same factor.
+- **Coefficients** in a diagonal scan per shape, with the contexts as
+  before; the six halves share three model sets by area.
+- **Signalling**: after "split in four", a "cut in two" flag and a
+  "down" flag, by node size and tree.
+
+The z-order of 4x4 cells already gives every reference pixel the right
+answer, since the halves of a node cover its quadrants in decoding
+order. The encoder codes each whole node whole, cut across, cut down
+and split, and keeps the cheapest; versions 13 and 14 still decode.
+
+Against libaom as a still, BD-rate on PSNR-Y:
+
+                          v14 (modes)   v15 (halves)
+    clip frame, clean        +5.9%         +3.9%
+    clip frame, noisy        +5.6%         +3.7%
+    montanha_pessoas         +5.7%         +4.7%
+    OIP-4140498144           +4.6%         +4.5%
+    OIP-3451121336           +0.0%         +0.3%
+    macarrão                +29.7%        +22.9%
+
+Coding an intra frame takes twice as long again; decoding is unchanged.
+Trying the halves only at 8 and 16, where nearly all of them are chosen
+(a third to half of those nodes come out cut, a tenth at 32), saved 5% of
+the time and lost 2.3 points on macarrão. Sequences (format 18), over 25
+frames against format 17: -2.6% on the clean pan, -2.9% on the three
+objects, -2.4% on the noisy pan.
+
+### Deblocking levels (container v16)
+
+The deblocking filter (see "Deblocking") was tuned on the progressive
+pictures of format v10, and a directional picture's seams are not
+theirs: its predictions run across the leaves, RDOQ drops what it can,
+and restoration comes after it. Against libaom, turning it off made
+luma better on the clip's frame and on OIP-4140498144 (by 0.4 and 0.3
+points) and worse on macarrão (0.5), and colour cost macarrão and
+OIP-4140498144 6 to 8% less without it and the clip 0.7% more. Scoring only luma had hidden that; scored as AOM's
+test conditions also do, PSNR-YUV weighted 6:1:1, NVDR spends on colour
+what libaom does not and gets it back (its U and V are 4 to 26% cheaper
+than libaom's at equal PSNR).
+
+So a directional picture now says how hard to filter: a level for luma
+and one for colour, 0 to 15 in eighths of the thresholds, 8 being the
+filter as it was. They take byte 28 of the header, the band, which a
+directional picture always had at 0. The encoder decodes the picture
+anyway to fit restoration; in that decode it tries all sixteen levels on
+each tree's planes and keeps the one that leaves the least squared error
+against the source, before restoration is fitted to what it left.
+Luma's lands around 5 or 6; colour's anywhere from 0 (macarrão) to 14
+(the clip at q 40). Versions 13 to 15 still decode, at level 8.
+
+Against libaom as a still, BD-rate on PSNR-Y and on PSNR-YUV 6:1:1:
+
+                          v15 Y    v16 Y    v15 YUV   v16 YUV
+    clip frame, clean     +3.9%    +3.4%    -2.3%     -2.7%
+    clip frame, noisy     +3.7%    +3.1%    -1.1%     -1.5%
+    montanha_pessoas      +4.7%    +4.3%    +0.5%     -0.2%
+    OIP-4140498144        +4.5%    +4.2%    +2.1%     +0.3%
+    OIP-3451121336        +0.3%    -0.0%    -0.8%     -1.9%
+    macarrão             +22.9%   +22.7%   +14.7%    +11.7%
+
+Sequences (format 19) gain nothing from it: over 25 frames against
+format 18, +0.2% on the clean pan, -0.5% on the three objects, +0.1% on
+the noisy pan (PSNR-RGB +0.2%, -0.4%, +0.1%). Each frame's levels are
+the best for that frame, and a frame is also the next one's reference,
+which least error now does not account for; choosing only on intra
+frames and leaving predicted ones at 8 came out the same (+0.1%, -0.4%,
+-0.1%).
+
+A lower lambda had looked like a gain on PSNR-Y (0.09 instead of 0.12:
+macarrão +22.0%, the clip +3.2%), but it only moved bytes from colour
+to luma: PSNR-YUV did not change (+15.3% and -2.4%), nor the sequences'
+PSNR-RGB. It stays at 0.12.
+
+### P frames from two anchors (sequence v20)
+
+A P frame sees one anchor, eight frames back with the default B frames.
+Sequence format 20 adds a fourth frame kind, PRED2, that sees two: that
+anchor and the one before it, per unit either or the mean of both, with
+the B frames' field, modes and direct units. This is multihypothesis
+prediction from more than one reference frame (Flierl, Wiegand and
+Girod, "Rate-constrained multihypothesis prediction for
+motion-compensated video compression", IEEE Trans. CSVT, 2002), which
+H.264 and AV1 also do with their lists of references. The mean of two
+predictions halves the noise either carries, and the older anchor still
+shows what the newer one had covered.
+
+Both sides now hold, besides the frames still to be shown, the two
+latest anchors. The second reference is the frame held just before the
+first, and never across an intra frame, so a stream can still be joined
+at any of them.
+
+Coding every P frame as PRED2 lost: +0.6% on the clean pan and +0.4% on
+the noisy one, against -0.4% on the clip with three objects (BD-rate on
+PSNR-Y, 25 frames, `--fast`). Half or more of the units took the mean,
+which saved less residual than the second list of vectors cost. So the
+encoder codes each P frame both ways and keeps the one cheaper in
+squared error plus lambda times bits, the lambda the still coder weighs
+its own choices with:
+
+                    PSNR-Y    PSNR-RGB
+    clean           0.0%      -0.1%
+    noisy           0.0%       0.0%
+    multi          -0.5%      -0.8%
+    long (49)      -0.2%      -0.5%
+
+It costs 6.5% more encoding time (the P frames, an eighth of the frames,
+coded twice) and nothing to decode; `--refs 1` codes P frames as before,
+byte for byte. The JS decoder reads PRED2 and matches the C pixels,
+whole and cut. A P frame's references are far apart with seven B frames
+between anchors, which is where the gain stays small.
+
+Without B frames (`--bframes 0`, every frame a P frame, as a live or
+low-delay stream codes) the two references are one and two frames back,
+every frame but the first two can use them, and the gain is the one the
+literature reports:
+
+                    PSNR-Y    PSNR-RGB   encoding time
+    clean          -2.0%      -2.3%      +58%
+    noisy          -4.7%      -4.8%      +63%
+    multi          -5.8%      -5.0%      +56%
+
+(25 frames, `--fast`, against `--refs 1`.) The noisy clip gains most of
+the pans: there the mean of two neighbouring frames is a mean over two
+draws of the noise, which with B frames the anchors' temporal filter had
+already taken.
+
+### Against the state of the art
+
+WebCodecs' encoders are real-time encoders, and beating them says
+little. `scripts/bench_video_offline.mjs` runs the best encoders there
+are through ffmpeg, at slow settings, with the same GOP of 48 and PSNR
+tuning where there is one: libaom's AV1 (cpu-used 3), x265 (slow), x264
+(veryslow) and libvpx's VP9 (good, cpu-used 1). Same frames in and out
+as I420, same scoring. BD-rate on PSNR-Y, positive meaning NVDRV needs
+that much more:
+
+    48 frames, 960x540          AV1 libaom    HEVC x265   H.264 x264   VP9 libvpx
+    clean, B frames (fmt 7)       +143.6%       +73.3%      +25.0%       +56.5%
+    clean, + model (fmt 8)        +128.5%       +54.6%      +12.1%       +42.1%
+    noisy, B frames (fmt 7)       +288.1%       +93.1%      +40.4%       +55.4%
+    noisy, + model (fmt 8)        +255.1%       +69.4%      +23.9%       +38.3%
+    clean, + look-ahead, RDOQ,
+      contexts, directional       +102.6%       +37.3%       +0.1%
+    noisy, the same               +216.0%       +50.0%       +9.8%
+    clean, + variable blocks,
+      intra in P and B (fmt 10)    +99.4%       +36.7%       -0.3%
+    noisy, the same               +217.1%       +50.6%      +10.4%
+    clean, + temporal filter       +99.2%       +36.8%       -0.4%
+    noisy, the same               +118.2%       +18.6%      -13.1%
+    clean, + overlapped blocks     +93.8%       +33.2%       -3.0%
+      (fmt 11)
+    noisy, the same               +111.5%       +14.9%      -15.7%
+    clean, + adaptive transforms,
+      restoration, adaptive rate,
+      carried models                +74.3%       +17.4%      -14.1%
+    noisy, the same                +86.8%        -1.2%      -27.2%
+    clean, + field of 32 blocks
+      predicted in time (seq v14)   +52.2%        +1.5%      -25.7%
+    noisy, the same                +58.6%       -16.6%      -38.6%
+    clean, + direct units,
+      predicted headers, HEVC's
+      interpolation (seq v16)       +28.0%       -15.3%      -37.7%
+    noisy, the same                +31.1%       -32.3%      -49.9%
+    clean, + 43 intra modes,
+      half nodes (seq v18)          +21.3%       -19.2%      -40.7%
+    noisy, the same                +24.6%       -35.1%      -52.0%
+    clean, + deblocking levels,
+      wider filter on clean clips
+      (seq v19)                     +18.6%       -20.6%      -41.9%
+    noisy, the same                +24.8%       -35.2%      -52.0%
+
+That is the honest position now: half the bytes of x264 at its slowest
+on the noisy clip, a fifth to a third fewer than x265, and AV1 still
+needing about five sixths of NVDRV's bytes. In the clean clip at q 20
+the intra frame is 63% of the file, 39 KB where AV1's is 34 KB at 0.9 dB
+less; the 47 frames after it average 495 bytes against AV1's 393, at
+0.24 dB less.
+
+### A target rate, and sound
+
+`--kbps N` aims at an average bitrate instead of a quantiser step. It is
+the same step for the whole sequence, which is constant quality with the
+bytes going where the pictures need them, chosen so that the file comes
+to that rate: two probes on a sample of the stretches (every second
+GOP, coded with `--fast`) give the step a trial and, when they are far
+enough apart, the slope of bytes against it; then the sequence is coded
+once, and again only if it missed by more than 6%. A probe averages
+intra and predicted frames apart and scales each to how many the
+sequence has: intra frames are four fifths of the bytes, and the first
+stretch holds two, which made a plain average 40% too high. On 48
+frames of the long clip, targets of 150, 300 and 600 kbit/s came to
+147, 290 and 597 in one pass, in twice the time of a fixed step. It is
+an average and not a ceiling: nothing limits a busy second.
+
+A sequence can carry sound (SOUND in nvdrv.h): somebody else's codec,
+whole, after the last frame, behind a byte no frame header starts with,
+so a decoder stops there. `nvdrv_encode --audio file` adds it; the
+server cuts the upload's sound to the frames coded (Opus in WebM, 64
+kbit/s, with ffmpeg) and the page plays it through the browser, pulling
+it back whenever it is a tenth of a second from the frame shown. It is
+the last thing in the file: a file cut short has its frames and plays
+silent.
+
+### Albums and the fluid context
+
+The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
+across files. It was never measured cold against warm, and v10 has no
+palette for it to feed. What an image codec actually learns from one
+image and could reuse in the next is its adaptive models: how often a
+leaf of each size carries texture, how its coefficients fall. Every
+container starts those at even odds.
+
+`NvdrContext` carries them. `nvdr_encode_mem_ctx` and
+`nvdr_decode_mem_ctx` start from the models the last container left and
+leave theirs behind. A context is only valid after a container decoded
+whole, and an empty one behaves exactly like none. Measured cold against
+warm:
+
+    six samples in a row               -0.67%   (-1.5% on the best image)
+    same at q 48                       -0.82%
+    eight frames of the clean clip     -0.52%
+    predicted frames of a sequence     ~0: +4% bytes and +0.2 dB, which
+                                       sit on the same rate-quality curve
+
+The gain is small because the models adapt within a few dozen symbols,
+so learning from even odds costs an image of thousands of symbols little.
+Sequences do not use it. The large win between images is in their
+content, not in their statistics: a photo that repeats most of an
+earlier one could be predicted from it the way a video frame is.
+
+`.nvda` is the album: many images in one file (`src/nvda.h`, format 3).
+Each image is coded one of two ways:
+
+- **on its own**, as a v11 container;
+- **predicted from an earlier image** of the same size, up to `window`
+  places back (8 by default, at most 32). This uses the machinery of a
+  sequence's predicted frames, exposed as `nvdrv_predict_encode` /
+  `nvdrv_predict_decode`: block motion in quarter pixels with the 6-tap
+  filter, the residual as a container with colours predicted as 128 and
+  blocks that need nothing left alone.
+
+The encoder ranks the earlier photos in the window by how much their
+eighth-size grey thumbnails differ (with a shift of up to 2 thumbnail
+pixels, for a pan), and codes a prediction from the best two. It
+compares at equal quality: the prediction is coded with a finer step,
+up to 2.4 times finer, until its squared error is within 0.1 dB of the
+image coded alone, and is kept only if it is still smaller. At the same
+step the prediction always won on bytes and lost about 1 dB, which is
+not a comparison. On photos of the clean clip:
+
+    album                                     alone      album
+    six photos 0.4 s apart (pan + zoom)      168367 B   103338 B   -38.6%
+    six photos 0.12 s apart (a burst)        169584 B    71702 B   -57.7%
+    two scenes interleaved, window 8                              -65.7%
+    the same, window 1 (only the one before)                       0%
+    the six unrelated samples                                       0%
+
+Referring to any earlier photo is what makes the interleaved album work:
+a shoot that goes back and forth between two subjects never has the
+similar photo right before. Unrelated photos are never predicted, so an
+album is never bigger than its images coded alone.
+
+#### One photo at a time, on a web page
+
+An album on a site is not read front to back. A page shows one photo,
+or a grid, and each photo has to come out as cheaply as a JPEG would.
+So the file starts with an index, 16 bytes per image: where its payload
+is, how long it is, its size, and which earlier image it was predicted
+from. A reader that wants photo 10 reads the header and the index,
+follows the references (10 from 8, 8 from 6, ...) down to a photo coded
+alone, and fetches those payloads and nothing else, with HTTP range
+requests. `nvda_decode` does the same in C with the bytes it has, holding
+at most `window` decoded images.
+
+The fluid context works against that: it makes every photo depend on
+all the ones before it. It was worth 0.7%, but since container 13 a
+model carries the count that sets how fast it adapts, a carried model
+arrives at the slowest rate, and on the samples it now costs 0.0 to 1.1%
+(q 24 to 96; keeping the odds and restarting the count, -0.3 to +0.5%,
+was not worth a format change). It is off unless `pack` is given
+`--fluid`; a fluid album still decodes, only in order.
+
+The window only reaches back so far, so the order photos are given in
+matters: eight frames from each of three 960x540 clips, shuffled, came
+to 310 KB. `pack --reorder` stores them nearest-first by thumbnail
+distance instead (from the first photo, always the closest one left),
+and the same 24 came to 272 KB, less than in the order of their names,
+grouped by clip (289 KB). The names keep the photos apart, so only the
+order they are listed in changes. Keeping a display order apart from
+the storage order, and predicting between photos of different sizes
+(today a crop or a portrait among landscapes is never a reference),
+are not built.
+
+`public/nvdr-img.js` is the piece a site uses, an element in place of
+`<img>`:
+
+    <script type="module" src="nvdr-img.js"></script>
+    <nvdr-img src="foto.nvdr" alt="..."></nvdr-img>
+    <nvdr-img src="galeria.nvda#3" alt="..."></nvdr-img>
+
+A single `.nvdr` is painted while it downloads, since every prefix of
+the file is a picture: flat colour, then coarse texture over the whole
+image, then detail. An album photo is fetched by ranges as above.
+Elements showing photos of the same album share what they fetched, so a
+grid of the whole demo album downloads 67.1 KB, the album's size, where
+eight independent fetches of each chain came to 198 KB. A server that
+ignores ranges sends the whole file, which still works. `server.js`
+answers ranges; any static host (nginx, a CDN, S3) does too.
+`public/galeria.html` is a page built that way, and `make demo` makes
+its files.
+
+#### Off the page's thread
+
+A 13.5 Mpx photo takes 2.6 s to decode in JS, and on the main thread
+that is 2.6 s of a page that neither scrolls nor answers a click. The
+decoding now runs in module workers. `nvdr-tasks.js` holds the work
+(decode a container or a prefix of it, open an album, decode one of its
+photos, fetch one from a server by ranges); `nvdr-worker.js` runs it;
+`nvdr-decoder.js` is the page's side, a promise per task and a few
+workers, with a key always sent to the same one so what it keeps (a
+container put once and cut at every slider position, an open album, the
+ranges fetched from an album URL) is there next time. Pixels come back
+transferred, not copied, and already averaged down to the size the
+canvas is shown at, so the page does not shrink tens of megapixels on
+its own thread either; the full picture comes too, for redrawing when
+the page is resized. A browser that cannot start a module worker gets
+the same results on the main thread: what was waiting, and what had
+been put, is replayed there.
+
+Measured as the longest stretch the page could not respond (Chromium's
+long tasks), on the 13.5 Mpx photo:
+
+                                   main thread   workers
+    opening it                       3961 ms      154 ms
+    moving the truncation slider     3007 ms        none
+
+While a download streams, `<nvdr-img>` has the worker decode the longest
+prefix that has arrived each time it is free, instead of queueing every
+prefix: the demo's hero goes through 22 pictures on its way in, with no
+long task. The slider likewise decodes only its latest position. The
+video tab still decodes on the main thread: its frames take about 30 ms,
+and the time it reports is meant to be the cost of playing the file
+there.
+
+`nvdr_album pack` and `unpack` make and open an album. `pack` prints, per
+image, whether it was predicted and from which, its bytes, and what it
+would cost alone; `unpack --only N` decodes one photo by its chain. On
+the page, dropping several images at once sends them to `/album` and
+shows the result; a `.nvda` file opens directly. The JS side
+(`public/nvda.js`) mirrors both kinds, and `scripts/crosscheck_album.mjs`
+holds it to the C pixels on every image, whole, cut, and one photo read
+alone. The regression gate packs the photographs, where an album must
+not be bigger, and the 12-frame sequence as a burst, where every image
+after the first must be predicted. The fuzzer mutates an album's header
+and index as well as its payloads, and reads its last photo alone.
+
+### Sharing as a PNG
+
+`nvdr_png` dresses an NVDR image, album or video as a PNG, so it can go
+where only common formats go and still open as itself:
+
+    ./nvdr_png foto.nvdr foto.png [--budget 1] [--preview 640] [--colours 256] [--dither 75]
+    ./nvdr_png --extract foto.png foto.nvdr
+
+Any viewer shows the PNG's picture: a preview decoded from the file (an
+album's first photo, a video's first frame). It is as large as it can be,
+up to 640 pixels on its longer side, while its picture data costs no more
+than the NVDR file itself (`--budget 1`, found by bisection on the size),
+so the PNG is about twice the file. Its 256 colours come from median cut
+(Heckbert, "Color image quantization for frame buffer display", SIGGRAPH
+1982) refined by five rounds of k-means, and pixels take them through
+Floyd-Steinberg error diffusion (Floyd and Steinberg, "An adaptive
+algorithm for spatial grey scale", Proc. SID, 1976) at 75% of the error,
+serpentine, so skin and sky show grain instead of bands. The NVDR file
+rides along untouched in a private ancillary chunk, `nvDr`,
+which PNG readers skip by rule (lower-case first letter: ancillary;
+second: private; fourth: safe to copy). It comes right after IHDR, so its
+data starts at byte 41 and a page streaming the PNG decodes the NVDR in it
+as it arrives.
+
+On the six samples, directional with `--fast`, against the first version
+(320 pixels always, median cut alone, no dithering):
+
+                     NVDR      PNG, first version     PNG now
+    q 24             138 KB    365 KB (2.65x)         278 KB (2.02x)
+    q 12             222 KB    456 KB (2.06x)         444 KB (2.00x)
+
+The preview follows the file: 128 to 280 pixels at q 24, 154 to 384 at
+q 12 (montanha_pessoas, 75.8 KB of NVDR, gets 384). Each change on its
+own, at q 24 and 320 pixels: k-means 0.35 dB better and 1% smaller;
+dithering at 75% 0.4 dB worse pixel by pixel but 0.8 dB better once
+blurred as an eye at a normal distance does, for 9% more bytes; 64 or
+128 colours dithered lose 1.1 to 2.7 dB blurred; full colour costs 2.7
+times the palette. 128 pixels is the floor, which the smallest files
+cross: macarrao at q 24 is 3.7 KB of NVDR in an 8.9 KB PNG.
+
+The page opens such a PNG wherever it opens the file inside (an image or
+an album on the image tab, a video on the video tab, either tab passing
+it to the other), offers "Baixar como PNG" next to each result (through
+the server's `/png`, which runs `nvdr_png`; served as plain files, the
+page makes the same kind of PNG itself, deflated by the browser's
+CompressionStream), and `<nvdr-img
+src="foto.png">` shows one, `#n` picking a photo of an album in it.
+`public/nvdr-png.js` reads and writes the layout.
+
+Services that recompress what they are sent, which is most social
+networks and chat apps, drop ancillary chunks, and what arrives is the
+preview alone. E-mail, file hosting, and anything that passes a file as a
+file keep it whole.
+
+### A whole folder
+
+`nvdr_batch <folder> [out-folder]` codes every image in a folder (JPEG,
+PNG, BMP, TGA, GIF, PPM; not a PNG already carrying an NVDR file) into
+out-folder, `<folder>/nvdr` unless given, and with `-r` the folders
+under it too, in the same tree. It codes directionally (`--progressive`
+for the layered mode), takes `--q`, `--fast`, `--grain` and `--chroma`
+as `nvdr_encode` does, and writes `.nvdr` files, the PNGs that carry
+them (`--as png`), or both. Two images whose names differ only by
+extension keep it (`foto.jpg.nvdr`).
+
+It codes one image per core at once. The still coder's scratch buffers
+are per thread and its tables are built once under a lock, so the
+output is byte for byte what one image at a time gives, and what
+`nvdr_encode --directional` gives for each: checked on a folder of
+eight, nested, both ways. On four cores it ran 2.8 times faster.
+
+A run can stop and start again: an image whose output is newer is
+skipped (`--force` codes it anyway), and each file is written under a
+temporary name and renamed when whole. It reports a line per image as
+each finishes, which the page reads: its "Pasta inteira" panel takes a
+folder's path on the machine serving the page, uses the image tab's
+options, and shows a progress bar with the time left, and a button that
+stops the run. The server's `/batch` answers only requests from that
+machine, since it reads and writes its folders.
+
+Small, heavily compressed web JPEGs can come out bigger at q 24, which
+keeps more than they had; a camera's photos come out a fraction of
+their size.
+
+### Frequency bands (format v11)
+
+Texture used to travel as one layer, tile by tile from the top. Half of
+montanha_pessoas therefore showed its top half sharp and its bottom half
+flat: 24.1 dB, where v9, which spread its refinement over the whole
+picture, gave 25.8. Texture now travels in two layers, the way
+progressive JPEG's spectral selection does. The low frequencies of every
+leaf come first, the rest after. A position in an n x n leaf is low when
+u + v <= max(1, n * band / 32). `band` is in the header, 8 by default,
+and 0 keeps all texture in one layer.
+
+Swept over the six samples:
+
+    band    bytes     PSNR, whole file   PSNR, first half of the file
+      0    172044        34.40 dB           22.64 dB
+      4    170849        34.32 dB           24.18 dB
+      8    170330        34.28 dB           25.06 dB
+     16    170525        34.27 dB           24.39 dB
+
+montanha_pessoas cut at 30%, 50% and 75% goes from 22.2, 24.1 and
+27.2 dB to 24.6, 26.5 and 28.8. The files come out about 1% smaller,
+because the high band gets adaptive models of its own. The tiny
+synthetic probes grow by the extra layer's fixed cost: `blocos` by 14
+bytes.
+
+Each band's inverse transform is rounded on its own. Clamping between
+them lost 0.4 to 0.8 dB wherever the low band overshot 0 or 255 and the
+high band could no longer pull it back. So the texture accumulates in a
+16-bit plane and is clamped only when shown: `full = clamp(flat + low +
+high)`.
+
+Sequences keep `band` 0. Nobody watches a video frame arrive, and the
+split costs bytes.
+
+### Deblocking
+
+Each leaf is quantised on its own, so where two leaves meet there is a
+small step, and the eye finds a grid of small steps long before PSNR
+does. With header flag `NVDR_FLAG_DEBLOCK` (on by default,
+`--no-deblock` to leave it off), the decoder filters every leaf edge the
+way H.264's normal filter does. A step smaller than alpha, with flat
+enough pixels either side, is taken for quantisation and pulled together
+by at most tc. Anything larger is a real edge and is left alone. alpha,
+beta and tc are 20/16, 6/16 and 3/16 of the step. Swept on the six
+samples, that gives +0.24 dB at q 24 and +0.28 at q 48; twice as strong
+starts to cost.
+
+Only edges with texture on at least one side are filtered. Between two
+flat leaves the step is their two colours, and a colour's quantisation
+error in pixels is step / n, a fraction of a level for any leaf larger
+than 4. Filtering those edges anyway cost the `blocos` probe 6.7 dB, and
+skipping them costs the photographs nothing.
+
+In a sequence the filter runs on every frame, whose decoded picture is
+the next frame's reference: a predicted frame has been a picture against
+its motion-compensated base since format 10, not a residual.
+
+At the defaults, per sample: +0.14 to +0.47 dB at the same bytes. A
+directional picture chooses how hard since container 16 (see
+"Deblocking levels").
+
+## The decomposition
+
+    ANCHOR = quantize_coarse(L)
+    R1     = quantize_mid  (L - dequant(ANCHOR))
+    R2     = quantize_fine (L - dequant(ANCHOR) - dequant(R1))
+
+In the spec, `L` is a 64x64x4 diffusion latent: a grid of fixed shape, so
+the three layers differ only in quantisation precision.
+
+An image has no fixed grid, and the first version of this code found that
+out the hard way. It held the leaf set constant and let the residuals
+correct colour, faithfully mirroring the spec — and PSNR climbed from
+23.3 dB to 26.3 dB and stopped, because 26.3 dB was never a colour limit.
+It was the geometry. The stack was polishing the axis that was already
+nearly solved.
+
+So here a level is a **tolerance**. Level 0 prunes the tree wherever a
+region is flat enough for a coarse tolerance; each further level lowers the
+tolerance, and leaves that no longer qualify split into their subtrees.
+Every rectangle at level k carries one signed delta against the colour that
+level k-1 displayed at that spot — so a rectangle that just split gets its
+colour, and a rectangle that stayed gets a correction, through the same
+mechanism. Geometric and colour refinement become one operation, and the
+residual is a parent-to-child delta, which is where the low entropy the
+spec counts on actually lives.
+
+## The guarantee
+
+Every prefix of the container past the anchor decodes. The decoder reads
+the header, takes whichever residual streams are fully present, and renders
+from those — it never waits for a layer and never fails on a partial one.
+Truncate the file anywhere and it still produces a picture at the quality
+the surviving bytes pay for.
+
+Each level is entropy-coded on its own rather than the container being
+compressed as a whole. That is what lets both properties hold at once: a
+prefix of a single compressed stream does not decode, so one stream across
+all three levels would buy a smaller file by destroying the only thing this
+format is for. Per level, the bytes on disk are the bytes on the wire and
+every prefix still ends on a boundary that decodes.
+
+## Delivering a level in pieces
+
+A level used to be one stream: every split bit, then three planes of
+residual. That made a truncated level worthless — a prefix gave the red
+channel and no green or blue — so the decoder threw it away and the
+truncation curve was a staircase. Holding 80% of the file bought exactly
+what holding 40% did.
+
+A level is now a sequence of independent **units**, one per rectangle of
+the level before, each carrying its own split bits followed by its own
+rectangles' residuals interleaved across channels. A prefix is a whole
+number of finished refinements; the units that never arrived keep the
+rectangle and colour they had at the previous level. Units are emitted
+largest-rectangle-first, an order both sides derive by sorting what they
+already have, so nothing about it is transmitted.
+
+    cut     before    after
+    10%     19.55     21.79
+    20%     19.55     23.07
+    30%     19.55     24.45
+    50%     25.15     25.62
+    75%     25.15     26.01
+    90%     25.15     26.13
+    100%    26.22     26.22
+
+Interleaving the residuals by rectangle costs nothing: measured at exactly
+88,486 bytes either way. That is only true because the entropy layer moved
+off deflate first — deflate leaned on runs of similar bytes, which the
+planar layout provided and interleaving would have destroyed, while the
+arithmetic coder's contexts are explicit and indifferent to grouping.
+
+Largest-first ordering costs 160 bytes, 0.18%, from slightly worse
+adaptation locality, and is worth up to +1.67 dB over tree order in the
+first tenth of the stream. Against an oracle that orders units by actual
+error reduction per byte — which cannot be shipped, since the decoder has
+no way to know the error — area ordering captures 65% to 82% of the gain.
+
+## Colour
+
+Residuals run in BT.601 YCbCr, with the two chroma channels quantised
+`--chroma` times coarser than luma. The transform is fixed-point integer
+on both sides, because encoder and decoder have to land on the same byte
+and a float would be a portability bug waiting to happen. The
+reconstruction is carried in YCbCr rather than re-derived from RGB at each
+level: that round trip is lossy by a few units, and re-deriving would let
+the drift accumulate.
+
+Against RGB residuals on `samples/`, at the default tolerances:
+
+    image                  source     RGB          YCbCr
+    OIP-1304511485.jpg       24K   18.5K 22.62   13.3K 22.49   -28%
+    OIP-3451121336.jpg       57K   55.5K 21.74   37.4K 21.60   -33%
+    OIP-3786546191.jpg       48K   55.4K 24.04   36.3K 23.80   -34%
+    OIP-4140498144.jpg       36K   45.1K 24.67   27.1K 24.43   -40%
+    macarrao.jpg             13K   16.3K 29.14   10.0K 28.86   -39%
+    montanha_pessoas.jpg    133K   86.6K 26.22   48.9K 25.90   -44%
+
+Held to the same size instead of the same settings, YCbCr is +1.03 dB;
+held to the same PSNR, it is 19% smaller. Note that most of this arrives
+before any chroma coarsening: the plain transform at `--chroma 1` already
+saves 30%, because R, G and B move together and coding them separately
+pays for the same information three times. The cross-plane context was
+worth 3.4% recovering exactly that redundancy after the fact — removing it
+at the source is worth ten times more.
+
+PSNR understates the case here. It weights the three channels equally
+while the eye does not, so chroma coarsening costs more on the meter than
+on screen. Measured by eye on the saturated regions, `--chroma 1` and `2`
+are indistinguishable, `3` puts a faint magenta cast in the sky, and `6`
+speckles colour across the backpack. The default is 2; `--chroma 0` drops
+the transform and codes RGB, for comparison.
+
+## The entropy coder
+
+Levels are coded with an adaptive binary arithmetic coder (the LZMA range
+coder) rather than deflate. Deflate models repetition; what the residual
+planes hold is a distribution concentrated near zero, and deflate cannot
+spend a fraction of a bit on a symbol it has no probability for.
+
+The context model is derived on both sides from data already in the
+stream, so nothing about it is transmitted — unlike spec §7, which budgets
+2-6 MB for a shipped `context_model`. Three conditionings carry it:
+
+- **Split flags** on the bucketed area of the rectangle they decide. A
+  half-canvas block and a 2x2 tile have very different odds of splitting.
+- **Residuals** on whether the parent rectangle subdivided. A rectangle
+  that just split carries a genuinely new colour and a large delta; one
+  that stayed carries a small correction to a colour already close.
+- **Residuals** again on the magnitude of the co-located residual in the
+  previous colour plane. A rectangle needing a large correction needs it
+  in all three channels, and that is about *this* rectangle rather than
+  about which regime it belongs to, so it survives the context above.
+
+Ablated on `montanha_pessoas.jpg`, total container bytes:
+
+    deflate                        116,260
+    arithmetic, no contexts         99,637   -14.3%
+    + residual split context        97,053    -2.6%
+    + split-flag area context       93,970    -5.7%
+    + cross-plane neighbour         87,060    -7.3%
+    + k-means palette (below)       86,039    -1.2%
+                                             -26.0% against deflate
+
+Two predictions that led here were wrong, and the measurements are the
+only reason that is known. The area context on split flags is worth more
+than twice the residual context that motivated the entropy work. And the
+neighbour conditioning was first tried on the *in-plane* predecessor,
+since depth-first order keeps image neighbours close in the stream: that
+was worth 0.04%, because whatever it predicts the split context already
+said. The same idea across colour planes is worth two orders of magnitude
+more.
+
+Output is bit-identical across codecs, verified by decoding both
+containers at all three levels and comparing every byte, in C and again
+in JavaScript against the C output.
+
+## Where detail goes
+
+The subdivision gate used to measure deviation against a constant 255,
+making it a test of absolute difference. The eye does not work that way:
+an error of 7 on a pixel of value 16 is obvious, the same error on a pixel
+of value 240 is invisible. The consequence was measurable and someone
+spotted it by eye first — large dark regions collapsing into single
+rectangles.
+
+Leaf size by source luminance on `montanha_pessoas.jpg`, before:
+
+    luminance    leaves   px per leaf   source's own deviation
+      0-31         4563       9.5            16.3
+     32-63         9322       6.5            33.8
+     64-95        12954       6.3            37.8
+    224-255         709      54.8             3.1
+
+Shadows were getting leaves 50% coarser than mid-tones despite carrying
+comparable detail. The deviation is now divided by
+`255 * (luma + weber) / (pivot + weber)`, where `pivot` is the image's own
+mean luminance — pivoting on a constant instead would tighten every dark
+image and loosen every bright one, which is a quality setting wearing a
+reallocation costume, and cost macarrao.jpg 1.35 dB when tried.
+
+After, at `--weber 64`: shadows drop to 7.1 px per leaf, mid-tones stay at
+6.1, and the sky coarsens from 54.8 to 79.1 — the bits move from a region
+whose source deviation is 3.1 to one whose deviation is 16.3. Across
+`samples/` it costs 0.4% to 6.9% more bytes at PSNR within 0.07 dB.
+
+PSNR cannot see this improvement, by construction: it is an absolute-error
+metric, and absolute error is exactly the thing the old gate was already
+optimising. `--weber 1e9` restores the previous behaviour for comparison.
+
+## Spending less on fine grain
+
+Deviation says a region is not uniform. It does not say whether
+subdividing would help. Distant grass varies as much inside a 4x4 window
+as it does across the whole patch, so splitting reproduces noise nobody
+could pick out; a face varies across the region and barely within a
+window, so splitting is what resolves it. The ratio between the two — the
+region's grain — comes from a 4x4 deviation map summed into an integral
+image once per encode, so any region's is an O(1) query.
+
+`--texture F` raises a region's minimum tile by `1 + F * grain`, which
+spends grain at a coarser resolution and leaves structure at the full one.
+At matched bytes on `montanha_pessoas.jpg` against plain tolerance
+loosening, it moves 40% of the rectangles out of the highest-grain band
+and into smooth and structured regions:
+
+    band (source 8x8 deviation)   tolerance only      --texture 1
+    smooth  <10                    95 @ 591.7 px     486 @ 109.4 px
+    10-25                         561 @ 123.2 px    3473 @  19.6 px
+    25-45                        2937 @  44.3 px    6898 @  17.0 px
+    45-70                        7049 @  12.7 px    5588 @  17.1 px
+    grain   >70                  6921 @   7.0 px    4157 @  14.1 px
+
+**It is a rate control, not a free improvement.** Capping how fine
+anything can get also caps quality: with it on, tightening the tolerance
+saturates at 23.9 dB and cannot reach the 26.2 dB the default hits. The
+crossover, measured:
+
+    budget      tolerance only      --texture
+    <= 60 KB   58.0 KB / 24.89 dB   36.7 KB / 23.87 dB    tolerance wins
+    <= 40 KB   31.0 KB / 20.64 dB   36.7 KB / 23.87 dB    +3.2 dB
+    <= 25 KB   14.8 KB / 19.33 dB   23.6 KB / 23.11 dB    +3.8 dB
+    <= 15 KB   14.8 KB / 19.33 dB    7.0 KB / 19.61 dB    half the bytes
+
+So it is off by default and is the right mechanism below roughly half the
+default rate.
+
+Two formulations failed before this one, both because they measured grain
+by splitting a node and watching its children's deviation drop, which is
+confounded with scale. Scaling the threshold by that drop only bit the
+middle of the range and left the highest-grain band untouched at 6.1 px
+per leaf. A hard floor on the drop pruned the root — the drop is small at
+the top of the tree whatever the content — and collapsed the image to one
+rectangle. The fixed 4x4 window is what removes the confound, and raising
+the minimum tile rather than the threshold is what actually stops a
+descent that a multiplier never could.
+
+## Ramps
+
+Every rectangle used to be a flat fill, and that is what set the format's
+ceiling. On montanha_pessoas the flat encoder stops at roughly 26 dB and
+stays there: tightening the tolerance to 0.050/0.020/0.004 and the step to
+8/2 buys 79 KB of container and 26.25 dB, against 50 KB and 25.90 dB at the
+defaults. More bytes do not help, because the thing being approximated is a
+gradient and a flat rectangle cannot represent one at any size. The only
+way out was to subdivide until each piece was small enough that its slope
+did not matter, which is expensive in exactly the regions — sky, skin,
+out-of-focus background — that ought to be cheap.
+
+So a rectangle may now carry a one-axis colour ramp instead: a flag, an
+axis bit, and one slope per channel, giving the total edge-to-edge change
+in the chain's colour space. The DC stays the region mean the residual
+already paid for, because the ramp has zero mean by construction, so the
+two never compete for the same bits.
+
+It is optional per rectangle, decided by rate-distortion. The encoder fits
+both axes by least squares, re-evaluates each with the exact integer ramp
+the renderer will use, and keeps the ramp only when the squared error it
+removes beats `--gradient` times the bits it costs. A ramp that quantises
+to all zeros costs four bits and buys nothing, so the comparison rejects it
+on its own. **This version never loses to the flat one**: the flat fill is
+always on the table and wins whenever it should.
+
+Rate-matched against the flat encoder — tolerance tuned so the containers
+come out the same size — across `samples/`:
+
+    image                    flat              ramp
+    OIP-1304511485.jpg   13640 B  22.49 dB  15711 B  23.57 dB
+    OIP-3451121336.jpg   38310 B  21.60 dB  38605 B  22.33 dB
+    OIP-3786546191.jpg   37209 B  23.80 dB  37162 B  23.87 dB
+    OIP-4140498144.jpg   27748 B  24.43 dB  27691 B  25.44 dB
+    macarrao.jpg         10215 B  28.86 dB  10343 B  29.43 dB
+    montanha_pessoas.jpg 50030 B  25.90 dB  50397 B  26.80 dB
+
++0.07 to +1.08 dB at matched rate, and it arrives with a third fewer
+rectangles, so there are fewer seams for the blend to clean up afterwards.
+
+The slope step is deliberately coarse — 16, where the residuals run at 16
+and 4. A slope is coded roughly unary, so its cost grows with its
+magnitude, and a fine step prices the large ramps out of the
+rate-distortion test. Those are precisely the ramps worth having. Swept at
+matched rate on montanha_pessoas:
+
+    step  lambda    bytes     PSNR
+       1     150    56603    26.61 dB
+       2     160    56051    26.59 dB
+       6     200    56265    26.67 dB
+      12     280    56577    26.92 dB
+      16     320    55381    26.85 dB
+      24     400    54460    26.77 dB
+
+The lambda above is 600. The first cut of this shipped 280 together with
+loosened tolerances, and that pairing was wrong in a way worth recording —
+see **Why tolerance is not one knob** below.
+
+Two alternatives lost. A full 2D plane fits better but needs two slopes per
+channel and comes out behind per byte. Gating the tree on ramp fit rather
+than mean fit — only splitting where a ramp would not do — makes the
+surviving rectangles precisely the ones with large, expensive slopes.
+
+Ramps live in the coded stream, so `--codec deflate` keeps every rectangle
+flat and the two codecs are only comparable with `--gradient 0`.
+
+## Why tolerance is not one knob
+
+Ramps arrived with the default tolerances loosened from 0.090/0.040/0.018
+to 0.140/0.070/0.040, on the reasoning that a rectangle able to follow a
+gradient does not need to be subdivided as far. Measured across the six
+photographs in `samples/` it looked like a straight gain. It was not.
+
+Those three numbers are one step apart from each other, so the change did
+not loosen the pyramid — it **shifted it down a level**. The new level 2
+came out with exactly the rectangle count the old level 1 had, on every
+image:
+
+    image              tol .09/.04/.018      tol .14/.07/.04
+    circulos         1018  1744  2308        196  1318  1744
+    macarrao          670  4843  9475          1  2209  4843
+    montanha_pessoas 9364 37663 53707       1930 17563 37663
+    starfield           7 103891 606430        1    13 103891
+
+A level of refinement was thrown away, and six photographs did not show it.
+
+What hid it is that the tolerance knob does not mean the same thing on
+different content. Rectangles produced as tolerance tightens:
+
+    tolerance        0.200  0.140  0.090  0.060  0.040  0.018  0.010
+    blocos              16     16     16     16     16     16     16
+    circulos             1    196   1018   1474   1744   2308   2626
+    macarrao.jpg         1      1    670   2746   4843   9475  11689
+    montanha_pessoas     4   1930   9364  23167  37663  53707  57415
+    starfield            1      1      7   4507 103891 606430 721771
+
+A star field multiplies by 23 between 0.060 and 0.040 and has still not
+saturated at 0.010, because noise has detail at every scale and there is no
+tolerance at which it is resolved. There the knob is a smooth, powerful
+rate dial: it lands anywhere on the curve, and PSNR degrades gracefully
+because the error is spread — 80% of the squared error is spread over 22%
+of the pixels.
+
+A picture of flat shapes is the opposite. `blocos` is 16 rectangles at
+every tolerance in the range: its structure is finite and the tree finds
+all of it immediately. `circulos` moves by a factor of 1.5 across the whole
+sweep. There the knob is a cliff, not a dial — below saturation it buys
+nothing, and above it the edges go, which is where the picture is: 1% of
+`circulos`' pixels carry half its squared error. Loosening cost it 5.5 dB
+to save 7% of its bytes.
+
+So tolerance is a rate control whose behaviour is a property of the image,
+not of the format, and it cannot be retuned on photographs alone. It stays
+where it was measured to belong, and the ramp is tuned separately through
+`--gradient`.
+
+The same asymmetry is why a star field looks like this codec's best case
+and is really its worst. It compresses well and scores well, but its anchor
+is **one rectangle** and its level 1 is thirteen — so the container has no
+usable intermediate states at all. Truncating it gives 21.59 dB at 1% of
+the file and 21.75 dB at 25%, flat across a quarter of the bytes, because
+level 2 is delivered as one unit per level-1 rectangle and there are only
+thirteen of them. The photograph next to it climbs 18.40 -> 19.85 -> 22.45
+-> 25.46 dB over the same range. Good rate-distortion numbers on that image
+are hiding the fact that the progressive ladder, which is the entire point
+of the format, is not there.
+
+## Delivering a unit in pieces
+
+A unit used to be all or nothing. Its split bits were emitted first and its
+residuals after, so a decoder that ran out halfway had the shape and no
+colours and had to throw the whole unit away. The truncation granularity of
+a level was therefore one unit, and a level has exactly as many units as
+the level before it has rectangles.
+
+Interleaving the colours into the geometry removes that. Each rectangle's
+residual and ramp are emitted the moment its split decision says it is a
+leaf, so a cut anywhere leaves a valid partial subtree: what arrived keeps
+its own colour and the region below the cut falls back to what its parent
+was showing there. The symbols are the same ones in the same per-model
+order, so the models adapt identically and the containers come out byte for
+byte the same size — 4470 / 12538 / 34685 on montanha_pessoas either way.
+
+Measured honestly, it is worth less than it looks. Across the sample set at
+six cut points it moves nothing at all in most cells, and its two real
+gains are at early cuts, where one unit is a large share of everything that
+arrived:
+
+    image                  12%    20%    30%    45%    65%    85%
+    macarrao.jpg         +0.88  +0.07  +0.02  +0.01   0.00   0.00
+    circulos (synthetic)     -  +0.89  +0.02  +0.39   0.00   0.00
+    montanha_pessoas.jpg +0.21  +0.01   0.00   0.00   0.00   0.00
+    everything else      +0.05  +0.01   0.00   0.00   0.00   0.00
+
+This was built to fix the flat truncation ladder a star field showed —
+21.59 dB at 1% of the container and 21.75 dB at 25% — and it does not fix
+it. That image had thirteen rectangles at level 1 and therefore thirteen
+units at level 2, and finer delivery inside those units is worth 0.16 dB
+there. The flat ladder was the broken tolerance schedule described above,
+not the delivery, and reverting the schedule is what fixed it. What
+interleaving actually buys is that a cut can no longer discard work that
+already arrived, which is worth keeping because it costs nothing.
+
+## Measured but not built: ordering a cut by worth
+
+A progressive container can be cut anywhere, but what a cut costs was
+measured against the alternative only later (an outside build, WASI,
+the six samples at q 8): a prefix of 15 to 80% of the file showed 5.2 to
+11.2 dB less than the same codec re-encoded to that size, 8.7 dB on
+average, and the gap grows with the share delivered. That is the
+signature of a stream ordered by place: within a layer the tiles come
+in raster order, so a cut leaves the last tiles with no texture at all,
+which is the worst way to lose bits. JPEG 2000's EBCOT orders each
+block's contributions by their rate-distortion slope across the whole
+picture instead, so every cut is near the best file of that size. Doing
+the same here would be a new progressive format (container, both
+decoders, the gate), and it matters only where a cut is the whole
+point, a lossy link with no second chance; directional pictures, which
+every sequence and every comparison against AV1 uses, have one layer
+and are not affected. Noted, not scheduled.
+
+## Measured but not built: screen content
+
+Measured from outside (a WASI build, the six samples): on the Windows
+screenshot (OIP-1304511485) YCbCr does not decorrelate the colours at
+all (mean |rho| between channels 0.40 in RGB, 0.41 after), Cr carries
+more variance than Y, and the partition hardly moves with the rate (7.3
+to 8.8 px from q 8 to q 96), where every photograph coarsens. It is also
+where WebP beats NVDR the most. The tools for it are AV1's and VVC's:
+a colour transform chosen per tile (YCbCr or YCoCg-R, one bit), palette
+mode and intra block copy. All change the format, none of the test
+clips is screen content, and photographs and camera video come first.
+Noted, not scheduled.
+
+## Measured but not built: cutting along a line
+
+Everything here partitions into axis-aligned rectangles, so any boundary
+that is not horizontal or vertical is approximated by a staircase, and the
+staircase costs rectangles without bound as the tolerance tightens. On a
+picture of four flat circles, 21% of the leaves sit on 0.76% of the area —
+they are the outlines — and each of them has a deviation of 0.23 against a
+tolerance of 0.04. They stopped splitting because they ran out of room, not
+because they were resolved.
+
+So the question is what one oblique cut would be worth against the 4-way
+split the tree actually does. At every node that decides to split, with the
+line searched over 8 angles and 7 offsets and both regions given their mean
+colour:
+
+    image                  erro removido      razao   custo   corte
+                          corte     split                     vence
+    circulos (synth)      37.5%     29.5%     1.27x   0.67x   88.8%
+    blocos   (synth)      30.6%     53.3%     0.58x   0.67x    0.0%
+    macarrao.jpg          36.6%     27.9%     1.31x   0.67x   76.0%
+    OIP-4140498144.jpg    39.1%     31.6%     1.24x   0.67x   69.4%
+    montanha_pessoas.jpg  33.9%     31.7%     1.07x   0.67x   63.2%
+    starfield             34.1%     33.6%     1.01x   0.67x   74.5%
+
+A cut removes 1.0 to 1.3 times the error of a full 4-way split while
+costing roughly two thirds of the bits — two residuals and a line instead
+of four residuals and four flags. It wins on 63 to 89% of decision nodes on
+real images. `blocos` is the honest exception: its edges are axis-aligned
+by construction, the quad split is exactly the right move there, and a
+rate-distortion test would keep it.
+
+Three caveats, because this is a ceiling and not a result. The line
+parameters are unquantised and the region colours free, so real coding
+costs more than the 10 bits assumed for angle and offset. The comparison is
+one step deep: whether a cut actually prevents the staircase from forming,
+rather than merely beating one split, cannot be measured without building
+the alternative encoder. And the search is 56 passes over each node's
+pixels.
+
+A shape vocabulary — circle, ellipse, polygon — was the starting point for
+this and is the narrower idea. On `circulos` it is worth far more: four
+centres, radii and colours plus a background is about 31 bytes against the
+3851 the container spends, a factor of 124. But it needs the shapes to be
+found, which is a recognition problem rather than a coding one, and a
+photograph contains none of them. The oblique cut is the same insight with
+the recognition removed, since every boundary is locally a line, and it
+composes with the tree, the levels, the truncation guarantee and the ramps
+as they already stand.
+
+## Measured: reusing the previous frame
+
+The project's target is video, so the question that matters is what frame
+N-1 is worth to frame N. There is no video here and nothing that can
+decode one, so the frames are synthesised: a window cropped out of a
+larger still and moved, which reproduces the camera translating, the
+camera zooming, and a region moving against a still background.
+`--noise` puts a deterministic per-pixel perturbation back to stand in for
+a sensor. Read every number below knowing they are built rather than
+filmed, so they are optimistic; the noise row is the honest one.
+
+The first thing measured was the obvious primitive — copy the region when
+it has not changed — and it does not work. Even between two **identical**
+frames only 38% of the area can be copied and only 16% of the leaves
+disappear, because the reference is the previous frame *decoded*, at
+26.5 dB, and that loss already exceeds the tolerance across most of the
+picture. Under a 3 px pan it collapses to 0.5%.
+
+What does work is the thing the format already does between levels: code
+the frame as a **residual against the previous frame's reconstruction**.
+Measured end to end with the codec exactly as it stands — encode frame
+N-1, decode it, subtract, encode the error, add it back:
+
+    sequencia          intra              inter           bytes    PSNR
+    static        40853 B  26.53 dB   12138 B  26.60 dB  -70.3%  +0.07
+    object        40484 B  26.50 dB   13822 B  26.51 dB  -65.9%  +0.01
+    pan           41643 B  26.52 dB   38668 B  26.43 dB   -7.1%  -0.09
+
+Motion is not optional. A co-located reference is worth almost nothing the
+moment the camera moves, and **one global motion vector** for the whole
+frame fixes it:
+
+    pan           41643 B  26.52 dB   16339 B  27.49 dB  -60.8%  +0.97
+    pan + noise   42488 B  26.45 dB   17996 B  27.38 dB  -57.6%  +0.93
+
+That is the crudest motion model there is — a single vector, found by
+minimising absolute difference over a lattice. Per-block vectors can only
+improve it.
+
+The failure mode that decides whether this is a codec or a demo is drift:
+frame 3 is predicted from a reconstruction of a reconstruction, and if
+each step loses a little the picture walks away from the source. Over an
+eight-frame chain, with the decoder's state carried forward exactly as a
+decoder would hold it, it does not drift — it improves:
+
+    quadro     bytes      PSNR    intra seria
+        0      40853   26.53 dB      40853 B
+        1      16339   27.49 dB      41643 B
+        3      11086   28.04 dB      41578 B
+        5       9958   28.29 dB      41299 B
+        7       9078   28.41 dB      41224 B
+                                     -63.2% total
+
+Quality climbs 1.89 dB while the cost per frame falls to a fifth. That is
+the truncation property working along the time axis rather than down the
+container: every residual adds detail on top of what the last one left, so
+a shot that holds still gets better and cheaper the longer it runs. With
+sensor noise the same chain gives -57.9% and +1.79 dB, so the effect is
+not an artefact of frames being perfect copies.
+
+It is faster too, though less than it looks: the error image encodes in
+25 ms against the frame's 46 ms, 1.8x, because at 26.5 dB the reference
+still leaves plenty of structure behind.
+
+Where this is still unproven: the frames are synthetic, the motion model
+is one vector, the chain is eight frames rather than a shot, and nothing
+here has been tried on footage with real lighting changes or a cut.
+
+## Speed
+
+Encoding runs at about 80 ms per megapixel, down from 136, with the
+container byte for byte what it was — checked against a recorded hash on
+every sample and on both video containers, because a speed change that
+quietly moves the output is a quality change in disguise.
+
+Where it went, measured on a 2.67 Mpx frame rather than guessed:
+
+    fase                antes    depois
+    arvore              163 ms   169 ms   (integral 17, desvio 92)
+    rampa               157 ms   113 ms
+    entropia             52 ms    53 ms
+
+Two changes. The ramp fit swept its rectangle five times — once for the
+flat error, once per axis for the least-squares fit, once per axis for the
+exact error — and now sweeps it three, with the moments of both axes
+accumulated together in the order they were summed before, since adding
+the same doubles in a different order gives a different double. The fill
+values of a candidate ramp depend only on the position along its axis, so
+they are tabulated per rectangle instead of recomputed per pixel.
+
+The tree used to compute every node's mean by adding up its pixels and
+then sweep the region again for the deviation, which is two passes per
+node at every depth. An integral image makes the mean four lookups. The
+deviation still needs its sweep — a mean absolute deviation cannot be
+recovered from sums — but it now accumulates the three channels as exact
+integers and applies the luma weighting once at the end, instead of a
+double multiply-add per pixel. That loop is the hot one in the whole
+encoder, sweeping roughly ten times the image over a build.
+
+Predicted right, measured wrong: the integral image was supposed to halve
+the tree and moved it by 9%. The deviation sweep is what the tree actually
+costs, and it is irreducible at 92 ms for 27 Mpx of reading.
+
+The ramp fit is now threaded, which is the rest of it:
+
+    imagem                  inicio    agora    ganho
+    macarrao.jpg             82.7     44.1    46.7%
+    montanha_pessoas.jpg    136.4     80.5    41.0%
+    starfield               139.5     92.9    33.4%
+
+Every rectangle's ramp is fitted from its own pixels into its own slot, so
+the loop has no order and nothing shared. The container has to come out
+identical anyway, and it does: checked against a recorded hash, and
+checked for determinism over 70 runs across three images and a video
+container, each producing exactly one hash. OpenMP is optional — without
+it the pragma is ignored and the loop runs as it did.
+
+ThreadSanitizer reports races here and they are libgomp's, not the code's.
+Every report crosses the runtime boundary, where TSan has no visibility
+into the barrier that `parallel for` ends with, and all of them disappear
+at `OMP_NUM_THREADS=1` with the same binary. What clears it is not that
+argument but the bit-identical runs; the argument only says why the tool
+cannot see it.
+
+The tree is not threaded. Its subtrees allocate nodes from one arena as
+they descend, so running them in parallel makes the numbering depend on
+which finished first — which is the bug the old pipeline had, and would
+need per-subtree arenas merged in fixed order to avoid.
+
+### The directional encoder's search
+
+The directional modes and the transform types made the encoder slow: a
+leaf candidate was coded in full for each of ten modes and, on each, for
+each of seven transform types, about 7 million forward transforms for a
+768x512 photo, and the partition search tried every shape of every node.
+What changed, in order, and what each did:
+
+    change                                          output
+    texture contexts read from a grid (nb_mag)      identical
+    a split stops once it cannot beat the whole     identical
+      (branch and bound: costs are never negative)
+    a reference's subpixel planes built once        identical
+    a node needing no texture is not split further  0.2% smaller
+      (intra pictures only; HEVC's HM does the same)
+    motion search reads subpixel samples by rows    identical
+    a leaf's transform types share each row pass    identical
+    modes and types ranked on estimated error       BD 0.0%
+    a leaf's predictions kept while it is tried     identical
+    a sequence's subpixel planes built on all cores identical
+    --fast: other types on the 2 cheapest modes     +0.8% bytes
+    --fast: modes ranked without RDOQ               +0.1% Y, +0.4% RGB
+
+Encoding time, one machine, 4 cores (stills run on one):
+
+                              before    now      --fast
+    montanha_pessoas, q 24    20.3 s    13.8 s    5.7 s
+    macarrao, q 24             5.5 s     2.3 s    0.9 s
+    clean clip, 9 frames      67.4 s    44.9 s   28.6 s
+
+The estimated error is the coefficients' quantisation error, which equals
+the pixels' since the transforms are orthonormal (Parseval), so a
+candidate costs no inverse transform and paints nothing. The ranking is
+checked by coding the two cheapest estimates in full: on the six samples
+that gives the same BD-rate on PSNR-Y and PSNR-RGB as coding every
+candidate in full, in 85% of the time (87% with --fast, where it is 0.1%
+smaller), and keeping only the cheapest loses 0.4%. On the clean and
+multi clips it is within 0.3% either way; video gains less time, since a
+predicted frame's leaves mostly stop at INTER. RDOQ weighs each level the
+same way (Karczewicz, Ye and Chong, "Rate distortion optimized
+quantization", ITU-T VCEG-AH21, 2008).
+
+With --fast the ranking also leaves RDOQ out: a candidate's levels are
+rounded with the dead zone, and RDOQ runs only on the two finalists. On
+the six samples that is 26% less time for +0.1% on PSNR-Y and +0.4% on
+PSNR-RGB; on the clean and multi clips 13 and 15% less, for +0.1 and
+0.0% on Y, +0.4% on RGB. Without --fast it would save 35% for +0.5% and
++0.8% (three finalists instead of two: +0.3% and +0.7%), so the default
+keeps RDOQ in the ranking. Measured and left out: the forward transform
+in single precision, BD 0.0% but only 3 to 4% faster.
+
+Kept per leaf while its modes and types are tried, its directional
+predictions (they read only the decoded pixels around it) took 5 to 8%
+off a still; built on all cores, a sequence's subpixel planes took 3.1
+s down to 0.95 s over 9 frames, 2 to 5% of the encode. Both leave every
+byte where it was.
+
+### v11, and albums of large photos
+
+A 3000x4500 photo took 13.6 s to encode and an album of three of them
+56 s, 110 s when they repeated each other. Most of it was work done
+again, or done where it could not pay:
+
+    3000x4500, 4 cores                   before   after
+    encode, with the report               13.6 s    6.0 s
+    album, three unrelated photos         56.6 s   19.8 s
+    album, a photo and two pans of it    110.6 s   47.4 s
+    decode in JS, all three layers         7.8 s    2.6 s
+
+Every container and album comes out byte for byte what it was, on every
+sample, the burst and the demo album, and the gate's baseline did not
+move.
+
+- **The forward transforms leave the search.** A leaf's texture is the
+  DCT of its pixels minus its flat colour, and a constant moves only
+  the DC: every other row of the integer DCT sums to exactly zero (odd
+  rows are antisymmetric, even rows fold into the half-size transform,
+  down to the 4-point one). So a block's quantised texture, and the
+  pixels each band of it adds, do not depend on what its neighbours
+  predict. The encoder computes them for a whole row of tiles before
+  searching it, on every core. The search itself stays one tile at a
+  time, because each tile is decided against the models and colours the
+  one before left.
+- **-O3**, with the transforms' loops ordered so the innermost walks
+  contiguous memory and each sum keeps its order: 25% on one core, the
+  same doubles.
+- **A residual leaf coded once, not twice.** Choosing between skipping a
+  leaf and coding it coded it, and the winner was then coded again.
+- **The report's three decodes run side by side.** `--quiet` skips
+  them.
+- **An album's motion search, once per candidate.** It does not depend
+  on the step, and the equal-quality search tried up to six steps. A
+  residual that already costs more than the photo alone is not decoded
+  back.
+- **Thumbnails too far apart are not tried.** A trial on a large photo
+  is three times its encode. Predictions measured to win came up to a
+  distance of 7.6 (a pan, 44 times smaller); pictures with nothing in
+  common from 12.7. The cut is 10 (`--distance`).
+- **The JS decoder** paints short rows by hand instead of a
+  `TypedArray.fill` per row, copies a tile's state without making a
+  subarray per row, and skips that copy when a layer arrived whole: a
+  tile of it can then only stop on damage, and then the decode starts
+  over the careful way. `scripts/crosscheck.mjs` now flips bits in
+  full-length copies too, to hold that path to the C pixels. The page
+  gets all three layers from one pass instead of three decodes.
+
+## Against the browser's JPEG and WebP (v11)
+
+`make bench` (`scripts/bench_codecs.mjs`) runs NVDR, and the JPEG and WebP
+encoders a browser has (Chromium's `convertToBlob`), over their quality
+ranges on the same pixels, scores every decoded picture here with one
+implementation of each metric, and compares the curves by Bjontegaard
+delta rate: how much bigger (+) or smaller (-) NVDR's file is than the
+other's at the same quality, over the range both reach.
+
+    image              NVDR vs JPEG                NVDR vs WebP              NVDR bits
+                       PSNR-Y  SSIM-Y  PSNR-RGB    PSNR-Y  SSIM-Y  PSNR-RGB  Y / Cb / Cr
+    OIP-1304511485     -15.5%   -6.1%  -49.8%      +57.1%  +80.6%   -2.8%    54 / 20 / 26
+    OIP-3451121336     -25.4%  -21.8%  -34.6%       +3.7%   +5.7%  -11.5%    84 / 12 / 4
+    OIP-3786546191     -19.4%   -9.2%  -34.7%       +8.2%  +17.1%  -13.2%    76 / 20 / 4
+    OIP-4140498144     -29.4%  -19.8%  -33.8%       -0.6%   +6.7%   -9.3%    85 / 10 / 5
+    macarrao           -36.7%  -31.3%  -46.5%       +2.7%   +4.8%  -11.8%    76 / 15 / 9
+    montanha_pessoas   -29.5%  -21.3%  -33.4%       -3.2%   +0.9%   -8.8%    89 / 6 / 5
+    montanha_ruido     -24.7%  -13.1%  -33.4%       -1.1%   +6.8%  -12.4%    87 / 7 / 6
+    mean               -25.8%  -17.5%  -38.0%       +9.5%  +17.5%  -10.0%
+
+NVDR beats the browser's JPEG everywhere, by a quarter on luma. Against
+WebP it is even on luma for most pictures and ahead once colour counts,
+and loses where colour is most of the picture. That is one choice, not
+tuning: JPEG and WebP keep colour at half resolution each way (4:2:0),
+which the eye barely sees and PSNR-Y does not see at all, and NVDR keeps
+it whole, at 11 to 46% of its bits (last column, the encoder's own count
+at q 24, now in its report). On OIP-1304511485, where the colour takes
+46%, WebP needs 57% fewer bytes for the same luma.
+
+Three things keep the comparison honest. Every codec gets the same
+pixels, read once the way the encoder reads them and handed to the
+browser as a PNG (the script checks the browser sees them). The samples
+are JPEGs, and re-encoding a JPEG on its own 8x8 grid near its own
+quality comes back almost exact: the browser's JPEG jumped from 35.6 to
+49.6 dB between two steps. So JPEG sources are cropped 3 and 5 pixels
+(`output/convert <in> <out> x0 y0`), off both grids. And montanha_ruido
+is montanha_pessoas with high-ISO sensor noise added
+(`scripts/analysis/addnoise.mjs`: spread growing with the light, mostly
+luma, a little over a pixel wide), since a photo straight from a camera
+is not a JPEG thumbnail. AVIF, JPEG XL and HEIC are in the next
+section.
+
+### Colour at half resolution (4:2:0)
+
+Header flag 0x04 gives Cb and Cr their own quadtree over a half-size
+canvas: per 32x32 tile, luma's tree, then colour's 16x16 tree, in the
+same three streams, so truncation and the progressive layers work as
+before. The encoder averages colour 2x2 and weighs a colour sample's
+error by four (it stands for four pixels); the decoders scale it back
+with integer bilinear weights 9 3 3 1 in sixteenths, identical in C and
+JS. The colour tree has its own split models.
+
+`--chroma auto` (the default) picks per image. When halving the colour
+costs little on its own (mean squared error under 2 per colour sample
+after averaging and scaling back: every photograph measured), it is
+4:2:0 straight away. Otherwise both modes are coded and the cheaper kept,
+counting colour error at half luma's weight: at that weight every
+photograph keeps 4:2:0 and every synthetic picture (blocos, circulos,
+the gate's sequence) goes 4:4:4, where 4:2:0 cost blocos 21 dB. Album
+photos predicted from another stay 4:4:4. A sequence's predicted frames
+follow their intra frame (see "Colour and seams in predicted frames"):
+halving the colour of residuals over a 4:4:4 reference drifted 1.3 dB
+over the gate's twelve frames.
+
+    BD-rate, mean of 7 images      vs JPEG            vs WebP
+                                   PSNR-Y  SSIM-Y     PSNR-Y  SSIM-Y  PSNR-RGB
+    4:4:4 (before)                 -25.8%  -17.5%     +9.5%  +17.5%  -10.0%
+    4:2:0 forced                   -36.0%  -29.1%     -6.3%   -0.5%   -5.5%
+    auto (default)                 -34.7%  -27.3%     -3.3%   +3.9%   -7.7%
+
+Auto sits between the two because on the most colourful photo it keeps
+4:4:4 at the high qualities, where its colour detail shows; `--chroma
+420` forces it. At the default q the photographs come out 7-13%
+smaller.
+
+### Film grain synthesis
+
+Sensor noise is the most expensive thing in a photograph to code and the
+least worth keeping exactly: every grain is random, so the codec pays
+full price for detail no one could tell from other grain of the same
+size and strength. With `--grain auto` or `on` (`src/grain.c`) the
+encoder measures the noise, filters it out, codes the clean picture, and
+stores 22 bytes after the header (flag 0x08, their length in header
+byte 29): the noise's strength at 16 brightnesses, how far a grain
+spreads (one of five 3x3 kernels), and its strength in colour against
+luma. Both decoders draw grain from AV1's 16-bit LFSR into a 64x64
+template per component, read it at a hashed offset per 32x32 block and
+lay it over the picture scaled by each pixel's brightness, in integers,
+identically (crosschecked whole, cut and damaged; fuzzed).
+
+Measuring noise on a photograph is the hard part, and what was learned:
+
+- **Where.** In an 8x8 DCT, a block's level is the median of its 63 AC
+  coefficients (texture is sparse, noise is not), and a brightness's the
+  tenth percentile of its blocks (its flattest), each corrected by its
+  bias for pure Gaussian noise (0.6745 and 0.8203, simulated). Reading
+  the flattest blocks' pixels instead is right on flat noise and three
+  times too strong on a textured photo; the DCT reading errs the other
+  way on demosaiced noise (it has almost nothing at the top
+  frequencies), so the strength used is the pixel reading capped at 1.8
+  times the DCT's.
+- **Shape.** Per-frequency noise measured directly let texture in; it is
+  computed instead from the neighbour correlation, taking the noise as
+  separable first-order autoregressive.
+- **Physics.** Sensor noise is sigma^2 = a Y + b (photon noise plus read
+  noise). Fitting that, weighed by block counts, keeps a night sky's
+  stars (few, bright blocks) from reading as noise.
+- **Filter.** Hard thresholding in the DCT (BM3D's first stage without
+  its block matching) removed texture with the noise and came out 3.5 dB
+  further from the clean picture than the noisy one; Wiener shrinkage,
+  c^2 / (c^2 + n^2), came out closer than the noisy one.
+
+On montanha at twice its size with sensor noise added (so the clean
+picture is known), at the same q, against coding the noisy picture:
+
+    q     without grain         with grain (distance to the clean picture,
+                                           decoded before the grain)
+    14    155031 B  33.84 dB    126025 B (-19%)  35.19 dB
+    20    107368 B  33.89 dB     88825 B (-17%)  35.02 dB
+    28     73732 B  33.75 dB     62406 B (-15%)  34.56 dB
+
+Coding the noise keeps the picture 33.8 dB from the clean one however
+many bytes are spent; filtering it gets closer with fewer. On a
+3000x4500 night sky the file goes from 1.98 MB to 1.34 MB (-32%), and
+the codec no longer turns the noise into blotches of blocks. The grain
+laid back is not the source's grain pixel for pixel, and PSNR against
+the noisy source says so; it looks the same.
+
+Grain is off by default. `auto` turns it on when the measured level
+passes 3.0: clean photographs at a camera's resolution read under 1.5,
+the noisy test 3.9, the night sky 10; but small, densely textured
+thumbnails are where texture and noise cannot be told apart (one clean
+sample read 2.8, a crop of montanha 5.4). Residuals never carry grain
+(a predicted frame would have to cancel its reference's), and albums and
+sequences do not use it. The page has a selector for it.
+
+### Measured but not built: directional prediction
+
+H.264, HEVC and AV1 predict a block by extending its neighbours along a
+direction, and it is worth 8-15% there. A prototype gave a leaf four
+modes beside the average colour (vertical, horizontal, HEVC's planar,
+the 135 degree diagonal), signalled per leaf. Luma PSNR as the encoder
+reconstructs it, and bytes, at q 24:
+
+                          no modes          from flat colours     from full reconstruction
+                                            (best mode by RD)     (best mode by RD)
+    montanha_pessoas      48427 B 33.89     48748 B 33.95         47951 B 33.99
+    OIP-4140498144        19874 B 34.53     19984 B 34.58         19668 B 34.71
+    montanha, 2x size     66047 B 38.34     66358 B 38.39         64827 B 38.38
+
+Predicting from the neighbours' flat colours keeps layer 0 decodable on
+its own and nets about 2%; choosing the mode by absolute difference
+instead of by rate-distortion made files 1-3% bigger. Predicting from
+the neighbours' full reconstruction, which would tie every layer to the
+ones after it and so give up the truncation guarantee, nets 3-5%. The
+quadtree already does most of what the modes do elsewhere: it splits to
+4x4 exactly where an edge runs, and each leaf's transform is chosen by
+rate-distortion, where HEVC's intra modes work on a fixed partition.
+Neither gain pays for its format.
+
+### Measured but not built: adaptive quantisation
+
+x264 moves bits from busy regions, where the eye masks error, to smooth
+ones, where it shows. A prototype gave each 32x32 tile a step offset of
+-4..4 sixths of a doubling (H.264's QP scale), from how far its luma
+activity (mean log variance of its 8x8 blocks) was from the picture's.
+BD-rate against WebP, mean of the seven benchmark images, and on
+montanha at twice its size:
+
+                     7 images               montanha x2
+    strength         PSNR-Y   SSIM-Y        PSNR-Y   SSIM-Y
+    0 (off)          -3.3%    +3.9%         -31.5%   -31.2%
+    0.5              -1.4%    +2.0%         -30.7%   -31.7%
+    1                +2.1%    +3.6%         -29.6%   -32.1%
+
+At a camera's scale it buys one point of SSIM for two of PSNR: a 32x32
+tile of a large photograph mixes smooth and busy parts, and a per-leaf
+offset would cost a symbol in every leaf. Not built.
+
+### At a camera's scale
+
+The benchmark's images are thumbnails of 400 to 800 pixels. On montanha
+at twice its size, a picture closer to a camera's, NVDR against the
+browser's WebP is -31.5% on PSNR-Y, -31.2% on SSIM-Y and -28.6% on
+PSNR-RGB, where the thumbnails averaged -3.3%, +3.9% and -7.7%: the
+quadtree's 32x32 leaves and the colour tree pay most where there are
+large smooth areas to cover, and a photograph at full size has more of
+them. `node scripts/bench_codecs.mjs <images>` runs any picture.
+
+## Against AVIF, JPEG XL and HEIC (v11)
+
+`make bench` also runs the reference encoders of the newer formats when
+they are installed (Ubuntu: `libavif-bin libjxl-tools libheif-examples
+libheif-plugin-x265`), each over its quality knob, decoded by its own
+decoder and scored by the same code as the rest:
+
+    AVIF     avifenc 1.0.4 (aom 3.8.2), 4:2:0, speed 4, -q 10..82
+    JPEG XL  cjxl 0.7.0, effort 7, distance 0.4..9
+    HEIC     heif-enc 1.17.6 (x265 3.5), HEVC intra, 4:2:0, -q 10..74
+
+`make bench-photos` runs everything on five camera photographs instead of
+the thumbnails, 2.5 to 21 megapixels, fetched and developed by
+`scripts/fetch_photos.py`: four raw files from rawpy's tests, developed
+with LibRaw (no noise reduction, so they carry the sensor's own noise;
+three are night shots) and libjxl's flower photograph. None has been
+through a lossy codec.
+
+BD-rate of NVDR (default options) against each, PSNR-Y / SSIM-Y /
+PSNR-RGB, + = NVDR needs more bytes:
+
+    7 thumbnails (make bench)    PSNR-Y  SSIM-Y  PSNR-RGB
+    vs JPEG (browser)            -34.7%  -27.3%  -36.9%
+    vs WebP (browser)             -3.3%   +3.9%   -7.7%
+    vs AVIF                      +33.2%  +41.9%  +25.2%
+    vs JPEG XL                   -12.1%   -3.0%  -23.7%
+    vs HEIC                      +21.6%  +30.4%   +6.8%
+
+    image            size       vs AVIF                  vs JPEG XL              vs HEIC
+    canon_40d_sraw   1944x1296  +46.2% +62.7% +39.0%     +9.1% +26.7% -46.7%     +22.7% +31.4%  +8.7%
+    canon_5d2        5634x3752  +29.2% +24.8% +25.4%     -9.2%  +0.7% -23.8%      +7.9% +13.0%  -8.0%
+    flower           2268x1512  +48.3% +52.4% +49.5%     +7.6% +18.6% -10.8%     +27.7% +37.1% +16.3%
+    iss030e122639    4284x2844  +27.2% +21.7% +12.0%     -4.5%  -1.2% -29.6%      +5.8%  +4.8% -21.1%
+    iss042e297200    4940x3292  +43.0% +43.7% +39.6%     -2.0%  +1.9%  -7.0%     +34.8% +33.5% +10.7%
+    mean of 5                   +38.8% +41.1% +33.1%     +0.2%  +9.3% -23.6%     +19.8% +24.0%  +1.3%
+
+    (the same photos against the browser's JPEG: -37.0% -30.8% -53.6%;
+     against its WebP: -19.6% -18.5% -18.4%)
+
+Where NVDR stands, in order: well ahead of JPEG and WebP (further ahead
+on camera photos than on thumbnails), ahead of JPEG XL on thumbnails
+and level with it on photos by luma (ahead by colour), 20% behind HEIC
+and 35-40% behind AVIF. AVIF is the one to beat.
+
+Caveats. PSNR and SSIM are what NVDR's rate-distortion optimises for,
+and JPEG XL is tuned for butteraugli instead, so these metrics
+undersell it; its PSNR-RGB loss is its XYB colour space spending less
+on what the eye sees least. cjxl 0.7 is from 2022 (current libjxl
+encodes better), and even at distance 9 it stays above about 34 dB, so
+against it only the upper half of the range is compared. AVIF at speed
+4 is not aom's best (speed 0-2 gains a few percent more). The dark
+photos have large nearly-black areas, which every codec codes almost
+for free.
+
+### The decoder as WebAssembly
+
+`public/nvdr.wasm` (24 KB, `make wasm`) is the C decoder compiled for
+the browser by clang and wasm-ld alone: no Emscripten, no wasi-libc.
+`nvdr.c` leaves out its file and image-format code under `NVDR_WASM`;
+`wasm/libc.c` supplies the memory functions (a stack the page rewinds
+between decodes) and `wasm/api.c` the three calls the page makes; the
+linker drops the encoder, and the module imports nothing.
+`public/nvdr-wasm.js` loads it and installs it behind `decode()` in
+nvdr.js, so everything that decodes (the page, the workers, albums,
+`<nvdr-img>`) uses it; a decode with a fluid context, or any decode
+where WebAssembly cannot load, stays in JavaScript.
+
+    decode, 3000x4500           JavaScript   WebAssembly
+    full picture                  2108 ms       856 ms
+    with grain                    2840 ms      1470 ms
+    three views (the page)        3690 ms      1919 ms
+    montanha, 768x512              145 ms        26 ms
+
+It is the same C the command line runs, so the three decoders are held
+to one another: `scripts/crosscheck.mjs` now compares C, JavaScript and
+WebAssembly on every layer, cut and damaged copy. One change went into
+the C decoder with it: like the JavaScript one, it no longer saves each
+tile of a texture layer that arrived whole (only damage can stop one
+mid-tile, and then the decode starts over saving them), which was a
+tenth of its time.
+
+## Showing a large picture small
+
+A night sky shown on the page at a tenth of its size came out as white
+noise, and a grid of album photos as worse. The pixels were right: C and
+JS agreed on them. The canvas was not. Every canvas carried
+`image-rendering: pixelated`, which is right for enlarging and, for
+shrinking, keeps one pixel of every 10x10 and drops the rest. On a
+smooth picture that passes; on grain it keeps a scatter of single
+grains, the brightest showing as white dots. Only the full layer has
+the grain, so only the third view showed it, and a thumbnail, shrunk
+further, more.
+
+`paintFitted` in `nvdr.js` now draws a picture at the size the canvas is
+shown, in device pixels, averaging every source pixel an output pixel
+covers, and draws it again when that size changes. The page, the album
+grid and `<nvdr-img>` all use it.
+
+## Playing it
+
+`public/nvdrv.js` is the sequence decoder in the browser, and the page has
+a video tab that plays a `.nvdrv` at the source's frame rate. A video
+dropped on the page goes to `POST /video`, where the server's GStreamer
+(`gst-launch-1.0`, or ffmpeg when GStreamer is missing or lacks the
+format's plugin) cuts it into frames, `nvdrv_encode` codes them, and the container comes back.
+
+The JS decoder has to hold the same state as the C one after every frame,
+not just draw something similar: a predicted frame is a residual on top of
+that state, so one pixel apart at frame 1 is a different reference at
+frame 2 and the difference compounds. `scripts/crosscheck_seq.mjs` compares
+the two frame by frame, whole and cut at seven points, and the gate runs
+it. Across 35 containers — every synthetic sequence, global and block
+motion, three block sizes, short GOPs, ramps off, scene cuts — 280 checks,
+no divergence. Moving the residual bias from 128 to 127 in the JS alone
+fails the gate at frame 1.
+
+### Against a real codec
+
+Tested end to end with a real ffmpeg on a real VP8 file: a 960x540 clip
+Playwright recorded from an animated page — a pan and a slow zoom over a
+photograph, with a region moving against it — at 25 fps. Unlike the
+synthetic sequences, it has the frame-to-frame noise a lossy codec leaves
+behind. Checked first for the trap that would flatter the result: no
+frame of the 144 is a duplicate, the smallest difference between
+consecutive frames is 2.5 levels.
+
+It is the first comparison against a video codec, and it loses:
+
+    tolerancia            bytes    kbit/s     PSNR vs the VP8 frames
+    0.090,0.040,0.018   2255789     3133      33.77 dB
+    0.120,0.060,0.030    671234      932      30.47 dB
+    VP8 itself           678729      943      (the reference)
+
+At VP8's own bitrate, NVDRV reproduces VP8's frames at 30.5 dB. A
+predicted frame costs 15 KB against an intra frame's 38 KB — 40%, where on
+the synthetic sequences it was 25% and falling.
+
+Two early explanations are wrong, and the measurements that ruled them out
+are worth keeping. Sub-pixel motion is not the cause: the best
+quarter-pixel shift lowers the mean frame-to-frame error from 3.56 levels
+to 3.24, 9%. Noise is not the cause either. A clean clip, rendered
+deterministically from the same page (`window.render(t)`, 125 frames,
+JPEG q100, no codec in between), loses worse. Both codecs are measured
+against that source with `scripts/analysis/psnr_dirs`:
+
+    VP8 target   kbit/s   PSNR        NVDRV tolerance      kbit/s   PSNR
+    150k            174   30.57 dB    0.200,0.100,0.050       925   28.72 dB
+    300k            309   33.52 dB    0.120,0.060,0.030       947   29.85 dB
+    600k            605   37.19 dB    0.090,0.040,0.018      3402   33.36 dB
+    1200k          1202   39.41 dB    0.050,0.020,0.008      6174   34.45 dB
+
+At equal quality NVDRV spends about 11 times the bits, and it has a floor:
+no tolerance takes it under about 925 kbit/s.
+
+`scripts/analysis/webm_frames.py` reads VP8's frame sizes out of the WebM,
+and they put the gap in one place:
+
+                       intra frame    predicted frame
+    VP8 300k             55333 B          1099 B
+    NVDRV default        56993 B         16029 B
+
+The intra frames are the same size. They are not the same quality (see
+"The intra frame is the gap", below). The predicted frames, which are
+124 of 125, are fifteen times larger. `scripts/analysis/loopcost` explains why: at
+the default tolerance, a predicted frame coded against the *source*
+previous frame costs 91 bytes, and coded against the *reconstructed*
+previous frame, as the closed loop must, about 20 KB. The genuine change
+between frames is 3.6 levels. The reference's own coding error is 5.9.
+Between 97% and 100% of every predicted frame is the codec re-coding
+texture the intra frame left out. Flat rectangles cannot converge on
+texture, so the error never goes away, and every frame pays for it again.
+That is the rate floor. "Re-coding" is not the same as "wasted", though:
+the same section below shows those bytes are refining an intra frame
+that starts 7 dB behind VP8's.
+
+Loosening only the predicted frames (`--pred-tolerance`, intra left at
+the default) stops that re-coding. Every loose setting gives the same
+file, 999 kbit/s at 30.29 dB. A predicted frame is then 91 bytes of
+residual and 3607 bytes of motion field. The field is now the cost, and
+it is coded naively, as deltas from the global vector:
+
+    block    kbit/s   PSNR
+    8           999   30.29 dB
+    16          473   28.20 dB
+    32          345   26.00 dB
+    global      405   20.19 dB
+
+So the gap has three parts, in order of size. The residual is decided by
+a tolerance, not by rate against distortion, so predicted frames
+re-code errors they cannot remove. The motion field ignores that
+neighbouring vectors agree. And there is no rate control. What to fix
+follows from that: predict each vector from its neighbours (done in v3,
+under "Coding the field"), decide the residual per block by rate and
+distortion (tried, and it measured something more basic, under "The
+intra frame is the gap"), and add a zoom/affine global model. `--pred-tolerance`
+stays off by default, because on its own it trades 3 dB for the rate.
+
+### The intra frame is the gap
+
+The next planned fix was to decide each block's residual in a predicted
+frame by rate against distortion, and drop what does not pay. The
+prototype coded the frame, decoded it, and measured what the residual
+bought in each 16x16 block. It set the losing blocks to the neutral 128
+and coded the frame again. It did not survive measurement, for two
+reasons that are worth more than the fix would have been.
+
+The residual pays for itself. Over the first predicted frames of the
+clean clip it removes 140 units of squared error per bit on average,
+and 55% of blocks gain. Per-frame PSNR shows what it is doing: the intra
+frame comes out at 31.2 dB, and the predicted frames lift the clip to
+33.4 dB within a few frames and hold it there. Dropping the residual
+holds the clip at the intra frame's quality instead, 30.7 dB.
+
+Dropping part of it drops all of it. The tolerance is a mean deviation
+over a region, and the texture error in the residual, about 6 levels,
+sits just above it, about 4.6. With half the blocks set to 128, every
+region that straddles both falls under the tolerance and stops
+splitting, the blocks that were meant to keep their residual included.
+Every lambda from 0.01 to 300 gives the same collapsed frame: 300 bytes
+of residual, 30.7 dB.
+
+The comparison that matters is the intra frame against VP8's key frame,
+measured on frame 0 of the same clip:
+
+                                  bytes    PSNR
+    NVDR, default tolerance       57113   29.6 dB (flat render; 31.2 in the sequence)
+    NVDR, 0.03/0.012/0.004        86975   30.1 dB
+    NVDR, same, --min-tile 1     239924   34.1 dB
+    VP8 300k key frame            55333   38.3 dB
+    JPEG, Chromium, quality 0.5   48117   37.2 dB
+
+The JPEG number is flattered, since the source is itself a JPEG on the
+same 8x8 grid. The VP8 one is not. Tightening the tolerance buys almost
+nothing, because 2x2 flat rectangles cannot represent texture finer than
+2 pixels. Allowing 1x1 buys 4 dB for four times the bytes. A transform
+coder at the same size is 7 to 8 dB ahead. That is a property of
+piecewise-constant approximation, not of any tuning. Every predicted
+frame inherits it: its residual is the same texture error, coded by the
+same rectangles.
+
+### Where the finest level's bytes go
+
+R2 costs 2.1 to 3.8 times R1's bytes. On every sample it is about 70%
+of the file, for +1.3 to +4.3 dB. The rectangle count grows much less,
+1.1 to 2.2 times, so most of the cost is not the new tiles. Counting
+bits by category in the coder:
+
+- every rectangle R1 hands down that does not split still pays a colour
+  correction at R2's finer step, and 91-97% of them need one. That is
+  40-80% of R2's bytes. The corrections are not waste: dropping them
+  costs 1.1 to 2.2 dB. Making R1's step finer only moves the same cost
+  into R1, and 16,4 stays the smallest file on every sample.
+- the new tiles R2 subdivides into are what barely pay: 4-7 KB for
+  +0.16 to +0.5 dB on most samples. That is the quadtree trying to hold
+  texture with flat fills.
+
+### A texture layer, measured
+
+`scripts/analysis/texture` renders the rectangles at some cut and codes
+what is left with an 8x8 DCT through the same arithmetic coder. PSNR at
+the byte size of today's container, interpolated along each curve:
+
+    image                  NVDR today       DCT alone        anchor + DCT     R1 + DCT
+    OIP-1304511485         18126 B 24.92   33.28 (+8.36)    29.91 (+4.99)    29.21 (+4.29)
+    OIP-3451121336         39852 B 21.83   30.06 (+8.23)    28.22 (+6.39)    26.18 (+4.35)
+    OIP-3786546191         38501 B 24.15   32.15 (+8.00)    30.26 (+6.11)    28.66 (+4.51)
+    OIP-4140498144         29253 B 25.20   34.70 (+9.50)    32.43 (+7.23)    30.86 (+5.66)
+    macarrão               10826 B 30.00   41.02 (+11.0)    38.35 (+8.35)    35.74 (+5.74)
+    montanha_pessoas       51765 B 26.30   31.93 (+5.63)    30.93 (+4.63)    29.68 (+3.38)
+    f0000 (video bench)    57113 B 29.60   38.56 (+8.96)    34.92 (+5.32)    32.98 (+3.38)
+
+The DCT alone, which is essentially JPEG with a better entropy coder,
+lands where Chromium's JPEG does on f0000, so the prototype is
+calibrated. The result is uncomfortable. Every rectangle added under
+the DCT makes it worse. The hard edges of a flat-filled base end up in
+the residual, and a fixed 8x8 transform pays dearly for edges that cross
+its blocks. Laid on a grid, the rectangles are a cost to the transform,
+not a help. Where the quadtree can still earn its place is as the
+partition the transform runs on: large blocks where the image is smooth,
+small ones where it is busy, each leaf carrying its colour plus the
+coefficients of its own texture. A flat fill is then just a leaf with
+no AC coefficients. `comparacao_macarrao.png` shows the images side by
+side.
+
+### The quadtree as the transform's partition
+
+`scripts/analysis/qtdct` gives the quadtree a new job. Its leaves are
+squares of 4 to 32 pixels on a power-of-two grid. Each leaf's colour is
+predicted from the decoded pixels just above and to its left, so it
+costs nothing to send, and what the prediction misses is coded with a
+DCT of the leaf's own size. A leaf with no AC coefficients is exactly a
+flat rectangle; the old codec is the special case where texture is never
+sent. Each node splits only if its four children, coded against the
+adaptive models as they stand, beat it on distortion + lambda * bits.
+
+PSNR at today's container size, same deadzone (0.1) for both DCTs:
+
+    image                  NVDR today       DCT 8x8 fixed   quadtree DCT            NVDR's PSNR in
+    OIP-3451121336         39852 B 21.83   31.13            31.32 (+0.19)            23% of the bytes
+    macarrão               10826 B 30.00   41.97            45.69 (+3.72)            13%
+    montanha_pessoas       51765 B 26.30   32.42            33.20 (+0.79)            25%
+    f0000 (video bench)    57113 B 29.60   39.11            41.24 (+2.13)            15%
+
+(deadzone 0.33, all seven samples: +0.2 to +3.7 dB over the fixed grid,
+NVDR's quality in 14-26% of the bytes.)
+
+The quadtree beats the fixed grid on every sample, most where the image
+has large smooth areas and least on dense texture. Two controls:
+
+- without the prediction from the neighbours (`--pred none`) the gain
+  over the fixed grid drops by 0.3 to 2 dB, and goes negative on the
+  most textured sample. Predicting the leaf's colour is what makes big
+  leaves cheap.
+- with the AC coefficients switched off (`--dc-only`), which is flat
+  rectangles again at a 4 px minimum, PSNR stops at 27.5 dB on macarrão
+  however many bytes it is given.
+
+lambda barely matters (0.06 to 0.3 times Q^2 moves nothing past 0.05 dB).
+A 32 px maximum beats 16 by up to 0.5 dB. Chroma at the luma step
+(`--chroma-q 1`) beats 1.5 slightly. `quadtree_dct.png` shows both images
+at equal size. At about a sixth of the bytes, the quadtree DCT matches
+today's PSNR. The artefacts it shows there are blocking in the largest
+leaves, which a deblocking filter is for, not the staircase of flat
+tiles.
+
+### Real time
+
+In the browser, on the same clip, a frame costs 21 ms to decode and 26 ms
+to display against a 40 ms budget at 25 fps: not real time, and the
+display is the larger half. The seam blend runs in JS over every pixel,
+after a copy from RGB to RGBA, on the main thread. The decoder in C runs
+at about 28 ms per megapixel, which is 38 fps at 720p and 17 at 1080p.
+
+Those numbers are from an older format. With sequence format 20 (32x32
+blocks, quarter pixels through HEVC's 8-tap filters, overlapped blocks,
+in-loop restoration) the player had slipped to about 120 ms a 960x540
+frame, three times its budget at 24 fps, and the C decoder to 130 ms:
+
+- The C decoder built, for every reference, all sixteen quarter-pixel
+  phases of the whole frame before predicting from it, as the encoder
+  does for its searches: 88% of its time. It now filters only the
+  region each block reads (`src/mc.c`), with the same sums and rounding,
+  so the pixels are the planes' to the bit. 25 frames: 3.2 s to 0.87 s.
+- The page's video tab never loaded the WebAssembly decoder (only the
+  image tab's workers did), so every frame was decoded in JavaScript,
+  57% of it in motion compensation. The tab now loads it, and
+  `src/mc.c` is compiled into it, so containers and predictions both run
+  as C: 125 ms a frame to 35 ms in Node, and in Chromium 37 ms to decode
+  and 4 ms to show against 41.7: real time, no frame dropped.
+
+`scripts/crosscheck_seq.mjs --wasm` holds the WebAssembly path to the C
+pixels as the plain run holds the JavaScript one: identical on three
+clips, whole and cut at seven points, one of them with PRED2 frames.
+
+The player then moved off the page's thread: a SequenceDecoder runs in
+the image tab's workers (`seqOpen`, `seqNext` and `seqClose` in
+`nvdr-tasks.js`), with the WebAssembly decoder loaded there, and the
+page only shows frames. Two things had to follow. The page asks for the
+next frame as soon as one arrives, not at its next animation frame,
+which left the worker idle up to 16 ms of every 42. And the start of the
+next loop is decoded while the end of this one is shown, since with B
+frames the first frame needs five decoded before it: a stall at every
+loop otherwise. On the 49-frame clip in Chromium, 2 stalls in 12 s of
+looping (the cold start) where there had been 28, 37 ms to decode and 4
+to show, now in parallel, and no task on the page longer than 8 ms.
+
+## Over a bad link
+
+`scripts/analysis/badnet.mjs <image>` sends a photo over a simulated bad
+link and reports what the receiver sees, and when. Every format is first
+encoded to the NVDR file's PSNR-Y (q 24, progressive), then cut at
+growing lengths and decoded, which gives its quality for each number of
+bytes received; a model of the link turns bytes into seconds: 1200-byte
+packets at the link's rate, losses in bursts (Gilbert-Elliott), and
+either retransmission a round trip after a loss, the receiver using the
+bytes up to the first packet still missing (TCP-like), or none, the
+bytes before the first loss being all there is (UDP-like, 50 draws).
+
+montanha_pessoas, at 33.9 dB; with retransmission:
+
+    satellite / radio: 16 kbit/s, RTT 1.2 s, 5% loss in bursts of ~3
+    format             bytes   first picture   25 dB   complete   at 5 s    at 15 s
+    NVDR progressive   45772         1.2 s     7.8 s       25 s   22.3 dB   27.5 dB
+    NVDR directional   43300         1.2 s      23 s       23 s   11.4 dB   17.0 dB
+    JPEG               98128         1.2 s      52 s       52 s   12.5 dB   13.9 dB
+    JPEG progressive   92600         1.2 s     9.0 s       49 s   22.4 dB   27.9 dB
+    WebP               57554          30 s      30 s       30 s   nothing   nothing
+    AVIF               52933          28 s      28 s       28 s   nothing   nothing
+    JPEG XL            54659          29 s      29 s       29 s   nothing   nothing
+
+    without retransmission, 2G (40 kbit/s, 3% loss): something arrives
+    100% of the time for NVDR and JPEG (median 33.9 dB NVDR progressive,
+    30.5 progressive JPEG, 14.7 baseline JPEG), 44% for WebP, AVIF and
+    JPEG XL, which need every byte.
+
+On two more photos over the 2G link the order holds. What it says:
+
+- The progressive NVDR file shows a picture at once and reaches full
+  quality first among the progressive ones, being half the size of a
+  progressive JPEG; the whole-file formats show nothing until the last
+  byte, and over a lossy datagram link usually nothing at all.
+- Progressive JPEG keeps up with it early, and on two of the three
+  photos reaches 25 dB a little sooner: NVDR's order of bytes (colour,
+  then the low texture band, then the rest) is not better than JPEG's
+  spectral selection at the start. Ordering a cut by worth (see
+  "Measured but not built: ordering a cut by worth") is where to look.
+- Directional NVDR is the smallest but fills the picture from the top
+  down, which a bad link turns into a long wait for the bottom.
+- A packet lost without retransmission ends what NVDR can use in that
+  model: the decoder had no point to pick up again after a gap. Restart
+  points and parity, below, are what came of it.
+
+Caveats. One photo in detail and two in summary, PSNR-Y (what NVDR
+optimises). AVIF and JPEG XL come from ffmpeg's libaom (cpu-used 4) and
+libjxl, which here made bigger files than NVDR at the same PSNR-Y where
+avifenc and cjxl, in "Against AVIF, JPEG XL and HEIC", beat it: take
+their sizes as these tools' and not the formats' best. JPEG XL can
+decode progressively, but not through ffmpeg, so it counts as
+whole-file. The link has no slow start or congestion control.
+
+### Restart points and parity
+
+Where packets are lost and not sent again, three things now work
+together.
+
+**Holes.** `nvdr_decode_mem_lossy()` (and `nvdr_decode --missing A-B,...`,
+and `decode()`'s `holes` in nvdr.js) takes the byte ranges that never
+arrived. Every layer starts where the header says, so a hole in one layer
+leaves the others readable; each decodes up to its first missing byte.
+
+**Slices** (container v17, `--slices N`, "Fatias" in the page; version 18
+since "Priors", below, which takes most of this cost away). Every N rows of tiles start a slice. Each layer's part of each
+slice is a stream of its own, coded from the picture's starting models,
+and a leaf's colour is predicted from nothing above its slice. A hole
+then costs the rest of the slice's part of that layer, where it cost the
+rest of the layer. This is what JPEG's restart markers and H.264's slices
+do. The file stays progressive, and a file without slices is still
+version 16, byte for byte what it was. What the restarts cost, by
+BD-rate on the six samples:
+
+    rows per slice     1       2       4       8
+    PSNR-Y           +5.5%   +2.9%   +1.4%   +0.4%
+    PSNR-RGB         +4.6%   +2.4%   +1.2%   +0.3%
+
+Most of it is the models learning again from even odds in every slice.
+
+**Parity** (`public/nvdr-fec.js`). The file goes out as numbered packets.
+Each layer is cut into blocks of k data packets, and each block gets m
+packets of Reed-Solomon parity over GF(2^8), applied across packets
+(Rizzo 1997) with a Cauchy matrix (Blömer et al. 1995). Any k of the
+k + m packets give back the block, so a burst of loss is no harder than
+scattered loss. The share of parity follows what the bytes are worth, as
+Priority Encoding Transmission does (Albanese et al. 1996): 0.5 for the
+header and colour layer, which are a few kilobytes and without which
+there is no picture, 0.25 for the low texture band, 0.1 for the high.
+Whatever cannot be filled in reaches the decoder as holes.
+
+montanha_pessoas at q 24, slices of 2 rows, 200 draws of the losses,
+1200-byte packets, all sent at the link's rate with no retransmission:
+
+    satellite / radio: 16 kbit/s, 5% loss in bursts of ~3
+    variant                  bytes sent   median    worst 10%   whole   complete at
+    no slices                   46612     32.8 dB    23.3 dB     49%       25 s
+    slices                      46867     32.6 dB    25.8 dB     49%       25 s
+    slices + even parity        56467     33.7 dB    27.1 dB     80%       30 s
+    slices + parity by layer    56467     33.7 dB    28.3 dB     80%       30 s
+
+    2G: 40 kbit/s, 3% loss in bursts of ~2
+    no slices                   46612     33.9 dB    23.7 dB     53%       10 s
+    slices                      46867     33.7 dB    26.0 dB     52%       10 s
+    slices + even parity        56467     33.7 dB    31.0 dB     90%       12 s
+    slices + parity by layer    56467     33.7 dB    33.7 dB     91%       12 s
+
+"Even parity" is the same bytes of parity spread evenly (0.19 of every
+layer). For the same cost, parity by layer keeps the worst draws 1.2 to
+2.6 dB higher. Across the 0.5/0.25/0.1 split, 1/0.4/0.15 and 1/0.25/0.05,
+and slices of 1, 2 and 4 rows, putting more on the colour and less on
+the high band did worse: on 2G its worst draws lost 3.6 dB to the even
+spread, and on both links fewer draws arrived whole (74% against 80% on
+the satellite). The high band is most of the file, so most of the
+packets that are lost.
+
+What it says:
+
+- On its own a slice helps most where a hole falls in the texture: the
+  rest of the picture keeps its detail. A hole in the colour layer still
+  greys a band of the picture, because one 1200-byte packet carries a
+  third of that layer across many slices. That is what the colour
+  layer's parity is for.
+- Retransmission, where there is a way back, still completes sooner: 25 s
+  on the satellite link and 9.8 s on 2G, against 30 s and 12 s. Parity is
+  for links with no way back (broadcast, one-way radio) or a round trip
+  too long to wait on, and it never waits.
+`scripts/analysis/badnet.mjs` measures all of this (`--slices`,
+`--protect`), against the same picture sent whole.
+
+**Concealment.** A tile whose colour never arrived, with tiles that did
+both above and below it in its column, is no longer left grey: each
+column of pixels runs in a straight line from the row above the gap to
+the row below it, each taken as its mean over 16 pixels either side (one
+row's texture drawn down the gap showed as stripes). In the picture the
+band reads as out of focus instead of missing; on the draw where a lost
+colour packet greyed a third of the picture, 16.6 dB became 19.0. In
+the tables above it changes nothing to a tenth of a dB: their worst
+draws lose the bottom or the top of the picture, where there is nothing
+on the other side to run to, and filling from one side alone is what
+`tile_fallback()` gives its reason against. A file cut short never has
+anything below what is missing, so truncation shows what it always did.
+
+**Over a real socket.** `tools/nvdr_send.mjs file host [port]` sends the
+packets over UDP, paced at `--kbps`; `tools/nvdr_recv.mjs prefix [port]`
+collects them per sender and file number, fills in what the parity
+allows, and writes the file and the picture decoded around its holes.
+`--drop P --burst L` on the sender loses packets on purpose.
+
+### Slices side by side
+
+A slice needs nothing from another, so the encoder codes them at the
+same time, one per core: each from a copy of the state the picture
+starts with, with its own row buffers, sharing the canvas (each writes
+its own rows and reads nothing above them). Slices are therefore also
+allowed in directional pictures (not in a sequence's frames, yet), where
+they are what makes one picture quick to encode: the search of one
+768x512 photo took 9.4 s on one core of four.
+
+`--slices auto` (the page's default in the directional mode) picks
+about sixteen slices of 4 to 16 rows of tiles by the picture's height,
+never by the machine, so the file is the same on one core or sixteen.
+The six samples, directional, auto against none, on four cores:
+
+                        PSNR-Y   PSNR-RGB   time
+    default             +2.2%     +2.2%     x0.46
+    --fast              +2.1%     +2.0%     x0.46
+
+    montanha_pessoas (768x512, four slices): 9.4 s to 3.0 s, +1.1% bytes
+
+The samples are 300 to 500 pixels tall, three or four slices each. A
+taller picture has more slices than cores and more bytes per slice, so
+more of the speed for less of the cost; what does not shrink is the
+restoration fit at the end, which is not in slices. The cost is, again,
+mostly every slice's models starting from even odds.
+
+### Priors: what a slice starts from (container v18)
+
+Both tables of costs above have the same cause: every slice's models
+start from even odds, since a slice cannot start from what the slice
+before it learnt. From version 18 it starts from what pictures in
+general teach instead. `scripts/analysis/priors.c` codes a set of
+pictures whole (the six samples and a frame of each bench clip,
+progressive and directional, q 16, 24 and 40) and averages, context by
+context, the probability each ended at; `src/priors.h` and
+`public/nvdr-priors.js` hold the result, 2105 probabilities for each of
+the two modes, to 8 bits. A context starts there with a count of 12, so
+it still moves an eighth of the way per symbol.
+
+Measured on pictures the priors did not see (trained on three samples,
+tested on the other three, both ways), BD-rate on PSNR-Y against a file
+without slices and from even odds:
+
+                                        even odds    priors
+    progressive, slices of 2 rows         +2.9%       +0.5%
+    progressive, slices of 4 rows         +1.4%       -0.2%
+    directional --fast, --slices auto     +2.1%       +0.6%
+    progressive, no slices                  0         -0.8%
+    directional --fast, no slices           0         -0.9%
+
+So slices now cost about half a percent, and the directional mode's
+speed with them (0.46 of the time on four cores) comes nearly free. A
+file without slices gains too, which `nvdr_encode` and `nvdr_batch` now
+take by default (`--no-priors` writes version 16 as before): 0.2 to
+0.8% on the photographs and about 3% on macarrão, 5 KB, where the slow
+start is a larger share. The library's default stays off, since a
+sequence rebuilds its frames' headers as version 16, and an album or a
+sequence carries its own models from one picture to the next.
+
+What it costs: the gate's three synthetic pictures, which are nothing
+like photographs, are 0.5 to 2.2% bigger (2 to 18 bytes), a decoder
+carries 4 KB of tables, and version 17 files (slices from even odds,
+written for a few days) still decode.
+
+**EXIF orientation.** A camera stores a photo as its sensor lies and
+says in EXIF which way is up. `nvdr_image_load()` now turns the pixels
+that way (all eight orientations, checked against ImageMagick's
+-auto-orient), where a phone photo taken upright used to come out lying
+on its side.
+
+## Damaged input
+
+Every test until this point fed the decoders valid files, or valid files
+cut short. A file that crosses a network can also arrive damaged, and one
+from an untrusted source can be damaged on purpose, so `make fuzz` builds
+a harness that mutates real containers — bit flips, overwritten bytes,
+header fields set to extremes, runs copied over other runs, truncation —
+and decodes each result under AddressSanitizer and
+UndefinedBehaviorSanitizer. Seeds cover every path the decoder has: arith
+and deflate, with and without ramps, YCbCr and RGB, and a block-motion
+sequence.
+
+It found heap-buffer overflows in the still decoder on its first run, in
+code that predates the sequence format. The per-rectangle arrays of a level
+were sized from the leaf count in the header, while the rectangle list
+itself grew on demand. A damaged split stream that subdivided past what the
+header promised wrote colours straight past the end of those arrays, both
+while replaying a unit and while filling in the units that never arrived.
+
+Reading the decoder for the same pattern turned up five more of its
+family that the fuzzer had not reached yet:
+
+  - a split bit on a rectangle under two pixels wide is accepted, and the
+    walk then descends through zero-area rectangles for as long as the
+    bits say so
+  - `anchor_bits` indexes a 256-entry model table and was never checked
+  - the palette is copied by a count the stream supplies, without checking
+    the stream holds that many bytes
+  - the deflate layout's split and token lengths come from the header and
+    were trusted against the inflated buffer
+  - `ramp_offset` multiplies a slope step from the header by an axis length
+    in `int`, which overflows on a damaged file — undefined behaviour, and
+    a value the JS decoder would compute differently
+
+All fixed on both sides, C and JS. A level that says something impossible
+is dropped whole and the last good level is shown, since nothing after the
+damage can be trusted to cover the canvas. The header is validated before
+anything is allocated from it, with a hard ceiling of 134 Mpx. None of it
+touches a valid file: every sample decodes to the same pixels, the
+regression gate is unchanged on the stills, and C and JS still agree byte
+for byte on every level and every cut.
+
+The original crashing inputs are the proof. Fifteen of them — two still
+containers and thirteen frame containers pulled out of sequences — overflow
+the heap in the decoder before this change and decode cleanly after it.
+
+## Softening the seams
+
+A rectangle meets its neighbour at a hard step, and that step is the most
+visible thing the format does wrong. Averaging every pixel with its four
+neighbours at 0.40 each fixes the one-pixel band along every seam and
+leaves everything else alone — inside a rectangle the neighbours carry the
+same colour, so the average returns it unchanged. It is exactly a boundary
+blend without needing to know where the boundaries are.
+
+Costs no bytes and changes no format: `nvdr_smooth()` is a choice the
+decoder makes, and `--smooth 0` renders the seams hard. Worth +0.00 to
++0.77 dB across `samples/`, never negative.
+
+The obvious design was tried first and does not work. Scaling the blend
+width by the colour difference across the seam — wide where the step is
+big, nothing below a threshold — moved PSNR by 0.03 dB. A large colour
+difference is usually a real edge, so widening the blend there smears what
+should stay sharp, while the banding actually worth fixing sits in smooth
+regions where the differences are small and the threshold skips it. The
+rule is backwards. Scaling the width by rectangle size instead, on the
+theory that a big flat block's seam reads as an artefact, measured 26.91
+against the flat rule's 26.90 — no better either.
+
+    no blend                             26.22 dB
+    width by colour difference, max 8px  26.25 dB
+    width by rectangle size, max 8px     26.91 dB
+    one pixel, uniform                   26.90 dB
+
+## The anchor palette
+
+Candidates come from a 5-bit-per-channel histogram of the level-0 leaf
+colours weighted by area, which bounds the work at 32768 bins whatever the
+image size. A greedy max-salience pass picks the seeds — heaviest colour
+first, then whichever candidate maximises weight x distance-to-nearest-
+chosen — and twelve Lloyd iterations refine them.
+
+The greedy pass maximises spread, which is good seeding but not the
+objective; the objective is area-weighted assignment error, which is what
+the refinement minimises. Worth +0.02 to +0.36 dB on the anchor across
+`samples/`, and it shrinks the container too, since a better anchor leaves
+smaller residuals behind it.
+
+    $ head -c 5% image.nvdr > partial.nvdr
+    $ nvdr_decode partial.nvdr out.ppm
+    ... rendered at ANCHOR  (file carries only ANCHOR)  psnr 19.99 dB
+
+The anchor is 1.5% of a typical container, so almost any surviving prefix
+carries it.
+
+## Sequences
+
+`src/nvdrv.c` codes a sequence of frames, and the frame codec does not
+change to make it work: a predicted frame is an ordinary NVDR container
+whose image happens to be the prediction error, biased to the middle of
+the range. Frame 0 is coded on its own; every frame after it is the error
+against what the decoder holds, moved by one global translation.
+
+Against coding every frame on its own, on the synthetic sequences:
+
+    sequence      so intra              NVDRV                  bytes
+    pan        984247 B  27.17 dB   245517 B  28.66 dB       -75.1%
+    object     995208 B  27.08 dB   311216 B  27.07 dB       -68.7%
+    pan+noise 1008011 B  27.09 dB   337152 B  28.58 dB       -66.6%
+
+Truncation now holds on two axes. A prefix of the file is a prefix of the
+movie, and the frame the cut lands in is handed to the still decoder as-is,
+so it shows at whatever quality its bytes paid for:
+
+    corte    bytes   quadros   PSNR medio
+       5%    12275         1     24.75 dB
+      15%    36827         1     27.12 dB
+      30%    73655         4     28.04 dB
+      50%   122758         9     28.40 dB
+     100%   245517        24     28.66 dB
+
+Scene cuts are found rather than declared: when the mean absolute
+prediction error passes `--intra-thresh`, the frame is coded intra. On a
+sequence spliced from two different sources the encoder puts an intra
+frame exactly at the splice without being told where it is.
+
+The encoder predicts from its own decoded output and never from the source
+frame, because that is all a decoder has. Getting this wrong is the
+classic way a codec drifts, and it is the reason the regression gate
+checks a sequence: replacing the reconstruction loop with the source frame
+makes the container **78.7% smaller**, which a size check would call an
+improvement, and costs 8.90 dB by frame 12.
+
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+    ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
+    ./nvdr_album unpack album.nvda out/ --compare .
+    ./nvdr_album unpack album.nvda out/ --only 3
+
+A predicted frame's levels look broken and are not. Its anchor comes out
+as one rectangle costing 9 bytes and its R1 as one more, with all 31585
+rectangles in R2 — the same shape that made a star field's truncation
+ladder flat. Here it is correct: a flat grey error means "no correction
+yet", which renders as the previous frame, so a predicted frame cut short
+falls back to what was already on screen. Tightening the tolerance does
+restore a ladder, and costs 59% more bytes for 0.15 dB, so it stays as it
+is. The anchor palette was the suspect before this was measured, and it
+is not: 9 bytes is not where the waste would be.
+
+### Per-block motion
+
+One vector per frame describes a camera pan and nothing else. When
+something in the shot moves differently from the camera, the global vector
+is right for one of them and wrong for the other. Each 8x8 block now
+carries its own vector, searched in two windows — around the global
+vector, where most blocks are, and around zero, because what moves against
+a pan is very often something holding still relative to the camera. The
+field went in the frame as deltas against the global vector, in two
+deflated planes, so a shot with nothing moving against the camera paid a
+few dozen bytes for it. Version 3 codes it predictively instead; see
+below.
+
+Measured with the field's cost inside the bytes:
+
+    sequence      global              block 8
+    pan        245517 B  28.66 dB   243331 B  28.76 dB     -0.9%
+    object     311216 B  27.07 dB   289666 B  27.24 dB     -6.9%
+    mixed      308443 B  28.16 dB   268886 B  28.53 dB    -12.8%
+    pan+noise  337152 B  28.58 dB   333416 B  28.67 dB     -1.1%
+
+Smaller and better on every sequence at once, for 18% more encode time.
+Blocks of 16 and 32 were expected to win on vector cost and lost at every
+row; a mostly-agreeing field deflates to almost nothing, so the finer grid
+is nearly free. `mixed` — camera panning while a region moves the other
+way — is the case one vector cannot describe, and it is only 4% of the
+area there. Real footage, where far more of the frame moves independently,
+is where this should matter most and is exactly what has not been measured.
+
+### Coding the field
+
+On the clean benchmark clip, once predicted frames stopped re-coding the
+intra frame's texture, the motion field was most of what was left: 3607
+of a predicted frame's 3714 bytes. Deflate over deltas against the global
+vector sees runs of equal bytes. It cannot see that the likeliest vector
+is the one next door.
+
+Version 3 predicts each vector from the median of its left, top and
+top-right neighbours, as H.264 does, and codes it with the same adaptive
+arithmetic coder as the stills. A block that matches its prediction costs
+one bit, conditioned on whether its left and top neighbours matched. Any
+other block codes the difference, x then y, as zero flag, sign and
+adaptive unary magnitude.
+
+A better coder for the field does little while the search ignores it,
+because the search picks each vector by prediction error alone. Among
+near-equal matches on texture, the winner flickers from block to block.
+A second pass therefore walks the blocks in coding order, when each
+block's prediction is known. It weighs a handful of candidates (the
+search's pick, the prediction and its four neighbours at one pixel, the
+global vector, the left and top vectors) by block error plus
+`--mv-lambda` times the bits the vector would cost. That pass is
+sequential, because every choice moves the prediction of the blocks
+after it. It is cheap, because it only evaluates candidates.
+
+On the clean clip, against v2:
+
+                               v2                    v3, lambda 8
+    default tolerance     3402 kbit/s 33.36 dB    3143 kbit/s 33.39 dB   -7.6%
+    --pred-tolerance loose 999 kbit/s 30.29 dB     816 kbit/s 30.36 dB  -18.3%
+
+    field per predicted frame, loose:  3607 B  ->  2674 B
+
+The coder alone, with lambda 0, gives 905 kbit/s. The rest comes from the
+rate-aware pass. Larger lambdas keep trading quality for rate (715 kbit/s
+at 16 and 30.17 dB; 593 at 32 and 29.81 dB). 8 is the default because it
+is the largest that costs no quality at the default tolerance. The
+12-frame sequence in the regression gate is 4.1% smaller at -0.02 dB.
+
+That is not the gap to VP8 closed. The field is still about 2.3 bits per
+8x8 block. VP8 spends its whole predicted frame, 637 bytes at 150 kbit/s,
+on 16x16 macroblocks that split only where it pays. The next step for
+the field is the same thing in this codec's own terms: a quadtree over
+the motion that stays whole where the vectors agree. At the default
+tolerance the residual is still 12 KB of the 15 KB frame, and that is
+fix (b).
+
+B frames came later: see "B frames (sequence format 7)".
+
+## Layout
+
+    src/        the codec: nvdr.c (v10), entropy.c, grain.c and restore.c, plus
+                nvdrv.c for sequences
+    tools/      seven CLIs: nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
+                nvdr_png, nvdr_batch
+    public/     the browser decoders (nvdr.js, nvdrv.js) and the page
+    scripts/    the regression gate, the C-vs-JS cross-checks, the fuzzer, analysis
+    samples/    the images every number in this file was measured on
+    vendor/     stb_image.h, the only third-party code
+    reference/  the v9 rectangle codec and two modules from a removed
+                pipeline; not built
+
+`GUIA.md` is the testing guide, in Portuguese, and is the shorter way in.
+
+## Build and run
+
+    make
+    ./nvdr_encode image.jpg out.nvdr [--q 24]
+    ./nvdr_decode out.nvdr out.png --layer 1 --compare image.jpg
+    ./nvdrv_encode frames/ out.nvdrv
+    ./nvdrv_decode out.nvdrv --out played/ --compare frames/
+    ./nvdr_album pack album.nvda a.jpg b.jpg c.jpg
+    ./nvdr_album unpack album.nvda out/ --compare .
+    ./nvdr_png out.nvdr out.png         # any of the three, as a PNG
+    ./nvdr_png --extract out.png back.nvdr
+    ./nvdr_batch ~/Fotos -r --fast       # every image in a folder (and under it)
+    make check          # the regression gate
+    make fuzz           # the decoders under ASan and UBSan
+
+`nvdr_encode` prints each layer's stored size and the PSNR of the file
+read back at that layer, and how many leaves of each size the tree chose.
+
+`public/index.html`, served by `server.js`, shows the three layers side by
+side, a slider that truncates the container, and plays sequences.
+
+## Format (v11)
+
+    [header 32B]  "NVDR", 11, flags, width u16, height u16, max block u8,
+                  min block u8, luma step u16, chroma step u16,
+                  layer 0/1/2 bytes u32 x3, band u8, 3 reserved
+    [layer 0]     per 32x32 tile in raster order: split flags, and per
+                  leaf three colour corrections
+    [layer 1]     per tile, per leaf in the same order: three low-band textures
+    [layer 2]     the same for the high band; empty when band is 0
+
+Flags: 0x01 residual (every colour predicted as 128), 0x02 deblock.
+Later formats add 0x04 4:2:0, 0x08 grain, 0x10 tile steps, 0x20
+directional prediction, 0x40 a base picture and 0x80 a transform type
+per leaf (see their sections). Byte 29 is the grain parameters' length
+and bytes 30 and 31 the restoration's, which follow the header in that
+order. A directional picture has no band, and from container 16 its
+byte 28 holds the deblocking levels instead, luma's in the low half.
+
+The canvas is padded to a multiple of the smallest block. A node that
+runs past it has no split flag and always splits; one wholly past it does
+not exist. The v9 format this replaced is described in the git history of
+this file and implemented in `reference/nvdr_v9`.

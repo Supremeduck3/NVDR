@@ -1,5 +1,5 @@
 /*
- * NVDR still images, format v10. See nvdr.h for the design; README.md
+ * NVDR still images, format v10. See nvdr.h for the design; NOTEBOOK.md
  * for the measurements behind it.
  */
 /* NVDR_WASM builds the decoder for the browser (wasm/): no files, no
@@ -324,7 +324,7 @@ static const int cos_table[33] = {
  * a basis function that is a constant, so the colour's correction goes
  * with the rest of the texture, which is then coded from scan position 0
  * against the same models as the DCT's (a set of their own did worse:
- * see README, "Adaptive transforms").
+ * see NOTEBOOK.md, "Adaptive transforms").
  */
 #define TX_DCT    0
 #define TX_ADST   1
@@ -1466,7 +1466,7 @@ static void restore_planes(const NvdrHeader* h, NvdrRestorePlane* g) {
  *
  * What it costs is each part starting its models afresh and flushing its
  * coder, and the colours along a slice's top edge predicted from the left
- * alone: see README, "Over a bad link". Progressive pictures only.
+ * alone: see NOTEBOOK.md, "Over a bad link". Progressive pictures only.
  */
 static int read_leb(const uint8_t* p, size_t size, size_t* at, uint32_t* v) {
     uint32_t x = 0;

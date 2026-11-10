@@ -1,7 +1,7 @@
 // node scripts/analysis/seqbd.mjs <clipdir> <out.json> [--bin DIR] [--frames N] [--qs 14,20,28,40] [-- encoder args...]
 // node scripts/analysis/seqbd.mjs --compare <base.json> <test.json>
 //
-// The measurement behind every "BD-rate over N frames" in the README's
+// The measurement behind every "BD-rate over N frames" in NOTEBOOK.md's
 // sequence sections: encode a clip at several q with nvdrv_encode, decode
 // it, score PSNR-Y (BT.601 luma of the RGB) and PSNR-RGB over all frames,
 // and keep bytes and scores in a JSON; --compare gives the BD-rate of one

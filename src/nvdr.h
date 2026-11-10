@@ -9,7 +9,7 @@
  * DCT at the same size it was 6 to 11 dB behind on every sample, and the
  * reason was structural: a flat rectangle cannot hold texture finer than
  * the smallest tile, so the finest level spent most of the file
- * subdividing into grain (see README, "A texture layer, measured"). v9
+ * subdividing into grain (see NOTEBOOK.md, "A texture layer, measured"). v9
  * lives on in reference/nvdr_v9 so the numbers measured with it stay
  * reproducible.
  *

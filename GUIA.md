@@ -3,16 +3,22 @@
 ## Onde está cada coisa
 
 ```
-src/        o codec: nvdr.c e entropy.c, mais nvdrv.c para sequências
-tools/      quatro CLIs: nvdr_encode/decode (imagem) e nvdrv_encode/decode
-            (sequência)
-public/     o decoder do navegador (nvdr.js) e a página que o usa
-scripts/    o gate de regressão, o crosscheck C×JS, e análises
-samples/    as imagens em que todo número do README foi medido
+src/        o codec: nvdr.c (imagem), nvdrv.c (sequência), nvda.c (álbum),
+            entropy.c, grain.c, restore.c, mc.c, pngwrap.c
+tools/      os CLIs (nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
+            nvdr_png, nvdr_batch) e o envio por UDP (nvdr_send/recv.mjs)
+public/     os decoders do navegador, o elemento <nvdr-img> e a página
+wasm/       o decoder C compilado para o navegador
+scripts/    o gate de regressão, os crosschecks C×JS, o fuzzer, análises
+samples/    as imagens em que todo número do NOTEBOOK.md foi medido
 vendor/     stb_image.h, o único código de terceiros
-reference/  dois módulos guardados de um pipeline removido; não compilam
-            no build
+reference/  o codec v9 e dois módulos de um pipeline removido; não
+            compilam no build
 ```
+
+Os documentos: `README.md` é o resumo (em inglês), este guia é o passo a
+passo, e `NOTEBOOK.md` é o caderno de medições, na ordem em que foram
+feitas, com o que foi tentado e o que ficou de fora.
 
 Havia um segundo codec no repositório (`src/` antigo, formato `.svbc`,
 binário `image_to_svg`). Ele foi removido: com a taxa casada o NVDR saía

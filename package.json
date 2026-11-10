@@ -1,0 +1,35 @@
+{
+  "name": "nvdr",
+  "version": "0.18.0",
+  "description": "NVDR still image and sequence codec: the browser decoders (JavaScript and WebAssembly), the <nvdr-img> element, and the demo server",
+  "private": true,
+  "license": "UNLICENSED",
+  "exports": {
+    ".": "./public/nvdr.js",
+    "./sequence": "./public/nvdrv.js",
+    "./album": "./public/nvda.js",
+    "./png": "./public/nvdr-png.js",
+    "./fec": "./public/nvdr-fec.js",
+    "./wasm": "./public/nvdr-wasm.js",
+    "./element": "./public/nvdr-img.js",
+    "./nvdr.wasm": "./public/nvdr.wasm"
+  },
+  "files": [
+    "public/*.js",
+    "public/nvdr.wasm",
+    "tools/*.mjs",
+    "README.md"
+  ],
+  "bin": {
+    "nvdr-send": "tools/nvdr_send.mjs",
+    "nvdr-recv": "tools/nvdr_recv.mjs"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "lan": "node server.js --lan",
+    "test": "python3 scripts/verify.py"
+  },
+  "engines": {
+    "node": ">=22.7"
+  }
+}

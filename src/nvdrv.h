@@ -52,7 +52,7 @@
  * Every eighth frame by default is an anchor (an I or P frame); the seven
  * between are B frames, coded after it, halfway first, and predicted per
  * block from the nearest decoded frame before, the nearest after, or the
- * mean of both. See "B frames" in the README.
+ * mean of both. See "B frames" in NOTEBOOK.md.
  */
 #ifndef NVDRV_H
 #define NVDRV_H
@@ -169,6 +169,11 @@ typedef struct {
      * nvdrv.c); with 2 each P frame is coded both ways and the cheaper
      * kept. */
     int   refs;
+    /* With refs 2, choose between a P frame's one anchor and two from
+     * their predictions (squared error, and the field's bits) and code
+     * only the one chosen, instead of coding the frame both ways: see
+     * code_frame(). */
+    int   refs_estimate;
     int   fps;             /* carried in the header, informational */
     /* A stretch of a longer sequence, coded on its own so that stretches
      * can be coded side by side (STRETCHES in nvdrv.c): the display

@@ -40,6 +40,32 @@ nvdrv_encode: tools/nvdrv_encode.c $(SEQ) $(SEQ_H)
 nvdrv_decode: tools/nvdrv_decode.c $(SEQ) $(SEQ_H)
 	$(CC) $(CFLAGS) -o $@ tools/nvdrv_decode.c $(SEQ) $(LDLIBS)
 
+# The codec as a library, for a program that calls it instead of running
+# the tools: libnvdr.a, and with `make install` the headers, the tools and
+# a pkg-config file under PREFIX. Link with what `pkg-config --libs
+# --static nvdr` says: -lnvdr -lm -lz, and OpenMP when built with it.
+# LIB_VERSION is the still container's version and the sequence format's.
+LIB_VERSION = 18.21
+LIB_SRC = $(SEQ) src/nvda.c src/pngwrap.c
+LIB_OBJ = $(LIB_SRC:src/%.c=build/%.o)
+LIB_H   = src/nvdr.h src/nvdrv.h src/nvda.h src/pngwrap.h
+
+build/%.o: src/%.c $(SEQ_H) src/nvda.h src/pngwrap.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
+
+libnvdr.a: $(LIB_OBJ)
+	$(AR) rcs $@ $^
+
+PREFIX ?= /usr/local
+install: all libnvdr.a
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/pkgconfig $(DESTDIR)$(PREFIX)/include/nvdr
+	install -m 755 $(TOOLS) $(DESTDIR)$(PREFIX)/bin
+	install -m 644 libnvdr.a $(DESTDIR)$(PREFIX)/lib
+	install -m 644 $(LIB_H) $(DESTDIR)$(PREFIX)/include/nvdr
+	printf 'prefix=%s\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include/nvdr\n\nName: nvdr\nDescription: NVDR still image and sequence codec\nVersion: %s\nLibs: -L$${libdir} -lnvdr\nLibs.private: -lm -lz %s\nCflags: -I$${includedir}\n' \
+	    '$(PREFIX)' '$(LIB_VERSION)' '$(OPENMP)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/nvdr.pc
+
 # The regression gate: encodes every sample, checks quality against a
 # floor, checks the encoder is deterministic, and checks the C and JS
 # decoders agree byte for byte.
@@ -89,6 +115,6 @@ demo: nvdr_encode nvdr_album
 	    output/demo_frames/f003.ppm output/demo_frames/f004.ppm output/demo_frames/f005.ppm
 
 clean:
-	rm -f $(TOOLS) fuzz_nvdr
+	rm -f $(TOOLS) fuzz_nvdr libnvdr.a $(LIB_OBJ)
 
-.PHONY: all check clean fuzz demo bench bench-photos
+.PHONY: all check clean fuzz demo bench bench-photos install
