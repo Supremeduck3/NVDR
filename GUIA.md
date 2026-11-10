@@ -141,6 +141,17 @@ esse toca direto, sem passar pelo servidor.
   economiza 2 a 6% ao vivo e até 0,8% com quadros B, por uns 6% (com B)
   a 60% (ao vivo) a mais de tempo. Uma (`--refs 1`) é o comportamento
   antigo.
+- **Taxa alvo** (`--kbps N`): em vez de uma qualidade fixa, uma taxa
+  média. O encoder codifica uma amostra do vídeo em dois passos de
+  qualidade, calcula o passo que dá a taxa pedida e codifica tudo com
+  ele: a qualidade fica constante e os bytes vão para onde a imagem
+  precisa. Acerta a taxa a poucos por cento e leva umas 2 vezes o tempo.
+  Não é um teto: um trecho agitado passa da média.
+- **Som**: se o vídeo enviado tem som e o servidor tem ffmpeg, a trilha
+  vai junto (Opus, 64 kbit/s), guardada inteira depois do último quadro
+  do `.nvdrv`, e o player toca em sincronia. Na linha de comando:
+  `--audio trilha.webm` (ou .ogg, .m4a, .mp3). Um arquivo cortado toca
+  mudo: o som é a última coisa nele.
 - **Velocidade** rápida é o `--fast`.
 - **Prévia do PNG** e **Pontilhado** valem para o botão "Baixar como PNG"
   (veja "Compartilhar como PNG"); são as mesmas nas duas abas.

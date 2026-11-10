@@ -17,6 +17,13 @@
  * server.js sharing them out): --plan lists them, and --from/--to codes
  * one from a folder holding just the frames it reads, ending with a line
  * that says what to join and how to check the joins.
+ *
+ * --kbps aims at a bitrate instead of a quantiser: the same step for the
+ * whole sequence (constant quality, the bytes going where the pictures
+ * need them), chosen so the file comes to that average rate. Two probes
+ * on a sample of the stretches, coded the fast way, give the step a
+ * trial and the slope of bytes against it; the sequence is then coded
+ * once, and once more only if it missed by more than a step's worth.
  */
 #include "nvdrv.h"
 
@@ -95,6 +102,9 @@ static void usage(const char* a0) {
         "  --tf N           source frames each side averaged into each anchor (default 7; 0 = off)\n"
         "  --tf-strength F  how far a match may differ, in units of the noise (default 4)\n"
         "  --no-restore     send no restoration filter with any frame\n"
+        "  --audio FILE     carry FILE after the frames as the sound track: a file a\n"
+        "                   browser plays (.webm, .ogg, .m4a, .mp3...), as long as the frames\n"
+        "  --kbps N         aim at an average of N kbit/s at --fps instead of a fixed --q\n"
         "  --jobs N         GOPs coded at once (default: one per core; 1 = in one pass)\n"
         "  --limit N        stop after N frames\n"
         "  --plan           list the stretches (from, to, first and last frame read) and stop\n"
@@ -247,6 +257,115 @@ static int join(const char* out, char** parts, Reports* reps, int count) {
     return rc;
 }
 
+/*
+ * The sound track `path` after the frames of `out` (SOUND in nvdrv.h): a
+ * file a browser plays, its type told by its name.
+ */
+static int append_sound(const char* out, const char* path) {
+    static const char* types[][2] = {
+        { ".webm", "audio/webm" }, { ".ogg", "audio/ogg" }, { ".opus", "audio/ogg" }, { ".m4a", "audio/mp4" },
+        { ".mp4", "audio/mp4" }, { ".aac", "audio/aac" }, { ".mp3", "audio/mpeg" }, { ".wav", "audio/wav" },
+    };
+    const char* dot = strrchr(path, '.');
+    const char* mime = NULL;
+    for (size_t i = 0; dot && i < sizeof(types) / sizeof(types[0]); i++)
+        if (!strcasecmp(dot, types[i][0])) mime = types[i][1];
+    if (!mime) { fprintf(stderr, "--audio: a .webm, .ogg, .opus, .m4a, .mp4, .aac, .mp3 or .wav file\n"); return -1; }
+    FILE* a = fopen(path, "rb");
+    if (!a) { fprintf(stderr, "cannot read %s\n", path); return -1; }
+    fseek(a, 0, SEEK_END);
+    long size = ftell(a);
+    fseek(a, 0, SEEK_SET);
+    uint8_t* data = size > 0 ? (uint8_t*)malloc((size_t)size) : NULL;
+    int ok = data && fread(data, 1, (size_t)size, a) == (size_t)size;
+    fclose(a);
+    FILE* o = ok ? fopen(out, "ab") : NULL;
+    if (o) {
+        uint8_t head[6] = { NVDRV_SOUND_MARK, 'N', 'V', 'A', 'U', (uint8_t)strlen(mime) };
+        uint8_t len[4] = { (uint8_t)size, (uint8_t)(size >> 8), (uint8_t)(size >> 16), (uint8_t)(size >> 24) };
+        ok = fwrite(head, 1, 6, o) == 6 && fwrite(mime, 1, strlen(mime), o) == strlen(mime) &&
+             fwrite(len, 1, 4, o) == 4 && fwrite(data, 1, (size_t)size, o) == (size_t)size;
+        if (fclose(o) != 0) ok = 0;
+    } else ok = 0;
+    free(data);
+    if (!ok) fprintf(stderr, "cannot add %s to %s\n", path, out);
+    return ok ? 0 : -1;
+}
+
+/*
+ * RATE
+ * ----
+ * What the whole sequence would cost at cfg's step, in bytes, from the
+ * stretches k = 0, stride, 2 * stride...: a probe for --kbps. Intra
+ * frames are most of the bytes and a sample holds more or fewer of them
+ * than its share (the first stretch has two), so the two kinds are
+ * averaged apart and each scaled to how many the sequence has. Nothing
+ * is kept.
+ */
+#include <math.h>
+static int probe(char** names, int n, const NvdrvConfig* cfg, int width, int height, const char* out,
+                 int count, int jobs, int stride, double* bytes) {
+    int failed = 0;
+    double bi = 0, bp = 0;
+    int ni = 0, np = 0;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(jobs < count ? jobs : count) reduction(+:bi, bp, ni, np)
+    for (int k = 0; k < count; k += stride) {
+        NvdrvConfig c = *cfg;
+        if (count > 1) { c.from = k * cfg->gop; c.to = k + 1 < count ? (k + 1) * cfg->gop : 0; }
+        char path[4096], err[256];
+        snprintf(path, sizeof(path), "%s.probe%d", out, k);
+        Reports r = { NULL, NULL, 0, 0, 0 };
+        if (code_stretch(names, n, 0, &c, width, height, path, &r, err, sizeof(err)) != 0) {
+            #pragma omp atomic write
+            failed = 1;
+        }
+        for (int i = 0; i < r.n; i++) {
+            if (r.r[i].kind == NVDRV_INTRA) { bi += (double)r.r[i].bytes; ni++; }
+            else { bp += (double)r.r[i].bytes; np++; }
+        }
+        free(r.r);
+        remove(path);
+    }
+    if (failed || ni + np == 0) return -1;
+    /* The intra frames the GOP places; a cut the encoder finds is one more. */
+    int intras = cfg->gop > 0 ? (n - 1) / cfg->gop + 1 : 1;
+    if (intras > n) intras = n;
+    *bytes = (ni ? bi / ni * intras : 0) + (np ? bp / np * (n - intras) : 0);
+    return 0;
+}
+
+/* The step that should bring `n` frames to `target` bytes: see the top of
+ * the file. `slope` takes the exponent found, for the correction after. */
+static int step_for_rate(char** names, int n, const NvdrvConfig* cfg, int width, int height, const char* out,
+                         int count, int jobs, double target, double* slope) {
+    NvdrvConfig c = *cfg;
+    c.frame.tx_modes = 2; c.frame.fast_rank = 1;   /* --fast: a probe is an estimate */
+    /* About half the sequence, in stretches spread along it. */
+    int stride = count >= 4 ? 2 : 1;
+    double b0, b1;
+    int q0 = cfg->frame.q;
+    if (probe(names, n, &c, width, height, out, count, jobs, stride, &b0) != 0) return -1;
+    /* Bytes go roughly as 1 / step: the second probe where that says. */
+    int q1 = (int)(q0 * b0 / target + 0.5);
+    q1 = q1 < 4 ? 4 : q1 > 200 ? 200 : q1;
+    if (q1 == q0) q1 = b0 > target ? q0 + 1 : q0 - 1;
+    c.frame.q = q1;
+    if (probe(names, n, &c, width, height, out, count, jobs, stride, &b1) != 0) return -1;
+    /* The slope the two probes show, where they are far enough apart to
+     * show one: between neighbouring steps the difference is mostly the
+     * rounding of the predicted frames' steps, and bytes go as 1 / step
+     * to within a few percent (-0.95 on the clip this was tried on). */
+    double e = -1.0;
+    if (fabs(log((double)q1 / q0)) > 0.25) {
+        e = log(b1 / b0) / log((double)q1 / q0);
+        if (!(e < -0.7)) e = -0.7;
+        if (e < -1.6) e = -1.6;
+    }
+    *slope = e;
+    int q = (int)(q1 * pow(target / b1, 1.0 / e) + 0.5);
+    return q < 4 ? 4 : q > 200 ? 200 : q;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && !strcmp(argv[1], "--version")) {
         printf("nvdrv_encode, sequence format %d\n", NVDRV_VERSION);
@@ -259,6 +378,8 @@ int main(int argc, char** argv) {
     const char* out = argv[2];
     NvdrvConfig cfg = nvdrv_default_config();
     int limit = 0, jobs = 0, stretch = 0;
+    double kbps = 0;
+    const char* audio = NULL;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gop") && i+1 < argc) cfg.gop = atoi(argv[++i]);
@@ -281,6 +402,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tf-levels") && i+1 < argc) cfg.tf_levels = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--limit") && i+1 < argc) limit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--jobs") && i+1 < argc) jobs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kbps") && i+1 < argc) kbps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--audio") && i+1 < argc) audio = argv[++i];
         else if (!strcmp(argv[i], "--from") && i+1 < argc) { cfg.from = atoi(argv[++i]); stretch = 1; }
         else if (!strcmp(argv[i], "--to") && i+1 < argc) { cfg.to = atoi(argv[++i]); stretch = 1; }
         else if (!strcmp(argv[i], "--no-restore")) cfg.frame.restore = 0;
@@ -308,8 +431,13 @@ int main(int argc, char** argv) {
     /* A stretch from each intra frame the GOP places, but for one on the
      * last frame, which the stretch before it ends with. */
     int count = 1;
-    if (cfg.gop > 0 && (jobs > 1 || plan))
+    if (cfg.gop > 0 && (jobs > 1 || plan || kbps > 0))
         while ((long)count * cfg.gop < n - 1) count++;
+    if (audio && (plan || stretch)) { fprintf(stderr, "--audio goes with a whole sequence\n"); return 1; }
+    if (kbps > 0 && (plan || stretch || cfg.fps <= 0)) {
+        fprintf(stderr, "--kbps codes a whole sequence, at a known --fps\n");
+        return 1;
+    }
 
     if (plan) {
         for (int k = 0; k < count; k++) {
@@ -354,6 +482,14 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    double target = kbps * 125.0 * n / (cfg.fps > 0 ? cfg.fps : 1), slope = -1.0;
+    int tries = 0;
+    if (kbps > 0) {
+        int q = step_for_rate(names, n, &cfg, width, height, out, count, jobs, target, &slope);
+        if (q < 0) { fprintf(stderr, "could not probe the sequence for --kbps\n"); return 1; }
+        cfg.frame.q = q;
+    }
+again:
     printf("%d frames  %dx%d  gop %d  search %d  block %d  bframes %d\n", n, width, height,
            cfg.gop, cfg.search, cfg.block, cfg.bframes);
     if (count > 1) printf("  %d trechos de um GOP, %d ao mesmo tempo\n", count, jobs < count ? jobs : count);
@@ -406,13 +542,27 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < reps[k].n; i++) print_report(&t, &reps[k].r[i]);
         for (int k = 0; k < count; k++) if (parts[k]) { remove(parts[k]); free(parts[k]); }
     }
-    free_frames(names, n);
     for (int k = 0; k < count; k++) {
         if (errs[k][0]) fprintf(stderr, "%s\n", errs[k]);
         free(reps[k].r);
     }
     free(reps); free(parts); free(errs);
-    if (failed) return 1;
+    if (failed) { free_frames(names, n); return 1; }
+    if (kbps > 0) {
+        /* A step is 4 to 5% of the bytes near the default: past that, the
+         * probes misjudged, and what was just coded says by how much. */
+        double got = (double)t.total;
+        int q = (int)(cfg.frame.q * pow(target / got, 1.0 / slope) + 0.5);
+        q = q < 4 ? 4 : q > 200 ? 200 : q;
+        printf("\n  taxa: %.0f kbit/s com q %d (alvo %.0f)\n", got / 125.0 * cfg.fps / n, cfg.frame.q, kbps);
+        if (fabs(got / target - 1.0) > 0.06 && q != cfg.frame.q && tries++ < 1) {
+            printf("  fora do alvo: de novo com q %d\n\n", q);
+            cfg.frame.q = q;
+            goto again;
+        }
+    }
+    free_frames(names, n);
+    if (audio && append_sound(out, audio) != 0) return 1;
 
     size_t inter = t.total - t.intra_total - NVDRV_HEADER_SIZE;
     int ninter = t.count - t.intra_count;

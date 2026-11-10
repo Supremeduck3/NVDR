@@ -3476,6 +3476,8 @@ static int decode_one(NvdrvDecoder* d) {
     size_t avail = d->size - d->pos, at = 0;
     int a = h[at++];
     int kind = a & 3, flags = (a >> 2) & 7, has_field = (a >> 5) & 1, changed = (a >> 6) & 1;
+    /* The frames end where a sound track begins (SOUND in nvdrv.h). */
+    if (a == NVDRV_SOUND_MARK) return 0;
     if (a >> 7) return -1;
     /* A header cut short ends the stream; one that makes no sense is damage. */
     uint32_t u;

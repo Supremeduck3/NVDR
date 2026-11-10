@@ -491,9 +491,36 @@ function videoOptions(req) {
 function encodeVideo(encoder, framesDir, outPath, args, done) {
     const alone = () => execFile(encoder, [framesDir, outPath, ...args],
                                  { timeout: 900000, maxBuffer: 8 * 1024 * 1024 }, done);
+    // A target rate is found by probing the whole sequence: on this machine.
+    if (args.includes('--kbps')) return alone();
     cluster.encodeShared(encoder, framesDir, outPath, args).then(
         (report) => (report === null ? alone() : done(null, report, '')),
         (err) => done(err, '', err.message));
+}
+
+/*
+ * The upload's sound for the stretch that was coded, as Opus in WebM,
+ * after the frames (SOUND in nvdrv.h). Only ffmpeg does this; without it,
+ * or without a sound track in the upload, the sequence stays silent.
+ */
+function addSound(input, outPath, seconds, done) {
+    const sound = `${outPath}.webm`;
+    execFile(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-t', String(seconds), '-vn',
+                      '-c:a', 'libopus', '-b:a', '64k', '-f', 'webm', sound], { timeout: 120000 }, (err) => {
+        let added = false;
+        try {
+            const data = err ? null : fs.readFileSync(sound);
+            if (data && data.length > 200) {
+                const mime = Buffer.from('audio/webm'), len = Buffer.alloc(4);
+                len.writeUInt32LE(data.length);
+                fs.appendFileSync(outPath, Buffer.concat([Buffer.from([0xff]), Buffer.from('NVAU'),
+                                                          Buffer.from([mime.length]), mime, len, data]));
+                added = true;
+            }
+        } catch { /* silent */ }
+        safeUnlink(sound);
+        done(added);
+    });
 }
 
 function handleVideo(req, res) {
@@ -537,10 +564,14 @@ function handleVideo(req, res) {
             if (!frames) return fail(422, `${tool} não extraiu nenhum quadro.`);
             console.log(`Video: ${frames} frames at ${fps} fps via ${tool}, encoding...`);
 
-            encodeVideo(encoder, framesDir, outPath, ['--fps', String(fps), '--q', String(q), ...videoOptions(req)],
+            // A target rate, when the page asks for one, takes the quality's place.
+            const kbps = /^[1-9]\d{1,5}$/.test(req.headers['x-kbps'] || '') ? ['--kbps', req.headers['x-kbps']] : [];
+            encodeVideo(encoder, framesDir, outPath, ['--fps', String(fps), '--q', String(q), ...kbps, ...videoOptions(req)],
                         (err2, stdout, stderr2) => {
                 if (err2) return fail(500, `nvdrv_encode falhou: ${(stderr2 || err2.message).trim()}`);
-                fs.readFile(outPath, (err3, data) => {
+                const withSound = req.headers['x-sound'] === '0' ? (cb) => cb(false)
+                                                                 : (cb) => addSound(inputPath, outPath, seconds, cb);
+                withSound(() => fs.readFile(outPath, (err3, data) => {
                     if (err3) return fail(500, 'nvdrv_encode não produziu saída');
                     // The per-frame report runs a line per frame; keep
                     // its head and its summary so the header stays small.
@@ -557,7 +588,7 @@ function handleVideo(req, res) {
                     res.end(data);
                     console.log(`Video: sent ${data.length} bytes for ${frames} frames.`);
                     cleanup();
-                });
+                }));
             });
         });
     }, { exts: VIDEO_EXTS, limit: MAX_VIDEO_BYTES });

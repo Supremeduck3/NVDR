@@ -320,6 +320,16 @@
             <option value="2" selected>Duas</option><option value="1">Uma</option>
           </select>
         </label>
+        <label title="Em vez de uma qualidade fixa, mira uma taxa média: o encoder mede uma amostra do vídeo, escolhe o passo que dá essa taxa e codifica com ele (qualidade constante). Leva umas 2 vezes mais tempo. Com uma taxa escolhida, a Qualidade acima é ignorada.">Taxa alvo
+          <select id="vkbps">
+            <option value="" selected>nenhuma (usa a Qualidade)</option>
+            <option value="150">150 kbit/s</option>
+            <option value="300">300 kbit/s</option>
+            <option value="600">600 kbit/s</option>
+            <option value="1200">1,2 Mbit/s</option>
+            <option value="2500">2,5 Mbit/s</option>
+          </select>
+        </label>
         <label title="Rápido testa os outros tipos de transformada só nos dois modos mais baratos de cada bloco.">Velocidade
           <select id="vfast">
             <option value="0">Normal</option><option value="1">Rápida</option>
@@ -351,6 +361,7 @@
         <div class="player-bar">
           <button id="vplay">▶ Tocar</button>
           <button id="vrestart" class="ghost">⟲ Início</button>
+          <label id="vsoundBox" class="hidden" title="A trilha de som vem inteira depois do último quadro; só toca com o arquivo inteiro."><input type="checkbox" id="vsound" checked> Som</label>
           <button id="vsaveNvdrv" class="ghost">Baixar .nvdrv</button>
           <button id="vsavePng" class="ghost">Baixar como PNG</button>
           <span class="hud" id="vhud"></span>
@@ -839,7 +850,7 @@ async function showTruncated() {
  * shows it at the rate the source was shot, one decode per animation tick,
  * so the timing it reports is the real cost of playing the file here.
  */
-import { readSequenceHeader, frameIndex, showRGB, INTRA, PRED, BI } from './nvdrv.js';
+import { readSequenceHeader, frameIndex, soundTrack, showRGB, INTRA, PRED, BI } from './nvdrv.js';
 import { loadWasm, wasmActive } from './nvdr-wasm.js';
 import { decoderFor } from './nvdr-decoder.js';
 // The player decodes in a worker (sequenceDecoder()), which loads the
@@ -928,7 +939,8 @@ async function loadFile(file) {
                 'x-q': $('vquality').value,
                 'x-bframes': $('vbframes').value,
                 'x-refs': $('vrefs').value,
-                'x-fast': $('vfast').value
+                'x-fast': $('vfast').value,
+                'x-kbps': $('vkbps').value
             },
             body: file
         });
@@ -958,6 +970,29 @@ const player = {
     decodeMs: [], showMs: []
 };
 
+/* The sequence's sound (SOUND in nvdrv.h): the browser plays the file,
+ * and every frame shown pulls it back in step if it has drifted. It is
+ * the last thing in the file, so a cut file plays silent. */
+let sound = null;   // { el, url }
+function openSound(buffer) {
+    if (sound) { sound.el.pause(); URL.revokeObjectURL(sound.url); sound = null; }
+    const s = soundTrack(buffer);
+    $('vsoundBox').classList.toggle('hidden', !s);
+    if (!s) return;
+    const url = URL.createObjectURL(new Blob([s.bytes], { type: s.mime }));
+    sound = { el: new Audio(url), url };
+}
+function syncSound(index) {
+    if (!sound) return;
+    if (!player.playing || !$('vsound').checked || player.kept !== seq.buffer.byteLength) { sound.el.pause(); return; }
+    const t = index / seq.info.fps;
+    // A tenth of a second apart is where sound and picture start to
+    // look apart; a seek takes a moment, so it aims a little ahead.
+    if (Math.abs(sound.el.currentTime - t) > 0.1) sound.el.currentTime = t + 0.04;
+    if (sound.el.paused) sound.el.play().catch(() => {});
+}
+$('vsound').onchange = () => { if (sound && !$('vsound').checked) sound.el.pause(); };
+
 /* Frame boundaries from the headers alone, without decoding anything. */
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
@@ -966,6 +1001,7 @@ function openSequence(buffer, name, sourceSize, report, seconds) {
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind === BI).length;
     seq = { buffer, info, frames, name };
+    openSound(buffer);
 
     const canvas = $('vcanvas');
     canvas.width = info.width; canvas.height = info.height;
@@ -977,6 +1013,7 @@ function openSequence(buffer, name, sourceSize, report, seconds) {
     setStatus(
         `<b>${name}</b> · ${info.width}×${info.height} · ${frames.length} quadros a ${info.fps} fps ` +
         `(${intra} intra, ${bi} B) · ${formatBytes(buffer.byteLength)} ≈ ${bitrate.toFixed(0)} kbit/s` +
+        (sound ? ' · com som' : ' · sem som') +
         ` · decodificado em ${wasmActive() ? 'WebAssembly' : 'JavaScript'}${videoWorker.offThread ? ', fora da página' : ''}` +
         (sourceSize ? ` · ${(100 * buffer.byteLength / sourceSize).toFixed(0)}% do vídeo enviado` : '') +
         (seconds ? ` · codificado em ${seconds.toFixed(1)} s` : ''));
@@ -1099,6 +1136,7 @@ function play() {
 }
 function pause() {
     player.playing = false;
+    if (sound) sound.el.pause();
     $('vplay').textContent = '▶ Tocar';
 }
 $('vplay').onclick = () => (player.playing ? pause() : play());
@@ -1116,6 +1154,7 @@ function tick(now) {
             remember(player.showMs, performance.now() - t0);
             player.current = f;
             player.stalled = false;
+            syncSound(f.index);
             player.due += period;
             // After a long stall, pick the clock up from now rather than
             // racing through every frame that was due in the meantime.
@@ -1129,6 +1168,7 @@ function tick(now) {
             // Due and not decoded yet: the decoder is behind real time.
             player.stalled = true;
             player.stalls++;
+            if (sound) sound.el.pause();
         }
     }
     updateHud();

@@ -1252,6 +1252,31 @@ the intra frame is 63% of the file, 39 KB where AV1's is 34 KB at 0.9 dB
 less; the 47 frames after it average 495 bytes against AV1's 393, at
 0.24 dB less.
 
+### A target rate, and sound
+
+`--kbps N` aims at an average bitrate instead of a quantiser step. It is
+the same step for the whole sequence, which is constant quality with the
+bytes going where the pictures need them, chosen so that the file comes
+to that rate: two probes on a sample of the stretches (every second
+GOP, coded with `--fast`) give the step a trial and, when they are far
+enough apart, the slope of bytes against it; then the sequence is coded
+once, and again only if it missed by more than 6%. A probe averages
+intra and predicted frames apart and scales each to how many the
+sequence has: intra frames are four fifths of the bytes, and the first
+stretch holds two, which made a plain average 40% too high. On 48
+frames of the long clip, targets of 150, 300 and 600 kbit/s came to
+147, 290 and 597 in one pass, in twice the time of a fixed step. It is
+an average and not a ceiling: nothing limits a busy second.
+
+A sequence can carry sound (SOUND in nvdrv.h): somebody else's codec,
+whole, after the last frame, behind a byte no frame header starts with,
+so a decoder stops there. `nvdrv_encode --audio file` adds it; the
+server cuts the upload's sound to the frames coded (Opus in WebM, 64
+kbit/s, with ffmpeg) and the page plays it through the browser, pulling
+it back whenever it is a tenth of a second from the frame shown. It is
+the last thing in the file: a file cut short has its frames and plays
+silent.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours

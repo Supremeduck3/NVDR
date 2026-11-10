@@ -64,6 +64,27 @@
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 
+/*
+ * SOUND
+ * -----
+ * A sequence's sound is somebody else's codec, carried whole after the
+ * last frame: a file a browser's <audio> plays (Opus in WebM, AAC in
+ * MP4), cut to the length of the frames.
+ *
+ *   [0xFF]  no frame header starts with it: where the frames end
+ *   "NVAU"
+ *   [mime length u8][mime type, ASCII]   "audio/webm", "audio/mp4"...
+ *   [length u32 LE][the file]
+ *
+ * A decoder stops at the mark; a player hands the file to the platform
+ * and keeps it in step with the frames it shows. A file cut short has
+ * its frames first and loses the sound, which is the last thing in it.
+ * Encoders before this one wrote none, and decoders before this one
+ * report damage after the last frame of a file that has one.
+ */
+#define NVDRV_SOUND_MARK  0xff
+#define NVDRV_SOUND_MAGIC "NVAU"
+
 #define NVDRV_INTRA 0   /* the frame on its own */
 #define NVDRV_PRED  1   /* the error against the frame before it */
 #define NVDRV_BI    2   /* the error against the frames before and after it */

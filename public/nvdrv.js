@@ -786,6 +786,29 @@ function findRefs(dpb, display) {
  * them. A frame cut short ends at the end of the bytes; the walk stops at
  * a header that did not arrive whole or makes no sense.
  */
+/*
+ * A sequence's sound track (SOUND in nvdrv.h): { mime, bytes }, a file
+ * the browser's <audio> plays, carried whole after the last frame. Null
+ * when there is none, or the file was cut before its end.
+ */
+const SOUND_MARK = 0xff;
+export function soundTrack(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const frames = frameIndex(bytes);
+    let at = frames.length ? frames[frames.length - 1].end : HEADER_SIZE;
+    if (at + 6 > bytes.length || bytes[at] !== SOUND_MARK ||
+        String.fromCharCode(...bytes.subarray(at + 1, at + 5)) !== 'NVAU') return null;
+    const n = bytes[at + 5];
+    at += 6;
+    if (at + n + 4 > bytes.length) return null;
+    const mime = String.fromCharCode(...bytes.subarray(at, at + n));
+    at += n;
+    const len = (bytes[at] | bytes[at + 1] << 8 | bytes[at + 2] << 16 | bytes[at + 3] << 24) >>> 0;
+    at += 4;
+    if (!/^audio\/[a-z0-9.+-]+$/.test(mime) || at + len > bytes.length) return null;
+    return { mime, bytes: bytes.subarray(at, at + len) };
+}
+
 export function frameIndex(buffer) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer), size = bytes.length;
     const out = [];
@@ -900,6 +923,7 @@ export class SequenceDecoder {
         let at = this.pos;
         const a = bytes[at++];
         const kind = a & 3, flags = (a >> 2) & 7, hasField = (a >> 5) & 1, changed = (a >> 6) & 1;
+        if (a === SOUND_MARK) return false;   // the frames end where the sound begins
         if (a >> 7) throw new Error('bad frame flags');
         let r = getVarint(bytes, at, size);
         if (r.n === 0) return false;
