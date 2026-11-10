@@ -58,8 +58,8 @@ class NvdrImg extends HTMLElement {
 
     /* At the size the element is shown, averaged down (see paintFitted):
      * a photo shrunk into a thumbnail keeps its grain as grain. */
-    paint(rgb, width, height, fitted) {
-        paintFitted(this.canvas, rgb, width, height, fitted);
+    paint(rgb, width, height, fitted, alpha = null) {
+        paintFitted(this.canvas, rgb, width, height, fitted, alpha);
     }
 
     async load() {
@@ -124,7 +124,7 @@ class NvdrImg extends HTMLElement {
             busy = decoder.run({ op: 'decode', bytes: buf.slice(lo, Math.min(upto, hi)), fit: shownWidth(this.canvas) }).then(r => {
                 busy = null;
                 if (generation !== this.generation) return;
-                if (r) this.paint(r.rgb, r.header.width, r.header.height, r.fitted);
+                if (r) this.paint(r.rgb, r.header.width, r.header.height, r.fitted, r.alpha);
                 painted = upto;
                 return repaint();
             }, err => { busy = null; throw err; });

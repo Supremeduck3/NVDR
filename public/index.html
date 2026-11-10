@@ -110,6 +110,8 @@
   .hud .bad { color: #f85149; }
   /* Video frames change 25 times a second: the browser's own smoothing,
      not an average per frame, and never pixelated when shrunk. */
+  /* Where the picture is transparent, the squares show through. */
+  #truncCanvas { background: repeating-conic-gradient(#2a2f37 0% 25%, #1b1f26 0% 50%) 0 0 / 20px 20px; }
   #vcanvas { image-rendering: auto; }
   #strip { height: 46px; margin-top: 14px; image-rendering: auto; cursor: pointer; }
 </style>
@@ -835,7 +837,7 @@ async function showTruncated() {
         return;
     }
 
-    paintFitted(truncCanvas, result.rgb, result.header.width, result.header.height, result.fitted);
+    paintFitted(truncCanvas, result.rgb, result.header.width, result.header.height, result.fitted, result.alpha);
     const [cor, baixa, alta] = result.tilesComplete;
     truncOut.innerHTML =
         `<b>${formatBytes(kept)}</b> de ${formatBytes(container.byteLength)} — ` +

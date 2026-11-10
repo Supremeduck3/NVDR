@@ -21,6 +21,7 @@
  * and the page's batch mode (server.js, /batch) reads these lines.
  */
 #include "nvdr.h"
+#include "extras.h"
 #include "pngwrap.h"
 
 #include <dirent.h>
@@ -317,9 +318,18 @@ int main(int argc, char** argv) {
             size_t len = 0;
             struct stat st;
             if (stat(in, &st) == 0) ib = (double)st.st_size;
-            if (nvdr_image_load(&img, in) != 0) snprintf(msg, sizeof msg, "ERRO: não consegui ler a imagem");
+            /* With its transparency and colour profile, after the layers (extras.h). */
+            uint8_t* alpha = NULL;
+            if (nvdr_image_load_alpha(&img, &alpha, in) != 0) snprintf(msg, sizeof msg, "ERRO: não consegui ler a imagem");
             else {
-                if (nvdr_encode_mem(&buf, &len, &img, &cfg, NULL) != 0)
+                size_t icc_len = 0;
+                uint8_t* icc = nvdr_icc_read(in, &icc_len);
+                int bad = nvdr_encode_mem(&buf, &len, &img, &cfg, NULL) != 0;
+                if (!bad && alpha) bad = nvdr_alpha_append(&buf, &len, alpha, img.width, img.height, &cfg) != 0;
+                if (!bad && icc) bad = nvdr_extra_append(&buf, &len, NVDR_EXTRA_ICC, icc, icc_len) != 0;
+                free(alpha);
+                free(icc);
+                if (bad)
                     snprintf(msg, sizeof msg, "ERRO: o codificador falhou");
                 else {
                     make_parents(nv);

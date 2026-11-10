@@ -16,6 +16,8 @@ No dependencies beyond libm, zlib and `stb_image.h`; nothing needs a GPU.
   with an optional sound track.
 - Any of them can ride inside an ordinary **PNG** that every viewer
   opens (`nvdr_png`).
+- A picture keeps its transparency and its ICC colour profile, and a
+  phone photo comes out the way up it was taken.
 
 ## Where it stands
 
@@ -34,7 +36,8 @@ made. BD-rate on PSNR-Y, negative meaning NVDR needs fewer bytes:
 
 What that does not say: the test set is small (six thumbnails, five
 photographs, a handful of short clips), the encoder optimises PSNR and
-is judged by it, and there is no audio codec, no alpha, no HDR.
+is judged by it, pictures are 8 bits a channel with no HDR, and a
+sequence's sound is carried as somebody else's codec, not coded here.
 
 Speed, on four cores: a 768x512 photograph encodes in 0.2 s progressive
 and 3 s directional (in slices, one per core); the WebAssembly decoder
@@ -88,7 +91,8 @@ ranges that never arrived (`nvdr_decode --missing`, `decode()`'s
 ## Layout
 
     src/        the codec: nvdr.c (stills), nvdrv.c (sequences), nvda.c
-                (albums), entropy.c, grain.c, restore.c, mc.c, pngwrap.c
+                (albums), entropy.c, grain.c, restore.c, mc.c, pngwrap.c,
+                extras.c (alpha and colour profile)
     tools/      the CLIs, and the UDP sender and receiver
     public/     the browser decoders, the <nvdr-img> element and the page
     wasm/       the C decoder built for the browser

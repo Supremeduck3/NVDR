@@ -6,6 +6,7 @@
  * not taken from the encoder's own state: layer 0 alone, then both.
  */
 #include "nvdr.h"
+#include "extras.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +49,8 @@ static void usage(const char* argv0) {
         "                   the two cheapest modes of a leaf and rank them without\n"
         "                   RDOQ (about 3.5x faster, ~1%% bigger)\n"
         "  --tx-modes N     the same with N modes (0, the default: all of them)\n"
+        "  --no-extras      leave out the source's transparency and colour profile,\n"
+        "                   which otherwise go after the layers\n"
         "  --no-priors      start the models from even odds, as before container 18,\n"
         "                   instead of from the built-in priors (up to 3%% bigger)\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
@@ -65,7 +68,7 @@ int main(int argc, char** argv) {
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
     cfg.priors = 1;
-    int quiet = 0, tile_q_test = 0;
+    int quiet = 0, tile_q_test = 0, no_extras = 0;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--q") && i + 1 < argc) cfg.q = atoi(argv[++i]);
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
         else if (!strcmp(argv[i], "--no-priors")) cfg.priors = 0;
+        else if (!strcmp(argv[i], "--no-extras")) no_extras = 1;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;
         else if (!strcmp(argv[i], "--no-halves")) cfg.halves = 0;
@@ -108,10 +112,16 @@ int main(int argc, char** argv) {
     }
 
     NvdrImage source;
-    if (nvdr_image_load(&source, in_path) != 0) {
+    /* With its transparency and its colour profile, when it has them:
+     * they go after the layers (extras.h). */
+    uint8_t* alpha = NULL;
+    if (nvdr_image_load_alpha(&source, &alpha, in_path) != 0) {
         fprintf(stderr, "cannot read image '%s'\n", in_path);
         return 1;
     }
+    size_t icc_len = 0;
+    uint8_t* icc = no_extras ? NULL : nvdr_icc_read(in_path, &icc_len);
+    if (no_extras) { free(alpha); alpha = NULL; }
     if (source.width > 65535 || source.height > 65535) {
         fprintf(stderr, "image exceeds the 65535px the container addresses\n");
         nvdr_image_free(&source);
@@ -132,7 +142,25 @@ int main(int argc, char** argv) {
     }
 
     NvdrHeader hdr;
-    int enc_rc = nvdr_encode_file(out_path, &source, &cfg, &hdr);
+    uint8_t* buf = NULL;
+    size_t len = 0, picture = 0;
+    int enc_rc = nvdr_encode_mem(&buf, &len, &source, &cfg, &hdr);
+    picture = len;
+    if (enc_rc == 0 && alpha) {
+        NvdrConfig acfg = cfg;
+        acfg.tile_q = NULL;
+        enc_rc = nvdr_alpha_append(&buf, &len, alpha, source.width, source.height, &acfg);
+    }
+    size_t with_alpha = len;
+    if (enc_rc == 0 && icc) enc_rc = nvdr_extra_append(&buf, &len, NVDR_EXTRA_ICC, icc, icc_len);
+    if (enc_rc == 0) {
+        FILE* f = fopen(out_path, "wb");
+        enc_rc = f && fwrite(buf, 1, len, f) == len ? 0 : -1;
+        if (f && fclose(f) != 0) enc_rc = -1;
+    }
+    free(buf);
+    free(alpha);
+    free(icc);
     free(tq);
     if (enc_rc != 0) {
         fprintf(stderr, "encode failed\n");
@@ -149,6 +177,8 @@ int main(int argc, char** argv) {
            (hdr.flags & NVDR_FLAG_CHROMA420) ? "4:2:0" : "4:4:4");
     if (hdr.flags & NVDR_FLAG_DEBLOCK) printf("  deblock %d/%d", hdr.deblock[0], hdr.deblock[1]);
     printf("\n");
+    if (with_alpha > picture) printf("  alpha: %zu bytes after the layers\n", with_alpha - picture);
+    if (len > with_alpha) printf("  colour profile: %zu bytes after the layers\n", len - with_alpha);
     if (hdr.flags & NVDR_FLAG_GRAIN) {
         printf("  grain: kernel %d, colour %d/%d, luma sigma x8", hdr.grain.kernel, hdr.grain.cb, hdr.grain.cr);
         for (int k = 0; k < NVDR_GRAIN_POINTS; k++) printf(" %d", hdr.grain.sigma[k]);

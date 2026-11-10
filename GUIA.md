@@ -3,8 +3,9 @@
 ## Onde está cada coisa
 
 ```
-src/        o codec: nvdr.c (imagem), nvdrv.c (sequência), nvda.c (álbum),
-            entropy.c, grain.c, restore.c, mc.c, pngwrap.c
+src/        o codec: nvdr.c (imagem; em partes, nvdr_*.inc, que ele inclui),
+            nvdrv.c (sequência), nvda.c (álbum), entropy.c, grain.c,
+            restore.c, mc.c, pngwrap.c, extras.c (alfa e perfil de cor)
 tools/      os CLIs (nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
             nvdr_png, nvdr_batch) e o envio por UDP (nvdr_send/recv.mjs)
 public/     os decoders do navegador, o elemento <nvdr-img> e a página
@@ -191,6 +192,13 @@ Arrasta uma imagem e pronto. Antes, dá para escolher:
 - **Velocidade**: rápida é o `--fast` (só no direcional), 2 a 3 vezes mais
   rápida por ~1% a mais de bytes.
 - **Grão de sensor**, como no `--grain`.
+
+Um PNG com **transparência** continua transparente: o canal alfa vai
+como uma imagem à parte depois das camadas (uns 5% do arquivo), a página
+mostra, e `./nvdr_decode arquivo.nvdr saida.png` grava um PNG com alfa.
+O **perfil de cor** (ICC) da foto também vai junto e volta no PNG
+decodificado; a página não aplica o perfil. `--no-extras` deixa os dois
+de fora.
 
 Depois aparecem:
 

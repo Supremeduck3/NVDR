@@ -15,6 +15,7 @@
     "./nvdr.wasm": "./public/nvdr.wasm"
   },
   "files": [
+    "public/package.json",
     "public/*.js",
     "public/nvdr.wasm",
     "tools/*.mjs",
@@ -30,6 +31,6 @@
     "test": "python3 scripts/verify.py"
   },
   "engines": {
-    "node": ">=22.7"
+    "node": ">=18"
   }
 }

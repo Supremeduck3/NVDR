@@ -10,7 +10,7 @@
  * readers (which hold the photos their chains need), and nvda.js's cache
  * of byte ranges already fetched from each album URL.
  */
-import { decode, shrinkRGB, fitSize } from './nvdr.js';
+import { decode, alphaOf, shrinkRGB, fitSize } from './nvdr.js';
 import { AlbumReader, openAlbumImage } from './nvda.js';
 import { SequenceDecoder } from './nvdrv.js';
 import { loadWasm, wasmActive } from './nvdr-wasm.js';
@@ -76,11 +76,14 @@ const ops = {
             engine: wasmActive() ? 'WebAssembly' : 'JavaScript',
             header: r.header, layersPresent: r.layersPresent, tiles: r.tiles,
             tilesComplete: r.tilesComplete, rgb: r.rgb, flatRgb: r.flatRgb, lowRgb: r.lowRgb,
+            // Transparency rides after the layers (extras.h): null until
+            // the file's end has arrived, and in a file that has none.
+            alpha: alphaOf(bytesOf(m)),
             fitted: fitted(r.rgb, width, height, m.fit),
             flatFitted: fitted(r.flatRgb, width, height, m.fit),
             lowFitted: fitted(r.lowRgb, width, height, m.fit)
         };
-        const transfer = buffers(r.rgb, r.flatRgb, r.lowRgb, result.fitted && result.fitted.rgb,
+        const transfer = buffers(r.rgb, r.flatRgb, r.lowRgb, result.alpha, result.fitted && result.fitted.rgb,
                                  result.flatFitted && result.flatFitted.rgb,
                                  result.lowFitted && result.lowFitted.rgb);
         return { result, transfer };

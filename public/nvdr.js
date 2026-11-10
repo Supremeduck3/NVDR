@@ -605,6 +605,39 @@ export function layerThresholds(header) {
     return [a, b, b + header.storedBytes[2]];
 }
 
+/**
+ * What rides after a container's layers (src/extras.h): chunks of a tag,
+ * a length and data, which no decoder reads as picture. { ALPH, ICCP },
+ * each the chunk's bytes, for the tags the file has whole.
+ */
+export function extras(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const h = readHeader(bytes), out = {};
+    if (!h) return out;
+    for (let p = layerThresholds(h)[2]; p + 8 <= bytes.length;) {
+        const n = (bytes[p + 4] | bytes[p + 5] << 8 | bytes[p + 6] << 16 | bytes[p + 7] << 24) >>> 0;
+        if (n > bytes.length - p - 8) break;
+        out[String.fromCharCode(bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3])] = bytes.subarray(p + 8, p + 8 + n);
+        p += 8 + n;
+    }
+    return out;
+}
+
+/**
+ * The picture's alpha plane, width * height bytes, or null when it has
+ * none (or its end has not arrived): the ALPH chunk is a grey picture of
+ * the same size, whose green is the alpha.
+ */
+export function alphaOf(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const chunk = extras(bytes).ALPH, h = chunk && readHeader(bytes);
+    const r = chunk && decode(chunk.slice());
+    if (!r || r.header.width !== h.width || r.header.height !== h.height) return null;
+    const n = h.width * h.height, a = new Uint8Array(n);
+    for (let i = 0; i < n; i++) a[i] = r.rgb[i * 3 + 1];
+    return a;
+}
+
 /** Where each layer's part of each slice lies in the file: [{ layer, slice, at, len }]. */
 export function sliceParts(header) {
     const out = [];
@@ -1687,8 +1720,8 @@ export function shrinkRGB(rgb, width, height, w, h) {
  * its displayed size changes: a canvas painted while hidden has no size
  * yet, and one on a resized page has a new one.
  */
-export function paintFitted(canvas, rgb, width, height, fitted = null) {
-    canvas._nvdrShown = { rgb, width, height, fitted };
+export function paintFitted(canvas, rgb, width, height, fitted = null, alpha = null) {
+    canvas._nvdrShown = { rgb, width, height, fitted, alpha };
     if (fitObserver) fitObserver.observe(canvas);
     drawFitted(canvas);
 }
@@ -1717,31 +1750,42 @@ const fitObserver = typeof ResizeObserver === 'undefined' ? null
 function drawFitted(canvas) {
     const shownPicture = canvas._nvdrShown;
     if (!shownPicture) return;
-    const { rgb, width, height, fitted } = shownPicture;
+    const { rgb, width, height, fitted, alpha } = shownPicture;
     const dpr = (typeof devicePixelRatio === 'number' && devicePixelRatio) || 1;
     // Not laid out yet (hidden): a small stand-in with the right shape,
     // until the observer sees the real size.
     const { w, h } = fitSize(width, height, canvas.clientWidth || Math.min(width, 256), dpr);
     const small = w < width;
-    if (canvas.width === w && canvas.height === h && canvas._nvdrDrawn === rgb) return;
+    if (canvas.width === w && canvas.height === h && canvas._nvdrDrawn === rgb && canvas._nvdrAlpha === alpha) return;
     canvas.width = w; canvas.height = h;
     canvas._nvdrDrawn = rgb;
+    canvas._nvdrAlpha = alpha;
     canvas.style.imageRendering = small ? 'auto' : 'pixelated';
     // Shrunk ahead of time for this very size, off the main thread, when
     // the caller has it; otherwise here.
     const pixels = !small ? rgb
         : fitted && fitted.w === w && fitted.h === h ? fitted.rgb
         : shrinkRGB(rgb, width, height, w, h);
-    showRGB(pixels, w, h, canvas.getContext('2d'));
+    // The alpha plane at the size drawn: averaged down as the colours are.
+    let a = alpha;
+    if (a && small) {
+        const grey = new Uint8Array(width * height * 3);
+        for (let i = 0; i < width * height; i++) grey[i * 3] = a[i];
+        const s = shrinkRGB(grey, width, height, w, h);
+        a = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) a[i] = s[i * 3];
+    }
+    showRGB(pixels, w, h, canvas.getContext('2d'), a);
 }
 
-/** Put an RGB buffer on a canvas. The buffer itself is left alone. */
-export function showRGB(rgb, width, height, ctx) {
+/** Put an RGB buffer on a canvas, with its alpha plane when it has one.
+ * The buffers themselves are left alone. */
+export function showRGB(rgb, width, height, ctx, alpha = null) {
     const image = ctx.createImageData(width, height);
     const pixels = image.data;
-    for (let i = 0, j = 0; i < width * height * 3; i += 3, j += 4) {
+    for (let i = 0, j = 0, k = 0; i < width * height * 3; i += 3, j += 4, k++) {
         pixels[j] = rgb[i]; pixels[j + 1] = rgb[i + 1]; pixels[j + 2] = rgb[i + 2];
-        pixels[j + 3] = 255;
+        pixels[j + 3] = alpha ? alpha[k] : 255;
     }
     ctx.putImageData(image, 0, 0);
     return image;

@@ -3069,6 +3069,33 @@ like photographs, are 0.5 to 2.2% bigger (2 to 18 bytes), a decoder
 carries 4 KB of tables, and version 17 files (slices from even odds,
 written for a few days) still decode.
 
+### Transparency and the colour profile
+
+A picture with an alpha channel lost it, and one with an ICC profile
+was read as sRGB. Both now ride after the layers (`src/extras.h`), as
+chunks of a tag, a length and data. A decoder reads a container by the
+sizes in its header, so what follows the last layer was never read:
+every decoder since v10 shows such a file as the same picture, opaque
+and in sRGB, and no version changes.
+
+The alpha plane is a picture of its own, an NVDR container in the
+`ALPH` chunk: grey, coded the way the picture is at half its step (an
+edge's alpha a few levels off shows as a halo), its flat colour costing
+a few bytes in 4:2:0. Where a pixel is fully transparent its colour is
+replaced by the mean of the pixels that are not: whatever the source
+had there is never seen and would be paid for. On a 474x313 photograph
+under a soft round mask the plane is 794 bytes of 16290, 53.8 dB
+against the source's; `nvdr_decode` writes an RGBA PNG and the page's
+canvas is transparent where the picture is, the C and JS decoders
+giving the same plane. It is the last thing in the file, so a
+progressive picture shows its colours first and turns transparent when
+its end arrives.
+
+The profile is kept as it was found (a JPEG's APP2 segments in their
+order, a PNG's iCCP inflated) in `ICCP`, and `nvdr_decode` writes it
+into the PNG it makes. The page does not apply it: a canvas is sRGB, or
+P3, and nothing in between. `--no-extras` leaves both out.
+
 **EXIF orientation.** A camera stores a photo as its sensor lies and
 says in EXIF which way is up. `nvdr_image_load()` now turns the pixels
 that way (all eight orientations, checked against ImageMagick's

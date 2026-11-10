@@ -9,6 +9,7 @@
  * first missing byte.
  */
 #include "nvdr.h"
+#include "extras.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,7 +77,31 @@ int main(int argc, char** argv) {
         fprintf(stderr, "cannot decode '%s' (no colour layer, or not an NVDR v10 file)\n", in_path);
         return 1;
     }
-    if (nvdr_image_write(&out, out_path) != 0) {
+    /* A PNG takes the file's transparency and colour profile, when it
+     * carries them after its layers (extras.h). */
+    uint8_t* alpha = NULL;
+    const uint8_t* icc = NULL;
+    size_t icc_len = 0, icc_at = 0, flen = 0, plen = strlen(out_path);
+    uint8_t* file = NULL;
+    int png = plen >= 4 && !strcmp(out_path + plen - 4, ".png"), wrote = -1;
+    FILE* ef = png && !missing ? fopen(in_path, "rb") : NULL;
+    if (ef) {
+        fseek(ef, 0, SEEK_END);
+        long sz = ftell(ef);
+        fseek(ef, 0, SEEK_SET);
+        if (sz > 0 && (file = (uint8_t*)malloc((size_t)sz))) flen = fread(file, 1, (size_t)sz, ef);
+        fclose(ef);
+    }
+    if (file) {
+        if (nvdr_alpha_decode(file, flen, &alpha) < 0) fprintf(stderr, "the alpha plane does not decode: left out\n");
+        if (nvdr_extra_find(file, flen, NVDR_EXTRA_ICC, &icc_at, &icc_len) == 1) icc = file + icc_at;
+    }
+    if (alpha || icc) wrote = nvdr_image_write_png_extra(&out, alpha, icc, icc_len, out_path);
+    else wrote = nvdr_image_write(&out, out_path);
+    int had_alpha = alpha != NULL, had_icc = icc != NULL;
+    free(alpha);
+    free(file);
+    if (wrote != 0) {
         fprintf(stderr, "cannot write '%s'\n", out_path);
         nvdr_image_free(&out);
         return 1;
@@ -86,6 +111,8 @@ int main(int argc, char** argv) {
            info.tiles_complete[0], info.tiles);
     if (layer >= 1) printf("  textura %d/%d", info.tiles_complete[1], info.tiles);
     if (layer >= 2 && hdr.band) printf("  alta %d/%d", info.tiles_complete[2], info.tiles);
+    if (had_alpha) printf("  alfa");
+    if (had_icc) printf("  perfil de cor");
     if (compare_path) {
         NvdrImage source;
         if (nvdr_image_load(&source, compare_path) == 0) {

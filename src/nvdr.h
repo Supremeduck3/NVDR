@@ -68,6 +68,10 @@ typedef struct {
 } NvdrImage;
 
 int  nvdr_image_load(NvdrImage* img, const char* path);
+/* The same pixels turned the way EXIF orientation `o` (1 to 8) says they
+ * are seen; what nvdr_image_load() does with the file's own. */
+int  nvdr_image_orient(NvdrImage* img, int o);
+int  nvdr_exif_orientation(const char* path);
 int  nvdr_image_write_ppm(const NvdrImage* img, const char* path);
 int  nvdr_image_write_png(const NvdrImage* img, const char* path);
 /* PNG when the path ends in .png, PPM otherwise. */
@@ -285,6 +289,10 @@ typedef struct {
  */
 int nvdr_decode_mem(const uint8_t* data, size_t size, int max_layer,
                     NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
+/* The bytes of the container at the start of `data`, by its header: the
+ * header, the parameters after it and its three layers. 0 when there is
+ * no header to say. What follows them is not the decoder's (extras.h). */
+size_t nvdr_container_bytes(const uint8_t* data, size_t size);
 int nvdr_decode_file(const char* path, int max_layer,
                      NvdrImage* out, NvdrHeader* hdr, NvdrDecodeInfo* info);
 

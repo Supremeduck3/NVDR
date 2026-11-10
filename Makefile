@@ -11,8 +11,9 @@ OPENMP  = $(shell $(CC) -fopenmp -E - < /dev/null > /dev/null 2>&1 && echo -fope
 CFLAGS  = -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -Ivendor $(OPENMP)
 LDLIBS  = -lm -lz
 
-CODEC   = src/nvdr.c src/entropy.c src/grain.c src/restore.c
-HEADERS = src/nvdr.h src/entropy.h src/grain.h src/restore.h src/priors.h
+CODEC   = src/nvdr.c src/entropy.c src/grain.c src/restore.c src/extras.c
+# nvdr.c is one translation unit in parts (src/nvdr_*.inc), which it includes.
+HEADERS = src/nvdr.h src/entropy.h src/grain.h src/restore.h src/priors.h src/extras.h $(wildcard src/nvdr_*.inc)
 SEQ     = $(CODEC) src/nvdrv.c src/mc.c
 SEQ_H   = $(HEADERS) src/nvdrv.h src/mc.h
 TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album nvdr_png nvdr_batch
@@ -48,7 +49,7 @@ nvdrv_decode: tools/nvdrv_decode.c $(SEQ) $(SEQ_H)
 LIB_VERSION = 18.21
 LIB_SRC = $(SEQ) src/nvda.c src/pngwrap.c
 LIB_OBJ = $(LIB_SRC:src/%.c=build/%.o)
-LIB_H   = src/nvdr.h src/nvdrv.h src/nvda.h src/pngwrap.h
+LIB_H   = src/nvdr.h src/nvdrv.h src/nvda.h src/pngwrap.h src/extras.h
 
 build/%.o: src/%.c $(SEQ_H) src/nvda.h src/pngwrap.h
 	@mkdir -p build

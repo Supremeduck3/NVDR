@@ -20,6 +20,7 @@
  *     make fuzz && ./fuzz_nvdr samples/*.jpg --iters 20000
  */
 #include "nvdr.h"
+#include "extras.h"
 #include "nvdrv.h"
 #include "nvda.h"
 
@@ -74,6 +75,13 @@ static int decode_still(const uint8_t* d, size_t n) {
     size_t holes[6] = { n / 3, n / 3 + 700, n / 2, n / 2 + 1, n - n / 5, n + 50 };
     NvdrImage img;
     if (nvdr_decode_mem_lossy(d, n, holes, 3, -1, &img, NULL, NULL) == 0) { nvdr_image_free(&img); ok = 1; }
+    /* What rides after the layers (extras.h): the chunks, and the alpha
+     * plane, a container inside the container. */
+    uint8_t* alpha = NULL;
+    size_t xat, xlen;
+    nvdr_alpha_decode(d, n, &alpha);
+    free(alpha);
+    nvdr_extra_find(d, n, NVDR_EXTRA_ICC, &xat, &xlen);
     /* A container predicted from a base decodes only against one, so it
      * gets one: a ramp of the size its header claims, while that is sane. */
     if (n >= 10 && (d[5] & NVDR_FLAG_INTER)) {
@@ -168,7 +176,7 @@ int main(int argc, char** argv) {
         size_t ntiles = (size_t)((img.width + 31) / 32) * ((img.height + 31) / 32);
         int8_t* tq = (int8_t*)malloc(ntiles);
         for (size_t t = 0; tq && t < ntiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
-        for (int variant = 0; variant < 9 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 10 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 5) { if (!tq) continue; c.tile_q = tq; }
             if (variant == 6) { c.directional = 1; c.q = 30; }
@@ -179,7 +187,18 @@ int main(int argc, char** argv) {
             if (variant == 2) c.band = 32;
             if (variant == 4) { c.grain = NVDR_GRAIN_ON; c.q = 40; }
             if (variant == 8) { c.slices = 1; c.tile_q = tq; c.q = 30; }
-            if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) == 0) nseeds++;
+            if (variant == 9) c.q = 60;
+            if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) != 0) continue;
+            if (variant == 9) {
+                /* with an alpha plane and a profile after the layers */
+                size_t px = (size_t)img.width * img.height;
+                uint8_t* a = (uint8_t*)malloc(px);
+                for (size_t i = 0; a && i < px; i++) a[i] = (uint8_t)(i * 255 / px);
+                if (a) nvdr_alpha_append(&seeds[nseeds], &seed_len[nseeds], a, img.width, img.height, &c);
+                nvdr_extra_append(&seeds[nseeds], &seed_len[nseeds], NVDR_EXTRA_ICC, (const uint8_t*)"profile", 7);
+                free(a);
+            }
+            nseeds++;
         }
         free(tq);
         nvdr_image_free(&img);
