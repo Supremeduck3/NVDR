@@ -147,9 +147,9 @@ esse toca direto, sem passar pelo servidor.
   das duas âncoras anteriores, e o encoder fica com o que custar menos;
   economiza 2 a 6% ao vivo e até 0,8% com quadros B, por uns 6% (com B)
   a 60% (ao vivo) a mais de tempo. Uma (`--refs 1`) é o comportamento
-  antigo. **Duas, por estimativa** (`--refs 2 --refs-estimate`) escolhe
-  entre uma e duas âncoras pela predição e codifica o quadro uma vez só:
-  guarda de dois terços a quase todo o ganho.
+  antigo. (`--refs-estimate` escolhe pela predição e codifica uma vez
+  só, mas medido não economiza tempo e perde parte do ganho: fica só
+  como opção da linha de comando.)
 - **Taxa alvo** (`--kbps N`): em vez de uma qualidade fixa, uma taxa
   média. O encoder codifica uma amostra do vídeo em dois passos de
   qualidade, calcula o passo que dá a taxa pedida e codifica tudo com

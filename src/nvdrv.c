@@ -2841,7 +2841,8 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
         /* The two ways as far as their predictions, and only the one that
          * leaves less coded, where the frame was otherwise coded both
          * ways: it keeps most of what two anchors gain on one clip and two
-         * thirds on another (NOTEBOOK.md, "P frames from two anchors"). */
+         * thirds on another, and saves almost no time, the search being
+         * where the time is (NOTEBOOK.md, "P frames from two anchors"). */
         Coded t[2];
         memset(t, 0, sizeof(t));
         t[0].estimate = t[1].estimate = 1;

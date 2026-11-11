@@ -1224,8 +1224,18 @@ BD-rate on PSNR-Y against `--refs 1`:
 It keeps nearly all of the gain where the second anchor shows what the
 first had covered, and two thirds where the gain is the mean of two
 noisy frames, which a prediction's error says less about than the bits
-of its residual do. It is an option, and coding both ways stays the
-default: the page has it as "Duas, por estimativa".
+of its residual do. And it saves next to nothing. One encode at q 24 on
+an idle machine of four cores, against `--refs 1`:
+
+                    both ways    by estimate
+    multi            +54%          +47%
+    noisy            +76%          +77%
+
+The time is in the motion search, which both ways run whichever is
+kept (and the one kept runs again), not in coding the frame. So it
+stays an option of the tool, off, and is not in the page: it gives up
+gain for no time. What would save the time is not searching the second
+anchor at all when the first already predicts well.
 
 ### Against the state of the art
 
