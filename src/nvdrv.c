@@ -245,6 +245,7 @@ NvdrvConfig nvdrv_default_config(void) {
      * -0.2 to -0.5% on the long one, nothing either way on the pans, for
      * 6.5% more encoding time. */
     c.refs = 2;
+    c.refs_estimate = 0;
     c.fps = 24;
     return c;
 }
@@ -2606,6 +2607,7 @@ typedef struct {
      * chosen leaves none: the encoder's and the decoder's for class fc. */
     NvdrContext *ctx, *dctx;
     double cost;             /* squared error and bits, see code_frame() */
+    int estimate;            /* stop at the prediction, and cost that */
 } Coded;
 
 static void coded_free(Coded* c) {
@@ -2720,6 +2722,18 @@ static int code_as(NvdrvEncoder* e, const NvdrImage* src, int display, int kind,
 
     NvdrConfig fcfg = e->cfg.frame;
     fcfg.q = q_for(e, kind, level);
+    if (out->estimate) {
+        /* What the prediction leaves, which the picture then pays for in
+         * bits or keeps as error, and what the field costs to send. */
+        double sse = 0.0;
+        for (size_t i = 0; i < npx; i++) {
+            int d = (int)src->pixels[i] - (int)ref->pixels[i];
+            sse += d * d;
+        }
+        out->cost = sse / 3.0 + e->cfg.frame.lambda_k * (double)fcfg.q * fcfg.q * 8.0 * (double)field_len;
+        free(field);
+        return 0;
+    }
     fcfg.tile_q = kind == NVDRV_INTRA && e->use_tile_q ? e->tile_q : NULL;
     if (kind != NVDRV_INTRA) {
         /*
@@ -2823,6 +2837,21 @@ static int code_frame(NvdrvEncoder* e, const NvdrImage* src, int display, int fo
     Coded c[2];
     memset(c, 0, sizeof(c));
     int pick = 0, rc;
+    if (older >= 0 && e->cfg.refs_estimate) {
+        /* The two ways as far as their predictions, and only the one that
+         * leaves less coded, where the frame was otherwise coded both
+         * ways: it keeps most of what two anchors gain on one clip and two
+         * thirds on another (NOTEBOOK.md, "P frames from two anchors"). */
+        Coded t[2];
+        memset(t, 0, sizeof(t));
+        t[0].estimate = t[1].estimate = 1;
+        t[0].ctx = e->tctx[0]; t[1].ctx = e->tctx[1];   /* so that a cut reports itself */
+        rc = code_as(e, src, display, NVDRV_PRED2, before, older, level, &t[1]);
+        if (rc == 0) rc = code_as(e, src, display, NVDRV_PRED, before, -1, level, &t[0]);
+        if (rc < 0) return -1;
+        if (rc == 0 && t[1].cost < t[0].cost) { kind = NVDRV_PRED2; after = older; }
+        older = -1;
+    }
     if (older >= 0) {
         c[0].ctx = e->tctx[0]; c[0].dctx = e->tdctx[0];
         c[1].ctx = e->tctx[1]; c[1].dctx = e->tdctx[1];

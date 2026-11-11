@@ -1210,6 +1210,23 @@ the pans: there the mean of two neighbouring frames is a mean over two
 draws of the noise, which with B frames the anchors' temporal filter had
 already taken.
 
+Coding every frame twice is what that time is. `--refs-estimate` takes
+the two ways only as far as their predictions (the motion search, the
+field, the prediction itself), compares the prediction's squared error
+plus lambda times the field's bits, and codes the frame once, the way
+that left less. Without B frames, 25 frames, default speed, q 14 to 40,
+BD-rate on PSNR-Y against `--refs 1`:
+
+                    both ways    by estimate
+    multi            -6.0%         -5.6%
+    noisy            -2.2%         -1.4%
+
+It keeps nearly all of the gain where the second anchor shows what the
+first had covered, and two thirds where the gain is the mean of two
+noisy frames, which a prediction's error says less about than the bits
+of its residual do. It is an option, and coding both ways stays the
+default: the page has it as "Duas, por estimativa".
+
 ### Against the state of the art
 
 WebCodecs' encoders are real-time encoders, and beating them says

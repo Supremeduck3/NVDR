@@ -478,7 +478,9 @@ function handleAlbum(req, res) {
 function videoOptions(req) {
     const args = [];
     if (req.headers['x-bframes']) args.push('--bframes', String(intHeader(req, 'x-bframes', 7, 0, 15)));
-    if (req.headers['x-refs']) args.push('--refs', String(intHeader(req, 'x-refs', 2, 1, 2)));
+    // "2e": two anchors, chosen from their predictions instead of by coding the frame both ways.
+    if (req.headers['x-refs'] === '2e') args.push('--refs', '2', '--refs-estimate');
+    else if (req.headers['x-refs']) args.push('--refs', String(intHeader(req, 'x-refs', 2, 1, 2)));
     if (req.headers['x-fast'] === '1') args.push('--fast');
     return args;
 }

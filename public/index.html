@@ -317,9 +317,11 @@
             <option value="0">Ao vivo, sem quadros B</option>
           </select>
         </label>
-        <label title="Duas: cada quadro P pode prever das duas âncoras anteriores, e o codificador fica com o que custar menos. Ao vivo economiza 2 a 6%; com quadros B, até 0,8%.">Referências
+        <label title="Duas: cada quadro P pode prever das duas âncoras anteriores, e o codificador codifica das duas formas e fica com a que custar menos. Ao vivo economiza 2 a 6%; com quadros B, até 0,8%. Por estimativa: escolhe pela predição e codifica uma vez só; guarda de dois terços a quase todo o ganho.">Referências
           <select id="vrefs">
-            <option value="2" selected>Duas</option><option value="1">Uma</option>
+            <option value="2" selected>Duas</option>
+            <option value="2e">Duas, por estimativa (mais rápido)</option>
+            <option value="1">Uma</option>
           </select>
         </label>
         <label title="Em vez de uma qualidade fixa, mira uma taxa média: o encoder mede uma amostra do vídeo, escolhe o passo que dá essa taxa e codifica com ele (qualidade constante). Leva umas 2 vezes mais tempo. Com uma taxa escolhida, a Qualidade acima é ignorada.">Taxa alvo
