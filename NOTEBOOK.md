@@ -1314,6 +1314,28 @@ it back whenever it is a tenth of a second from the frame shown. It is
 the last thing in the file: a file cut short has its frames and plays
 silent.
 
+### The same comparison, run again (sequence format 21)
+
+Run again after the groups of pictures of format 21, with the ffmpeg
+this machine has (6.1.1: libaom 3.8.2, x265 3.5, x264 164) where the
+table above used the one `imageio-ffmpeg` ships, same settings, same 48
+frames, BD-rate on PSNR-Y / PSNR-RGB:
+
+                    AV1 libaom        HEVC x265         H.264 x264
+    clean         +53.9% / +49.0%   -13.2% / -15.8%   -39.6% / -42.2%
+    noisy         +56.3% / +51.1%   -17.2% / -21.2%   -43.1% / -44.9%
+
+That is a long way from the +18.6% and +24.8% against AV1 above, and
+it is not NVDRV that moved: the clean clip at q 20 is 229 kbit/s where
+it was about 250 (39 KB of intra frame and 47 frames of 495 bytes over
+two seconds). The reference encoders did, AV1's most. The two tables
+were made with different builds of them, and the earlier build's
+points were not kept, so which of its settings fell short cannot be
+said from here. This table is the one to go by: it is the stronger
+opponent, and the build is named. NVDRV needs about half as many bytes
+again as AV1, a seventh to a sixth fewer than x265 and two fifths fewer
+than x264.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours

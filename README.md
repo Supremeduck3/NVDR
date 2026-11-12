@@ -30,9 +30,9 @@ made. BD-rate on PSNR-Y, negative meaning NVDR needs fewer bytes:
                                               vs WebP          -20%
                                               vs JPEG XL       level
                                               vs AVIF          +39%
-    video, two 48-frame clips at 960x540      vs AV1 (libaom)  +19% and +25%
-                                              vs HEVC (x265)   -21% and -35%
-                                              vs H.264 (x264)  -42% and -52%
+    video, two 48-frame clips at 960x540      vs AV1 (libaom)  +54% and +56%
+                                              vs HEVC (x265)   -13% and -17%
+                                              vs H.264 (x264)  -40% and -43%
 
 What that does not say: the test set is small (six thumbnails, five
 photographs, a handful of short clips), the encoder optimises PSNR and
