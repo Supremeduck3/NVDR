@@ -1336,6 +1336,54 @@ opponent, and the build is named. NVDRV needs about half as many bytes
 again as AV1, a seventh to a sixth fewer than x265 and two fifths fewer
 than x264.
 
+### Where the field's bits go, and three ways not to save them
+
+Against AV1 the clean clip's 47 predicted frames are 24.5 KB where AV1's
+are 11.3, and 10.2 KB of NVDRV's are the motion field: nearly AV1's
+whole predicted frames. So the field was taken apart. A copy of the
+encoder priced every symbol it codes at its model's odds (q 20, every
+field coded, trial encodes included):
+
+    clean, P frames                     clean, B frames
+    same as predicted   25%  0.97 bit   direct flag         19%  0.43 bit
+    magnitude           17%  0.73       magnitude           14%  0.81
+    zero flag           14%  0.97       same as predicted   16%  0.96
+    sign                11%  0.98       mode                10%  0.52
+    temporal flag        8%  0.90       split                8%  0.23
+    split                6%  0.75       zero, sign          13%  ~0.96
+
+The bits are spread thin: no one symbol is the field. Three ways in
+were measured:
+
+- **A list of candidates** (AV1's NEARESTMV and NEARMV, HEVC's merge):
+  of the vectors coded in full, only 13 to 16% equal a neighbour's
+  (left, top, top-right, top-left) that is not already the prediction,
+  so an index to them would save about 3% of the field. What is there
+  instead is jitter: 50 to 65% of them lie within a quarter pixel of a
+  neighbour.
+- **Weighing the vector's bits more**, which would smooth that jitter
+  away: twice the weight cost +1.0% (clean). The quarter-pixel steps
+  buy more in the residual than they cost in the field.
+- **Contexts for the differences** from the neighbours' differences
+  (zero by how many of them are zero, sign by theirs, magnitude by
+  their size): -2.5% of the field on the clean clip, between -0.5% and
+  +1% on the clip with three objects. Under half a percent of the file.
+- **Blocks of 64** (split to 32) where they are 32 (split to 16), as
+  AV1's large blocks would suggest: +8.6% on the clean clip and +13.8%
+  on the one with three objects. The fine field pays for itself.
+
+None was kept: none pays for a format change. The field codes what the
+search chooses at close to what its symbols are worth, and the
+search's choices are right for this prediction. What AV1 has is
+better prediction for the same vectors (eight-tap interpolation filters
+chosen per block, warped motion, compound masks, more references),
+so a block needs fewer of them and less residual. That is where to look
+next, not at the field's coding.
+
+(The bench clips do not survive a new machine:
+`node scripts/analysis/mkclips.mjs samples/video/bench 48` rebuilds
+them, to the byte: the clean clip at q 20 is again 57,333 bytes.)
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
