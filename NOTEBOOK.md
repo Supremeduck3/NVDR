@@ -3215,6 +3215,44 @@ order, a PNG's iCCP inflated) in `ICCP`, and `nvdr_decode` writes it
 into the PNG it makes. The page does not apply it: a canvas is sRGB, or
 P3, and nothing in between. `--no-extras` leaves both out.
 
+### Priors, pushed further: measured, mostly not kept
+
+Held out throughout (trained on three samples and tested on the other
+three, both ways, unless said), BD-rate on PSNR-Y against no priors:
+
+How firmly a context starts from its prior (PRIOR_SEEN, the count it
+starts with; the shift that moves it falls from 1/4 to 1/8 at 12, 1/16
+at 40 and 1/64 at 96):
+
+    count            4       12      24      48      64      96
+    progressive   -0.50%  -0.83%  -0.90%  -0.93%  -0.95%  -0.70%
+    directional   -0.28%  -0.85%  -1.00%  -1.13%  -1.08%  -0.77%
+
+48 is the best, a tenth to three tenths of a point past the 12 version
+18 uses. Changing it changes what every version 18 file means, so it
+would be version 19; not worth one on its own.
+
+Tables by quality (q up to 18, to 32, past it, each trained on its own
+encodes): -0.78% progressive, -1.18% directional, at a count of 48.
+No better than one table: three tables from three photographs each are
+thinner than one, and the probabilities move less with q than expected.
+
+More photographs to learn from: trained on five and tested on the
+sixth, -0.95% and -1.22%, against -0.93% and -1.13% from three. Nearly
+all of it is the small picture (macarrão, 5 KB: -3.5%); the larger ones
+gain 0.2 to 0.4%, having enough symbols to learn on their own. Priors
+are worth most where a picture or a slice is small, and a larger
+training set would add little to photographs.
+
+Sequences (the same idea for video, measured and parked): the models a
+group of pictures starts each class of frame from, trained per class on
+the other clips (left out one at a time): -1.0% clean, -1.1% noisy,
+-0.9% multi (the stills' directional table gave -0.8, -1.0, -0.5). And
+the motion field's models, which start from even odds in every frame:
+-1.6 to -2.4% of the field, a third of a percent of the file. About
+1.3% together, a new sequence format and every decoder: kept for when
+the format changes anyway.
+
 **EXIF orientation.** A camera stores a photo as its sensor lies and
 says in EXIF which way is up. `nvdr_image_load()` now turns the pixels
 that way (all eight orientations, checked against ImageMagick's
