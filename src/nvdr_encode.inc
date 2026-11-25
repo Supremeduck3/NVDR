@@ -985,6 +985,8 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     int8_t* tq = NULL;
     uint32_t* seg = NULL;
     SliceOut* so = NULL;
+    Bytes table;              /* the slice table, freed at done whatever happens */
+    memset(&table, 0, sizeof(table));
     int nslices_done = 0;   /* how many of `so` hold coders to free */
     Bytes lay[3];
     memset(lay, 0, sizeof(lay));
@@ -1140,8 +1142,6 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     int nslices = srows ? (tiles_y + srows - 1) / srows : 1;
     const uint8_t* lp[3];
     size_t ln[3];
-    Bytes table;
-    memset(&table, 0, sizeof(table));
     /* Version 18: in slices, or starting from the priors, or both. */
     int v18 = srows || (cfg.priors && !inter && !cfg.residual);
     if (v18 && !(ctx && ctx->valid)) models_prior(&e.cm, &e.tm, &e.tm2, dirpred);
@@ -1176,7 +1176,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
         }
         for (int k = 0; k < NVDR_LAYERS; k++)
             for (int i = 0; i < nslices - 1; i++) bad |= bytes_leb(&table, seg[k * nslices + i]);
-        if (bad) { free(table.b); goto done; }
+        if (bad) goto done;
         for (int k = 0; k < NVDR_LAYERS; k++) { lp[k] = lay[k].b; ln[k] = lay[k].n; }
     } else {
         uint8_t none = 0;
@@ -1195,7 +1195,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
 
     size_t total = NVDR_HEADER_SIZE + table.n + ln[0] + ln[1] + n2;
     uint8_t* buf = (uint8_t*)malloc(total);
-    if (!buf) { free(table.b); goto done; }
+    if (!buf) goto done;
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
     buf[4] = v18 ? NVDR_VERSION_SLICES : NVDR_VERSION;
@@ -1229,7 +1229,6 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     h.version = buf[4];
     h.slice_rows = (uint8_t)srows;
     h.table_len = (uint32_t)table.n;
-    free(table.b);
     h.stored_bytes[0] = (uint32_t)ln[0];
     h.stored_bytes[1] = (uint32_t)ln[1];
     h.stored_bytes[2] = (uint32_t)n2;
@@ -1251,6 +1250,7 @@ done:
     nvdr_context_free(start);
     free(tq);
     free(seg);
+    free(table.b);
     if (so) for (int i = 0; i < nslices_done; i++) for (int k = 0; k < NVDR_LAYERS; k++) nvdr_enc_free(&so[i].enc[k]);
     free(so);
     for (int k = 0; k < NVDR_LAYERS; k++) free(lay[k].b);
