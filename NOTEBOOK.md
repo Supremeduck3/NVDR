@@ -1384,6 +1384,28 @@ next, not at the field's coding.
 `node scripts/analysis/mkclips.mjs samples/video/bench 48` rebuilds
 them, to the byte: the clean clip at q 20 is again 57,333 bytes.)
 
+### Interpolation filters chosen per block: measured, not built
+
+AV1 lets each block pick its interpolation filter (regular, smooth or
+sharp). Before building it, an oracle: the P frames of 16 frames without
+B frames (q 20, one reference), every 16-pixel cell keeping the vector
+the encoder chose with HEVC's filter, and predicted again with a smooth
+filter (taps at 64: half pixel 0 -1 7 26 26 7 -1 0, quarter 0 -1 10 32
+20 3 0 0) and a sharp one (half -1 3 -12 42 42 -12 3 -1), the best of
+them taken per cell with nothing paid for saying which:
+
+                 regular or smooth    any of the three   cells won
+    clean             -0.3%               -0.4%          11% smooth, 20% sharp
+    noisy             -0.2%               -0.4%          12%, 23%
+    multi             -0.3%               -0.5%           9%, 31%
+
+That is the prediction's SAD, before any bits go to the choice: an upper
+bound under half a percent. Smoothing the whole-pixel phase as well
+(8 48 8) changed it by a tenth. The cells that would switch are many,
+but each gains almost nothing: HEVC's 8-tap filter already is close to
+the best fixed one, and the noisy clip's anchors are denoised by the
+temporal filter before anything predicts from them. Not built.
+
 ### Albums and the fluid context
 
 The Fluid Codebook in `reference/codebook_db.c` persisted palette colours
