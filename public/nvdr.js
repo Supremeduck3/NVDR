@@ -18,7 +18,7 @@
 
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
 export const VERSION = 16;          // what a container without slices or priors is written as
-export const VERSION_SLICES = 18;   // slices, priors or both; 17 was slices from even odds
+export const VERSION_SLICES = 19;   // slices, priors or both; 18 held the priors more loosely, 17 had none
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;

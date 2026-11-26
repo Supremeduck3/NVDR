@@ -998,7 +998,7 @@ $('vsound').onchange = () => { if (sound && !$('vsound').checked) sound.el.pause
 /* Frame boundaries from the headers alone, without decoding anything. */
 function openSequence(buffer, name, sourceSize, report, seconds) {
     const info = readSequenceHeader(buffer);
-    if (!info) { setStatus('Não é um arquivo NVDRV v20 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
+    if (!info) { setStatus('Não é um arquivo NVDRV dos formatos 20 a 22 (recompile o encoder com make e recarregue a página sem cache).', true); return; }
     const frames = frameIndex(buffer);
     const intra = frames.filter(f => f.kind === INTRA).length;
     const bi = frames.filter(f => f.kind === BI).length;

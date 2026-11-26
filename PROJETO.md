@@ -121,7 +121,7 @@ Não precisa decorar; volte aqui quando um termo aparecer.
 | Recurso | Para que serve | Onde |
 |---|---|---|
 | Fatias (`--slices`) | codificar uma faixa por núcleo do processador, e isolar estragos de rede | `nvdr_encode.inc`, `nvdr_header.inc` |
-| Modelos iniciais (versão 18) | o codificador começa já "sabendo" como fotos costumam ser | `src/priors.h`, `nvdr_models.inc` |
+| Modelos iniciais (versão 19; 18 os segurava mais frouxos) | o codificador começa já "sabendo" como fotos costumam ser; nos vídeos (formato 22), cada tipo de quadro e o campo de movimento também | `src/priors.h`, `src/seqpriors.h`, `nvdr_models.inc` |
 | Transparência e perfil de cor | guardados depois das camadas, sem quebrar decodificadores antigos | `src/extras.c` |
 | Decodificar com buracos | mostrar o que chegou quando faltam pedaços do arquivo | `nvdr_decode.inc` |
 | Ocultação | faixa perdida vira um degradê em vez de cinza | `nvdr_planes.inc` |
@@ -311,10 +311,13 @@ compostas, mais referências e a distribuição de qualidade entre quadros.
    saíram: a das imagens (~1 360 linhas) e a do vídeo (~960 linhas, o
    campo de movimento e a compensação). Fotos, álbuns e vídeos no
    navegador são o C compilado.
-2. **Ganhos medidos e guardados para a próxima mudança de formato**:
-   - modelos iniciais para vídeo: ~1%;
-   - modelos iniciais para o campo de movimento: ~0,3%;
-   - peso maior para os modelos iniciais das fotos: ~0,2%.
+2. **Modelos iniciais — feito** (vídeo no formato 22, fotos no
+   contêiner 19). Cada tipo de quadro, o quadro intra e o campo de
+   movimento começam de tabelas treinadas: vídeos 1,3% a 1,6% menores,
+   medidos com cada clipe fora do próprio treino. Nas fotos os modelos
+   iniciais seguram mais firme: 0,1% a 0,2% menores, até 1% numa foto
+   pequena. Imagens pequenas são codificadas das duas formas (19 e 18) e
+   fica a menor, porque desenhos de poucas centenas de bytes perdiam 7%.
 3. **Base de testes maior** (fotos e vídeos reais) e **licença**:
    adiados.
 

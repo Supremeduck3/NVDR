@@ -60,7 +60,10 @@
 #include "nvdr.h"
 
 #define NVDRV_MAGIC        "NVDV"
-#define NVDRV_VERSION      21
+/* 22: every group of pictures starts each class of frame, the intra
+ * frame and the motion field from trained models (PRIORS in nvdrv.c);
+ * 21 started them from even odds. */
+#define NVDRV_VERSION      22
 #define NVDRV_HEADER_SIZE  24
 #define NVDRV_FRAME_HEADER 20   /* bytes after the header the fuzzer aims at; a frame header is 3 to 30 */
 

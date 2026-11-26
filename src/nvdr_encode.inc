@@ -967,9 +967,10 @@ static void code_slice(const Enc* start, int ty0, int ty1, SliceOut* o, const do
     free(w);
 }
 
-/* One encode in the mode cfg->chroma420 names (420 when nonzero). */
-static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
-                       const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+/* One encode in the mode cfg->chroma420 names (420 when nonzero); with
+ * `loose`, priors taken as version 18 took them (see encode_mode()). */
+static int encode_mode_at(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                          const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx, int loose) {
     *out_buf = NULL; *out_len = 0;
     NvdrConfig cfg = *cfg_in;
     if (img->width <= 0 || img->height <= 0 || img->width > 65535 || img->height > 65535 ||
@@ -1142,9 +1143,9 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     int nslices = srows ? (tiles_y + srows - 1) / srows : 1;
     const uint8_t* lp[3];
     size_t ln[3];
-    /* Version 18: in slices, or starting from the priors, or both. */
+    /* Version 19: in slices, or starting from the priors, or both. */
     int v18 = srows || (cfg.priors && !inter && !cfg.residual);
-    if (v18 && !(ctx && ctx->valid)) models_prior(&e.cm, &e.tm, &e.tm2, dirpred);
+    if (v18 && !(ctx && ctx->valid)) models_prior(&e.cm, &e.tm, &e.tm2, dirpred, loose ? PRIOR_SEEN_V18 : PRIOR_SEEN);
     if (srows) {
         if (!(seg = (uint32_t*)calloc((size_t)NVDR_LAYERS * nslices, sizeof(uint32_t))) ||
             !(so = (SliceOut*)calloc((size_t)nslices, sizeof(SliceOut)))) goto done;
@@ -1198,7 +1199,7 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
     if (!buf) goto done;
     memset(buf, 0, NVDR_HEADER_SIZE);
     memcpy(buf, NVDR_MAGIC, 4);
-    buf[4] = v18 ? NVDR_VERSION_SLICES : NVDR_VERSION;
+    buf[4] = !v18 ? NVDR_VERSION : loose ? 18 : NVDR_VERSION_SLICES;
     buf[5] = (uint8_t)((cfg.residual ? NVDR_FLAG_RESIDUAL : 0) | (cfg.deblock ? NVDR_FLAG_DEBLOCK : 0) |
                        (use420 ? NVDR_FLAG_CHROMA420 : 0) | (e.tq ? NVDR_FLAG_TILEQ : 0) |
                        (dirpred ? NVDR_FLAG_DIRPRED : 0) | (inter ? NVDR_FLAG_INTER : 0) |
@@ -1411,6 +1412,9 @@ static double container_cost(const uint8_t* buf, size_t len, const NvdrImage* im
  * that 4:2:0 codes 30% smaller at the same luma. */
 #define CHROMA_AUTO_WEIGHT 0.5
 
+static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                       const NvdrConfig* cfg, NvdrHeader* hdr_out, NvdrContext* ctx);
+
 static int encode_chroma(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                          const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
     *out_buf = NULL; *out_len = 0;
@@ -1483,6 +1487,30 @@ static int encode_chroma(uint8_t** out_buf, size_t* out_len, const NvdrImage* im
     free(a); free(b);
     nvdr_context_free(start); nvdr_context_free(other); nvdr_context_free(check);
     return rc;
+}
+
+/*
+ * Version 19 holds the priors firmly, which suits photographs (about
+ * 0.2% smaller); a small picture unlike them, a drawing or a gradient of
+ * a few hundred bytes, does better with version 18's looser hold, by up
+ * to 8%. A small picture is cheap to code twice, so it is coded both
+ * ways and the smaller kept; past SMALL_PICTURE it is always version 19.
+ */
+#define SMALL_PICTURE (256 * 256)
+static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                       const NvdrConfig* cfg, NvdrHeader* hdr_out, NvdrContext* ctx) {
+    int rc = encode_mode_at(out_buf, out_len, img, cfg, hdr_out, ctx, 0);
+    if (rc != 0 || (size_t)img->width * img->height > SMALL_PICTURE || *out_len <= 4 ||
+        (*out_buf)[4] != NVDR_VERSION_SLICES || ctx)
+        return rc;
+    uint8_t* b = NULL; size_t blen = 0;
+    NvdrHeader hb;
+    if (encode_mode_at(&b, &blen, img, cfg, &hb, NULL, 1) != 0) return 0;
+    if (blen < *out_len) {
+        free(*out_buf); *out_buf = b; *out_len = blen;
+        if (hdr_out) *hdr_out = hb;
+    } else free(b);
+    return 0;
 }
 
 /*

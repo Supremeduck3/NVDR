@@ -39,24 +39,34 @@ static void models_fill(NvdrProb* p, size_t count) {
  * in general teach instead: priors.h holds, per context, the probability
  * it ended at averaged over a set of photographs (scripts/analysis/
  * priors.c), one table for progressive pictures and one for directional.
- * Each context takes its probability with a count of PRIOR_SEEN, so it
- * moves an eighth of the way per symbol at first, not a quarter: it is a
- * better guess than even odds and still only a guess. A file with a
- * fluid context starts from that instead, as it always did.
+ * Each context takes its probability as if it had already seen a number
+ * of symbols, which sets how fast it moves away (the shift in
+ * nvdr_prob_update): it is a better guess than even odds and still only
+ * a guess. Version 18 took them with a count of 12, an eighth of the way
+ * per symbol at first; version 19 with 48, a sixteenth, which held out
+ * over the photographs 0.1 to 0.3 points better (NOTEBOOK.md, "Priors,
+ * pushed further"). A file with a fluid context starts from that
+ * instead, as it always did.
  *
  * A picture without slices can start from them too (NvdrConfig.priors):
- * it is then version 18 with a slice table of one byte, 0.
+ * it is then version 19 with a slice table of one byte, 0.
  */
 #include "priors.h"
-#define PRIOR_SEEN 12
+#define PRIOR_SEEN_V18 12
+#define PRIOR_SEEN 48
 _Static_assert(NVDR_PRIOR_COUNT == (sizeof(ColourModels) + 2 * sizeof(TextureModels)) / sizeof(NvdrProb),
                "priors.h was made for other models: run scripts/analysis/priors.c again");
-static void models_prior(ColourModels* cm, TextureModels* tm, TextureModels* tm2, int directional) {
-    const uint8_t* p = NVDR_PRIORS[directional ? 1 : 0];
+/* `p`: NVDR_PRIOR_COUNT probabilities in 256ths, each taken with a count
+ * of `seen`. */
+static void models_prior_from(ColourModels* cm, TextureModels* tm, TextureModels* tm2, const uint8_t* p,
+                              int seen) {
     NvdrProb* dst[3] = { (NvdrProb*)cm, (NvdrProb*)tm, (NvdrProb*)tm2 };
     size_t n[3] = { sizeof(*cm) / sizeof(NvdrProb), sizeof(*tm) / sizeof(NvdrProb), sizeof(*tm2) / sizeof(NvdrProb) };
     for (int k = 0; k < 3; k++)
-        for (size_t i = 0; i < n[k]; i++) dst[k][i] = ((NvdrProb)*p++ << 7 | 64) | (NvdrProb)PRIOR_SEEN << 16;
+        for (size_t i = 0; i < n[k]; i++) dst[k][i] = ((NvdrProb)*p++ << 7 | 64) | (NvdrProb)seen << 16;
+}
+static void models_prior(ColourModels* cm, TextureModels* tm, TextureModels* tm2, int directional, int seen) {
+    models_prior_from(cm, tm, tm2, NVDR_PRIORS[directional ? 1 : 0], seen);
 }
 
 /*
@@ -79,6 +89,15 @@ struct NvdrContext {
 NvdrContext* nvdr_context_new(void) { return (NvdrContext*)calloc(1, sizeof(NvdrContext)); }
 void nvdr_context_free(NvdrContext* ctx) { free(ctx); }
 void nvdr_context_reset(NvdrContext* ctx) { if (ctx) ctx->valid = 0; }
+void nvdr_context_prior_table(NvdrContext* ctx, const uint8_t* table, int seen) {
+    if (!ctx) return;
+    models_prior_from(&ctx->cm, &ctx->tm, &ctx->tm2, table, seen);
+    ctx->valid = 1;
+}
+void nvdr_context_prior(NvdrContext* ctx, int directional, int seen) {
+    nvdr_context_prior_table(ctx, NVDR_PRIORS[directional ? 1 : 0], seen);
+}
+size_t nvdr_context_prior_count(void) { return NVDR_PRIOR_COUNT; }
 size_t nvdr_context_size(void) { return sizeof(NvdrContext); }
 void nvdr_context_copy(NvdrContext* dst, const NvdrContext* src) { *dst = *src; }
 int nvdr_context_equal(const NvdrContext* a, const NvdrContext* b) {

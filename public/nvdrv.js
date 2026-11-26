@@ -11,7 +11,7 @@ import { wasmSequence, wasmPredictDecode } from './nvdr-wasm.js';
 import { showRGB } from './nvdr.js';
 
 const MAGIC = 0x5644564e;      // "NVDV" read as a little-endian uint32
-const VERSION = 21;
+const VERSION = 22;
 const HEADER_SIZE = 24;
 const MAX_PIXELS = 1 << 27;    // NVDR_MAX_PIXELS
 
@@ -141,9 +141,9 @@ const sequenceRegistry = new FinalizationRegistry(seq => seq.close());
 export class SequenceDecoder {
     constructor(buffer) {
         this.info = readSequenceHeader(buffer);
-        if (!this.info) throw new Error('not an NVDRV v20 or v21 file');
+        if (!this.info) throw new Error('not an NVDRV file of format 20 to 22');
         this.seq = wasmSequence(new Uint8Array(buffer));
-        if (!this.seq) throw new Error('not an NVDRV v20 or v21 file');
+        if (!this.seq) throw new Error('not an NVDRV file of format 20 to 22');
         sequenceRegistry.register(this, this.seq, this);
     }
 

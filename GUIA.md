@@ -743,6 +743,39 @@ coisa em `src/`.
 
 ---
 
+## Modelos iniciais: de onde vêm e como refazer
+
+Os modelos do codificador aritmético não começam do zero: começam de
+tabelas aprendidas, que vão dentro do código e portanto do formato.
+
+- **Fotos:** `src/priors.h`, feito por `scripts/analysis/priors.c` a
+  partir das amostras.
+- **Vídeo (formato 22):** `src/seqpriors.h`, com uma tabela por classe de
+  quadro (P e três tipos de B) e uma para o campo de movimento de P e de
+  B. O quadro intra usa a tabela de fotos direcionais.
+
+Para refazer a do vídeo, codifique clipes com `NVDRV_DUMP` e passe o que
+saiu para `seqpriors`:
+
+```bash
+make output/seqpriors
+for c in clean noisy multi long; do
+  NVDRV_DUMP=/tmp/$c.bin ./nvdrv_encode samples/video/bench/$c /tmp/$c.nvdrv --q 24 --jobs 1
+done
+./output/seqpriors src/seqpriors.h /tmp/*.bin
+make && make wasm
+```
+
+Com `NVDRV_DUMP` o codificador grava o formato 21, que começa de
+probabilidades iguais, para que a tabela aprenda com os clipes e não
+consigo mesma. Use `--jobs 1`, ou um arquivo de despejo por codificação.
+
+**Mudar uma tabela muda o formato:** um arquivo feito com a tabela
+antiga decodifica errado com a nova. Por isso elas só mudam junto com
+um número de formato novo.
+
+---
+
 ## Coisas que confundem
 
 - **A página mostra a imagem em cores erradas, com a parte de baixo

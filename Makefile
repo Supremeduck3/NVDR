@@ -15,7 +15,7 @@ CODEC   = src/nvdr.c src/entropy.c src/grain.c src/restore.c src/extras.c
 # nvdr.c is one translation unit in parts (src/nvdr_*.inc), which it includes.
 HEADERS = src/nvdr.h src/entropy.h src/grain.h src/restore.h src/priors.h src/extras.h $(wildcard src/nvdr_*.inc)
 SEQ     = $(CODEC) src/nvdrv.c src/mc.c
-SEQ_H   = $(HEADERS) src/nvdrv.h src/mc.h
+SEQ_H   = $(HEADERS) src/nvdrv.h src/mc.h src/seqpriors.h
 TOOLS   = nvdr_encode nvdr_decode nvdrv_encode nvdrv_decode nvdr_album nvdr_png nvdr_batch
 
 all: $(TOOLS)
@@ -81,6 +81,12 @@ fuzz_nvdr: scripts/fuzz.c src/nvda.c src/nvda.h $(SEQ) $(SEQ_H)
 	    -Isrc -Ivendor $(OPENMP) -o $@ scripts/fuzz.c src/nvda.c $(SEQ) $(LDLIBS)
 
 fuzz: fuzz_nvdr
+
+# The models a sequence starts from, from the encoder's NVDRV_DUMP runs
+# (it includes nvdr.c itself, for the models' layout).
+output/seqpriors: scripts/analysis/seqpriors.c $(CODEC) $(HEADERS)
+	mkdir -p output
+	$(CC) $(CFLAGS) -Isrc -Ivendor -o $@ scripts/analysis/seqpriors.c src/entropy.c src/grain.c src/restore.c src/extras.c $(LDLIBS)
 
 output/convert: scripts/analysis/convert.c $(CODEC) $(HEADERS)
 	mkdir -p output

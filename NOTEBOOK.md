@@ -3253,6 +3253,39 @@ the motion field's models, which start from even odds in every frame:
 1.3% together, a new sequence format and every decoder: kept for when
 the format changes anyway.
 
+**Taken: sequence format 22 and container 19.** The three gains above,
+in one change of format. Sequences: every group of pictures starts each
+class of predicted frame from its own table, the intra frame from the
+stills' directional table, and the motion field (P or B) from its own;
+all at a count of 48 (`src/seqpriors.h`, made by
+`scripts/analysis/seqpriors.c` from the encoder's NVDRV_DUMP runs on
+the four bench clips at q 12, 24 and 48). A dump run writes format 21
+from even odds: dumped from runs that start at the tables, the averages
+leaned towards the tables themselves, since a model taken at a count of
+48 moves away slowly (the B field's magnitude models came out at 85 to
+90 in 256ths, where runs from even odds say 46 to 62).
+
+BD-rate against format 21, PSNR-Y, 48 frames, each clip coded with
+tables trained on the other three:
+
+                       clean   noisy   multi    long
+    count 48           -1.4%   -1.3%   -1.4%   -1.6%
+    count 12           -1.2%   -1.2%   -1.0%   -1.0%
+
+RGB within a tenth or two of the same. More than the 1.3% estimated
+from the parts, and 48 beats 12 here as for stills. The gate's 12-frame
+synthetic sequence is level (+0.2% bytes, +0.01 dB).
+
+Stills: version 19 takes the priors at 48 (version 18 files still read
+at 12): -0.1% progressive, -0.2% directional over the six samples,
+-1.0% on macarrão. Two synthetic pictures of the gate lost 7% (blocos
+249 -> 267 bytes, degrade 321 -> 346): a drawing far from what
+photographs teach unlearns a firm prior slowly. A picture of up to
+256x256 is therefore coded both ways and keeps the smaller, version 18
+or 19; both are cheap at that size, and the gate is back to its sizes.
+
+The tables add 12 KB to nvdr.wasm (95 to 107 KB).
+
 **EXIF orientation.** A camera stores a photo as its sensor lies and
 says in EXIF which way is up. `nvdr_image_load()` now turns the pixels
 that way (all eight orientations, checked against ImageMagick's

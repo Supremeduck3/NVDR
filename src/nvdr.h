@@ -187,7 +187,8 @@ typedef struct {
      * picture predicted from a base, ignores it. Container v17. */
     int   slices;
     /* Start the models from what pictures in general teach instead of
-     * from even odds (PRIORS in nvdr.c): container v18, which a picture
+     * from even odds (PRIORS in nvdr.c): container v19 (v18 held them
+     * more loosely), which a picture
      * in slices always is. Under 1% smaller on photographs, about 3%
      * on small files, and what makes slices nearly free. Off by default here, since a sequence rebuilds its
      * frames' headers as version 16; the still tools turn it on. A
@@ -227,7 +228,8 @@ NvdrConfig nvdr_default_config(void);
 /* What a container without slices is written as (sequences rebuild
  * their frames' headers with it), and one with them. */
 #define NVDR_VERSION     16
-#define NVDR_VERSION_SLICES 18          /* slices, priors or both; 17: slices from even odds */
+#define NVDR_VERSION_SLICES 19          /* slices, priors or both; 18: the priors held more
+                                           loosely, 17: slices from even odds */
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */
@@ -243,7 +245,7 @@ typedef struct {
     uint8_t  max_block, min_block;
     uint16_t q_luma, q_chroma;
     uint8_t  flags;                     /* NVDR_FLAG_* */
-    uint8_t  version;                   /* 16, or 18 with slices or priors; 15 had no deblocking levels,
+    uint8_t  version;                   /* 16, or 19 with slices or priors; 15 had no deblocking levels,
                                            14 no half nodes, 13 also fifteen intra modes */
     uint8_t  band;
     /* How hard leaf seams are deblocked, luma's and colour's: 8 is the
@@ -321,6 +323,16 @@ typedef struct NvdrContext NvdrContext;
 NvdrContext* nvdr_context_new(void);
 void nvdr_context_free(NvdrContext* ctx);
 void nvdr_context_reset(NvdrContext* ctx);
+/* A context holding the priors (PRIORS in nvdr_models.inc) for
+ * progressive pictures or directional ones, each probability taken as if
+ * `seen` symbols had set it: what a run of containers can start from
+ * instead of even odds. */
+void nvdr_context_prior(NvdrContext* ctx, int directional, int seen);
+/* The same from a table of nvdr_context_prior_count() probabilities in
+ * 256ths, in the order the models are laid out (a sequence's, see
+ * src/seqpriors.h). */
+void nvdr_context_prior_table(NvdrContext* ctx, const uint8_t* table, int seen);
+size_t nvdr_context_prior_count(void);
 /* Bytes a context takes, for a caller that keeps its own storage (a
  * zeroed block that size is an empty context). */
 size_t nvdr_context_size(void);

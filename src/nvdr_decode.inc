@@ -432,7 +432,8 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
         models_fill((NvdrProb*)&cm, sizeof(cm) / sizeof(NvdrProb));
         for (int k = 0; k < 2; k++) models_fill((NvdrProb*)&tms[k], sizeof(TextureModels) / sizeof(NvdrProb));
     }
-    if (h.version >= 18 && !(ctx && ctx->valid)) models_prior(&cm, &tms[0], &tms[1], dirpred);
+    if (h.version >= 18 && !(ctx && ctx->valid))
+        models_prior(&cm, &tms[0], &tms[1], dirpred, h.version >= 19 ? PRIOR_SEEN : PRIOR_SEEN_V18);
     cm0 = cm; tms0[0] = tms[0]; tms0[1] = tms[1];
     NvdrDecoder d0;
     /* A directional picture's texture comes with its colours, from the

@@ -1,4 +1,5 @@
 #include "nvdrv.h"
+#include "seqpriors.h"
 
 #include <limits.h>
 #include <math.h>
@@ -799,6 +800,62 @@ static void mv_models_init(MvModels* m) {
     for (size_t i = 0; i < sizeof(*m) / sizeof(NvdrProb); i++) p[i] = NVDR_PROB_INIT;
 }
 
+/*
+ * PRIORS
+ * ------
+ * Up to format 21 every group of pictures started each class of frame
+ * (frame_class()) from even odds, every intra frame too, and every
+ * frame's motion field: each paid, in its first symbols, to learn again
+ * what every clip teaches. From format 22 they start from trained models
+ * instead, as a still's slices do (PRIORS in nvdr_models.inc): the
+ * predicted frames from seqpriors.h's table for their class, the intra
+ * frame from the stills' directional table, the field from seqpriors.h's
+ * table for P or B frames. scripts/analysis/seqpriors.c makes
+ * seqpriors.h from what the encoder's runs ended with (NVDRV_DUMP).
+ * Each probability is taken as if SEQ_PRIOR_SEEN symbols had set it.
+ */
+#ifndef SEQ_PRIOR_SEEN
+#define SEQ_PRIOR_SEEN 48
+#endif
+
+/* A motion field's models, P or B (pack_vfield()). */
+typedef struct {
+    MvModels m0, m1;
+    NvdrProb split_m[3], not_bi[3], bwd[3], direct_m[3];
+} FieldModels;
+_Static_assert(sizeof(FieldModels) / sizeof(NvdrProb) == NVDRV_FIELD_PRIOR_COUNT,
+               "seqpriors.h was made for other models: run scripts/analysis/seqpriors.c again");
+/* The class tables are as long as a still's models: checked where an
+ * encoder or decoder opens (nvdr_context_prior_count()). */
+
+/* Even odds, or the prior of a B field (`two`) or a P one. */
+static void field_models_init(FieldModels* m, int priors, int two) {
+    NvdrProb* p = (NvdrProb*)m;
+    const uint8_t* t = NVDRV_FIELD_PRIORS[two ? 1 : 0];
+    for (size_t i = 0; i < sizeof(*m) / sizeof(NvdrProb); i++)
+        p[i] = priors ? ((NvdrProb)t[i] << 7 | 64) | (NvdrProb)SEQ_PRIOR_SEEN << 16 : NVDR_PROB_INIT;
+}
+
+/* Training (scripts/analysis/seqpriors.c): with NVDRV_DUMP set, the
+ * encoder appends what each run of models ended with, as a tag (a frame
+ * class, 0 to 3, then a context; 4 or 5, a P or B field's models) and
+ * the bytes. It then writes format 21, from even odds, so that what it
+ * dumps is what the clips teach and not the tables it would replace:
+ * a model taken from a prior moves away from it slowly. */
+#ifndef NVDR_WASM
+static void prior_dump(int tag, const void* p, size_t n) {
+    const char* path = getenv("NVDRV_DUMP");
+    if (!path) return;
+    FILE* f = fopen(path, "ab");
+    if (!f) return;
+    fwrite(&tag, sizeof(int), 1, f);
+    fwrite(p, n, 1, f);
+    fclose(f);
+}
+#else
+#define prior_dump(tag, p, n) ((void)0)
+#endif
+
 static int median3(int a, int b, int c) {
     if (a > b) { int t = a; a = b; b = t; }
     return c < a ? a : (c > b ? b : c);
@@ -1579,16 +1636,15 @@ static void vf_direct(VfList* l0, VfList* l1, int fx, int fy, int w) {
  * vectors of lists a unit does not use are overwritten with their
  * predictions, as the decoder will see them. */
 static uint8_t* pack_vfield(const Grid* G, const uint8_t* split, const uint8_t* mode,
-                            VfList* l0, VfList* l1, size_t* out_len) {
+                            VfList* l0, VfList* l1, int priors, size_t* out_len) {
     size_t nf = (size_t)G->nfx * G->nfy;
     uint8_t* same = (uint8_t*)calloc(nf * 2, 1);
     if (!same) return NULL;
-    MvModels m0, m1;
-    mv_models_init(&m0); mv_models_init(&m1);
-    NvdrProb split_m[3], not_bi[3], bwd[3], direct_m[3];
-    for (int i = 0; i < 3; i++) split_m[i] = not_bi[i] = bwd[i] = direct_m[i] = NVDR_PROB_INIT;
-    l0->same = same; l0->mm = &m0;
-    if (l1) { l1->same = same + nf; l1->mm = &m1; }
+    FieldModels fm;
+    field_models_init(&fm, priors, mode != NULL);
+    NvdrProb *split_m = fm.split_m, *not_bi = fm.not_bi, *bwd = fm.bwd, *direct_m = fm.direct_m;
+    l0->same = same; l0->mm = &fm.m0;
+    if (l1) { l1->same = same + nf; l1->mm = &fm.m1; }
     uint8_t* dmode = mode ? (uint8_t*)calloc(nf * 2, 1) : NULL;    /* as decoded so far, for contexts */
     uint8_t* direct = dmode ? dmode + nf : NULL;                    /* per cell, whether direct */
     NvdrEncoder enc;
@@ -1618,23 +1674,24 @@ static uint8_t* pack_vfield(const Grid* G, const uint8_t* split, const uint8_t* 
             }
         }
     free(same); free(dmode);
+    prior_dump(mode ? 5 : 4, &fm, sizeof(fm));
     if (nvdr_enc_finish(&enc) != 0) { nvdr_enc_free(&enc); return NULL; }
     *out_len = enc.count;
     return enc.bytes;
 }
 
+/* `priors`: the field starts from them (format 22), not from even odds. */
 static int unpack_vfield(const uint8_t* packed, size_t len, const Grid* G, uint8_t* split, uint8_t* mode,
-                         VfList* l0, VfList* l1) {
+                         VfList* l0, VfList* l1, int priors) {
     size_t nf = (size_t)G->nfx * G->nfy;
     uint8_t* same = (uint8_t*)calloc(nf * 3, 1);    /* list 0's flags, list 1's, the direct flags */
     if (!same) return -1;
-    MvModels m0, m1;
-    mv_models_init(&m0); mv_models_init(&m1);
-    NvdrProb split_m[3], not_bi[3], bwd[3], direct_m[3];
-    for (int i = 0; i < 3; i++) split_m[i] = not_bi[i] = bwd[i] = direct_m[i] = NVDR_PROB_INIT;
+    FieldModels fm;
+    field_models_init(&fm, priors, mode != NULL);
+    NvdrProb *split_m = fm.split_m, *not_bi = fm.not_bi, *bwd = fm.bwd, *direct_m = fm.direct_m;
     uint8_t* direct = same + 2 * nf;
-    l0->same = same; l0->mm = &m0;
-    if (l1) { l1->same = same + nf; l1->mm = &m1; }
+    l0->same = same; l0->mm = &fm.m0;
+    if (l1) { l1->same = same + nf; l1->mm = &fm.m1; }
     if (mode) memset(mode, 0, nf);
     NvdrDecoder dec;
     nvdr_dec_init(&dec, packed, len);
@@ -2167,6 +2224,8 @@ struct NvdrvEncoder {
      * reconstruct() rebuilds them. */
     NvdrContext *ctx[4], *dctx[4];
     NvdrContext *tctx[2], *tdctx[2];   /* scratch, when two ways are compared (code_frame()) */
+    NvdrContext *ictx, *idctx;         /* an intra frame's, from the priors each time */
+    int         priors;                /* format 22; 21 when training (NVDRV_DUMP) */
     /* Searched vectors at block size (s) and half size (h), the chosen
      * field (v), the models' vectors (m) and modes on the half-size grid,
      * and which blocks split. */
@@ -2343,7 +2402,9 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
         !(e->dctx[0] = nvdr_context_new()) || !(e->dctx[1] = nvdr_context_new()) ||
         !(e->dctx[2] = nvdr_context_new()) || !(e->dctx[3] = nvdr_context_new()) ||
         !(e->tctx[0] = nvdr_context_new()) || !(e->tctx[1] = nvdr_context_new()) ||
-        !(e->tdctx[0] = nvdr_context_new()) || !(e->tdctx[1] = nvdr_context_new())) {
+        !(e->tdctx[0] = nvdr_context_new()) || !(e->tdctx[1] = nvdr_context_new()) ||
+        !(e->ictx = nvdr_context_new()) || !(e->idctx = nvdr_context_new()) ||
+        nvdr_context_prior_count() != NVDRV_CLASS_PRIOR_COUNT) {
         nvdrv_encode_close(e); return -1;
     }
     if (e->cfg.block > 0) {
@@ -2366,11 +2427,14 @@ int nvdrv_encode_open(NvdrvEncoder** out, const char* path,
 
     e->f = fopen(path, "wb");
     if (!e->f) { nvdrv_encode_close(e); return -1; }
+#ifndef NVDR_WASM
+    e->priors = !getenv("NVDRV_DUMP");
+#endif
 
     uint8_t h[NVDRV_HEADER_SIZE];
     memset(h, 0, sizeof(h));
     memcpy(h, NVDRV_MAGIC, 4);
-    h[4] = NVDRV_VERSION;
+    h[4] = (uint8_t)(e->priors ? NVDRV_VERSION : 21);
     put_u16v(h + 6, (uint16_t)width);
     put_u16v(h + 8, (uint16_t)height);
     /* Frame count is patched on close; a stream that never closes still
@@ -2711,12 +2775,12 @@ static int code_as(NvdrvEncoder* e, const NvdrImage* src, int display, int kind,
         if (kind == NVDRV_PRED && block) {
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             field = with_models(aff0 ? &model0 : NULL, NULL,
-                                pack_vfield(&G, e->split, NULL, &l0, NULL, &field_len), &field_len);
+                                pack_vfield(&G, e->split, NULL, &l0, NULL, e->priors, &field_len), &field_len);
         } else if (two) {
             VfList l0 = { &G, &model0, e->v0x, e->v0y, e->m0x, e->m0y, NULL, NULL, e->t0x, e->t0y, t0ok };
             VfList l1 = { &G, &model1, e->v1x, e->v1y, e->m1x, e->m1y, NULL, NULL, e->t1x, e->t1y, t1ok };
             field = with_models(aff0 ? &model0 : NULL, aff1 ? &model1 : NULL,
-                                pack_vfield(&G, e->split, e->mode, &l0, &l1, &field_len), &field_len);
+                                pack_vfield(&G, e->split, e->mode, &l0, &l1, e->priors, &field_len), &field_len);
         }
         if (block && !field) return -1;
     }
@@ -2777,11 +2841,21 @@ static int code_as(NvdrvEncoder* e, const NvdrImage* src, int display, int kind,
     if (fc >= 0) {
         int g = gop_of(&e->gops, display);
         if (e->ctx_gop[fc] != g) {
-            nvdr_context_reset(e->ctx[fc]); nvdr_context_reset(e->dctx[fc]);
+            if (e->ctx_gop[fc] >= 0) prior_dump(fc, e->ctx[fc], nvdr_context_size());
+            if (e->priors) {
+                nvdr_context_prior_table(e->ctx[fc], NVDRV_CLASS_PRIORS[fc], SEQ_PRIOR_SEEN);
+                nvdr_context_prior_table(e->dctx[fc], NVDRV_CLASS_PRIORS[fc], SEQ_PRIOR_SEEN);
+            } else {
+                nvdr_context_reset(e->ctx[fc]); nvdr_context_reset(e->dctx[fc]);
+            }
             e->ctx_gop[fc] = g;
         }
+    } else if (e->priors) {
+        nvdr_context_prior(e->ictx, 1, SEQ_PRIOR_SEEN);
+        nvdr_context_prior(e->idctx, 1, SEQ_PRIOR_SEEN);
     }
-    NvdrContext *ectx = fc >= 0 ? e->ctx[fc] : NULL, *dctx = fc >= 0 ? e->dctx[fc] : NULL;
+    NvdrContext *ectx = fc >= 0 ? e->ctx[fc] : e->priors ? e->ictx : NULL;
+    NvdrContext *dctx = fc >= 0 ? e->dctx[fc] : e->priors ? e->idctx : NULL;
     if (out->ctx && fc >= 0) {
         nvdr_context_copy(out->ctx, ectx); ectx = out->ctx;
         nvdr_context_copy(out->dctx, dctx); dctx = out->dctx;
@@ -3425,8 +3499,10 @@ int nvdrv_encode_close(NvdrvEncoder* e) {
     free(e->mode); free(e->split);
     free(e->t0x); free(e->t0y); free(e->t1x); free(e->t1y); free(e->t0ok); free(e->t1ok);
     free(e->tile_q);
+    for (int i = 0; i < 4; i++) if (e->ctx[i] && e->ctx_gop[i] >= 0) prior_dump(i, e->ctx[i], nvdr_context_size());
     for (int i = 0; i < 4; i++) { nvdr_context_free(e->ctx[i]); nvdr_context_free(e->dctx[i]); }
     for (int i = 0; i < 2; i++) { nvdr_context_free(e->tctx[i]); nvdr_context_free(e->tdctx[i]); }
+    nvdr_context_free(e->ictx); nvdr_context_free(e->idctx);
     free(e);
     return rc;
 }
@@ -3449,6 +3525,7 @@ struct NvdrvDecoder {
     int       ended;
     NvdrImage pred, err;
     NvdrContext* ctx[4];     /* the models frames left, per class: see code_frame() */
+    NvdrContext* ictx;       /* an intra frame's (format 22) */
 };
 
 #ifndef NVDR_WASM
@@ -3493,7 +3570,8 @@ int nvdrv_decode_open_mem(NvdrvDecoder** out, uint8_t* data, size_t got, NvdrvIn
         alloc_image(&d->pred, d->width, d->height) != 0 ||
         alloc_image(&d->err, d->width, d->height) != 0 ||
         !(d->ctx[0] = nvdr_context_new()) || !(d->ctx[1] = nvdr_context_new()) ||
-        !(d->ctx[2] = nvdr_context_new()) || !(d->ctx[3] = nvdr_context_new())) {
+        !(d->ctx[2] = nvdr_context_new()) || !(d->ctx[3] = nvdr_context_new()) ||
+        !(d->ictx = nvdr_context_new()) || nvdr_context_prior_count() != NVDRV_CLASS_PRIOR_COUNT) {
         nvdrv_decode_close(d); return -1;
     }
     if (info) {
@@ -3656,12 +3734,12 @@ static int decode_one(NvdrvDecoder* d) {
              * not from their subpixel planes as the encoder makes it:
              * the same pixels, for a fraction of the work. */
             if (kind == NVDRV_PRED) {
-                if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL) == 0) {
+                if (unpack_vfield(fp + head, field_len - head, &G, split, NULL, &l0, NULL, d->version >= 22) == 0) {
                     mc_predict_frame(d->dpb[before].img.pixels, NULL, d->pred.pixels, NULL, d->width, d->height,
                                      G.g, G.nfx, G.nfy, v, v + nb, NULL, NULL, NULL, (flags & FRAME_OBMC) != 0);
                     rc = 0;
                 }
-            } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1) == 0) {
+            } else if (unpack_vfield(fp + head, field_len - head, &G, split, mode, &l0, &l1, d->version >= 22) == 0) {
                 mc_predict_frame(d->dpb[before].img.pixels, d->dpb[after].img.pixels, d->pred.pixels, d->err.pixels,
                                  d->width, d->height, G.g, G.nfx, G.nfy, v, v + nb, v + 2 * nb, v + 3 * nb, mode,
                                  (flags & FRAME_OBMC) != 0);
@@ -3696,12 +3774,18 @@ static int decode_one(NvdrvDecoder* d) {
     if (alloc_image(&s->img, d->width, d->height) != 0) { slot_free(s); return -1; }
     /* A frame cut before its colour layer has no picture yet: the stream
      * ends there, it is not damaged. */
+    NvdrContext* fctx = fc >= 0 ? d->ctx[fc] : NULL;
     if (kind == NVDRV_INTRA) {
         if (d->version < 21) for (int i = 0; i < 4; i++) nvdr_context_reset(d->ctx[i]);
         gops_add(&d->gops, display);
+        if (d->version >= 22) { nvdr_context_prior(d->ictx, 1, SEQ_PRIOR_SEEN); fctx = d->ictx; }
     } else if (d->version >= 21) {
         int g = gop_of(&d->gops, display);
-        if (d->ctx_gop[fc] != g) { nvdr_context_reset(d->ctx[fc]); d->ctx_gop[fc] = g; }
+        if (d->ctx_gop[fc] != g) {
+            if (d->version >= 22) nvdr_context_prior_table(d->ctx[fc], NVDRV_CLASS_PRIORS[fc], SEQ_PRIOR_SEEN);
+            else nvdr_context_reset(d->ctx[fc]);
+            d->ctx_gop[fc] = g;
+        }
     }
     size_t clen = 0;
     int damaged = 0;
@@ -3710,7 +3794,7 @@ static int decode_one(NvdrvDecoder* d) {
         slot_free(s);
         return partial && !damaged ? 0 : -1;
     }
-    int rc = reconstruct(cont, clen, kind == NVDRV_INTRA ? NULL : ref, &s->img, fc >= 0 ? d->ctx[fc] : NULL);
+    int rc = reconstruct(cont, clen, kind == NVDRV_INTRA ? NULL : ref, &s->img, fctx);
     free(cont);
     if (rc != 0) {
         slot_free(s);
@@ -3771,6 +3855,7 @@ void nvdrv_decode_close(NvdrvDecoder* d) {
     free(d->pred.pixels);
     free(d->err.pixels);
     for (int i = 0; i < 4; i++) nvdr_context_free(d->ctx[i]);
+    nvdr_context_free(d->ictx);
     free(d);
 }
 
