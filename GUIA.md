@@ -17,7 +17,8 @@ reference/  o codec v9 e dois módulos de um pipeline removido; não
             compilam no build
 ```
 
-Os documentos: `README.md` é o resumo (em inglês), este guia é o passo a
+Os documentos: `PROJETO.md` explica o projeto parte por parte (comece
+por ele), `README.md` é o resumo (em inglês), este guia é o passo a
 passo, e `NOTEBOOK.md` é o caderno de medições, na ordem em que foram
 feitas, com o que foi tentado e o que ficou de fora.
 

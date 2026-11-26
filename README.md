@@ -103,6 +103,8 @@ ranges that never arrived (`nvdr_decode --missing`, `decode()`'s
 
 ## Reading on
 
+- `PROJETO.md` — the project taken apart piece by piece, in plain
+  Portuguese: the place to start.
 - `GUIA.md` — how to build, run and test everything, in Portuguese.
 - `NOTEBOOK.md` — the measurements, in the order they were made, with
   what was tried and left out. The formats are specified there and in
