@@ -11,8 +11,6 @@
  *   decode()            the WebAssembly decoder, once loadWasm() (or
  *                       loadWasmBytes()) has run; it throws before that
  *   newDecodeContext()  a context for containers decoded in order
- *   ArithDecoder        the range decoder, which nvdrv.js still reads a
- *                       sequence's motion field with
  *   paintFitted() ...   putting a picture on a canvas
  *
  * The format is described in src/nvdr.h.
@@ -26,7 +24,6 @@ const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
 export const LAYER_NAMES = ['COR', 'COR+TEXTURA BAIXA', 'COR+TEXTURA COMPLETA'];
 
-const NSIZES = 4, MIN_BLOCK = 4, MAX_BLOCK = 32;
 const FLAG_RESIDUAL = 0x01;   // every colour predicted as 128
 const FLAG_DEBLOCK = 0x02;    // leaf seams filtered after decoding
 const FLAG_CHROMA420 = 0x04;  // colour in its own half-resolution tree
@@ -35,89 +32,9 @@ const FLAG_TILEQ = 0x10;      // a step offset per tile, in layer 0
 const FLAG_DIRPRED = 0x20;    // directional prediction, not progressive
 const FLAG_INTER = 0x40;      // and from a base picture the caller holds
 const FLAG_TXSEL = 0x80;      // a transform type per leaf, with FLAG_DIRPRED
-const GRAIN_SIZE = 22, GRAIN_POINTS = 16, GRAIN_T = 64;
+const GRAIN_SIZE = 22, GRAIN_POINTS = 16;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_LEVEL = 8;
-
-const PROB_BITS = 11, STATE_BITS = 15;
-export const PROB_INIT = 1 << (STATE_BITS - 1);
-/* A context array of n states, as the models hold them. */
-export const newProbs = n => new Uint32Array(n).fill(PROB_INIT);
-const TOP_VALUE = 1 << 24;
-
-/*
- * The LZMA range decoder. Arithmetic is forced through >>> because the
- * coder works on unsigned 32-bit words and JavaScript's bitwise operators
- * are signed.
- */
-export class ArithDecoder {
-    constructor(bytes, offset, size) {
-        this.bytes = bytes;
-        this.pos = offset;
-        this.end = offset + size;
-        this.range = 0xFFFFFFFF;
-        this.code = 0;
-        this.overrun = false;
-        // The encoder's first byte is always zero, so five are read and the
-        // first is discarded.
-        for (let i = 0; i < 5; i++) this.code = ((this.code << 8) | this.byte()) >>> 0;
-    }
-
-    byte() {
-        if (this.pos >= this.end) { this.overrun = true; return 0; }
-        return this.bytes[this.pos++];
-    }
-
-    normalize() {
-        while (this.range >>> 0 < TOP_VALUE) {
-            this.range = (this.range << 8) >>> 0;
-            this.code = ((this.code << 8) | this.byte()) >>> 0;
-        }
-    }
-
-    bit(probs, index) {
-        const s = probs[index];
-        let p = s & 0xffff, n = s >>> 16;
-        let q = p >>> (STATE_BITS - PROB_BITS);
-        q = q < 1 ? 1 : q > 2047 ? 2047 : q;
-        const bound = ((this.range >>> PROB_BITS) * q) >>> 0;
-        let result;
-        const sh = n < 12 ? 2 : n < 40 ? 3 : n < 96 ? 4 : 6;
-        if ((this.code >>> 0) < bound) {
-            this.range = bound;
-            p += ((1 << STATE_BITS) - p) >>> sh;
-            result = 0;
-        } else {
-            this.code = (this.code - bound) >>> 0;
-            this.range = (this.range - bound) >>> 0;
-            p -= p >>> sh;
-            result = 1;
-        }
-        if (n < 96) n++;
-        probs[index] = (p | (n << 16)) >>> 0;
-        this.normalize();
-        return result;
-    }
-
-    direct(bitCount) {
-        let result = 0;
-        while (bitCount-- > 0) {
-            this.range = this.range >>> 1;
-            this.code = (this.code - this.range) >>> 0;
-            const mask = (0 - (this.code >>> 31)) >>> 0;
-            this.code = (this.code + (this.range & mask)) >>> 0;
-            this.normalize();
-            result = ((result << 1) + mask + 1) >>> 0;
-        }
-        return result;
-    }
-
-    tree(probs, bitCount) {
-        let node = 1;
-        for (let i = 0; i < bitCount; i++) node = (node << 1) | this.bit(probs, node);
-        return node - (1 << bitCount);
-    }
-}
 
 const validBlock = n => n === 4 || n === 8 || n === 16 || n === 32;
 

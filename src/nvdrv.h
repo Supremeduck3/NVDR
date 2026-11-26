@@ -236,6 +236,10 @@ typedef struct {
 typedef struct NvdrvDecoder NvdrvDecoder;
 
 int  nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info);
+/* The same from bytes in memory: `data` (malloc'd, `size` bytes) becomes
+ * the decoder's, freed by nvdrv_decode_close(), or here on failure. What
+ * the browser's decoder opens (wasm/api.c). */
+int  nvdrv_decode_open_mem(NvdrvDecoder** out, uint8_t* data, size_t size, NvdrvInfo* info);
 
 /*
  * Render the next frame, in display order, into `out`, which the caller

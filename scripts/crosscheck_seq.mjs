@@ -1,11 +1,10 @@
 /*
- * The C sequence decoder and the browser's (nvdrv.js, which reads the
- * motion field itself and hands each frame's container and prediction
- * to the C code compiled to WebAssembly) have to hold the same state
- * after every frame, byte for byte. A predicted frame is a residual on top of that
- * state, so a one-pixel disagreement at frame 1 is a different reference
- * at frame 2 and the error compounds down the clip — a player that drifts
- * from the file while every individual frame looks plausible.
+ * The browser's sequence decoder (nvdrv.js) is the C one compiled to
+ * WebAssembly, and has to show what nvdrv_decode shows, byte for byte:
+ * the two builds differ in compiler, in allocator (wasm/libc.c) and in
+ * rounding helpers (wasm/include), and a predicted frame is a residual on
+ * top of the frames before it, so a one-pixel disagreement at frame 1 is
+ * a different reference at frame 2 and compounds down the clip.
  *
  * This decodes a sequence both ways, whole and cut at several points, and
  * reports the first frame and pixel where they part.

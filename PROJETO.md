@@ -200,15 +200,17 @@ Para rádio, satélite ou qualquer canal que perde pacotes sem reenviar:
 |---|---|
 | `nvdr.wasm` + `nvdr-wasm.js` | o decodificador: o C compilado para o navegador |
 | `nvdr.js` | lê cabeçalhos e extras, chama a WebAssembly, desenha na tela |
-| `nvdrv.js`, `nvda.js` | vídeo e álbum: organizam os quadros e as fotos e pedem cada imagem à WebAssembly |
+| `nvdrv.js`, `nvda.js` | vídeo e álbum: acham onde cada quadro e cada foto está no arquivo; quem decodifica é a WebAssembly |
 | `nvdr-tasks.js`, `nvdr-worker.js`, `nvdr-decoder.js` | decodificam fora da página (*worker*), para ela não travar |
 | `nvdr-img.js` | o elemento `<nvdr-img>`, para usar o formato num site |
 
-Havia uma cópia do decodificador escrita à mão em JavaScript; ela foi
-removida, e o navegador usa só o C compilado. Toda mudança de formato
-agora é feita uma vez só. O que ainda é JavaScript no vídeo é a leitura
-do campo de movimento (`nvdrv.js`); a compensação de movimento e as
-imagens já são o C.
+Havia uma cópia do decodificador escrita à mão em JavaScript, para
+fotos e para vídeo; ela foi removida, e o navegador usa só o C
+compilado, o mesmo que as ferramentas de linha de comando rodam. Toda
+mudança de formato agora é feita uma vez só. Para isso a WebAssembly
+ganhou um alocador de memória de verdade (`wasm/libc.c`): o
+decodificador de vídeo guarda quadros de referência de uma chamada para
+a outra e os devolve em qualquer ordem.
 
 ### 4.7 A página e o servidor
 
@@ -305,9 +307,10 @@ compostas, mais referências e a distribuição de qualidade entre quadros.
 
 ## 7. Decisões em aberto
 
-1. **Unificação dos decodificadores — fotos feita.** A cópia em
-   JavaScript das imagens saiu (~1 360 linhas). Falta a do vídeo: a
-   leitura do campo de movimento em `nvdrv.js`, que ainda repete o C.
+1. **Unificação dos decodificadores — feita.** As cópias em JavaScript
+   saíram: a das imagens (~1 360 linhas) e a do vídeo (~960 linhas, o
+   campo de movimento e a compensação). Fotos, álbuns e vídeos no
+   navegador são o C compilado.
 2. **Ganhos medidos e guardados para a próxima mudança de formato**:
    - modelos iniciais para vídeo: ~1%;
    - modelos iniciais para o campo de movimento: ~0,3%;

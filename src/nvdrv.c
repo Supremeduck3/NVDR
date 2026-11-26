@@ -934,6 +934,7 @@ static uint8_t* pack_field(const int16_t* vx, const int16_t* vy, const int16_t* 
 static int unpack_field(const uint8_t* packed, size_t len, int nbx, int nby, const int16_t* mx,
                         const int16_t* my, int esc, int lim, int16_t* vx, int16_t* vy) {
     int nb = nbx * nby;
+    if (nb <= 0) return -1;
     uint8_t* same = (uint8_t*)malloc((size_t)nb);
     if (!same) return -1;
     MvModels m;
@@ -3450,6 +3451,7 @@ struct NvdrvDecoder {
     NvdrContext* ctx[4];     /* the models frames left, per class: see code_frame() */
 };
 
+#ifndef NVDR_WASM
 int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
     *out = NULL;
     FILE* f = fopen(path, "rb");
@@ -3463,6 +3465,13 @@ int nvdrv_decode_open(NvdrvDecoder** out, const char* path, NvdrvInfo* info) {
     if (!data) { fclose(f); return -1; }
     size_t got = fread(data, 1, (size_t)size, f);
     fclose(f);
+    return nvdrv_decode_open_mem(out, data, got, info);
+}
+#endif
+
+int nvdrv_decode_open_mem(NvdrvDecoder** out, uint8_t* data, size_t got, NvdrvInfo* info) {
+    *out = NULL;
+    if (!data) return -1;
     if (got < NVDRV_HEADER_SIZE ||
         memcmp(data, NVDRV_MAGIC, 4) != 0 || data[4] < 20 || data[4] > NVDRV_VERSION) {
         free(data); return -1;

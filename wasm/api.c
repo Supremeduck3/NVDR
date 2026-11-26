@@ -3,6 +3,7 @@
  * buffer, decoded as many times as the page wants views of it:
  *
  *   p = nvdr_wasm_input(n)       room for the container, written by JS
+ *                                (it takes the place of the one before)
  *   b = nvdr_wasm_base(w, h)     room for the picture a container with
  *                                NVDR_FLAG_INTER is predicted from, RGB,
  *                                written by JS after the input
@@ -12,25 +13,25 @@
  *                                read around them (nvdr_decode_mem_lossy)
  *   r = nvdr_wasm_decode(n, L)   decode its first n bytes up to layer L;
  *                                r points at a Result, 0 when no picture
- *   nvdr_wasm_release()          give back everything since the input
+ *   nvdr_wasm_release()          give back the picture of the last decode
  *
- * and a pool of contexts outside that heap, for a sequence's frames,
- * whose models carry from one to the next:
+ * a pool of contexts, for containers whose models carry from one to the
+ * next (a fluid album's photos):
  *
  *   k = nvdr_wasm_ctx_alloc()    an empty context, -1 when none is free
  *   nvdr_wasm_ctx_reset(k)       empty it again
  *   nvdr_wasm_ctx_free(k)        give it back
  *   nvdr_wasm_use_ctx(k)         the next decode starts from it and
  *                                leaves the frame's models in it
+ *
+ * and the sequence decoder of src/nvdrv.c, and its one picture predicted
+ * from another (an album's), further down.
  */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nvdr.h"
-#include "mc.h"
-
-uintptr_t nvdr_heap_top(void);
-void nvdr_heap_rewind(uintptr_t to);
+#include "nvdrv.h"
 
 typedef struct {
     uint32_t rgb;                 /* pointer to width * height * 3 bytes */
@@ -42,7 +43,7 @@ typedef struct {
 static const uint8_t* input;
 static size_t* holes;
 static int nholes;
-static uintptr_t after_input;
+static NvdrImage last;      /* the last decode's picture, until released */
 static Result result;
 static NvdrImage base;
 
@@ -71,30 +72,30 @@ void nvdr_wasm_use_ctx(int32_t k) { use_ctx = k >= 0 && k < CTX_SLOTS && ctx_use
 
 __attribute__((export_name("nvdr_wasm_input")))
 uint8_t* nvdr_wasm_input(uint32_t n) {
-    nvdr_heap_rewind(0);
-    uint8_t* p = (uint8_t*)malloc(n ? n : 1);
-    input = p;
+    free((void*)input); free(base.pixels); free(holes);
+    free(last.pixels); last.pixels = NULL;
     base.pixels = NULL;
     holes = NULL; nholes = 0;
     use_ctx = -1;
-    after_input = nvdr_heap_top();
+    uint8_t* p = (uint8_t*)malloc(n ? n : 1);
+    input = p;
     return p;
 }
 
 __attribute__((export_name("nvdr_wasm_base")))
 uint8_t* nvdr_wasm_base(int32_t w, int32_t h) {
+    free(base.pixels);
     base.pixels = (unsigned char*)malloc((size_t)w * h * 3);
     base.width = w; base.height = h;
-    after_input = nvdr_heap_top();
     return base.pixels;
 }
 
 __attribute__((export_name("nvdr_wasm_holes")))
 uint32_t* nvdr_wasm_holes(int32_t k) {
     _Static_assert(sizeof(size_t) == sizeof(uint32_t), "wasm32: a byte offset is 32 bits");
+    free(holes);
     holes = (size_t*)malloc((size_t)(k > 0 ? k : 1) * 2 * sizeof(size_t));
     nholes = holes && k > 0 ? k : 0;
-    after_input = nvdr_heap_top();
     return (uint32_t*)holes;
 }
 
@@ -108,6 +109,8 @@ Result* nvdr_wasm_decode(uint32_t n, int32_t max_layer) {
            : base.pixels || ctx ? nvdr_decode_mem_base(input, n, base.pixels ? &base : NULL, &out, NULL, &info, ctx)
                                 : nvdr_decode_mem(input, n, max_layer, &out, NULL, &info);
     if (rc != 0) return 0;
+    free(last.pixels);
+    last = out;
     result.rgb = (uint32_t)(uintptr_t)out.pixels;
     result.width = out.width; result.height = out.height;
     result.tiles = info.tiles; result.layers_present = info.layers_present;
@@ -116,51 +119,87 @@ Result* nvdr_wasm_decode(uint32_t n, int32_t max_layer) {
 }
 
 __attribute__((export_name("nvdr_wasm_release")))
-void nvdr_wasm_release(void) { nvdr_heap_rewind(after_input); }
+void nvdr_wasm_release(void) { free(last.pixels); last.pixels = NULL; }
+
+/* Room of the decoder's own heap, for what JS hands the calls below. */
+__attribute__((export_name("nvdr_wasm_alloc")))
+void* nvdr_wasm_alloc(uint32_t n) { return malloc(n ? n : 1); }
+
+__attribute__((export_name("nvdr_wasm_free")))
+void nvdr_wasm_free(void* p) { free(p); }
 
 /*
- * A sequence frame's motion-compensated prediction (src/mc.c), for
- * public/nvdrv.js:
+ * A sequence, for public/nvdrv.js, decoded by the command-line decoder's
+ * code (nvdrv_decode_next()):
  *
- *   p = nvdr_wasm_mc_alloc(w, h, cells)  room for the references, the
- *                                        field and the prediction; p
- *                                        points at five pointers: r0, r1,
- *                                        the vectors (4 * cells int16,
- *                                        v0x v0y v1x v1y), the modes, and
- *                                        the prediction, w * h * 3 bytes
- *   nvdr_wasm_mc(w, h, g, nfx, nfy, two, obmc)
- *
- * The room is the heap a decode's input takes, so the next
- * nvdr_wasm_input() takes it back.
+ *   p = nvdr_wasm_alloc(n)           the file, written by JS
+ *   s = nvdr_wasm_seq_open(p, n)     a decoder, which keeps p; 0 when the
+ *                                    header makes no sense (p is freed)
+ *   f = nvdr_wasm_seq_next(s)        the next frame in display order:
+ *                                    f points at a SeqFrame, whose rc is
+ *                                    1 for a frame, 0 at the end, -1 on
+ *                                    damage; the pixels stay until the
+ *                                    next call
+ *   nvdr_wasm_seq_close(s)
  */
-static uint32_t mc_at[5];
-static uint8_t* mc_tmp;
+typedef struct {
+    int32_t rc, display, kind, partial;
+    uint32_t rgb;
+    int32_t width, height, fps, frames;
+} SeqFrame;
 
-__attribute__((export_name("nvdr_wasm_mc_alloc")))
-uint32_t* nvdr_wasm_mc_alloc(int32_t w, int32_t h, int32_t cells) {
-    nvdr_heap_rewind(0);
-    input = NULL;
-    base.pixels = NULL;
-    size_t n = (size_t)w * h * 3;
-    uint8_t* r0 = (uint8_t*)malloc(n);
-    uint8_t* r1 = (uint8_t*)malloc(n);
-    int16_t* v = (int16_t*)malloc((size_t)cells * 4 * sizeof(int16_t));
-    uint8_t* mode = (uint8_t*)malloc((size_t)cells);
-    uint8_t* dst = (uint8_t*)malloc(n);
-    mc_tmp = (uint8_t*)malloc(n);
-    if (!r0 || !r1 || !v || !mode || !dst || !mc_tmp) return 0;
-    mc_at[0] = (uint32_t)(uintptr_t)r0; mc_at[1] = (uint32_t)(uintptr_t)r1;
-    mc_at[2] = (uint32_t)(uintptr_t)v; mc_at[3] = (uint32_t)(uintptr_t)mode;
-    mc_at[4] = (uint32_t)(uintptr_t)dst;
-    return mc_at;
+typedef struct {
+    SeqFrame f;              /* first: s is where JS reads the size from */
+    NvdrvDecoder* dec;
+    NvdrImage out;
+} Seq;
+
+__attribute__((export_name("nvdr_wasm_seq_open")))
+Seq* nvdr_wasm_seq_open(uint8_t* data, uint32_t n) {
+    Seq* s = (Seq*)calloc(1, sizeof(*s));
+    NvdrvInfo info;
+    if (!s) { free(data); return 0; }
+    if (nvdrv_decode_open_mem(&s->dec, data, n, &info) != 0) { free(s); return 0; }
+    s->out.width = info.width; s->out.height = info.height;
+    s->out.pixels = (unsigned char*)malloc((size_t)info.width * info.height * 3);
+    if (!s->out.pixels) { nvdrv_decode_close(s->dec); free(s); return 0; }
+    s->f.width = info.width; s->f.height = info.height;
+    s->f.fps = info.fps; s->f.frames = info.frame_count;
+    s->f.rgb = (uint32_t)(uintptr_t)s->out.pixels;
+    return s;
 }
 
-__attribute__((export_name("nvdr_wasm_mc")))
-void nvdr_wasm_mc(int32_t w, int32_t h, int32_t g, int32_t nfx, int32_t nfy, int32_t two, int32_t obmc) {
-    size_t cells = (size_t)nfx * nfy;
-    const int16_t* v = (const int16_t*)(uintptr_t)mc_at[2];
-    mc_predict_frame((const uint8_t*)(uintptr_t)mc_at[0], two ? (const uint8_t*)(uintptr_t)mc_at[1] : NULL,
-                     (uint8_t*)(uintptr_t)mc_at[4], mc_tmp, w, h, g, nfx, nfy,
-                     v, v + cells, v + 2 * cells, v + 3 * cells,
-                     two ? (const uint8_t*)(uintptr_t)mc_at[3] : NULL, obmc);
+__attribute__((export_name("nvdr_wasm_seq_next")))
+SeqFrame* nvdr_wasm_seq_next(Seq* s) {
+    int kind = 0, partial = 0;
+    s->f.rc = nvdrv_decode_next(s->dec, &s->out, &kind, &partial);
+    s->f.kind = kind; s->f.partial = partial;
+    s->f.display = nvdrv_decode_display(s->dec);
+    return &s->f;
+}
+
+__attribute__((export_name("nvdr_wasm_seq_close")))
+void nvdr_wasm_seq_close(Seq* s) {
+    if (!s) return;
+    nvdrv_decode_close(s->dec);
+    free(s->out.pixels);
+    free(s);
+}
+
+/*
+ * One picture predicted from another of its size (nvdrv_predict_decode()),
+ * an album's photo:
+ *
+ *   r = nvdr_wasm_alloc(w * h * 3), d = nvdr_wasm_alloc(n), both by JS
+ *   o = nvdr_wasm_predict(r, w, h, d, n)   the picture, w * h * 3 bytes
+ *                                          to give back with
+ *                                          nvdr_wasm_free(); 0 when it
+ *                                          does not decode
+ */
+__attribute__((export_name("nvdr_wasm_predict")))
+uint8_t* nvdr_wasm_predict(uint8_t* ref, int32_t w, int32_t h, const uint8_t* data, uint32_t n) {
+    NvdrImage r = { ref, w, h }, out;
+    int partial;
+    if (nvdrv_predict_decode(&r, data, n, &out, &partial) != 0) return 0;
+    return out.pixels;
 }

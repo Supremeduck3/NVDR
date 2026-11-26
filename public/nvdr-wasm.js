@@ -95,31 +95,61 @@ export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = fal
     };
 }
 
+const NOT_LOADED = 'the WebAssembly decoder (nvdr.wasm) is not loaded: await loadWasm() first';
+
+/* Copies `bytes` into the decoder's heap: the pointer, for a call that
+ * takes it (or for nvdr_wasm_free()). */
+function put(w, bytes) {
+    const at = w.nvdr_wasm_alloc(bytes.length);
+    if (!at) throw new Error('out of WebAssembly memory');
+    new Uint8Array(w.memory.buffer, at, bytes.length).set(bytes);
+    return at;
+}
+
 /*
- * A sequence frame's motion-compensated prediction (src/mc.c, the C
- * decoder's) into `dst`: from r0 alone, or with `mode` from r0 and r1 per
- * cell; vectors in quarter pixels on G's grid of G.g-pixel cells. False,
- * with nothing done, when the WebAssembly decoder is not loaded; nvdrv.js
- * then makes the same pixels itself.
+ * A sequence decoder of src/nvdrv.c, the command-line decoder's, on
+ * `bytes` (a whole .nvdrv or any prefix of one): { width, height, next(),
+ * close() }. next() is the next frame in display order, { index, kind,
+ * partial, pixels } with pixels a copy of its own, or null at the end;
+ * it throws where the C decoder returns -1. Null when the header makes
+ * no sense. close() gives the decoder's memory back.
  */
-export function wasmPredict(r0, r1, dst, width, height, G, v0x, v0y, v1x, v1y, mode, obmc) {
+export function wasmSequence(bytes) {
     const w = exports_;
-    if (!w || !w.nvdr_wasm_mc) return false;
-    const cells = G.nfx * G.nfy, two = mode ? 1 : 0;
-    const at = w.nvdr_wasm_mc_alloc(width, height, cells);
-    if (!at) return false;
-    // Views of memory after each call that may grow it.
-    const p = new Uint32Array(w.memory.buffer, at, 5);
-    const mem = w.memory.buffer;
-    new Uint8Array(mem, p[0], r0.length).set(r0);
-    const v = new Int16Array(mem, p[2], cells * 4);
-    v.set(v0x.subarray(0, cells), 0); v.set(v0y.subarray(0, cells), cells);
-    if (two) {
-        new Uint8Array(mem, p[1], r1.length).set(r1);
-        v.set(v1x.subarray(0, cells), 2 * cells); v.set(v1y.subarray(0, cells), 3 * cells);
-        new Uint8Array(mem, p[3], cells).set(mode.subarray(0, cells));
-    }
-    w.nvdr_wasm_mc(width, height, G.g, G.nfx, G.nfy, two, obmc ? 1 : 0);
-    dst.set(new Uint8Array(w.memory.buffer, p[4], width * height * 3));
-    return true;
+    if (!w) throw new Error(NOT_LOADED);
+    const s = w.nvdr_wasm_seq_open(put(w, bytes), bytes.length);
+    if (!s) return null;
+    const info = new Int32Array(w.memory.buffer, s, 9);
+    let open = true;
+    return {
+        width: info[5], height: info[6],
+        next() {
+            if (!open) throw new Error('sequence decoder closed');
+            // The view after the call: a frame can grow the memory.
+            const r = w.nvdr_wasm_seq_next(s);
+            const m = new Int32Array(w.memory.buffer, r, 9);
+            if (m[0] < 0) throw new Error('the sequence is damaged');
+            if (m[0] === 0) return null;
+            const pixels = new Uint8Array(w.memory.buffer, m[4] >>> 0, m[5] * m[6] * 3).slice();
+            return { index: m[1], kind: m[2], partial: !!m[3], pixels };
+        },
+        close() { if (open) { open = false; w.nvdr_wasm_seq_close(s); } }
+    };
+}
+
+/*
+ * One picture predicted from another of its size, an album's photo
+ * (nvdrv_predict_decode() in src/nvdrv.c): the new RGB picture, or null
+ * where the C side returns -1.
+ */
+export function wasmPredictDecode(ref, width, height, data) {
+    const w = exports_;
+    if (!w) throw new Error(NOT_LOADED);
+    const r = put(w, ref), d = put(w, data);
+    const o = w.nvdr_wasm_predict(r, width, height, d, data.length);
+    w.nvdr_wasm_free(d); w.nvdr_wasm_free(r);
+    if (!o) return null;
+    const out = new Uint8Array(w.memory.buffer, o, width * height * 3).slice();
+    w.nvdr_wasm_free(o);
+    return out;
 }

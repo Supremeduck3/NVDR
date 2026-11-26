@@ -31,6 +31,14 @@ jobs:
           ./nvdr_encode samples/OIP-4140498144.jpg /tmp/dir.nvdr --directional --fast --slices auto --quiet
           node scripts/crosscheck.mjs /tmp/prog.nvdr
           node scripts/crosscheck.mjs /tmp/dir.nvdr
+      - name: Sequences and albums, C against WebAssembly
+        run: |
+          ./nvdrv_encode samples/video/bench/clean /tmp/a.nvdrv --limit 16 --jobs 2
+          ./nvdrv_encode samples/video/bench/multi /tmp/b.nvdrv --limit 16 --gop 8 --bframes 0 --block 8
+          node scripts/crosscheck_seq.mjs /tmp/a.nvdrv
+          node scripts/crosscheck_seq.mjs /tmp/b.nvdrv
+          ./nvdr_album pack /tmp/c.nvda samples/OIP-1304511485.jpg samples/OIP-3451121336.jpg samples/OIP-3786546191.jpg
+          node scripts/crosscheck_album.mjs /tmp/c.nvda
       - name: Fuzz, briefly
         run: |
           make fuzz

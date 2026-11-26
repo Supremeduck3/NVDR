@@ -857,8 +857,8 @@ import { loadWasm, wasmActive } from './nvdr-wasm.js';
 import { decoderFor } from './nvdr-decoder.js';
 // The player decodes in a worker (sequenceDecoder()), which loads the
 // WebAssembly decoder itself; this thread loads it too, for the status
-// line and for when the worker cannot start. A 960x540 frame takes 35 ms
-// with it instead of 125 in JavaScript, inside 24 fps's 42.
+// line and for when the worker cannot start. A 960x540 frame takes about
+// 36 ms, inside 24 fps's 42.
 const wasmReady = loadWasm();
 import { isPng, nvdrFromPng, kindOf, pngFor, download, pngOptions } from './nvdr-png.js';
 

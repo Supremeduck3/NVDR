@@ -8,9 +8,9 @@
  * times; a decoder reads each pixel of a frame once or twice, and
  * building the planes was 88% of decoding a 960x540 sequence. Here each
  * block filters only the region it reads, with the same sums and the same
- * rounding, so the pixels are the planes' to the bit; public/nvdrv.js's
- * predictRegionSeq() and obmcApply() are the same code, and this file is
- * compiled into nvdr.wasm too, so the page's player runs it.
+ * rounding, so the pixels are the planes' to the bit. This file is
+ * compiled into nvdr.wasm too, with the rest of the sequence decoder, so
+ * the page's player runs it.
  */
 #include "mc.h"
 
