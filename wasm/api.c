@@ -6,6 +6,10 @@
  *   b = nvdr_wasm_base(w, h)     room for the picture a container with
  *                                NVDR_FLAG_INTER is predicted from, RGB,
  *                                written by JS after the input
+ *   h = nvdr_wasm_holes(k)       room for k byte ranges [start, end) that
+ *                                never arrived, as 2k uint32, written by
+ *                                JS; decodes until the next input then
+ *                                read around them (nvdr_decode_mem_lossy)
  *   r = nvdr_wasm_decode(n, L)   decode its first n bytes up to layer L;
  *                                r points at a Result, 0 when no picture
  *   nvdr_wasm_release()          give back everything since the input
@@ -36,6 +40,8 @@ typedef struct {
 } Result;
 
 static const uint8_t* input;
+static size_t* holes;
+static int nholes;
 static uintptr_t after_input;
 static Result result;
 static NvdrImage base;
@@ -69,6 +75,7 @@ uint8_t* nvdr_wasm_input(uint32_t n) {
     uint8_t* p = (uint8_t*)malloc(n ? n : 1);
     input = p;
     base.pixels = NULL;
+    holes = NULL; nholes = 0;
     use_ctx = -1;
     after_input = nvdr_heap_top();
     return p;
@@ -82,13 +89,23 @@ uint8_t* nvdr_wasm_base(int32_t w, int32_t h) {
     return base.pixels;
 }
 
+__attribute__((export_name("nvdr_wasm_holes")))
+uint32_t* nvdr_wasm_holes(int32_t k) {
+    _Static_assert(sizeof(size_t) == sizeof(uint32_t), "wasm32: a byte offset is 32 bits");
+    holes = (size_t*)malloc((size_t)(k > 0 ? k : 1) * 2 * sizeof(size_t));
+    nholes = holes && k > 0 ? k : 0;
+    after_input = nvdr_heap_top();
+    return (uint32_t*)holes;
+}
+
 __attribute__((export_name("nvdr_wasm_decode")))
 Result* nvdr_wasm_decode(uint32_t n, int32_t max_layer) {
     NvdrImage out;
     NvdrDecodeInfo info;
     NvdrContext* ctx = use_ctx >= 0 ? (NvdrContext*)ctx_mem[use_ctx] : NULL;
     use_ctx = -1;    /* one decode only: another view must not move it again */
-    int rc = base.pixels || ctx ? nvdr_decode_mem_base(input, n, base.pixels ? &base : NULL, &out, NULL, &info, ctx)
+    int rc = nholes ? nvdr_decode_mem_lossy(input, n, holes, nholes, max_layer, &out, NULL, &info)
+           : base.pixels || ctx ? nvdr_decode_mem_base(input, n, base.pixels ? &base : NULL, &out, NULL, &info, ctx)
                                 : nvdr_decode_mem(input, n, max_layer, &out, NULL, &info);
     if (rc != 0) return 0;
     result.rgb = (uint32_t)(uintptr_t)out.pixels;

@@ -1,6 +1,6 @@
 # The checks that are otherwise run by hand: the regression gate (which
 # builds on determinism, the recorded baseline, truncation and the C and
-# JS decoders agreeing), the decoders against each other on files with
+# WebAssembly decoders agreeing), the two builds against each other on files with
 # slices and holes, and a short run of the fuzzer under the sanitizers.
 name: ci
 
@@ -25,7 +25,7 @@ jobs:
         run: make wasm
       - name: Regression gate
         run: python3 scripts/verify.py
-      - name: Slices and holes, C against JS and WebAssembly
+      - name: Slices and holes, C against WebAssembly
         run: |
           ./nvdr_encode samples/OIP-4140498144.jpg /tmp/prog.nvdr --slices 2 --quiet
           ./nvdr_encode samples/OIP-4140498144.jpg /tmp/dir.nvdr --directional --fast --slices auto --quiet

@@ -37,8 +37,8 @@ por onde só passa imagem.
           ┌───────────────────────────┼─────────────────────────────┐
           ▼                           ▼                             ▼
   DECODIFICADOR C            DECODIFICADOR NO NAVEGADOR       ENVIO POR REDE RUIM
-  (nvdr_decode etc.)         WebAssembly (o mesmo C)          pacotes + paridade
-                             e JavaScript (cópia à mão)       (nvdr-fec.js, UDP)
+  (nvdr_decode etc.)         WebAssembly: o mesmo C,          pacotes + paridade
+                             compilado para o navegador       (nvdr-fec.js, UDP)
                                       │
                                       ▼
                              PÁGINA E SERVIDOR
@@ -198,16 +198,17 @@ Para rádio, satélite ou qualquer canal que perde pacotes sem reenviar:
 
 | Arquivo | Papel |
 |---|---|
-| `nvdr.wasm` + `nvdr-wasm.js` | o decodificador C compilado para o navegador (rápido) |
-| `nvdr.js`, `nvdrv.js`, `nvda.js` | o decodificador reescrito à mão em JavaScript (reserva e conferência) |
-| `nvdr-priors.js` | a mesma tabela de modelos iniciais do C |
+| `nvdr.wasm` + `nvdr-wasm.js` | o decodificador: o C compilado para o navegador |
+| `nvdr.js` | lê cabeçalhos e extras, chama a WebAssembly, desenha na tela |
+| `nvdrv.js`, `nvda.js` | vídeo e álbum: organizam os quadros e as fotos e pedem cada imagem à WebAssembly |
 | `nvdr-tasks.js`, `nvdr-worker.js`, `nvdr-decoder.js` | decodificam fora da página (*worker*), para ela não travar |
 | `nvdr-img.js` | o elemento `<nvdr-img>`, para usar o formato num site |
 
-O WebAssembly é o mesmo código C, então na prática há **dois**
-decodificadores: o C e a cópia em JavaScript. Toda mudança de formato
-precisa ser feita nos dois. Unificar, deixando só o WebAssembly, é uma
-decisão pendente (seção 7).
+Havia uma cópia do decodificador escrita à mão em JavaScript; ela foi
+removida, e o navegador usa só o C compilado. Toda mudança de formato
+agora é feita uma vez só. O que ainda é JavaScript no vídeo é a leitura
+do campo de movimento (`nvdrv.js`); a compensação de movimento e as
+imagens já são o C.
 
 ### 4.7 A página e o servidor
 
@@ -244,7 +245,7 @@ usar o codec diretamente.
 | Teste | Garante |
 |---|---|
 | `scripts/verify.py` (`make check`) | o codificador é determinístico, a qualidade e o tamanho não pioraram, arquivos cortados ainda decodificam |
-| `scripts/crosscheck*.mjs` | C, JavaScript e WebAssembly dão os mesmos pixels, inclusive com cortes, danos e buracos |
+| `scripts/crosscheck*.mjs` | o C da linha de comando e o compilado para o navegador dão os mesmos pixels, inclusive com cortes, danos e buracos |
 | `scripts/fuzz.c` (`make fuzz`) | arquivos corrompidos de propósito não quebram o decodificador |
 | CI no GitHub | roda os três acima a cada push |
 
@@ -304,12 +305,10 @@ compostas, mais referências e a distribuição de qualidade entre quadros.
 
 ## 7. Decisões em aberto
 
-1. **Unificar os decodificadores do navegador.** Deixar só o
-   WebAssembly e apagar a cópia em JavaScript (~2 000 linhas). Cada
-   mudança de formato passaria a ser feita uma vez só. Perde-se a
-   conferência independente C contra JS.
-2. **Ganhos medidos e guardados para a próxima mudança de formato**
-   (melhor aplicar depois da unificação):
+1. **Unificação dos decodificadores — fotos feita.** A cópia em
+   JavaScript das imagens saiu (~1 360 linhas). Falta a do vídeo: a
+   leitura do campo de movimento em `nvdrv.js`, que ainda repete o C.
+2. **Ganhos medidos e guardados para a próxima mudança de formato**:
    - modelos iniciais para vídeo: ~1%;
    - modelos iniciais para o campo de movimento: ~0,3%;
    - peso maior para os modelos iniciais das fotos: ~0,2%.

@@ -1,7 +1,7 @@
 /*
- * priors — the models a slice starts from (src/priors.h, public/nvdr-priors.js).
+ * priors — the models a slice starts from (src/priors.h).
  *
- *   priors <out.h> <out.js> <image>...
+ *   priors <out.h> <image>...
  *
  * A slice cannot start from what the slice before it learnt, since it has
  * to decode without it, and from even odds every slice pays again for
@@ -21,11 +21,11 @@
 #define NP (sizeof(ColourModels) / sizeof(NvdrProb) + 2 * sizeof(TextureModels) / sizeof(NvdrProb))
 
 int main(int argc, char** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s <out.h> <out.js> <image>...\n", argv[0]); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: %s <out.h> <image>...\n", argv[0]); return 2; }
     static double sum[2][NP];
     static int used[2][NP];
     const int qs[3] = { 16, 24, 40 };
-    for (int i = 3; i < argc; i++) {
+    for (int i = 2; i < argc; i++) {
         NvdrImage img;
         if (nvdr_image_load(&img, argv[i]) != 0) { fprintf(stderr, "skip %s\n", argv[i]); continue; }
         for (int mode = 0; mode < 2; mode++)
@@ -53,30 +53,22 @@ int main(int argc, char** argv) {
         nvdr_image_free(&img);
     }
     FILE* h = fopen(argv[1], "w");
-    FILE* js = fopen(argv[2], "w");
-    if (!h || !js) return 1;
+    if (!h) return 1;
     fprintf(h, "/* The models a slice starts from: see scripts/analysis/priors.c, which\n"
                " * wrote this. [0] progressive, [1] directional; the probability of a 0,\n"
                " * in 256ths, in the order of ColourModels, the low band's TextureModels\n"
                " * and the high band's. */\n"
                "#define NVDR_PRIOR_COUNT %zu\nstatic const uint8_t NVDR_PRIORS[2][NVDR_PRIOR_COUNT] = {\n", (size_t)NP);
-    fprintf(js, "// The models a slice starts from: see scripts/analysis/priors.c, which\n"
-                "// wrote this, and src/priors.h, the same numbers. [0] progressive,\n"
-                "// [1] directional.\nexport const PRIORS = [\n");
     for (int mode = 0; mode < 2; mode++) {
         fprintf(h, "    {");
-        fprintf(js, "    new Uint8Array([");
         for (size_t j = 0; j < NP; j++) {
             int v = used[mode][j] ? (int)(sum[mode][j] / used[mode][j] * 256 + 0.5) : 128;
             v = v < 1 ? 1 : v > 255 ? 255 : v;
             fprintf(h, "%s%d,", j % 24 ? "" : "\n        ", v);
-            fprintf(js, "%s%d,", j % 24 ? "" : "\n        ", v);
         }
         fprintf(h, "\n    },\n");
-        fprintf(js, "\n    ]),\n");
     }
     fprintf(h, "};\n");
-    fprintf(js, "];\n");
-    fclose(h); fclose(js);
+    fclose(h);
     return 0;
 }

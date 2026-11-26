@@ -1,23 +1,19 @@
 /*
- * The C and JS decoders have to agree on every byte, or the viewer shows
- * something the container does not contain. This decodes the same
- * container both ways — each layer, cuts that land inside either layer,
- * and copies with a few bits flipped, whole length, which is where the JS
- * decoder starts over (see decode() in nvdr.js), and copies with holes
- * (packets that never arrived, filled with noise the decoders must not
- * read: nvdr_decode --missing, decode()'s `holes`) — and reports the
- * first pixel where they differ.
+ * The C decoder as the tools run it and as the browser runs it, compiled
+ * to WebAssembly (wasm/), have to agree on every byte: the same source
+ * through two compilers, two libcs and two word sizes. This decodes the
+ * same container both ways — each layer, cuts that land inside either
+ * layer, copies with a few bits flipped, and copies with holes (packets
+ * that never arrived, filled with noise the decoders must not read:
+ * nvdr_decode --missing, decode()'s `holes`) — and reports the first
+ * pixel where they differ. Needs `make` and `make wasm`.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { decodeJs as decode, readHeader, sliceParts } from '../public/nvdr.js';
-import { loadWasmBytes, decodeWasm } from '../public/nvdr-wasm.js';
+import { decode, readHeader, sliceParts } from '../public/nvdr.js';
+import { loadWasmBytes } from '../public/nvdr-wasm.js';
 
-// The WebAssembly build of the C decoder is held to the same pixels, when
-// it has been built (make wasm).
-const wasmPath = new URL('../public/nvdr.wasm', import.meta.url).pathname;
-let wasm = false;
-try { await loadWasmBytes(readFileSync(wasmPath)); wasm = true; } catch { }
+await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
 
 const [, , container] = process.argv;
 if (!container) {
@@ -53,11 +49,11 @@ function check(label, file, layer, holes = null) {
         cDecoded = false;
     }
     const result = decode(new Uint8Array(bytes), layer, false, null, false, null, holes);
-    const jsDecoded = !!result;
-    if (!cDecoded || !jsDecoded) {
-        if (cDecoded !== jsDecoded) {
+    const wDecoded = !!result;
+    if (!cDecoded || !wDecoded) {
+        if (cDecoded !== wDecoded) {
             console.log(`${label}: C ${cDecoded ? 'decoded' : 'refused'}, ` +
-                        `JS ${jsDecoded ? 'decoded' : 'refused'}`);
+                        `WebAssembly ${wDecoded ? 'decoded' : 'refused'}`);
             failures++;
         } else {
             console.log(`${label}: both refuse (no colour layer yet)`);
@@ -65,24 +61,15 @@ function check(label, file, layer, holes = null) {
         return;
     }
     const ref = readPPM('/tmp/cc.ppm');
-    if (wasm && !holes) {
-        const w = decodeWasm(new Uint8Array(bytes), layer);
-        for (let i = 0; i < ref.pixels.length; i++)
-            if (!w || w.rgb[i] !== ref.pixels[i]) {
-                console.log(`${label}: WebAssembly differs from C at pixel ${Math.floor(i / 3)}`);
-                failures++;
-                return;
-            }
-    }
     const got = result.rgb;
     for (let i = 0; i < got.length; i++)
         if (got[i] !== ref.pixels[i]) {
             console.log(`${label}: differ at pixel ${Math.floor(i / 3)} channel ${i % 3}: ` +
-                        `js ${got[i]} vs c ${ref.pixels[i]}`);
+                        `WebAssembly ${got[i]} vs C ${ref.pixels[i]}`);
             failures++;
             return;
         }
-    console.log(`${label}: identical${wasm && !holes ? ' (C, JS, WASM)' : ' (C, JS)'} (${result.header.width}x${result.header.height}, ` +
+    console.log(`${label}: identical (C, WebAssembly) (${result.header.width}x${result.header.height}, ` +
                 `tiles ${result.tilesComplete.join('/')} of ${result.tiles})`);
 }
 

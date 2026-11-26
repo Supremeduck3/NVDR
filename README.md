@@ -1,7 +1,8 @@
 # NVDR
 
 A still-image and video codec written from scratch in C, with decoders
-in JavaScript and WebAssembly that produce the same pixels to the bit.
+in the browser that are the same C compiled to WebAssembly, and produce
+the same pixels to the bit.
 No dependencies beyond libm, zlib and `stb_image.h`; nothing needs a GPU.
 
 - **`.nvdr`** — a picture. A quadtree of leaves of 4 to 32 pixels, each
@@ -73,9 +74,8 @@ Each tool prints its options when run without arguments.
     <script type="module" src="nvdr-img.js"></script>
     <nvdr-img src="photo.nvdr"></nvdr-img>
 
-`public/nvdr-img.js` decodes in a worker, with the WebAssembly decoder
-when it loads and the JavaScript one otherwise, and shows a progressive
-file as it arrives. `GUIA.md` lists the files to copy.
+`public/nvdr-img.js` decodes in a worker, with the C decoder compiled to
+WebAssembly, and shows a progressive file as it arrives. `GUIA.md` lists the files to copy.
 
 ## Over a bad link
 

@@ -1,6 +1,8 @@
 /*
- * The C and JS sequence decoders have to hold the same state after every
- * frame, byte for byte. A predicted frame is a residual on top of that
+ * The C sequence decoder and the browser's (nvdrv.js, which reads the
+ * motion field itself and hands each frame's container and prediction
+ * to the C code compiled to WebAssembly) have to hold the same state
+ * after every frame, byte for byte. A predicted frame is a residual on top of that
  * state, so a one-pixel disagreement at frame 1 is a different reference
  * at frame 2 and the error compounds down the clip — a player that drifts
  * from the file while every individual frame looks plausible.
@@ -8,11 +10,9 @@
  * This decodes a sequence both ways, whole and cut at several points, and
  * reports the first frame and pixel where they part.
  *
- *     node scripts/crosscheck_seq.mjs file.nvdrv [--wasm]
+ *     node scripts/crosscheck_seq.mjs file.nvdrv
  *
- * With --wasm the JS decoder runs with public/nvdr.wasm loaded, as the
- * page's player does: frames' containers and their motion-compensated
- * predictions then go through the C code compiled to WebAssembly.
+ * (--wasm, which this once needed, is still accepted.)
  */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -23,11 +23,10 @@ import { loadWasmBytes } from '../public/nvdr-wasm.js';
 
 const [, , container] = process.argv;
 if (!container) {
-    console.error('usage: node scripts/crosscheck_seq.mjs <file.nvdrv> [--wasm]');
+    console.error('usage: node scripts/crosscheck_seq.mjs <file.nvdrv>');
     process.exit(2);
 }
-if (process.argv.includes('--wasm'))
-    await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
+await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
 const decoder = new URL('../nvdrv_decode', import.meta.url).pathname;
 
 function readPPM(path) {

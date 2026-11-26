@@ -1,15 +1,14 @@
 /*
  * The C decoder, compiled to WebAssembly (wasm/, `make wasm`), behind the
- * same decode() as nvdr.js. It is the code the command-line decoder runs,
- * so its pixels are the C decoder's, which nvdr.js is held to anyway
- * (scripts/crosscheck_wasm.mjs checks all three agree).
+ * decoder behind nvdr.js's decode(), and the only one: it is the code the
+ * command-line decoder runs, so its pixels are the C decoder's
+ * (scripts/crosscheck.mjs holds the two builds to the same bytes).
  *
  *   import { loadWasm } from './nvdr-wasm.js';
- *   await loadWasm();          // from here on nvdr.js's decode() uses it
+ *   await loadWasm();          // from here on nvdr.js's decode() works
  *
- * A container decoded with a fluid context (a sequence, a fluid album)
- * still goes through nvdr.js, which keeps the context's models; so does
- * everything when WebAssembly is not available.
+ * Contexts for containers decoded in order (a sequence's frames, a fluid
+ * album's photos) live here too, in a pool of 64.
  */
 import { readHeader, setFastDecoder } from './nvdr.js';
 
@@ -41,9 +40,8 @@ export async function loadWasmBytes(bytes) {
     return exports_;
 }
 
-/* decode() of nvdr.js, without a fluid context. Each view is a decode of
- * its own (the C decoder shows one layer per call); layer 0 and 1 are
- * the cheap ones. */
+/* decode() of nvdr.js. Each view is a decode of its own (the C decoder
+ * shows one layer per call); layer 0 and 1 are the cheap ones. */
 /* The pool of contexts wasm/api.c keeps, for newDecodeContext(). */
 const wasmContexts = {
     alloc: () => exports_.nvdr_wasm_ctx_alloc(),
@@ -51,7 +49,8 @@ const wasmContexts = {
     free: k => exports_.nvdr_wasm_ctx_free(k)
 };
 
-export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false, base = null, slot = -1) {
+export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = false, base = null, slot = -1,
+                           holes = null) {
     const w = exports_;
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     const header = readHeader(bytes);
@@ -62,6 +61,12 @@ export function decodeWasm(buffer, maxLayer = 2, wantFlat = false, wantLow = fal
     if (base && (header.flags & 0x40)) {
         const bp = w.nvdr_wasm_base(base.width, base.height);
         new Uint8Array(w.memory.buffer, bp, base.rgb.length).set(base.rgb);
+    }
+    // Byte ranges that never arrived: as [start, end) pairs, or flat.
+    if (holes && holes.length) {
+        const flat = Array.isArray(holes[0]) ? holes.flat() : Array.from(holes);
+        const hp = w.nvdr_wasm_holes(flat.length >> 1);
+        new Uint32Array(w.memory.buffer, hp, flat.length).set(flat);
     }
     const view = layer => {
         const r = w.nvdr_wasm_decode(bytes.length, layer);

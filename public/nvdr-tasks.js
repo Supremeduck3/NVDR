@@ -15,10 +15,8 @@ import { AlbumReader, openAlbumImage } from './nvda.js';
 import { SequenceDecoder } from './nvdrv.js';
 import { loadWasm, wasmActive } from './nvdr-wasm.js';
 
-// The C decoder as WebAssembly, when it loads: from then on decode()
-// (here and in nvda.js) uses it, twice as fast on a large photo and
-// several times on a small one. Until it has loaded, or where it cannot,
-// the JavaScript decoder answers.
+// The C decoder as WebAssembly: the only decoder there is. Every task
+// waits for it; where it cannot load, tasks fail and say so.
 const wasm = loadWasm();
 
 const stored = new Map();   // key -> Uint8Array
@@ -56,12 +54,14 @@ const ops = {
     /* Keep a container (or an album) to decode later by key. */
     put(m) {
         stored.set(m.key, m.bytes instanceof Uint8Array ? m.bytes : new Uint8Array(m.bytes));
+        albums.get(m.key)?.close();
         albums.delete(m.key);
         return { result: true, transfer: [] };
     },
 
     drop(m) {
         stored.delete(m.key);
+        albums.get(m.key)?.close();
         albums.delete(m.key);
         return { result: true, transfer: [] };
     },
@@ -73,7 +73,7 @@ const ops = {
         if (!r) return { result: null, transfer: [] };
         const { width, height } = r.header;
         const result = {
-            engine: wasmActive() ? 'WebAssembly' : 'JavaScript',
+            engine: 'WebAssembly',
             header: r.header, layersPresent: r.layersPresent, tiles: r.tiles,
             tilesComplete: r.tilesComplete, rgb: r.rgb, flatRgb: r.flatRgb, lowRgb: r.lowRgb,
             // Transparency rides after the layers (extras.h): null until
@@ -92,6 +92,7 @@ const ops = {
     /* Open a stored album: its index, for the page to lay out. */
     albumOpen(m) {
         const reader = new AlbumReader(bytesOf(m));
+        albums.get(m.key)?.close();
         albums.set(m.key, reader);
         const names = reader.index.map((_, i) => reader.name(i));
         return { result: { count: reader.count, window: reader.window, index: reader.index, names },
@@ -137,6 +138,7 @@ const ops = {
      * resolve it against. */
     async albumImage(m) {
         const got = await openAlbumImage(m.url, m.which);
+        got.reader.close();
         const { result, transfer } = image(got.image, m.fit);
         return { result: { image: result, index: got.index, fetched: got.fetched }, transfer };
     }
@@ -146,5 +148,6 @@ export async function runTask(m) {
     const op = ops[m.op];
     if (!op) throw new Error(`unknown task ${m.op}`);
     await wasm;
+    if (!wasmActive()) throw new Error('o decodificador (nvdr.wasm) não carregou neste navegador');
     return op(m);
 }

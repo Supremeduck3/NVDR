@@ -15,7 +15,10 @@ import dgram from 'node:dgram';
 import { writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { reassemble, packetId } from '../public/nvdr-fec.js';
-import { decodeJs } from '../public/nvdr.js';
+import { readFileSync } from 'node:fs';
+import { decode as decodeJs } from '../public/nvdr.js';
+import { loadWasmBytes } from '../public/nvdr-wasm.js';
+await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
 
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };

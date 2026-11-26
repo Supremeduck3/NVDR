@@ -5,7 +5,7 @@
  * in only its chain of references; openAlbumImage() below fetches exactly
  * those bytes from a server with range requests.
  */
-import { decode, newContext } from './nvdr.js';
+import { decode, newDecodeContext, freeContext } from './nvdr.js';
 import { predictDecode } from './nvdrv.js';
 
 const MAGIC = 0x4144564e;   // "NVDA" read as a little-endian uint32
@@ -61,14 +61,28 @@ function parseIndex(bytes) {
  * { width, height, rgb, partial }, null when the bytes are not there yet,
  * and throws on damage, as nvda_decode() returns 1, 0 and -1.
  */
+/* A fluid album's context lives in the WebAssembly decoder, which keeps
+ * a fixed number: given back by close(), or when the reader is collected. */
+const contexts = typeof FinalizationRegistry === 'undefined' ? null
+    : new FinalizationRegistry(slot => freeContext({ slot }));
+
 export class AlbumReader {
     constructor(buffer) {
         this.bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
         Object.assign(this, parseIndex(this.bytes));
         this.fluid = (this.flags & FLAG_FLUID) !== 0;
-        this.ctx = this.fluid ? newContext() : null;
+        this.ctx = null;   /* a fluid album's, taken at its first photo */
         this.nextFluid = 0;
         this.ring = new Array(this.window).fill(null);   // { i, rgb, width, height }
+    }
+
+    /* Gives the decoder's context back; the reader decodes no more. */
+    close() {
+        if (!this.ctx) return;
+        if (contexts) contexts.unregister(this);
+        freeContext(this.ctx);
+        this.ctx = null;
+        this.closed = true;
     }
 
     name(i) {
@@ -90,11 +104,16 @@ export class AlbumReader {
         if (slot && slot.i === i) return { width: slot.width, height: slot.height, rgb: slot.rgb.slice(), partial: false };
         const x = this.index[i];
         if (this.fluid && i !== this.nextFluid) throw new Error('a fluid album reads in order');
+        if (this.closed) throw new Error('the album reader was closed');
         if (x.offset >= this.bytes.length) return null;
         let len = x.length, cut = false;
         if (len > this.bytes.length - x.offset) { len = this.bytes.length - x.offset; cut = true; }
         const payload = this.bytes.subarray(x.offset, x.offset + len);
         let rgb;
+        if (this.fluid && !this.ctx) {
+            this.ctx = newDecodeContext();
+            if (contexts) contexts.register(this, this.ctx.slot, this);
+        }
         if (x.kind === KIND_INTRA) {
             const r = decode(payload, 2, false, this.ctx);
             if (!r) { if (cut) return null; throw new Error('album is damaged'); }

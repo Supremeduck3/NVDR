@@ -39,7 +39,9 @@ import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readPPM } from './addnoise.mjs';
-import { decodeJs } from '../../public/nvdr.js';
+import { decode as decodeJs } from '../../public/nvdr.js';
+import { loadWasmBytes } from '../../public/nvdr-wasm.js';
+await loadWasmBytes(readFileSync(new URL('../../public/nvdr.wasm', import.meta.url)));
 import { packetize, reassemble } from '../../public/nvdr-fec.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');

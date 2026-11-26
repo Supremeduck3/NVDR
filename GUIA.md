@@ -10,7 +10,7 @@ tools/      os CLIs (nvdr_encode/decode, nvdrv_encode/decode, nvdr_album,
             nvdr_png, nvdr_batch) e o envio por UDP (nvdr_send/recv.mjs)
 public/     os decoders do navegador, o elemento <nvdr-img> e a página
 wasm/       o decoder C compilado para o navegador
-scripts/    o gate de regressão, os crosschecks C×JS, o fuzzer, análises
+scripts/    o gate de regressão, os crosschecks (C × WebAssembly), o fuzzer, análises
 samples/    as imagens em que todo número do NOTEBOOK.md foi medido
 vendor/     stb_image.h, o único código de terceiros
 reference/  o codec v9 e dois módulos de um pipeline removido; não
@@ -64,8 +64,10 @@ Ele checa cinco coisas em cada imagem de `samples/`:
 4. **Truncagem** — corta em 9 pontos; todo corte que já tem o começo da
    camada de cor tem que decodificar, e a qualidade não pode cair conforme
    os bytes aumentam.
-5. **C contra JS** — os dois decoders têm que dar os mesmos pixels, nas
-   duas camadas e em arquivo cortado.
+5. **C contra WebAssembly** — o decoder da linha de comando e o do
+   navegador (o mesmo C, compilado para WebAssembly) têm que dar os
+   mesmos pixels, em todas as camadas, em arquivo cortado, danificado e
+   com buracos.
 
 E mais uma, sobre uma sequência de 12 quadros que ele também gera na hora:
 **deriva**. O encoder tem que predizer da própria reconstrução, nunca do
@@ -405,7 +407,7 @@ isso vem desligado.
 ### Usando num site
 
 O arquivo continua com as propriedades quando vai para um site. Coloque
-o `nvdr-img.js` (e `nvdr.js`, `nvdr-priors.js`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
+o `nvdr-img.js` (e `nvdr.js`, `package.json`, `nvda.js`, `nvdrv.js`, `nvdr-decoder.js`,
 `nvdr-worker.js`, `nvdr-tasks.js`, `nvdr-wasm.js` e `nvdr.wasm`) junto do
 site e use o
 elemento no lugar do `<img>`:
@@ -423,9 +425,9 @@ elemento no lugar do `<img>`:
   do mesmo álbum na página compartilham o que já baixaram: uma grade com o
   álbum todo baixa o tamanho do álbum, uma vez.
 - A decodificação usa o **decodificador C compilado para WebAssembly**
-  (`nvdr.wasm`, 24 KB): 2 a 5 vezes mais rápido que o JavaScript. Se o
-  arquivo não carregar, o JavaScript decodifica igual. Para recompilar:
-  `make wasm` (precisa só de clang e wasm-ld).
+  (`nvdr.wasm`, ~68 KB), o único que existe no navegador: sem ele a
+  página avisa que não consegue decodificar. Para recompilar: `make wasm`
+  (precisa só de clang e wasm-ld).
 - A decodificação roda num **Web Worker**: uma foto grande leva segundos
   para decodificar, e a página continua rolando e respondendo enquanto
   isso. Navegador sem suporte a worker de módulo decodifica na própria
@@ -702,7 +704,7 @@ trecho.
 
 ---
 
-## Conferindo que C e JS decodificam igual
+## Conferindo que o C e o navegador decodificam igual
 
 Para vídeo o equivalente é `scripts/crosscheck_seq.mjs`: compara o
 **estado** dos dois decoders depois de cada quadro, não a imagem na tela.
@@ -717,10 +719,12 @@ node scripts/crosscheck_seq.mjs /tmp/saida.nvdrv
 O gate (`make check`) roda os dois.
 
 O decoder em C e o do navegador têm que produzir **os mesmos bytes** — se
-divergirem, a página mostra algo que o formato não gravou. Por isso tudo
-que o decoder calcula é inteiro: a DCT inversa é a aproximação inteira do
-HEVC, a conversão de cor é em ponto fixo. O script compara os dois nas duas
-camadas e em vários cortes:
+divergirem, a página mostra algo que o formato não gravou. O do navegador
+é o mesmo código C compilado para WebAssembly (houve uma cópia escrita à
+mão em JavaScript; ela saiu, e cada mudança de formato passou a ser feita
+uma vez só). Mesmo sendo o mesmo código, os dois passam por compiladores
+diferentes, então o script compara os dois em todas as camadas, em vários
+cortes, com bits trocados e com buracos:
 
 ```bash
 node scripts/crosscheck.mjs /tmp/m.nvdr
@@ -734,8 +738,8 @@ cut 3%: identical (768x512, tiles 182/0 of 384)
 ```
 
 Sai com código 1 e aponta o primeiro pixel divergente se algo quebrar.
-Vale rodar depois de mexer em `src/entropy.c`, `src/nvdr.c` ou
-`public/nvdr.js` — as três coisas que precisam concordar.
+Precisa de `make` e `make wasm`. Vale rodar depois de mexer em qualquer
+coisa em `src/`.
 
 ---
 

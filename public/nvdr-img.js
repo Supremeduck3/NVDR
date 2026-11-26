@@ -32,8 +32,9 @@
  * `throttle="bytes-per-second"` slows the download down, to watch the
  * progressive render on a fast connection. The element fires `load` with
  * { detail: { bytes } } when it is done and `error` when it cannot be
- * shown. Deploy nvdr-img.js with nvdr.js, nvda.js, nvdrv.js, nvdr-png.js,
- * nvdr-decoder.js, nvdr-worker.js and nvdr-tasks.js next to it.
+ * shown. Deploy nvdr-img.js with nvdr.js, nvdr-wasm.js, nvdr.wasm, nvda.js,
+ * nvdrv.js, nvdr-png.js, nvdr-decoder.js, nvdr-worker.js, nvdr-tasks.js and
+ * package.json (which says they are ES modules) next to it.
  */
 import { paintFitted, shownWidth } from './nvdr.js';
 import { decoderFor } from './nvdr-decoder.js';

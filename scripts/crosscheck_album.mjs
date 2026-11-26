@@ -8,6 +8,8 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AlbumReader } from '../public/nvda.js';
+import { loadWasmBytes } from '../public/nvdr-wasm.js';
+await loadWasmBytes(readFileSync(new URL('../public/nvdr.wasm', import.meta.url)));
 
 const [, , album] = process.argv;
 if (!album) { console.error('usage: node scripts/crosscheck_album.mjs <file.nvda>'); process.exit(2); }
