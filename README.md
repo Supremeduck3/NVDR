@@ -26,17 +26,25 @@ No dependencies beyond libm, zlib and `stb_image.h`; nothing needs a GPU.
 ## Where it stands
 
 Measured, not estimated; `NOTEBOOK.md` has every table and how it was
-made. BD-rate on PSNR-Y, negative meaning NVDR needs fewer bytes:
+made. BD-rate, negative meaning NVDR needs fewer bytes:
 
-    stills, directional, five photographs     vs AV1 (libaom)  +6.5%
-                                              vs HEVC (x265)   -6.2%
+    stills, directional, the six samples      PSNR-Y   PSNR-RGB
+        vs AV1 (libaom), colour halved         +11.3%    -7.9%
+        vs AV1 (libaom), colour whole           -3.2%    +5.6%
+        vs HEVC (x265), colour halved          -12.2%   -30.5%
+        vs HEVC (x265), colour whole           -22.1%   -17.7%
     stills, progressive, five camera photos   vs JPEG          -37%
-                                              vs WebP          -20%
+      (PSNR-Y)                                vs WebP          -20%
                                               vs JPEG XL       level
                                               vs AVIF          +39%
-    video, two 48-frame clips at 960x540      vs AV1 (libaom)  +54% and +56%
-                                              vs HEVC (x265)   -13% and -17%
-                                              vs H.264 (x264)  -40% and -43%
+    video, two 48-frame clips at 960x540      vs AV1 (libaom)  +52% and +55%
+      (PSNR-Y)                                vs HEVC (x265)   -14% and -18%
+                                              vs H.264 (x264)  -40% and -44%
+
+NVDR chooses per picture whether to halve the colour; the other codecs
+are run both ways, which is why each line comes twice. A drawing, a
+chart or a screenshot of up to 256 colours is coded losslessly as a
+palette, where it often comes in under PNG.
 
 What that does not say: the test set is small (six thumbnails, five
 photographs, a handful of short clips), the encoder optimises PSNR and

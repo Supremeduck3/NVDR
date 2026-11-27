@@ -3324,6 +3324,46 @@ frequent colour (circulos at 30% of its bytes: above the gate's line,
 where repeating the last row fell under it). It ignores slices: one
 stream, so a hole costs everything after it.
 
+## Against AV1 and HEVC again (sequence format 22, container 19)
+
+Video, `scripts/bench_video_offline.mjs`, same settings as "The same
+comparison, run again (sequence format 21)" (ffmpeg 6.1.1, libaom 3.8.2,
+x265 3.5, x264 164), BD-rate on PSNR-Y / PSNR-RGB:
+
+                    AV1 libaom        HEVC x265         H.264 x264
+    clean         +51.8% / +47.0%   -14.3% / -16.9%   -40.4% / -43.0%
+    noisy         +54.5% / +49.4%   -18.0% / -22.0%   -43.7% / -45.5%
+
+Two points better than format 21 against AV1, as the priors' 1.4% says
+it should be, and one against x265 and x264. The gap to AV1 is where it
+was: about half as many bytes again.
+
+Stills, with `scripts/analysis/stillref.mjs`, new: the reference
+encoders get each sample as 8-bit YCbCr (BT.601, full range), 4:2:0 or
+4:4:4, as a single still (libaom -still-picture, cpu-used 3, tune psnr;
+x265 slow, tune psnr, every frame intra) and are decoded back to RGB;
+everything is scored against the source RGB as stillbd.mjs scores NVDR
+(directional, its default q range). BD-rate, PSNR-Y / PSNR-RGB:
+
+                          AV1 4:2:0        AV1 4:4:4        HEVC 4:2:0       HEVC 4:4:4
+    OIP-1304511485      +40.4 / -33.2    +8.0 / +9.2      -4.5 / -63.6    -21.5 / -21.9
+    OIP-3451121336       +0.7 /  -5.2    -8.5 / +2.2      -8.3 / -21.2    -18.7 / -11.9
+    OIP-3786546191       +4.7 /  -7.9    -9.5 / +4.3      -9.2 / -26.3    -23.8 / -14.7
+    OIP-4140498144       +3.0 /  -0.4    -4.2 / +2.0     -11.0 / -18.5    -16.9 / -14.3
+    macarrão            +15.9 /  +0.8    -1.0 / +14.2    -36.1 / -42.8    -41.4 / -36.1
+    montanha_pessoas     +3.1 /  -1.7    -3.9 / +2.0      -4.1 / -10.9    -10.2 /  -7.0
+    mean                +11.3 /  -7.9    -3.2 / +5.6     -12.2 / -30.5    -22.1 / -17.7
+
+Not comparable with the +6.5% of the earlier table, which scored both
+codecs on I420 and left the strongly coloured OIP-1304511485 out; that
+picture is where the method shows. NVDR keeps its colour whole there,
+which 4:2:0 AV1 cannot (its RGB stops at 34 dB while its Y reaches 46):
+PSNR-Y sees only NVDR's bytes spent on colour, PSNR-RGB only AV1's lost
+colour. Against AV1 with its colour whole too, NVDR is 3% smaller on
+luma and 6% larger on all three channels; on the four photographs of
+ordinary colour it is within a few percent of AV1 either way. HEVC it
+beats under every scoring.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
