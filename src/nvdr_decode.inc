@@ -346,6 +346,12 @@ static int decode_once(const uint8_t* data, size_t size, const size_t* holes, in
     NvdrHeader h;
     if (read_header(data, size, &h) != 0) return -1;
     if (hdr_out) *hdr_out = h;
+    if (h.version == NVDR_VERSION_PALETTE) {
+        /* Nothing to predict from, nothing to restore. */
+        if (h.flags & NVDR_FLAG_INTER) return -1;
+        return palette_decode(data + NVDR_HEADER_SIZE,
+                              readable(size, holes, nholes, NVDR_HEADER_SIZE, h.stored_bytes[0]), &h, out, info);
+    }
     /* Everything before the first layer has to be there. */
     size_t base = NVDR_HEADER_SIZE + (size_t)h.grain_len + h.restore_len + h.table_len;
     if (readable(size, holes, nholes, 0, base) < base) return -1;

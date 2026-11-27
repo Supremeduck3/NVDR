@@ -11,6 +11,9 @@ No dependencies beyond libm, zlib and `stb_image.h`; nothing needs a GPU.
   prefix of the file is a whole picture) and *directional* (each leaf
   predicted from its decoded neighbours along 43 modes: the smaller
   file, shown whole).
+  A picture of 256 colours or fewer (a drawing, a chart, a screenshot)
+  is coded instead as its colours and an index per pixel, losslessly,
+  when that is smaller: *palette* (container 20).
 - **`.nvda`** — an album: pictures in one file, each predicted from the
   one before where that pays.
 - **`.nvdrv`** — a sequence: intra, P and B frames over a motion field,

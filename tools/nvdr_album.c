@@ -56,6 +56,7 @@ static void safe_stem(const char* name, char* out, size_t cap) {
 
 static int pack(int argc, char** argv) {
     NvdrConfig cfg = nvdr_default_config();
+    cfg.palette = 1;   /* a drawing among the photos is coded as one (container 20) */
     NvdaOptions opt = nvda_default_options();
     const char* out = argv[2];
     int reorder = 0;

@@ -122,6 +122,7 @@ Não precisa decorar; volte aqui quando um termo aparecer.
 |---|---|---|
 | Fatias (`--slices`) | codificar uma faixa por núcleo do processador, e isolar estragos de rede | `nvdr_encode.inc`, `nvdr_header.inc` |
 | Modelos iniciais (versão 19; 18 os segurava mais frouxos) | o codificador começa já "sabendo" como fotos costumam ser; nos vídeos (formato 22), cada tipo de quadro e o campo de movimento também | `src/priors.h`, `src/seqpriors.h`, `nvdr_models.inc` |
+| Paleta (versão 20) | desenho, gráfico, captura de tela: até 256 cores guardadas como as cores e um índice por pixel, sem perda, quando sai menor | `nvdr_palette.inc` |
 | Transparência e perfil de cor | guardados depois das camadas, sem quebrar decodificadores antigos | `src/extras.c` |
 | Decodificar com buracos | mostrar o que chegou quando faltam pedaços do arquivo | `nvdr_decode.inc` |
 | Ocultação | faixa perdida vira um degradê em vez de cinza | `nvdr_planes.inc` |
@@ -318,7 +319,11 @@ compostas, mais referências e a distribuição de qualidade entre quadros.
    iniciais seguram mais firme: 0,1% a 0,2% menores, até 1% numa foto
    pequena. Imagens pequenas são codificadas das duas formas (19 e 18) e
    fica a menor, porque desenhos de poucas centenas de bytes perdiam 7%.
-3. **Base de testes maior** (fotos e vídeos reais) e **licença**:
+3. **Modo paleta — feito.** Imagens de até 256 cores viram as cores
+   e um índice por pixel, sem perda. Num gráfico, 427 bytes contra 862
+   com perda do modo direcional e 865 do PNG; numa captura de tela,
+   18,8 KB contra 29,3 KB (40 dB) e 21,8 KB do PNG.
+4. **Base de testes maior** (fotos e vídeos reais) e **licença**:
    adiados.
 
 ---

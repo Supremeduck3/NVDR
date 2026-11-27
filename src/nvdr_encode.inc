@@ -1519,11 +1519,34 @@ static int encode_mode(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
  * before the first layer. Residuals never carry grain: a predicted frame
  * or photo would have to cancel its reference's grain and add its own.
  */
+static int encode_picture(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                          const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx);
+
+/* The quadtree's picture, or the palette's when that costs less: no
+ * error, so its bytes alone, against the quadtree's bytes and error at
+ * the same lambda (container_cost()). */
 int nvdr_encode_mem_ctx(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
                         const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
+    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    int rc = encode_picture(out_buf, out_len, img, &cfg, hdr_out, ctx);
+    if (rc != 0 || !cfg.palette || ctx || cfg.residual || cfg.base || cfg.tile_q || !img->pixels) return rc;
+    uint8_t* p = NULL; size_t plen = 0;
+    NvdrHeader ph;
+    if (palette_encode(img, &p, &plen, &ph) != 0) return 0;
+    int q = cfg.q < 1 ? 1 : (cfg.q > 4095 ? 4095 : cfg.q);
+    double lambda = cfg.lambda_k * (double)q * q;
+    if (lambda * 8.0 * (double)plen < container_cost(*out_buf, *out_len, img, NULL, lambda, CHROMA_AUTO_WEIGHT)) {
+        free(*out_buf); *out_buf = p; *out_len = plen;
+        if (hdr_out) *hdr_out = ph;
+    } else free(p);
+    return 0;
+}
+
+static int encode_picture(uint8_t** out_buf, size_t* out_len, const NvdrImage* img,
+                          const NvdrConfig* cfg_in, NvdrHeader* hdr_out, NvdrContext* ctx) {
     *out_buf = NULL; *out_len = 0;
     tables_init();
-    NvdrConfig cfg = cfg_in ? *cfg_in : nvdr_default_config();
+    NvdrConfig cfg = *cfg_in;
     if (cfg.grain == NVDR_GRAIN_OFF || cfg.residual || cfg.base || !img->pixels)
         return encode_chroma(out_buf, out_len, img, &cfg, hdr_out, ctx);
     NvdrImage clean;

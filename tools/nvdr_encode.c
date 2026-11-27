@@ -51,6 +51,9 @@ static void usage(const char* argv0) {
         "  --tx-modes N     the same with N modes (0, the default: all of them)\n"
         "  --no-extras      leave out the source's transparency and colour profile,\n"
         "                   which otherwise go after the layers\n"
+        "  --no-palette     never code the picture as its colours and an index per\n"
+        "                   pixel (container 20), which a picture of 256 colours or\n"
+        "                   fewer otherwise is when that is smaller\n"
         "  --no-priors      start the models from even odds, as before container 18,\n"
         "                   instead of from the built-in priors (up to 3%% bigger)\n"
         "  --no-rdoq        round texture levels with the dead zone instead of\n"
@@ -68,6 +71,7 @@ int main(int argc, char** argv) {
     const char* out_path = argv[2];
     NvdrConfig cfg = nvdr_default_config();
     cfg.priors = 1;
+    cfg.palette = 1;
     int quiet = 0, tile_q_test = 0, no_extras = 0;
 
     for (int i = 3; i < argc; i++) {
@@ -84,6 +88,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--tile-q-test")) tile_q_test = 1;
         else if (!strcmp(argv[i], "--no-rdoq")) cfg.rdoq = 0;
         else if (!strcmp(argv[i], "--no-priors")) cfg.priors = 0;
+        else if (!strcmp(argv[i], "--no-palette")) cfg.palette = 0;
         else if (!strcmp(argv[i], "--no-extras")) no_extras = 1;
         else if (!strcmp(argv[i], "--directional")) cfg.directional = 1;
         else if (!strcmp(argv[i], "--no-adaptive-tx")) cfg.adaptive_tx = 0;

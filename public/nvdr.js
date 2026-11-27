@@ -19,6 +19,7 @@
 const MAGIC = 0x5244564e;   // "NVDR" read as a little-endian uint32
 export const VERSION = 16;          // what a container without slices or priors is written as
 export const VERSION_SLICES = 19;   // slices, priors or both; 18 held the priors more loosely, 17 had none
+export const VERSION_PALETTE = 20;  // a picture of few colours: PALETTE in src/nvdr_palette.inc
 const HEADER_SIZE = 32;
 const MAX_PIXELS = 1 << 27; // NVDR_MAX_PIXELS
 export const LAYERS = 3;
@@ -36,6 +37,25 @@ const GRAIN_SIZE = 22, GRAIN_POINTS = 16;
 const GRAIN_KERNELS = [[1, 0, 0], [8, 1, 0], [4, 1, 0], [4, 2, 1], [2, 2, 1]];
 const DB_LEVEL = 8;
 
+/* Mirrors palette_header(): the size and layer 0, everything else fixed;
+ * the whole picture is in layer 0. */
+function paletteHeader(v) {
+    const h = {
+        version: VERSION_PALETTE, width: v.getUint16(6, true), height: v.getUint16(8, true),
+        maxBlock: v.getUint8(10), minBlock: v.getUint8(11),
+        qLuma: v.getUint16(12, true), qChroma: v.getUint16(14, true), flags: v.getUint8(5),
+        storedBytes: [v.getUint32(16, true), v.getUint32(20, true), v.getUint32(24, true)],
+        band: 0, deblock: [DB_LEVEL, DB_LEVEL], grainLen: 0, grain: null, restoreLen: 0,
+        sliceRows: 0, tableLen: 0, slices: 1
+    };
+    h.seg = h.storedBytes.slice();
+    if (!h.width || !h.height || h.width * h.height > MAX_PIXELS) return null;
+    if (h.flags || h.maxBlock !== 32 || h.minBlock !== 4 || h.qLuma !== 1 || h.qChroma !== 1 ||
+        h.storedBytes[1] || h.storedBytes[2] || v.getUint8(28) || v.getUint8(29) || v.getUint16(30, true) ||
+        h.storedBytes[0] < 4 || h.storedBytes[0] > 0x7fffffff) return null;
+    return h;
+}
+
 const validBlock = n => n === 4 || n === 8 || n === 16 || n === 32;
 
 /** The header, or null where read_header() refuses it. */
@@ -48,7 +68,9 @@ export function readHeader(buffer) {
     // Version 16 differs only in having no slice table, 15 also in having
     // no deblocking levels, 14 also in having no half nodes, 13 also in
     // having fifteen intra modes.
-    if (v.getUint32(0, true) !== MAGIC || v.getUint8(4) < 13 || v.getUint8(4) > VERSION_SLICES) return null;
+    if (v.getUint32(0, true) !== MAGIC) return null;
+    if (v.getUint8(4) === VERSION_PALETTE) return paletteHeader(v);
+    if (v.getUint8(4) < 13 || v.getUint8(4) > VERSION_SLICES) return null;
     const h = {
         version: v.getUint8(4),
         width: v.getUint16(6, true),

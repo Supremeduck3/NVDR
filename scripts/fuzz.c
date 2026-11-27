@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
         size_t ntiles = (size_t)((img.width + 31) / 32) * ((img.height + 31) / 32);
         int8_t* tq = (int8_t*)malloc(ntiles);
         for (size_t t = 0; tq && t < ntiles; t++) tq[t] = (int8_t)((int)((t * 7) % 25) - 12);
-        for (int variant = 0; variant < 10 && nseeds < 64; variant++) {
+        for (int variant = 0; variant < 11 && nseeds < 64; variant++) {
             NvdrConfig c = cfg;
             if (variant == 5) { if (!tq) continue; c.tile_q = tq; }
             if (variant == 6) { c.directional = 1; c.q = 30; }
@@ -188,7 +188,21 @@ int main(int argc, char** argv) {
             if (variant == 4) { c.grain = NVDR_GRAIN_ON; c.q = 40; }
             if (variant == 8) { c.slices = 1; c.tile_q = tq; c.q = 30; }
             if (variant == 9) c.q = 60;
-            if (nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &img, &c, NULL) != 0) continue;
+            /* The picture in eight colours, which the palette (container
+             * 20) is sure to take. */
+            NvdrImage few = img;
+            if (variant == 10) {
+                size_t nb = (size_t)img.width * img.height * 3;
+                if (!(few.pixels = (unsigned char*)malloc(nb))) continue;
+                for (size_t i = 0; i < nb; i++) few.pixels[i] = img.pixels[i] > 127 ? 255 : 0;
+                c.palette = 1;
+            }
+            int erc = nvdr_encode_mem(&seeds[nseeds], &seed_len[nseeds], &few, &c, NULL);
+            if (variant == 10) {
+                free(few.pixels);
+                if (erc == 0 && seeds[nseeds][4] != 20) { free(seeds[nseeds]); continue; }
+            }
+            if (erc != 0) continue;
             if (variant == 9) {
                 /* with an alpha plane and a profile after the layers */
                 size_t px = (size_t)img.width * img.height;

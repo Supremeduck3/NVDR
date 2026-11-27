@@ -95,7 +95,12 @@ static int slice_table(const uint8_t* data, size_t size, size_t at, NvdrHeader* 
     return 0;
 }
 
+static int palette_header(const uint8_t* data, NvdrHeader* h);
+
 static int read_header(const uint8_t* data, size_t size, NvdrHeader* h) {
+    /* Version 20 is the palette container, a picture of its own kind. */
+    if (size >= NVDR_HEADER_SIZE && memcmp(data, NVDR_MAGIC, 4) == 0 && data[4] == 20)
+        return palette_header(data, h);
     /* Version 16 differs only in having no slice table, 15 also in having
      * no deblocking levels, 14 also in having no half nodes, 13 also in
      * having fifteen intra modes. */

@@ -74,6 +74,7 @@ NvdrConfig nvdr_default_config(void) {
     c.tile_q = NULL;
     c.slices = 0;
     c.priors = 0;
+    c.palette = 0;
     return c;
 }
 

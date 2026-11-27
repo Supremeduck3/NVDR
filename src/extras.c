@@ -95,6 +95,8 @@ int nvdr_alpha_append(uint8_t** buf, size_t* len, const uint8_t* alpha, int widt
     c.base = NULL;
     c.residual = 0;
     c.priors = 1;
+    /* A mask of a few levels (often two) is what the palette is for. */
+    c.palette = 1;
     NvdrImage g;
     g.width = width; g.height = height;
     size_t n = (size_t)width * height;

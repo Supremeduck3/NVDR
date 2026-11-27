@@ -394,7 +394,7 @@
 </main>
 
 <script type="module">
-import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION_SLICES } from './nvdr.js';
+import { paintFitted, shownWidth, layerThresholds, LAYER_NAMES, VERSION_SLICES, VERSION_PALETTE } from './nvdr.js';
 import { decoderFor } from './nvdr-decoder.js';
 import { isPng, nvdrFromPng, kindOf, pngFor, download, pngOptions } from './nvdr-png.js';
 
@@ -775,8 +775,8 @@ async function showLevels() {
         // A container of another version is the encoder and this page out
         // of step: one rebuilt and the other not, or the page cached.
         const v = container && container.byteLength > 4 ? new Uint8Array(container)[4] : 0;
-        setStatus(v && (v < 13 || v > VERSION_SLICES)
-            ? `Contêiner da versão ${v}; esta página lê da 13 à ${VERSION_SLICES}. Recompile o encoder (make) ` +
+        setStatus(v && (v < 13 || (v > VERSION_SLICES && v !== VERSION_PALETTE))
+            ? `Contêiner da versão ${v}; esta página lê da 13 à ${VERSION_SLICES} e a ${VERSION_PALETTE}. Recompile o encoder (make) ` +
               `e recarregue a página sem cache (Ctrl+Shift+R).`
             : 'Container ilegível.', true);
         return;
@@ -792,7 +792,12 @@ async function showLevels() {
         paintFitted(canvas, pictures[k][0], header.width, header.height, pictures[k][1]);
     });
 
-    setStatus(statusEl.textContent +
+    // A palette picture (container 20) is whole in its first layer.
+    const palette = header.version === VERSION_PALETTE
+        ? ` Em paleta: ${new Uint8Array(container)[32] + 1} cores e um índice por pixel, sem perda; ` +
+          'as três camadas são a mesma imagem.'
+        : '';
+    setStatus(statusEl.textContent + palette +
               ` Decodificado em ${decodeMs.toFixed(0)}ms` +
               (imageDecoder.offThread ? ', fora da página' : '') +
               (result.engine ? `, em ${result.engine}.` : '.'));

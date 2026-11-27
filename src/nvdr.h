@@ -194,6 +194,13 @@ typedef struct {
      * frames' headers as version 16; the still tools turn it on. A
      * residual, or a picture predicted from a base, ignores it. */
     int   priors;
+    /* Code a picture of 256 colours or fewer as its colours and an index
+     * per pixel (PALETTE in nvdr_palette.inc, container v20) when that
+     * costs less than the quadtree's picture; lossless. Off by default
+     * here, since a sequence's frames are never one; the still tools
+     * turn it on. Ignored with a residual, a base, a context or steps
+     * per tile. */
+    int   palette;
 } NvdrConfig;
 
 #define NVDR_SLICES_AUTO (-1)
@@ -230,6 +237,7 @@ NvdrConfig nvdr_default_config(void);
 #define NVDR_VERSION     16
 #define NVDR_VERSION_SLICES 19          /* slices, priors or both; 18: the priors held more
                                            loosely, 17: slices from even odds */
+/* 20 is a palette picture: see PALETTE in nvdr_palette.inc. */
 #define NVDR_HEADER_SIZE 32
 #define NVDR_FLAG_RESIDUAL 0x01         /* colours predicted as 128 */
 #define NVDR_FLAG_DEBLOCK  0x02         /* leaf seams filtered after decoding */

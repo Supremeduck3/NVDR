@@ -33,5 +33,6 @@
 #include "nvdr_models.inc"
 #include "nvdr_planes.inc"
 #include "nvdr_header.inc"
+#include "nvdr_palette.inc"
 #include "nvdr_encode.inc"
 #include "nvdr_decode.inc"

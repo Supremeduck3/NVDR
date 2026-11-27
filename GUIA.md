@@ -255,6 +255,15 @@ Como ler:
   levam textura. Blocos grandes onde a imagem é lisa, pequenos onde tem
   detalhe.
 
+**Paleta.** Uma imagem de até 256 cores (desenho, gráfico, captura de
+tela, ícone) pode sair de outro jeito: as cores, e para cada pixel qual
+delas é. Não há perda nenhuma, e o PSNR sai como 99 dB, que é como o
+decoder escreve "idêntico". O codificador tenta as duas formas e fica com
+a mais barata, pesando a perda do modo normal. Aí a imagem inteira está
+na primeira camada (as outras duas vêm vazias) e o arquivo é o contêiner
+versão 20. `--no-palette` desliga isso. Um arquivo de paleta cortado no
+meio mostra as linhas que chegaram e o resto na cor mais frequente.
+
 ### Decodificar
 
 ```bash

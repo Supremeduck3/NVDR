@@ -3292,6 +3292,38 @@ that way (all eight orientations, checked against ImageMagick's
 -auto-orient), where a phone photo taken upright used to come out lying
 on its side.
 
+## Palette pictures (container 20)
+
+The quadtree codes a drawing's hard edges as texture, approximately and
+at a price. A picture of 256 colours or fewer can instead be its
+colours and an index per pixel, losslessly (`src/nvdr_palette.inc`):
+each index against its left, top and top-right neighbours ("same as
+left?", "same as top?", "same as top-right?", then the index through a
+tree), eight contexts each from which of those neighbours agree. The
+encoder codes the picture both ways and keeps the palette when its bytes
+cost less than the quadtree's bytes and error at the same lambda.
+
+    picture                         palette     quadtree (no palette)          PNG -9
+    gate: blocos                    139 B       249 B                          -
+    gate: circulos                  288 B       3504 B, 41.8 dB                -
+    chart 640x400, 6 colours        427 B       862 B directional, 46.7 dB     865 B
+    screenshot 800x500, 8 colours   18815 B     29313 B directional, 40.0 dB   21764 B
+    icon 300x200 with transparency  1018 B      1790 B                         1776 B
+    photo reduced to 64 colours     -           kept the quadtree: 18116 B at 31.8 dB
+
+The chart and the screenshot were drawn by a script for the test, not
+taken from real use; real screenshots have antialiased text and often
+more than 256 colours, where the palette does not apply. The degrade of
+the gate has more colours and is unchanged; the photographs are
+unchanged. A transparency mask, coded as a picture after the layers,
+takes the palette too (the icon's).
+
+Not progressive: the whole picture is in layer 0, decoded row by row,
+and a cut file shows the rows that arrived and the rest in the most
+frequent colour (circulos at 30% of its bytes: above the gate's line,
+where repeating the last row fell under it). It ignores slices: one
+stream, so a hole costs everything after it.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
