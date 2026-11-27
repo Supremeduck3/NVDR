@@ -3364,6 +3364,35 @@ luma and 6% larger on all three channels; on the four photographs of
 ordinary colour it is within a few percent of AV1 either way. HEVC it
 beats under every scoring.
 
+### Is the intra frame the gap? (measured, nothing changed)
+
+Of the 19.2 KB between NVDRV (q 20, 56.7 KB, 38.65 dB) and AV1 (crf 54,
+37.5 KB) on the clean clip, 7.6 KB are the intra frame: 32.7 KB against
+25.1. It is not worse coding. Frame 0 coded alone as a still, NVDR
+reaches AV1's 38.43 dB in about 23.6 KB, 6% under AV1's key frame; in
+the sequence it is coded at 40.70 dB instead, the tpl refinement
+spending on it for the frames that reuse it. AV1 keeps every frame
+within 0.16 dB of 38.3; NVDRV starts at 40.7 and drifts down the group
+to 37.9 (0.57 dB between frames).
+
+Flattening it costs (BD-rate on PSNR-Y over 48 frames, clean / noisy):
+
+    no tpl (--tpl 0)                    +3.1% / +1.4%
+    P frames at 1.2 q (1.4 now)         +1.4% / +2.2%
+    P frames at 1.0 q                   +5.0% / +7.2%
+    B levels 1.35 apart (1.5 now)       +1.8% / +2.2%
+
+and steepening it pays a little:
+
+    P frames at 1.6 q                   -0.5% / -1.1%
+    B levels 1.65 apart                 -0.8% / -1.1%
+    tpl twice as strong (--tpl 2)       -0.0% / -0.9%
+
+So NVDRV is right to lean on its intra frame, and could lean slightly
+more: its prediction is weaker than AV1's, so a better reference is
+worth more to it. The gap is in the predicted frames (11.6 KB, 9.7 of
+them the motion field), not in the intra frame.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
