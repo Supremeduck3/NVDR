@@ -600,7 +600,7 @@ Parâmetros:
   Nos clipes de teste isso deixou o arquivo **11 a 31% menor** na mesma
   qualidade.
 - **`--b-q-step F`** — quanto cada nível de B é mais grosso que os P
-  (default 0,5: níveis 1, 2 e 3 a 1,5×, 2× e 2,5× o passo dos P).
+  (default 0,65: níveis 1, 2 e 3 a 1,65×, 2,3× e 2,95× o passo dos P).
 - **`--lookahead N`** e **`--tpl F`** — antes de um quadro intra o encoder
   olha até N quadros à frente (default 16) e dá q mais fino às regiões que
   eles vão reaproveitar, com intensidade F (default 1; `0` desliga). Rende
