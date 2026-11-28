@@ -1372,6 +1372,20 @@ were measured:
   AV1's large blocks would suggest: +8.6% on the clean clip and +13.8%
   on the one with three objects. The fine field pays for itself.
 
+- **The best candidate as the starting point** (VVC's MMVD, AV1's
+  NEWMV against a chosen reference vector): instead of the difference
+  from the median, an index among the median and the four neighbours,
+  then the difference from that one, so the jitter of a quarter pixel
+  around a neighbour costs little. Measured on every vector coded in
+  full at q 20 (trial encodes included), by the empirical entropy of the
+  differences and of the indices, each vector free to take the
+  candidate that costs it least: -1.4% of those vectors' bits on the
+  clean clip, -1.5% on the noisy one, -7.8% on the one with three
+  objects (where the left neighbour is the better start a third of the
+  time). Those vectors are about two fifths of the field, the field a
+  sixth of the file: a tenth of a percent of the clean clip, half a
+  percent of the three objects'.
+
 None was kept: none pays for a format change. The field codes what the
 search chooses at close to what its symbols are worth, and the
 search's choices are right for this prediction. What AV1 has is
