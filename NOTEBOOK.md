@@ -3435,6 +3435,27 @@ see something the contexts do not (the co-located symbol of the frame
 before, the block next door's coefficients), each a design of its own.
 Not built.
 
+### AV1's CDEF over NVDR's pictures: measured, not built
+
+CDEF finds each 8x8 block's direction and smooths along it, with a
+weaker filter at 45 degrees, every difference constrained so edges stay.
+Its ceiling over what NVDR decodes now, outside the codec: luma filtered
+as AV1 filters it (cdef_find_dir, primary taps 4 2 or 3 3, secondary
+2 1, damping 5 and 4), eight presets per picture chosen greedily for
+the most gain among 44 (primary 0 to 15, secondary 0, 1, 2, 4), the
+best of them per 64x64 block, at 3 bits a block and 6 a preset:
+
+    six photographs, q 20, directional    +0.001 to +0.06 dB (macarrão)
+    the same, progressive                 +0.004 to +0.15 dB (macarrão)
+    clean clip, q 20, 48 frames           +0.014 dB, 57 bytes a frame to say so
+    noisy clip, the same                  +0.010 dB
+    montanha as JPEG at quality 15, 25    +0.25 dB (the filter works)
+
+NVDR already deblocks with levels the encoder chooses and sends a
+restoration filter fitted to each picture: what CDEF would take out is
+mostly gone. On video the 57 bytes outweigh what it gives a predicted
+frame of 500. Not built.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
