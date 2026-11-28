@@ -3407,6 +3407,34 @@ more: its prediction is weaker than AV1's, so a better reference is
 worth more to it. The gap is in the predicted frames (11.6 KB, 9.7 of
 them the motion field), not in the intra frame.
 
+### Mixing predictions (PAQ's way): measured, not built
+
+Every modelled bit takes its probability from one adaptive context. A
+context-mixing coder asks several models and mixes their answers in
+the logistic domain, with weights learnt as it goes. Its ceiling, before
+building anything: a copy of the decoder logged every bit it read with
+the context it came from and that context's state (the six samples at
+q 20, directional and progressive, and the clean clip at q 20), and a
+simulation coded the same bits both ways. The mixer, per family of
+symbol (split flags, sig, last, gt1 and so on, 25 of them), mixed the
+current probability, the same context adapting fast (1/16), the context
+with the last two bits it coded, and an SSE stage refining the current
+probability per family; its learning rate was swept.
+
+    best mix (all four inputs, rate 0.002 to 0.005)
+    montanha_pessoas, directional       -0.1%
+    OIP-3451121336, progressive         -0.1%
+    macarrão, directional               -0.4 to -0.7%
+    clean clip, frames' containers      -0.6 to -0.7%
+
+A tenth of a percent on photographs, half a percent on small pictures
+and sequences, for a decoder that would do several times the work per
+bit. The contexts already carry what these inputs know: mixing views of
+the same context adds little. A mix that paid would need inputs that
+see something the contexts do not (the co-located symbol of the frame
+before, the block next door's coefficients), each a design of its own.
+Not built.
+
 ## Damaged input
 
 Every test until this point fed the decoders valid files, or valid files
