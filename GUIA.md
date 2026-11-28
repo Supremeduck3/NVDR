@@ -587,7 +587,7 @@ Parâmetros:
   intra mesmo fora do GOP (default 24). É assim que corte de cena é
   detectado, não declarado.
 - **`--q N`** — o passo de quantização dos quadros intra (default 24), e
-  **`--pred-q N`** o dos quadros P (default 1,4× o `--q` com quadros B,
+  **`--pred-q N`** o dos quadros P (default 1,6× o `--q` com quadros B,
   1,2× sem).
 - **`--block N`** — movimento por bloco de NxN, com vetores em **quarto de
   pixel** (default: 16 a partir de 0,2 Mpx, 8 abaixo; `0` usa um vetor só

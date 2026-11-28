@@ -3402,6 +3402,13 @@ and steepening it pays a little:
     B levels 1.65 apart                 -0.8% / -1.1%
     tpl twice as strong (--tpl 2)       -0.0% / -0.9%
 
+Both together, made the defaults (P frames at 1.6 q, B levels 1.65
+apart), against 1.4 and 1.5:
+
+                       clean    noisy    multi     long
+    1.6 and 1.65       -0.9%    -1.8%    -1.7%    -1.1%
+    1.8 and 1.8        +0.1%    -1.8%      -        -
+
 So NVDRV is right to lean on its intra frame, and could lean slightly
 more: its prediction is weaker than AV1's, so a better reference is
 worth more to it. The gap is in the predicted frames (11.6 KB, 9.7 of

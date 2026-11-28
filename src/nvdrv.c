@@ -235,7 +235,7 @@ NvdrvConfig nvdrv_default_config(void) {
      * it. So -1: 24 with blocks of 32 and up, 16 below. */
     c.mv_lambda = -1;
     c.bframes = 7;
-    c.b_q_step = 0.5f;
+    c.b_q_step = 0.65f;   /* see q_for() */
     c.lookahead = 16;
     c.tpl_strength = 1.0f;
     c.tf_radius = 7;
@@ -2610,11 +2610,17 @@ static int q_for(const NvdrvEncoder* e, int kind, int level) {
     }
     /* P frames coarser than the intra frames unless told otherwise: by
      * 1.2 when every frame is a P frame (on the clean clip that was 0.1 dB
-     * better at equal rate across q 16-40), by 1.4 between B frames (2%
-     * smaller at equal luma on the three test clips than 1.2, 4% than
-     * 1.0). */
+     * better at equal rate across q 16-40), by 1.6 between B frames, and
+     * each level of B frames 1.65 times coarser than the one above
+     * (b_q_step 0.65). Measured again with sequence format 22: against 1.4
+     * and 1.5, 0.9 to 1.8% smaller on the four bench clips; 1.8 and 1.8
+     * went too far on the clean one. Quality falls down a group of
+     * pictures more than AV1's does, and that is right for NVDRV: its
+     * prediction is weaker, so the intra frame and the anchors it is
+     * built from are worth more (NOTEBOOK.md, "Is the intra frame the
+     * gap?"). */
     int pq = e->cfg.pred_q > 0 ? e->cfg.pred_q
-           : e->cfg.bframes > 0 ? (q * 7 + 2) / 5 : (q * 6 + 2) / 5;
+           : e->cfg.bframes > 0 ? (q * 8 + 2) / 5 : (q * 6 + 2) / 5;
     if (kind == NVDRV_PRED || kind == NVDRV_PRED2) return pq;
     return (int)(pq * (1.0f + e->cfg.b_q_step * (float)level) + 0.5f);
 }
